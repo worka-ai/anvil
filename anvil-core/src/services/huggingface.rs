@@ -1,4 +1,4 @@
-use crate::{AppState, auth, permissions::AnvilAction, tasks::TaskType};
+use crate::{AppState, access_control, auth, permissions::AnvilAction, tasks::TaskType};
 use tonic::{Request, Response, Status};
 
 use crate::anvil_api as api;
@@ -11,10 +11,16 @@ impl api::hugging_face_key_service_server::HuggingFaceKeyService for AppState {
         request: Request<api::CreateHfKeyRequest>,
     ) -> Result<Response<api::CreateHfKeyResponse>, Status> {
         let (_metadata, extensions, req) = request.into_parts();
-        let scopes = auth::try_get_scopes_from_extensions(&extensions).unwrap_or_default();
-        if !auth::is_authorized(AnvilAction::HfKeyCreate, &req.name, &scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        let claims = auth::try_get_claims_from_extensions(&extensions)
+            .ok_or_else(|| Status::unauthenticated("Missing authentication claims"))?;
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::HfKeyCreate,
+            &req.name,
+        )
+        .await?;
 
         if req.name.trim().is_empty() {
             return Err(Status::invalid_argument("name is required"));
@@ -50,11 +56,16 @@ impl api::hugging_face_key_service_server::HuggingFaceKeyService for AppState {
         request: Request<api::DeleteHfKeyRequest>,
     ) -> Result<Response<api::DeleteHfKeyResponse>, Status> {
         let (_metadata, extensions, req) = request.into_parts();
-        let scopes = auth::try_get_scopes_from_extensions(&extensions).unwrap_or_default();
-
-        if !auth::is_authorized(AnvilAction::HfKeyDelete, &req.name, &scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        let claims = auth::try_get_claims_from_extensions(&extensions)
+            .ok_or_else(|| Status::unauthenticated("Missing authentication claims"))?;
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::HfKeyDelete,
+            &req.name,
+        )
+        .await?;
 
         let n = self
             .persistence
@@ -74,11 +85,16 @@ impl api::hugging_face_key_service_server::HuggingFaceKeyService for AppState {
         request: Request<api::ListHfKeysRequest>,
     ) -> Result<Response<api::ListHfKeysResponse>, Status> {
         let (_metadata, extensions, _req) = request.into_parts();
-        let scopes = auth::try_get_scopes_from_extensions(&extensions).unwrap_or_default();
-
-        if !auth::is_authorized(AnvilAction::HfKeyList, "*", &scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        let claims = auth::try_get_claims_from_extensions(&extensions)
+            .ok_or_else(|| Status::unauthenticated("Missing authentication claims"))?;
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::HfKeyList,
+            "*",
+        )
+        .await?;
 
         let rows = self
             .persistence
@@ -117,15 +133,16 @@ impl api::hf_ingestion_service_server::HfIngestionService for AppState {
             ));
         }
 
-        let scopes = auth::try_get_scopes_from_extensions(&extensions).unwrap_or_default();
-
-        tracing::info!(?scopes, "Extracted scopes");
-
-        if !auth::is_authorized(AnvilAction::HfIngestionCreate, "*", &scopes) {
-            tracing::warn!("Authorization failed for start_ingestion");
-
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        let claims = auth::try_get_claims_from_extensions(&extensions)
+            .ok_or_else(|| Status::unauthenticated("Missing authentication claims"))?;
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::HfIngestionCreate,
+            "*",
+        )
+        .await?;
 
         tracing::info!("Authorization successful for start_ingestion");
         // Lookup key id
@@ -137,9 +154,6 @@ impl api::hf_ingestion_service_server::HfIngestionService for AppState {
         else {
             return Err(Status::not_found("key not found"));
         };
-        let claims = auth::try_get_claims_from_extensions(&extensions)
-            .ok_or_else(|| Status::unauthenticated("Missing authentication claims"))?;
-
         let app_id = claims
             .sub
             .parse::<i64>()
@@ -192,22 +206,23 @@ impl api::hf_ingestion_service_server::HfIngestionService for AppState {
         request: Request<api::GetHfIngestionStatusRequest>,
     ) -> Result<Response<api::GetHfIngestionStatusResponse>, Status> {
         let (_metadata, extensions, req) = request.into_parts();
-        let scopes = auth::try_get_scopes_from_extensions(&extensions).unwrap_or_default();
-        if !auth::is_authorized(AnvilAction::HfIngestionRead, &req.ingestion_id, &scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        let claims = auth::try_get_claims_from_extensions(&extensions)
+            .ok_or_else(|| Status::unauthenticated("Missing authentication claims"))?;
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::HfIngestionRead,
+            &req.ingestion_id,
+        )
+        .await?;
 
         let id: i64 = req
             .ingestion_id
             .parse()
             .map_err(|_| Status::invalid_argument("invalid id"))?;
-        // Policy: allow requester or explicit permission
-        let (_state_s, _q, _d, _s, _f, _err, _st, _ft, _cr) = self
-            .persistence
-            .hf_status_summary(id)
-            .await
-            .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?;
-        // Authorization aligned: interceptor validated token; rely on cluster policy wildcard in tests
+        // The action matrix already checked the caller through Zanzibar before
+        // this point; this endpoint only materialises the ingestion status.
         let (
             state_s,
             queued,
@@ -245,10 +260,16 @@ impl api::hf_ingestion_service_server::HfIngestionService for AppState {
         request: Request<api::CancelHfIngestionRequest>,
     ) -> Result<Response<api::CancelHfIngestionResponse>, Status> {
         let (_metadata, extensions, req) = request.into_parts();
-        let scopes = auth::try_get_scopes_from_extensions(&extensions).unwrap_or_default();
-        if !auth::is_authorized(AnvilAction::HfIngestionDelete, &req.ingestion_id, &scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        let claims = auth::try_get_claims_from_extensions(&extensions)
+            .ok_or_else(|| Status::unauthenticated("Missing authentication claims"))?;
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::HfIngestionDelete,
+            &req.ingestion_id,
+        )
+        .await?;
 
         let id: i64 = req
             .ingestion_id

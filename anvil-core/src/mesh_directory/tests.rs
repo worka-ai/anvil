@@ -60,7 +60,7 @@ fn tenant_name_partition_path_is_stable() {
     assert_eq!(tenant_name.partition(), "c1ae");
     assert_eq!(
         tenant_name.descriptor_key(),
-        "_anvil/control/v1/mesh/tenant-names/c1ae/acme.json"
+        "_anvil/control/v1/mesh/tenant-names/c1ae/acme.pb"
     );
 }
 
@@ -78,7 +78,7 @@ fn bucket_locator_partition_path_is_stable() {
     assert_eq!(key.partition(), "b41d");
     assert_eq!(
         key.descriptor_key(),
-        "_anvil/control/v1/mesh/buckets/b41d/tenant_acme/releases.json"
+        "_anvil/control/v1/mesh/buckets/b41d/tenant_acme/releases.pb"
     );
 }
 
@@ -198,16 +198,18 @@ async fn tenant_name_reservation_is_create_once_and_promoted_by_generation() {
     .await
     .unwrap();
     assert_eq!(stream.records.len(), 2);
-    let first_header: serde_json::Value =
-        serde_json::from_slice(&stream.records[0].frame.header_json).unwrap();
-    let second_header: serde_json::Value =
-        serde_json::from_slice(&stream.records[1].frame.header_json).unwrap();
-    assert_eq!(first_header["operation"], "create");
-    assert_eq!(first_header["sequence"], 1);
-    assert_eq!(first_header["writer_node_id"], "node-test");
-    assert_eq!(first_header["writer_fence"], name_permit.fence_token);
-    assert_eq!(second_header["operation"], "upsert");
-    assert_eq!(second_header["sequence"], 2);
+    let first_header =
+        mesh_control_stream::decode_control_mutation_header(&stream.records[0].frame.header_proto)
+            .unwrap();
+    let second_header =
+        mesh_control_stream::decode_control_mutation_header(&stream.records[1].frame.header_proto)
+            .unwrap();
+    assert_eq!(first_header.operation, "create");
+    assert_eq!(first_header.sequence, 1);
+    assert_eq!(first_header.writer_node_id, "node-test");
+    assert_eq!(first_header.writer_fence, name_permit.fence_token);
+    assert_eq!(second_header.operation, "upsert");
+    assert_eq!(second_header.sequence, 2);
 }
 
 #[tokio::test]
@@ -238,15 +240,9 @@ async fn routing_reads_and_lists_use_control_stream_when_projection_is_stale_or_
     let active = activate_tenant_name(&storage, &tenant_name, &tenant_id, 1, NOW, name_authority)
         .await
         .unwrap();
-    let mut stale_projection: serde_json::Value = serde_json::from_str(
-        &read_descriptor_ref_payload(&storage, &active.descriptor_key())
-            .await
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap();
-    stale_projection["tenant_id"] = serde_json::json!("tenant_wrong");
-    stale_projection["generation"] = serde_json::json!(99);
+    let mut stale_projection = active.clone();
+    stale_projection.tenant_id = TenantId::new("tenant_wrong").unwrap();
+    stale_projection.generation = 99;
     write_descriptor(&storage, &active.descriptor_key(), &stale_projection)
         .await
         .unwrap();
@@ -258,7 +254,7 @@ async fn routing_reads_and_lists_use_control_stream_when_projection_is_stale_or_
     assert_eq!(read.tenant_id.as_str(), "tenant_01");
     assert_eq!(read.generation, 2);
     let repaired_projection: serde_json::Value = serde_json::from_str(
-        &read_descriptor_ref_payload(&storage, &active.descriptor_key())
+        &read_descriptor_projection_payload(&storage, &active.descriptor_key())
             .await
             .unwrap()
             .unwrap(),
@@ -267,7 +263,7 @@ async fn routing_reads_and_lists_use_control_stream_when_projection_is_stale_or_
     assert_eq!(repaired_projection["tenant_id"], "tenant_01");
     assert_eq!(repaired_projection["generation"], 2);
 
-    delete_descriptor_ref(&storage, &active.descriptor_key())
+    delete_descriptor_projection(&storage, &active.descriptor_key())
         .await
         .unwrap();
     let recovered = read_tenant_name_descriptor(&storage, &tenant_name)
@@ -276,7 +272,7 @@ async fn routing_reads_and_lists_use_control_stream_when_projection_is_stale_or_
         .expect("tenant-name rebuilt from stream");
     assert_eq!(recovered.tenant_id.as_str(), "tenant_01");
     assert!(
-        read_descriptor_ref_payload(&storage, &active.descriptor_key())
+        read_descriptor_projection_payload(&storage, &active.descriptor_key())
             .await
             .unwrap()
             .is_some()

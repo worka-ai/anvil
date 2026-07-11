@@ -29,6 +29,7 @@ fn query_filters_match_path_prefix_and_metadata() {
 fn query_filters_reject_non_matching_metadata_without_leaking_object() {
     let req = QueryIndexRequest {
         metadata_filters_json: serde_json::json!({"tenant": "alpha"}).to_string(),
+        boundary_predicates_json: String::new(),
         ..Default::default()
     };
     let filters = QueryFilters::from_request(&req).unwrap();
@@ -46,6 +47,7 @@ fn query_filters_reject_non_matching_metadata_without_leaking_object() {
 fn query_filters_reject_invalid_metadata_filter_shape() {
     let req = QueryIndexRequest {
         metadata_filters_json: "[]".to_string(),
+        boundary_predicates_json: String::new(),
         ..Default::default()
     };
 
@@ -108,6 +110,15 @@ fn hybrid_scoring_disables_freshness_for_single_source_queries() {
 }
 
 #[test]
+fn score_index_candidate_limit_ignores_authorisation_shape() {
+    let filter = QueryPermissionFilter::default();
+
+    assert_eq!(score_index_candidate_limit(20, 250, Some(&filter)), 20);
+    assert_eq!(score_index_candidate_limit(20, 5, Some(&filter)), 20);
+    assert_eq!(score_index_candidate_limit(20, 250, None), 20);
+}
+
+#[test]
 fn index_page_token_binds_principal_mesh_authz_and_index_inputs() {
     let config = Config {
         mesh_id: "mesh-test".to_string(),
@@ -116,9 +127,17 @@ fn index_page_token_binds_principal_mesh_authz_and_index_inputs() {
     let claims = auth::Claims {
         sub: "principal-a".to_string(),
         exp: 0,
-        scopes: vec!["*|*".to_string()],
         tenant_id: 42,
         jti: Some("token-a".to_string()),
+    };
+    let authz_scope = QueryAuthzScope {
+        realm_id: "realm-default".to_string(),
+        object_namespace: "bucket_object".to_string(),
+        relation: "read".to_string(),
+        authorization_mode: "none".to_string(),
+        principal_hash: stable_string_hash("principal-hash"),
+        scope_hash: stable_string_hash("scope-hash"),
+        revision: 11,
     };
     let binding = IndexPageTokenBinding::single_index(
         &config,
@@ -127,10 +146,13 @@ fn index_page_token_binds_principal_mesh_authz_and_index_inputs() {
         "bucket-a",
         "idx-a",
         7,
+        7,
         3,
         11,
-        "predicate-a".to_string(),
-        "order-a".to_string(),
+        &authz_scope,
+        stable_string_hash("predicate-a"),
+        stable_string_hash("order-a"),
+        stable_string_hash("generation:1:sha256:boundary"),
     );
     let signing_key = b"page-token-test-key";
     let encoded = IndexPageToken::for_cursor(
@@ -161,10 +183,13 @@ fn index_page_token_binds_principal_mesh_authz_and_index_inputs() {
         "bucket-a",
         "idx-a",
         7,
+        7,
         3,
         11,
-        "predicate-a".to_string(),
-        "order-a".to_string(),
+        &authz_scope,
+        stable_string_hash("predicate-a"),
+        stable_string_hash("order-a"),
+        stable_string_hash("generation:1:sha256:boundary"),
     );
     assert!(decoded.validate(&other_principal_binding).is_err());
 
@@ -177,10 +202,13 @@ fn index_page_token_binds_principal_mesh_authz_and_index_inputs() {
         "bucket-a",
         "idx-a",
         7,
+        7,
         3,
         11,
-        "predicate-a".to_string(),
-        "order-a".to_string(),
+        &authz_scope,
+        stable_string_hash("predicate-a"),
+        stable_string_hash("order-a"),
+        stable_string_hash("generation:1:sha256:boundary"),
     );
     assert!(decoded.validate(&other_mesh_binding).is_err());
 
@@ -191,12 +219,49 @@ fn index_page_token_binds_principal_mesh_authz_and_index_inputs() {
         "bucket-a",
         "idx-a",
         8,
+        8,
         3,
         11,
-        "predicate-a".to_string(),
-        "order-a".to_string(),
+        &authz_scope,
+        stable_string_hash("predicate-a"),
+        stable_string_hash("order-a"),
+        stable_string_hash("generation:1:sha256:boundary"),
     );
     assert!(decoded.validate(&other_generation_binding).is_err());
+
+    let other_root_generation_binding = IndexPageTokenBinding::single_index(
+        &config,
+        &claims,
+        "typed_json",
+        "bucket-a",
+        "idx-a",
+        7,
+        8,
+        3,
+        11,
+        &authz_scope,
+        stable_string_hash("predicate-a"),
+        stable_string_hash("order-a"),
+        stable_string_hash("generation:1:sha256:boundary"),
+    );
+    assert!(decoded.validate(&other_root_generation_binding).is_err());
+
+    let other_boundary_binding = IndexPageTokenBinding::single_index(
+        &config,
+        &claims,
+        "typed_json",
+        "bucket-a",
+        "idx-a",
+        7,
+        7,
+        3,
+        11,
+        &authz_scope,
+        "predicate-a".to_string(),
+        "order-a".to_string(),
+        "generation:2:sha256:boundary-other".to_string(),
+    );
+    assert!(decoded.validate(&other_boundary_binding).is_err());
 
     let expired = IndexPageToken {
         expires_at: (chrono::Utc::now() - chrono::Duration::seconds(1))

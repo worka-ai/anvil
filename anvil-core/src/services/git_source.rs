@@ -34,9 +34,14 @@ impl GitSourceService for AppState {
             return Err(Status::invalid_argument("bucket_name must not be empty"));
         }
         let resource = git_source_resource(&metadata.repository_id);
-        if !auth::is_authorized(AnvilAction::GitSourceWrite, &resource, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::GitSourceWrite,
+            &resource,
+        )
+        .await?;
 
         let source_hash = blake3::hash(&pack_bytes);
         let source_hash_hex = source_hash.to_hex().to_string();
@@ -46,17 +51,12 @@ impl GitSourceService for AppState {
             "git-source/{}/packs/{}.pack",
             metadata.repository_id, source_hash_hex
         );
-        let object_scope = vec![format!(
-            "object:write|{}/{}",
-            metadata.bucket_name, object_key
-        )];
         let pack_object = self
             .object_manager
             .put_object(
-                claims.tenant_id,
+                &claims,
                 &metadata.bucket_name,
                 &object_key,
-                &object_scope,
                 tokio_stream::iter(vec![Ok(pack_bytes.clone())]),
                 ObjectWriteOptions {
                     content_type: Some("application/x-git-packed-objects".to_string()),
@@ -64,6 +64,9 @@ impl GitSourceService for AppState {
                         "object_kind": "git_pack",
                         "repository_id": metadata.repository_id.clone(),
                     })),
+                    transaction_id: None,
+                    transaction_principal: None,
+                    storage_class_id: None,
                 },
             )
             .await?;
@@ -168,10 +171,10 @@ impl GitSourceService for AppState {
         let claims = authorize_git_source_read(&request)?;
         let req = request.into_inner();
         validate_component("repository_id", &req.repository_id)?;
-        ensure_git_source_read(&self.storage, &claims, &req.repository_id).await?;
+        ensure_git_source_read(self, &claims, &req.repository_id).await?;
         let object_id = parse_git_hex_id("object_id", &req.object_id)?;
         let index = self
-            .latest_git_source_index(claims.tenant_id, &req.repository_id)
+            .latest_git_source_index(&claims, &req.repository_id)
             .await?;
         let locations = git_source_query::get_git_object(&index, &object_id)
             .map_err(|err| Status::invalid_argument(err.to_string()))?
@@ -189,10 +192,10 @@ impl GitSourceService for AppState {
         let claims = authorize_git_source_read(&request)?;
         let req = request.into_inner();
         validate_component("repository_id", &req.repository_id)?;
-        ensure_git_source_read(&self.storage, &claims, &req.repository_id).await?;
+        ensure_git_source_read(self, &claims, &req.repository_id).await?;
         let commit_id = parse_git_hex_id("commit_id", &req.commit_id)?;
         let index = self
-            .latest_git_source_index(claims.tenant_id, &req.repository_id)
+            .latest_git_source_index(&claims, &req.repository_id)
             .await?;
         let location = git_source_query::get_git_blob_by_path(&index, &commit_id, &req.tree_path)
             .map_err(|err| Status::invalid_argument(err.to_string()))?
@@ -210,10 +213,10 @@ impl GitSourceService for AppState {
         let claims = authorize_git_source_read(&request)?;
         let req = request.into_inner();
         validate_component("repository_id", &req.repository_id)?;
-        ensure_git_source_read(&self.storage, &claims, &req.repository_id).await?;
+        ensure_git_source_read(self, &claims, &req.repository_id).await?;
         let commit_id = parse_git_hex_id("commit_id", &req.commit_id)?;
         let index = self
-            .latest_git_source_index(claims.tenant_id, &req.repository_id)
+            .latest_git_source_index(&claims, &req.repository_id)
             .await?;
         let mut entries = git_source_query::list_git_tree(&index, &commit_id, &req.prefix)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
@@ -243,9 +246,14 @@ impl GitSourceService for AppState {
         let req = request.into_inner();
         validate_component("repository_id", &req.repository_id)?;
         let resource = git_source_resource(&req.repository_id);
-        if !auth::is_authorized(AnvilAction::GitSourceWatch, &resource, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::GitSourceWatch,
+            &resource,
+        )
+        .await?;
 
         let after_cursor = join_u128(req.after_cursor_low, req.after_cursor_high);
         let snapshot = git_source_watch::list_git_source_watch_events(
@@ -306,23 +314,23 @@ impl GitSourceService for AppState {
 impl AppState {
     async fn latest_git_source_index(
         &self,
-        tenant_id: i64,
+        claims: &auth::Claims,
         repository_id: &str,
     ) -> Result<git_source_index::DecodedGitSourceIndex, Status> {
         match git_source_query::read_latest_git_source_index(
             &self.storage,
-            tenant_id,
+            claims.tenant_id,
             repository_id,
         )
         .await
         {
             Ok(Some(index)) => Ok(index),
             Ok(None) => {
-                self.rebuild_latest_git_source_index_from_manifest(tenant_id, repository_id)
+                self.rebuild_latest_git_source_index_from_manifest(claims, repository_id)
                     .await
             }
             Err(_) => {
-                self.rebuild_latest_git_source_index_from_manifest(tenant_id, repository_id)
+                self.rebuild_latest_git_source_index_from_manifest(claims, repository_id)
                     .await
             }
         }
@@ -330,12 +338,12 @@ impl AppState {
 
     async fn rebuild_latest_git_source_index_from_manifest(
         &self,
-        tenant_id: i64,
+        claims: &auth::Claims,
         repository_id: &str,
     ) -> Result<git_source_index::DecodedGitSourceIndex, Status> {
         let manifest = git_source_manifest::read_git_source_repository_manifest(
             &self.storage,
-            tenant_id,
+            claims.tenant_id,
             repository_id,
         )
         .await
@@ -343,20 +351,10 @@ impl AppState {
         .ok_or_else(|| Status::not_found("Git source index not found"))?;
         let version_id = uuid::Uuid::parse_str(&manifest.pack_object_version_id)
             .map_err(|_| Status::internal("Git source manifest stores invalid pack version id"))?;
-        let internal_claims = auth::Claims {
-            sub: "internal-git-source-indexer".to_string(),
-            exp: usize::MAX,
-            scopes: vec![format!(
-                "object:read|{}/{}",
-                manifest.bucket_name, manifest.object_key
-            )],
-            tenant_id,
-            jti: None,
-        };
         let (_object, stream, _range_start) = self
             .object_manager
             .get_object(
-                Some(internal_claims),
+                Some(claims.clone()),
                 manifest.bucket_name.clone(),
                 manifest.object_key.clone(),
                 Some(version_id),
@@ -378,7 +376,7 @@ impl AppState {
         let index_ref = git_source_index::write_git_source_index(
             &self.storage,
             git_source_index::GitSourceIndexWrite {
-                tenant_id,
+                tenant_id: claims.tenant_id,
                 repository_id,
                 generation: manifest.generation,
                 source_hash: parsed.pack_hash,
@@ -398,10 +396,14 @@ impl AppState {
                 .await
                 .map_err(|err| Status::internal(err.to_string()))?;
         }
-        git_source_query::read_latest_git_source_index(&self.storage, tenant_id, repository_id)
-            .await
-            .map_err(|err| Status::internal(err.to_string()))?
-            .ok_or_else(|| Status::not_found("Git source index not found"))
+        git_source_query::read_latest_git_source_index(
+            &self.storage,
+            claims.tenant_id,
+            repository_id,
+        )
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?
+        .ok_or_else(|| Status::not_found("Git source index not found"))
     }
 
     async fn next_git_source_generation(
@@ -475,28 +477,19 @@ fn authorize_git_source_read<T>(request: &Request<T>) -> Result<auth::Claims, St
 }
 
 async fn ensure_git_source_read(
-    storage: &crate::storage::Storage,
+    state: &AppState,
     claims: &auth::Claims,
     repository_id: &str,
 ) -> Result<(), Status> {
     let resource = git_source_resource(repository_id);
-    if access_control::scope_or_relationship_allows(
-        storage,
+    access_control::require_action(
+        &state.storage,
+        &state.persistence,
         claims,
         AnvilAction::GitSourceRead,
         &resource,
-        "git_repository",
-        repository_id,
-        "reader",
-        None,
     )
     .await
-    .map_err(|e| Status::internal(e.to_string()))?
-    {
-        Ok(())
-    } else {
-        Err(Status::permission_denied("Permission denied"))
-    }
 }
 
 fn git_source_resource(repository_id: &str) -> String {

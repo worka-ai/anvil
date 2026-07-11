@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 use anyhow::Result;
 use axum::ServiceExt;
 use once_cell::sync::OnceCell;

@@ -1,5 +1,15 @@
 use super::*;
 
+fn index_write_transaction_id(options: Option<&WriteOptions>) -> Result<Option<&str>, Status> {
+    let Some(transaction_id) = options.and_then(|options| options.transaction_id.as_deref()) else {
+        return Ok(None);
+    };
+    if transaction_id.trim().is_empty() {
+        return Err(Status::invalid_argument("transaction_id must not be empty"));
+    }
+    Ok(Some(transaction_id))
+}
+
 #[tonic::async_trait]
 impl IndexService for AppState {
     type WatchIndexDefinitionStream = std::pin::Pin<
@@ -22,9 +32,14 @@ impl IndexService for AppState {
         validate_index_name(&req.name)?;
         let kind = concrete_index_kind(req.kind)?;
         let resource = index_resource(&req.bucket_name, &req.name);
-        if !auth::is_authorized(AnvilAction::IndexCreate, &resource, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::IndexCreate,
+            &resource,
+        )
+        .await?;
         let bucket = self
             .get_index_bucket(claims.tenant_id, &req.bucket_name)
             .await?;
@@ -33,6 +48,9 @@ impl IndexService for AppState {
         let build_policy = parse_json_field("build_policy_json", &req.build_policy_json)?;
         validate_authorization_mode(&req.authorization_mode)?;
         validate_index_definition_shape(kind, &build_policy, &extractor, &self.config)?;
+        let transaction_id = index_write_transaction_id(req.options.as_ref())?;
+        let transaction_principal = transaction_id
+            .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
 
         let index = self
             .persistence
@@ -48,12 +66,32 @@ impl IndexService for AppState {
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        self.publish_index_definition_event(&bucket, &index, "create")
-            .await?;
-        self.persistence
-            .enqueue_index_build_for_index(&bucket, &index)
+        if transaction_id.is_none() {
+            access_control::grant_index_defaults(
+                &self.persistence,
+                &bucket,
+                &index.name,
+                &claims.sub,
+                &claims.sub,
+                "grant creator index owner",
+            )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        }
+        self.publish_index_definition_event_with_transaction(
+            &bucket,
+            &index,
+            "create",
+            transaction_id,
+            transaction_principal.as_deref(),
+        )
+        .await?;
+        if transaction_id.is_none() {
+            self.persistence
+                .enqueue_index_build_for_index(&bucket, &index)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
 
         Ok(Response::new(IndexDefinitionResponse {
             index: Some(index_record(&bucket.name, index)?),
@@ -72,9 +110,14 @@ impl IndexService for AppState {
         let req = request.into_inner();
         validate_index_name(&req.name)?;
         let resource = index_resource(&req.bucket_name, &req.name);
-        if !auth::is_authorized(AnvilAction::IndexUpdate, &resource, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::IndexUpdate,
+            &resource,
+        )
+        .await?;
         let bucket = self
             .get_index_bucket(claims.tenant_id, &req.bucket_name)
             .await?;
@@ -82,6 +125,9 @@ impl IndexService for AppState {
         let extractor = parse_json_field("extractor_json", &req.extractor_json)?;
         let build_policy = parse_json_field("build_policy_json", &req.build_policy_json)?;
         validate_authorization_mode(&req.authorization_mode)?;
+        let transaction_id = index_write_transaction_id(req.options.as_ref())?;
+        let transaction_principal = transaction_id
+            .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
         let existing = self
             .persistence
             .get_index_definition(claims.tenant_id, bucket.id, &req.name)
@@ -104,12 +150,20 @@ impl IndexService for AppState {
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Index definition not found"))?;
-        self.publish_index_definition_event(&bucket, &index, "update")
-            .await?;
-        self.persistence
-            .enqueue_index_build_for_index(&bucket, &index)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        self.publish_index_definition_event_with_transaction(
+            &bucket,
+            &index,
+            "update",
+            transaction_id,
+            transaction_principal.as_deref(),
+        )
+        .await?;
+        if transaction_id.is_none() {
+            self.persistence
+                .enqueue_index_build_for_index(&bucket, &index)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
 
         Ok(Response::new(IndexDefinitionResponse {
             index: Some(index_record(&bucket.name, index)?),
@@ -128,20 +182,34 @@ impl IndexService for AppState {
         let req = request.into_inner();
         validate_index_name(&req.name)?;
         let resource = index_resource(&req.bucket_name, &req.name);
-        if !auth::is_authorized(AnvilAction::IndexUpdate, &resource, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::IndexUpdate,
+            &resource,
+        )
+        .await?;
         let bucket = self
             .get_index_bucket(claims.tenant_id, &req.bucket_name)
             .await?;
+        let transaction_id = index_write_transaction_id(req.options.as_ref())?;
+        let transaction_principal = transaction_id
+            .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
         let index = self
             .persistence
             .disable_index_definition(claims.tenant_id, bucket.id, &req.name)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Index definition not found"))?;
-        self.publish_index_definition_event(&bucket, &index, "disable")
-            .await?;
+        self.publish_index_definition_event_with_transaction(
+            &bucket,
+            &index,
+            "disable",
+            transaction_id,
+            transaction_principal.as_deref(),
+        )
+        .await?;
 
         Ok(Response::new(IndexDefinitionResponse {
             index: Some(index_record(&bucket.name, index)?),
@@ -160,20 +228,34 @@ impl IndexService for AppState {
         let req = request.into_inner();
         validate_index_name(&req.name)?;
         let resource = index_resource(&req.bucket_name, &req.name);
-        if !auth::is_authorized(AnvilAction::IndexDelete, &resource, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::IndexDelete,
+            &resource,
+        )
+        .await?;
         let bucket = self
             .get_index_bucket(claims.tenant_id, &req.bucket_name)
             .await?;
+        let transaction_id = index_write_transaction_id(req.options.as_ref())?;
+        let transaction_principal = transaction_id
+            .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
         let index = self
             .persistence
             .drop_index_definition(claims.tenant_id, bucket.id, &req.name)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Index definition not found"))?;
-        self.publish_index_definition_event(&bucket, &index, "drop")
-            .await?;
+        self.publish_index_definition_event_with_transaction(
+            &bucket,
+            &index,
+            "drop",
+            transaction_id,
+            transaction_principal.as_deref(),
+        )
+        .await?;
         Ok(Response::new(DropIndexResponse {}))
     }
 
@@ -187,9 +269,14 @@ impl IndexService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
-        if !auth::is_authorized(AnvilAction::IndexRead, &req.bucket_name, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::IndexRead,
+            &req.bucket_name,
+        )
+        .await?;
         let bucket = self
             .get_index_bucket(claims.tenant_id, &req.bucket_name)
             .await?;
@@ -219,9 +306,15 @@ impl IndexService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
         validate_index_name(&req.index_name)?;
-        if !auth::is_authorized(AnvilAction::IndexRead, &req.bucket_name, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        let index_resource = format!("{}/{}", req.bucket_name, req.index_name);
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::IndexRead,
+            &index_resource,
+        )
+        .await?;
         let bucket = self
             .get_index_bucket(claims.tenant_id, &req.bucket_name)
             .await?;
@@ -277,9 +370,14 @@ impl IndexService for AppState {
                 "QuerySpec storage tenant does not match authenticated tenant",
             ));
         }
-        if !auth::is_authorized(AnvilAction::IndexRead, bucket_name, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::IndexRead,
+            bucket_name,
+        )
+        .await?;
         let bucket = self.get_index_bucket(claims.tenant_id, bucket_name).await?;
         let plan = self
             .plan_query_spec(&claims, &bucket, &spec, req.accept_degraded)
@@ -343,9 +441,14 @@ impl IndexService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
-        if !auth::is_authorized(AnvilAction::IndexWatch, &req.bucket_name, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::IndexWatch,
+            &req.bucket_name,
+        )
+        .await?;
         let bucket = self
             .get_index_bucket(claims.tenant_id, &req.bucket_name)
             .await?;
@@ -423,9 +526,14 @@ impl IndexService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
         validate_index_name(&req.index_name)?;
-        if !auth::is_authorized(AnvilAction::IndexWatch, &req.bucket_name, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::IndexWatch,
+            &req.bucket_name,
+        )
+        .await?;
         let bucket = self
             .get_index_bucket(claims.tenant_id, &req.bucket_name)
             .await?;
@@ -542,9 +650,14 @@ impl IndexService for AppState {
         if !req.severity.is_empty() {
             validate_diagnostic_severity(&req.severity)?;
         }
-        if !auth::is_authorized(AnvilAction::IndexRead, &req.bucket_name, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::IndexRead,
+            &req.bucket_name,
+        )
+        .await?;
         let bucket = self
             .get_index_bucket(claims.tenant_id, &req.bucket_name)
             .await?;

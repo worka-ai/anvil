@@ -1,7 +1,7 @@
 use crate::anvil_api::internal_proxy_service_server::InternalProxyService;
 use crate::anvil_api::*;
-use crate::object_manager::{ObjectLinkReadMode, ObjectWriteOptions};
-use crate::{AppState, auth, permissions::AnvilAction};
+use crate::object_manager::{ObjectLinkReadMode, ObjectReadConsistency, ObjectWriteOptions};
+use crate::{AppState, access_control, auth, permissions::AnvilAction};
 use futures_util::StreamExt;
 use http::HeaderValue;
 use tokio::sync::mpsc;
@@ -39,7 +39,7 @@ impl InternalProxyService for AppState {
             None => return Err(Status::invalid_argument("empty proxy request stream")),
         };
 
-        validate_internal_proxy_claims(&internal_claims, &header)?;
+        validate_internal_proxy_claims(self, &internal_claims, &header).await?;
         let original_claims = decode_proxy_authz_context(&header)?;
         validate_proxy_principal_matches_header(&original_claims, &header)?;
 
@@ -73,6 +73,7 @@ async fn proxy_get_or_head(
                 &header.object_key,
                 version_id,
                 ObjectLinkReadMode::Follow,
+                ObjectReadConsistency::Latest,
             )
             .await?;
         ProxyReadEither::Head(object.object)
@@ -88,6 +89,7 @@ async fn proxy_get_or_head(
                     version_id,
                     None,
                     ObjectLinkReadMode::Follow,
+                    ObjectReadConsistency::Latest,
                 )
                 .await?,
         )
@@ -164,10 +166,9 @@ async fn proxy_put(
         let current = state
             .object_manager
             .current_object_for_write_precondition(
-                tenant_id,
+                &original_claims,
                 &header.bucket_name,
                 &header.object_key,
-                &original_claims.scopes,
             )
             .await?;
         evaluate_proxy_write_etag_preconditions(
@@ -190,14 +191,16 @@ async fn proxy_put(
     let object = state
         .object_manager
         .put_object(
-            tenant_id,
+            &original_claims,
             &header.bucket_name,
             &header.object_key,
-            &original_claims.scopes,
             data_stream,
             ObjectWriteOptions {
                 content_type,
                 user_metadata: proxy_user_metadata(&header.headers),
+                transaction_id: None,
+                transaction_principal: None,
+                storage_class_id: None,
             },
         )
         .await?;
@@ -225,21 +228,23 @@ async fn proxy_delete(
         state
             .object_manager
             .delete_object_version(
-                tenant_id,
+                &original_claims,
                 &header.bucket_name,
                 &header.object_key,
                 version_id,
-                &original_claims.scopes,
+                None,
+                None,
             )
             .await?
     } else {
         state
             .object_manager
             .delete_object(
-                tenant_id,
+                &original_claims,
                 &header.bucket_name,
                 &header.object_key,
-                &original_claims.scopes,
+                None,
+                None,
             )
             .await?
     };
@@ -317,31 +322,82 @@ fn proxy_header(name: &str, value: &[u8]) -> ProxyHeader {
     }
 }
 
-fn validate_internal_proxy_claims(
+async fn validate_internal_proxy_claims(
+    state: &AppState,
     claims: &auth::Claims,
     header: &ProxyRequestHeader,
 ) -> Result<(), Status> {
-    if claims.tenant_id != 0 || !(claims.sub == "internal" || claims.sub == "internal-worker") {
-        return Err(Status::permission_denied(
-            "Internal proxy requires a node-issued token",
-        ));
-    }
     let resource = format!(
         "tenant/{}/bucket/{}/{}",
         header.tenant_id, header.bucket_name, header.object_key
     );
-    if !auth::is_authorized(AnvilAction::InternalProxyObject, &resource, &claims.scopes) {
-        return Err(Status::permission_denied("Permission denied"));
-    }
-    Ok(())
+    access_control::require_action(
+        &state.storage,
+        &state.persistence,
+        claims,
+        AnvilAction::InternalProxyObject,
+        &resource,
+    )
+    .await
 }
 
 fn decode_proxy_authz_context(header: &ProxyRequestHeader) -> Result<auth::Claims, Status> {
-    if header.authz_context.is_empty() {
+    decode_proxy_authz_context_bytes(&header.authz_context)
+}
+
+pub(crate) fn decode_proxy_authz_context_bytes(bytes: &[u8]) -> Result<auth::Claims, Status> {
+    if bytes.is_empty() {
         return Err(Status::invalid_argument("proxy authz_context is required"));
     }
-    serde_json::from_slice::<auth::Claims>(&header.authz_context)
-        .map_err(|error| Status::invalid_argument(format!("invalid proxy authz_context: {error}")))
+    let proto = crate::core_store::decode_deterministic_proto::<ProxyAuthzContextProto>(
+        bytes,
+        "proxy authz context",
+    )
+    .map_err(|error| Status::invalid_argument(format!("invalid proxy authz_context: {error}")))?;
+    proxy_authz_context_from_proto(proto)
+}
+
+pub fn encode_proxy_authz_context(claims: &auth::Claims) -> Result<Vec<u8>, Status> {
+    let proto = ProxyAuthzContextProto {
+        version: PROXY_AUTHZ_CONTEXT_VERSION,
+        sub: claims.sub.clone(),
+        exp: u64::try_from(claims.exp)
+            .map_err(|_| Status::invalid_argument("proxy authz_context exp is invalid"))?,
+        tenant_id: claims.tenant_id,
+        jti: claims.jti.clone(),
+    };
+    Ok(crate::core_store::encode_deterministic_proto(&proto))
+}
+
+const PROXY_AUTHZ_CONTEXT_VERSION: u32 = 1;
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct ProxyAuthzContextProto {
+    #[prost(uint32, tag = "1")]
+    version: u32,
+    #[prost(string, tag = "2")]
+    sub: String,
+    #[prost(uint64, tag = "3")]
+    exp: u64,
+    #[prost(int64, tag = "5")]
+    tenant_id: i64,
+    #[prost(string, optional, tag = "6")]
+    jti: Option<String>,
+}
+
+fn proxy_authz_context_from_proto(proto: ProxyAuthzContextProto) -> Result<auth::Claims, Status> {
+    if proto.version != PROXY_AUTHZ_CONTEXT_VERSION {
+        return Err(Status::invalid_argument(
+            "invalid proxy authz_context version",
+        ));
+    }
+    Ok(auth::Claims {
+        sub: proto.sub,
+        exp: usize::try_from(proto.exp)
+            .map_err(|_| Status::invalid_argument("invalid proxy authz_context exp"))?,
+        tenant_id: proto.tenant_id,
+        jti: proto.jti,
+    })
 }
 
 fn validate_proxy_principal_matches_header(
@@ -465,11 +521,10 @@ mod tests {
     use super::*;
     use tonic::Code;
 
-    fn claims(sub: &str, tenant_id: i64, scopes: Vec<String>) -> auth::Claims {
+    fn claims(sub: &str, tenant_id: i64) -> auth::Claims {
         auth::Claims {
             sub: sub.to_string(),
             exp: usize::MAX,
-            scopes,
             tenant_id,
             jti: None,
         }
@@ -488,34 +543,15 @@ mod tests {
             canonical_path: "/path/file.txt".to_string(),
             bucket_locator_generation: 7,
             headers: Vec::new(),
-            authz_context: serde_json::to_vec(&claims(
-                "app-a",
-                42,
-                vec!["object:*|bucket-a/*".to_string()],
-            ))
-            .unwrap(),
+            authz_context: encode_proxy_authz_context(&claims("app-a", 42)).unwrap(),
         }
     }
 
     #[test]
-    fn proxy_auth_requires_internal_token_with_proxy_scope() {
-        let header = header();
-        validate_internal_proxy_claims(
-            &claims("internal", 0, vec!["internal:proxy_object|*".to_string()]),
-            &header,
-        )
-        .unwrap();
-
-        let tenant = validate_internal_proxy_claims(
-            &claims("app-a", 42, vec!["internal:proxy_object|*".to_string()]),
-            &header,
-        )
-        .unwrap_err();
-        assert_eq!(tenant.code(), Code::PermissionDenied);
-
-        let missing_scope =
-            validate_internal_proxy_claims(&claims("internal", 0, vec![]), &header).unwrap_err();
-        assert_eq!(missing_scope.code(), Code::PermissionDenied);
+    fn proxy_authz_context_encodes_principal_identity_only() {
+        let decoded = decode_proxy_authz_context(&header()).unwrap();
+        assert_eq!(decoded.sub, "app-a");
+        assert_eq!(decoded.tenant_id, 42);
     }
 
     #[test]

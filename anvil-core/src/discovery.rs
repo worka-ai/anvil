@@ -2,7 +2,6 @@ use anyhow::Result;
 use std::net::IpAddr;
 
 /// A trait for discovering the public IP address of the node.
-#[async_trait::async_trait]
 pub trait IpDiscovery: Send + Sync {
     async fn discover_ip(&self) -> Result<IpAddr>;
 }
@@ -19,7 +18,6 @@ impl StaticDiscovery {
     }
 }
 
-#[async_trait::async_trait]
 impl IpDiscovery for StaticDiscovery {
     async fn discover_ip(&self) -> Result<IpAddr> {
         Ok(self.addr)
@@ -30,7 +28,6 @@ impl IpDiscovery for StaticDiscovery {
 
 pub struct LocalDiscovery;
 
-#[async_trait::async_trait]
 impl IpDiscovery for LocalDiscovery {
     async fn discover_ip(&self) -> Result<IpAddr> {
         local_ip_address::local_ip().map_err(Into::into)
@@ -68,7 +65,6 @@ impl CloudflareDiscovery {
     }
 }
 
-#[async_trait::async_trait]
 impl IpDiscovery for CloudflareDiscovery {
     async fn discover_ip(&self) -> Result<IpAddr> {
         // Prefer DNS, fall back to HTTP
@@ -83,7 +79,6 @@ impl IpDiscovery for CloudflareDiscovery {
 
 pub struct GoogleDiscovery;
 
-#[async_trait::async_trait]
 impl IpDiscovery for GoogleDiscovery {
     async fn discover_ip(&self) -> Result<IpAddr> {
         use trust_dns_resolver::TokioAsyncResolver;

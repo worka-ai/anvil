@@ -1,7 +1,8 @@
 use crate::anvil_api::bucket_service_server::BucketService;
 use crate::anvil_api::*;
+use crate::bucket_journal::BucketJournalMutation;
 use crate::{
-    AppState, auth, bucket_journal,
+    AppState, auth, bucket_journal, mesh_lifecycle,
     permissions::AnvilAction,
     services::watch_envelope::{self, WatchEnvelopeParts},
     validation,
@@ -10,6 +11,16 @@ use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+
+fn bucket_transaction_id(options: Option<&WriteOptions>) -> Result<Option<&str>, Status> {
+    let Some(transaction_id) = options.and_then(|options| options.transaction_id.as_deref()) else {
+        return Ok(None);
+    };
+    if transaction_id.trim().is_empty() {
+        return Err(Status::invalid_argument("transaction_id must not be empty"));
+    }
+    Ok(Some(transaction_id))
+}
 
 #[tonic::async_trait]
 impl BucketService for AppState {
@@ -28,18 +39,19 @@ impl BucketService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
 
         let req = request.get_ref();
-
-        let bucket = self
-            .bucket_manager
-            .create_bucket(
-                claims.tenant_id,
-                &req.bucket_name,
-                &req.region,
-                &claims.scopes,
-            )
-            .await?;
-        self.publish_bucket_metadata_event(claims.tenant_id, &bucket, "create", false)
-            .await?;
+        let transaction_id = bucket_transaction_id(req.options.as_ref())?;
+        let bucket = if let Some(transaction_id) = transaction_id {
+            self.create_bucket_in_transaction(claims, req, transaction_id)
+                .await?
+        } else {
+            let bucket = self
+                .bucket_manager
+                .create_bucket(claims, &req.bucket_name, &req.region)
+                .await?;
+            self.publish_bucket_metadata_event(claims.tenant_id, &bucket, "create", false)
+                .await?;
+            bucket
+        };
 
         tracing::debug!("[service] EXITING create_bucket");
         Ok(Response::new(CreateBucketResponse {
@@ -56,13 +68,18 @@ impl BucketService for AppState {
             .get::<auth::Claims>()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.get_ref();
-
-        let bucket = self
-            .bucket_manager
-            .delete_bucket(claims.tenant_id, &req.bucket_name, &claims.scopes)
-            .await?;
-        self.publish_bucket_metadata_event(claims.tenant_id, &bucket, "delete", true)
-            .await?;
+        let transaction_id = bucket_transaction_id(req.options.as_ref())?;
+        if let Some(transaction_id) = transaction_id {
+            self.delete_bucket_in_transaction(claims, req, transaction_id)
+                .await?;
+        } else {
+            let bucket = self
+                .bucket_manager
+                .delete_bucket(claims, &req.bucket_name)
+                .await?;
+            self.publish_bucket_metadata_event(claims.tenant_id, &bucket, "delete", true)
+                .await?;
+        }
 
         Ok(Response::new(DeleteBucketResponse {}))
     }
@@ -77,10 +94,7 @@ impl BucketService for AppState {
             .get::<auth::Claims>()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
 
-        let buckets = self
-            .bucket_manager
-            .list_buckets(claims.tenant_id, &claims.scopes)
-            .await?;
+        let buckets = self.bucket_manager.list_buckets(claims).await?;
 
         let response_buckets: Vec<crate::anvil_api::Bucket> = buckets
             .into_iter()
@@ -115,7 +129,7 @@ impl BucketService for AppState {
 
         let policy = self
             .bucket_manager
-            .get_bucket_policy(claims.tenant_id, &req.bucket_name, &claims.scopes)
+            .get_bucket_policy(claims, &req.bucket_name)
             .await?;
 
         Ok(Response::new(GetBucketPolicyResponse {
@@ -132,23 +146,25 @@ impl BucketService for AppState {
             .get::<auth::Claims>()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.get_ref();
+        let transaction_id = bucket_transaction_id(req.options.as_ref())?;
 
-        // A bit of a hack: we only support is_public_read for now.
+        // Bucket policy is projected into Anvil's native public-read flag; all
+        // object-level enforcement still flows through the normal authorisation path.
         let policy: serde_json::Value = serde_json::from_str(&req.policy_json)
             .map_err(|e| Status::invalid_argument(format!("Invalid policy JSON: {}", e)))?;
         let is_public_read = policy["is_public_read"].as_bool().unwrap_or(false);
 
-        let bucket = self
-            .bucket_manager
-            .set_bucket_public_access(
-                claims.tenant_id,
-                &req.bucket_name,
-                is_public_read,
-                &claims.scopes,
-            )
-            .await?;
-        self.publish_bucket_metadata_event(claims.tenant_id, &bucket, "policy_update", false)
-            .await?;
+        if let Some(transaction_id) = transaction_id {
+            self.put_bucket_policy_in_transaction(claims, req, is_public_read, transaction_id)
+                .await?;
+        } else {
+            let bucket = self
+                .bucket_manager
+                .set_bucket_public_access(claims, &req.bucket_name, is_public_read)
+                .await?;
+            self.publish_bucket_metadata_event(claims.tenant_id, &bucket, "policy_update", false)
+                .await?;
+        }
 
         Ok(Response::new(PutBucketPolicyResponse {}))
     }
@@ -171,9 +187,14 @@ impl BucketService for AppState {
         } else {
             req.bucket_name.as_str()
         };
-        if !auth::is_authorized(AnvilAction::BucketWatch, resource, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        crate::access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::BucketWatch,
+            resource,
+        )
+        .await?;
         let after_cursor = i64::try_from(req.after_cursor)
             .map_err(|_| Status::invalid_argument("after_cursor exceeds supported range"))?;
         let snapshot = bucket_journal::list_bucket_metadata_events(
@@ -239,6 +260,147 @@ impl BucketService for AppState {
 }
 
 impl AppState {
+    async fn create_bucket_in_transaction(
+        &self,
+        claims: &auth::Claims,
+        req: &CreateBucketRequest,
+        transaction_id: &str,
+    ) -> Result<crate::persistence::Bucket, Status> {
+        if !validation::is_valid_bucket_name(&req.bucket_name) {
+            return Err(Status::invalid_argument("Invalid bucket name"));
+        }
+        crate::access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            claims,
+            AnvilAction::BucketCreate,
+            &req.bucket_name,
+        )
+        .await?;
+        mesh_lifecycle::ensure_new_writable_placement(
+            &self.storage,
+            &req.region,
+            &self.config.cell_id,
+            &self.config.node_id,
+        )
+        .await
+        .map_err(|err| Status::failed_precondition(err.to_string()))?;
+        if bucket_journal::read_current_bucket(&self.storage, claims.tenant_id, &req.bucket_name)
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?
+            .is_some()
+        {
+            return Err(Status::already_exists(
+                "A bucket with that name already exists.",
+            ));
+        }
+        let bucket = crate::persistence::Bucket {
+            id: bucket_journal::next_bucket_id(&self.storage)
+                .await
+                .map_err(|err| Status::internal(err.to_string()))?,
+            tenant_id: claims.tenant_id,
+            name: req.bucket_name.clone(),
+            region: req.region.clone(),
+            created_at: chrono::Utc::now(),
+            is_public_read: false,
+        };
+        self.stage_bucket_metadata_transaction(
+            claims,
+            &bucket,
+            BucketJournalMutation::Create,
+            transaction_id,
+        )
+        .await?;
+        Ok(bucket)
+    }
+
+    async fn delete_bucket_in_transaction(
+        &self,
+        claims: &auth::Claims,
+        req: &DeleteBucketRequest,
+        transaction_id: &str,
+    ) -> Result<crate::persistence::Bucket, Status> {
+        crate::access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            claims,
+            AnvilAction::BucketDelete,
+            &req.bucket_name,
+        )
+        .await?;
+        let bucket =
+            bucket_journal::read_current_bucket(&self.storage, claims.tenant_id, &req.bucket_name)
+                .await
+                .map_err(|err| Status::internal(err.to_string()))?
+                .ok_or_else(|| Status::not_found("Bucket not found"))?;
+        if self
+            .persistence
+            .bucket_has_retained_objects_or_uploads(bucket.id)
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?
+        {
+            return Err(Status::failed_precondition("Bucket not empty"));
+        }
+        self.stage_bucket_metadata_transaction(
+            claims,
+            &bucket,
+            BucketJournalMutation::Delete,
+            transaction_id,
+        )
+        .await?;
+        Ok(bucket)
+    }
+
+    async fn put_bucket_policy_in_transaction(
+        &self,
+        claims: &auth::Claims,
+        req: &PutBucketPolicyRequest,
+        is_public_read: bool,
+        transaction_id: &str,
+    ) -> Result<crate::persistence::Bucket, Status> {
+        crate::access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            claims,
+            AnvilAction::BucketWrite,
+            &req.bucket_name,
+        )
+        .await?;
+        let mut bucket =
+            bucket_journal::read_current_bucket(&self.storage, claims.tenant_id, &req.bucket_name)
+                .await
+                .map_err(|err| Status::internal(err.to_string()))?
+                .ok_or_else(|| Status::not_found("Bucket not found"))?;
+        bucket.is_public_read = is_public_read;
+        self.stage_bucket_metadata_transaction(
+            claims,
+            &bucket,
+            BucketJournalMutation::Update,
+            transaction_id,
+        )
+        .await?;
+        Ok(bucket)
+    }
+
+    async fn stage_bucket_metadata_transaction(
+        &self,
+        claims: &auth::Claims,
+        bucket: &crate::persistence::Bucket,
+        mutation: BucketJournalMutation,
+        transaction_id: &str,
+    ) -> Result<(), Status> {
+        let principal = crate::object_manager::transaction_principal_from_claims(claims);
+        bucket_journal::stage_bucket_mutation_in_transaction(
+            &self.storage,
+            bucket,
+            mutation,
+            transaction_id,
+            &principal,
+        )
+        .await
+        .map_err(bucket_core_store_status)
+    }
+
     async fn publish_bucket_metadata_event(
         &self,
         tenant_id: i64,
@@ -318,4 +480,34 @@ fn json_string_field(value: &JsonValue, name: &str) -> Result<String, Status> {
         .and_then(JsonValue::as_str)
         .map(ToString::to_string)
         .ok_or_else(|| Status::internal("Malformed bucket metadata event"))
+}
+
+fn bucket_core_store_status(error: anyhow::Error) -> Status {
+    let message = error.to_string();
+    if message.contains("TransactionNotFound") {
+        Status::not_found("TransactionNotFound")
+    } else if message.contains("TransactionPrincipalMismatch") {
+        Status::permission_denied("TransactionPrincipalMismatch")
+    } else if message.contains("TransactionScopeMismatch") {
+        Status::failed_precondition("TransactionScopeMismatch")
+    } else if message.contains("TransactionExpired")
+        || message.contains("TransactionRolledBack")
+        || message.contains("TransactionAlreadyCommitted")
+        || message.contains("TransactionNotOpen")
+        || message.contains("TransactionNotCommittable")
+    {
+        Status::failed_precondition(message)
+    } else if message.contains("TransactionConflict") {
+        Status::aborted("TransactionConflict")
+    } else if message.contains("idempotency conflict") {
+        Status::already_exists("TransactionConflict")
+    } else if message.contains("must not be empty")
+        || message.contains("must be a sha256 hash")
+        || message.contains("root key hash mismatch")
+        || message.contains("contains an invalid component")
+    {
+        Status::invalid_argument(message)
+    } else {
+        Status::internal(message)
+    }
 }

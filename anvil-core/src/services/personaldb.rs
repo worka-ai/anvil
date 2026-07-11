@@ -10,7 +10,7 @@ use crate::{
     formats::{Hash32, hash32, personaldb::PersonalDbLogRecord as CorePersonalDbLogRecord},
     partition_fence::{
         PartitionRecoveryAcquire, PartitionWritePermit, acquire_partition_recovery,
-        partition_write_ref_precondition, publish_partition_ready,
+        partition_write_precondition, publish_partition_ready,
     },
     permissions::AnvilAction,
     personaldb_catchup::{
@@ -74,7 +74,6 @@ use tonic::{Request, Response, Status};
 struct PersonalDbCommitActor {
     tenant_id: i64,
     principal: String,
-    scopes: Vec<String>,
     bearer_token: Option<String>,
     require_public_commit_authorization: bool,
 }
@@ -117,9 +116,14 @@ impl PersonalDbService for AppState {
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
 
         let resource = personaldb_resource(claims.tenant_id, &req.database_id);
-        if !auth::is_authorized(AnvilAction::PersonalDbCreate, &resource, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::PersonalDbCreate,
+            &resource,
+        )
+        .await?;
         let signing_key = self.personaldb_signing_key();
         if read_personaldb_group_manifest(
             &self.storage,
@@ -177,7 +181,7 @@ impl PersonalDbService for AppState {
             database_id: req.database_id,
             log_index: 0,
             log_hash: manifest.genesis_hash.clone(),
-            segment_path: String::new(),
+            segment_ref: String::new(),
             row_index_generation: 0,
             policy_epoch: manifest.active_policy_epoch,
             membership_epoch: manifest.active_membership_epoch,
@@ -195,6 +199,16 @@ impl PersonalDbService for AppState {
             &committed_head.database_id,
             &committed_head,
             signing_key,
+        )
+        .await
+        .map_err(internal_status)?;
+        access_control::grant_personaldb_group_defaults(
+            &self.persistence,
+            claims.tenant_id,
+            &committed_head.database_id,
+            &claims.sub,
+            &claims.sub,
+            "grant creator PersonalDB group owner",
         )
         .await
         .map_err(internal_status)?;
@@ -218,7 +232,6 @@ impl PersonalDbService for AppState {
             &claims,
             &req.database_id,
             AnvilAction::PersonalDbRead,
-            "reader",
         )
         .await?
         {
@@ -267,9 +280,14 @@ impl PersonalDbService for AppState {
             &req.database_id,
             &definition.projection_id,
         );
-        if !auth::is_authorized(AnvilAction::PersonalDbCreate, &resource, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::PersonalDbCreate,
+            &resource,
+        )
+        .await?;
         let signing_key = self.personaldb_signing_key();
         read_personaldb_group_manifest(
             &self.storage,
@@ -336,7 +354,6 @@ impl PersonalDbService for AppState {
             &req.database_id,
             &req.projection_id,
             AnvilAction::PersonalDbRead,
-            "reader",
         )
         .await?
         {
@@ -367,7 +384,6 @@ impl PersonalDbService for AppState {
         let actor = PersonalDbCommitActor {
             tenant_id: claims.tenant_id,
             principal: claims.sub.clone(),
-            scopes: claims.scopes.clone(),
             bearer_token: Some(bearer_token),
             require_public_commit_authorization: true,
         };
@@ -413,7 +429,6 @@ impl PersonalDbService for AppState {
             &claims,
             &req.database_id,
             AnvilAction::PersonalDbRead,
-            "reader",
         )
         .await?
         {
@@ -450,7 +465,6 @@ impl PersonalDbService for AppState {
             &claims,
             &req.database_id,
             AnvilAction::PersonalDbWatch,
-            "watcher",
         )
         .await?
         {
@@ -522,7 +536,6 @@ impl PersonalDbService for AppState {
             &req.database_id,
             &req.projection_id,
             AnvilAction::PersonalDbWatch,
-            "watcher",
         )
         .await?
         {
@@ -673,7 +686,7 @@ impl AppState {
         &self,
         permit: &PartitionWritePermit,
     ) -> Result<CoreMutationPrecondition, Status> {
-        partition_write_ref_precondition(&self.storage, permit, self.personaldb_signing_key())
+        partition_write_precondition(&self.storage, permit, self.personaldb_signing_key())
             .await
             .map_err(|err| {
                 Status::failed_precondition(format!(
@@ -698,7 +711,6 @@ impl AppState {
             &actor,
             &request.database_id,
             AnvilAction::PersonalDbCommit,
-            "committer",
         )
         .await?
         {
@@ -868,7 +880,6 @@ impl AppState {
                 &actor,
                 &request.database_id,
                 AnvilAction::PersonalDbCommit,
-                "committer",
             )
             .await?
         {
@@ -1123,7 +1134,7 @@ impl AppState {
             database_id: validated.request.database_id.clone(),
             log_index: proposed_log_index,
             log_hash: hex::encode(record.entry_hash),
-            segment_path: segment_ref,
+            segment_ref: segment_ref,
             row_index_generation,
             policy_epoch: manifest.active_policy_epoch,
             membership_epoch: manifest.active_membership_epoch,
@@ -1366,7 +1377,6 @@ impl AppState {
                 PersonalDbCommitActor {
                     tenant_id,
                     principal: internal_actor,
-                    scopes: vec!["*|*".to_string()],
                     bearer_token: None,
                     require_public_commit_authorization: false,
                 },
@@ -1497,32 +1507,22 @@ async fn authorize_personaldb_row_effects(
             actor.tenant_id, envelope.database_id, binding.resource_type, binding.resource_id
         );
         for permission in &effect.required_permissions {
-            let action = permission
-                .parse::<AnvilAction>()
-                .map_err(|_| Status::internal("Invalid PersonalDB derived permission"))?;
-            let claims = auth::Claims {
-                sub: actor.principal.clone(),
-                exp: 0,
-                scopes: actor.scopes.clone(),
-                tenant_id: actor.tenant_id,
-                jti: None,
-            };
-            if !access_control::scope_or_relationship_allows(
+            let revision = i64::try_from(envelope.authz_revision)
+                .map_err(|_| Status::internal("Invalid PersonalDB authz revision"))?;
+            let allowed = authz_journal::resolve_permission_at_revision(
                 storage,
-                &claims,
-                action,
-                &resource,
-                "personaldb_row",
+                actor.tenant_id,
+                &encode_realm_namespace(DEFAULT_AUTHZ_REALM_ID, "personaldb_row"),
                 &resource,
                 permission,
-                Some(
-                    i64::try_from(envelope.authz_revision)
-                        .map_err(|_| Status::internal("Invalid PersonalDB authz revision"))?,
-                ),
+                access_control::APP_SUBJECT_KIND,
+                &actor.principal,
+                "",
+                revision,
             )
             .await
-            .map_err(internal_status)?
-            {
+            .map_err(internal_status)?;
+            if !allowed {
                 return Err(Status::permission_denied(
                     "PersonalDB row/resource mutation is not authorized",
                 ));

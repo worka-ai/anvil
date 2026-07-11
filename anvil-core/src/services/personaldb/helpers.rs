@@ -71,7 +71,7 @@ pub(super) fn committed_head_record(
         database_id: head.database_id,
         log_index: head.log_index,
         log_hash: head.log_hash,
-        segment_path: head.segment_path,
+        segment_ref: head.segment_ref,
         row_index_generation: head.row_index_generation,
         policy_epoch: head.policy_epoch,
         membership_epoch: head.membership_epoch,
@@ -92,7 +92,7 @@ pub(super) fn snapshots_head_record(
         database_id: head.database_id,
         latest_snapshot_log_index: head.latest_snapshot_log_index,
         latest_snapshot_log_hash: head.latest_snapshot_log_hash,
-        latest_snapshot_manifest_path: head.latest_snapshot_manifest_path,
+        latest_snapshot_manifest_ref: head.latest_snapshot_manifest_ref,
         retained_snapshot_count: head.retained_snapshot_count,
         updated_at: head.updated_at,
         updated_by_node: head.updated_by_node,
@@ -140,7 +140,7 @@ pub(super) fn log_record(
         certificate_hash: hex::encode(record.certificate_hash),
         payload_ref: String::from_utf8_lossy(&record.payload_ref).into_owned(),
         certificate_ref: String::from_utf8_lossy(&record.certificate_ref).into_owned(),
-        inline_certificate_json: record.inline_certificate_json,
+        inline_certificate_bytes: record.inline_certificate_bytes,
         entry_hash: hex::encode(record.entry_hash),
     }
 }
@@ -159,7 +159,7 @@ pub(super) fn catch_up_response(response: CoreCatchUpResponse) -> PersonalDbCatc
                     log_record: Some(log_record(entry.record)),
                     changeset_bytes: entry.changeset_bytes,
                     certificate: Some(certificate_record(entry.certificate)),
-                    certificate_json: entry.certificate_json,
+                    certificate_bytes: entry.certificate_bytes,
                 })
                 .collect(),
             has_more: entries.has_more,
@@ -287,21 +287,33 @@ pub(super) fn personaldb_resource(tenant_id: i64, database_id: &str) -> String {
     format!("tenant-{tenant_id}/{database_id}")
 }
 
+fn personaldb_relation_for_action(action: AnvilAction) -> Result<&'static str, Status> {
+    match action {
+        AnvilAction::PersonalDbRead => Ok("get_snapshot"),
+        AnvilAction::PersonalDbWatch => Ok("watch"),
+        AnvilAction::PersonalDbCommit
+        | AnvilAction::PersonalDbInsert
+        | AnvilAction::PersonalDbUpdate
+        | AnvilAction::PersonalDbDelete => Ok("apply_changeset"),
+        _ => Err(Status::invalid_argument(
+            "action is not valid for PersonalDB group access",
+        )),
+    }
+}
+
 pub(super) async fn personaldb_access_allowed(
     storage: &crate::storage::Storage,
     claims: &auth::Claims,
     database_id: &str,
     action: AnvilAction,
-    relation: &str,
 ) -> Result<bool, Status> {
-    let resource = personaldb_resource(claims.tenant_id, database_id);
-    access_control::scope_or_relationship_allows(
+    let relation = personaldb_relation_for_action(action)?;
+    let object_id = access_control::personaldb_group_object_id(claims.tenant_id, database_id);
+    access_control::system_realm_relationship_allows(
         storage,
         claims,
-        action,
-        &resource,
-        "personaldb",
-        &resource,
+        crate::system_realm::SYSTEM_PERSONALDB_GROUP_NAMESPACE,
+        &object_id,
         relation,
         None,
     )
@@ -314,16 +326,14 @@ pub(super) async fn personaldb_actor_access_allowed(
     actor: &PersonalDbCommitActor,
     database_id: &str,
     action: AnvilAction,
-    relation: &str,
 ) -> Result<bool, Status> {
     let claims = auth::Claims {
         sub: actor.principal.clone(),
         exp: 0,
-        scopes: actor.scopes.clone(),
         tenant_id: actor.tenant_id,
         jti: None,
     };
-    personaldb_access_allowed(storage, &claims, database_id, action, relation).await
+    personaldb_access_allowed(storage, &claims, database_id, action).await
 }
 
 pub(super) fn personaldb_group_partition_family() -> &'static str {
@@ -348,18 +358,16 @@ pub(super) async fn personaldb_projection_access_allowed(
     storage: &crate::storage::Storage,
     claims: &auth::Claims,
     database_id: &str,
-    projection_id: &str,
+    _projection_id: &str,
     action: AnvilAction,
-    relation: &str,
 ) -> Result<bool, Status> {
-    let resource = personaldb_projection_resource(claims.tenant_id, database_id, projection_id);
-    access_control::scope_or_relationship_allows(
+    let relation = personaldb_relation_for_action(action)?;
+    let object_id = access_control::personaldb_group_object_id(claims.tenant_id, database_id);
+    access_control::system_realm_relationship_allows(
         storage,
         claims,
-        action,
-        &resource,
-        "personaldb_projection",
-        &resource,
+        crate::system_realm::SYSTEM_PERSONALDB_GROUP_NAMESPACE,
+        &object_id,
         relation,
         None,
     )
@@ -402,7 +410,7 @@ pub(super) fn now_rfc3339() -> String {
 }
 
 pub(super) fn internal_status(err: impl std::fmt::Display) -> Status {
-    Status::internal(err.to_string())
+    Status::internal(format!("{err:#}"))
 }
 
 pub(super) fn personaldb_ownership_status(err: impl std::fmt::Display) -> Status {

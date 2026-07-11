@@ -1,12 +1,12 @@
 use crate::core_store::{
-    CompareAndSwapRef, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-    CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, CoreTransactionUpdate, GetBlob,
-    ReadStream, WriteLogicalFileRequest, core_object_ref_from_logical_file_manifest,
+    CF_MESH, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
+    CoreStore, CoreTransactionUpdate, ReadStream, TABLE_MESH_PARTITION_ROW,
+    core_meta_committed_row_common, core_meta_payload_digest, core_meta_root_key_hash,
+    core_meta_tuple_key, decode_deterministic_proto, encode_deterministic_proto,
 };
 use crate::storage::Storage;
 use anyhow::{Context, Result as AnyhowResult, anyhow};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use prost::Message;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::convert::TryInto;
@@ -15,10 +15,10 @@ use std::fmt;
 pub const CONTROL_STREAM_MAGIC: &[u8; 8] = b"ANVCTL1\0";
 pub const CONTROL_STREAM_VERSION: u16 = 1;
 pub const CONTROL_STREAM_FIXED_HEADER_LEN: usize = 8 + 2 + 4 + 8 + 4 + 4;
+pub const MAX_CONTROL_PROTO_PAYLOAD_LEN: usize = 64 * 1024;
 pub const CONTROL_CHECKPOINT_SCHEMA: &str = "anvil.mesh.control_checkpoint.v1";
-const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 const CONTROL_STREAM_ID_PREFIX: &str = "mesh_control_stream:";
-const CONTROL_CHECKPOINT_REF_PREFIX: &str = "mesh_control_checkpoint:";
+const CONTROL_CHECKPOINT_ROW_PREFIX: &str = "mesh-control-checkpoint";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ControlStreamFrameError {
@@ -44,8 +44,12 @@ pub enum ControlStreamFrameError {
     InvalidDigest,
     #[error("control stream frame header metadata is missing field {field}")]
     MissingHeaderField { field: &'static str },
-    #[error("control stream frame header JSON is invalid: {0}")]
-    InvalidHeaderJson(String),
+    #[error("control stream frame header protobuf is invalid")]
+    InvalidHeaderProtobuf,
+    #[error("control stream frame header protobuf is not deterministic")]
+    NonDeterministicHeaderProtobuf,
+    #[error("control stream protobuf payload is too large: {actual} bytes exceeds {max} bytes")]
+    PayloadTooLarge { actual: usize, max: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -182,33 +186,102 @@ impl From<ControlFrameMetadata> for ControlStreamPosition {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlStreamFrame {
-    pub header_json: Vec<u8>,
-    pub payload_json: Vec<u8>,
+    pub header_proto: Vec<u8>,
+    pub payload_proto: Vec<u8>,
 }
 
 impl ControlStreamFrame {
-    pub fn new(header_json: Vec<u8>, payload_json: Vec<u8>) -> Self {
+    pub fn new(header_proto: Vec<u8>, payload_proto: Vec<u8>) -> Self {
         Self {
-            header_json,
-            payload_json,
+            header_proto,
+            payload_proto,
         }
     }
 
     pub fn metadata(&self) -> std::result::Result<ControlFrameMetadata, ControlStreamFrameError> {
-        metadata_from_header_json(&self.header_json)
+        metadata_from_header_proto(&self.header_proto)
     }
 
     pub fn encoded_len(&self) -> std::result::Result<usize, ControlStreamFrameError> {
-        encoded_frame_len(self.header_json.len(), self.payload_json.len())
+        encoded_frame_len(self.header_proto.len(), self.payload_proto.len())
     }
 
     pub fn encode(&self) -> std::result::Result<Vec<u8>, ControlStreamFrameError> {
-        encode_control_stream_frame(&self.header_json, &self.payload_json)
+        encode_control_stream_frame(&self.header_proto, &self.payload_proto)
     }
 
     pub fn decode(input: &[u8]) -> std::result::Result<(Self, usize), ControlStreamFrameError> {
         decode_control_stream_frame(input)
     }
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ControlFrameHeaderProto {
+    #[prost(string, tag = "1")]
+    pub schema: String,
+    #[prost(string, tag = "2")]
+    pub mesh_id: String,
+    #[prost(string, tag = "3")]
+    pub stream_family: String,
+    #[prost(string, tag = "4")]
+    pub partition: String,
+    #[prost(uint64, tag = "5")]
+    pub sequence: u64,
+    #[prost(string, tag = "6")]
+    pub record_key: String,
+    #[prost(string, tag = "7")]
+    pub operation: String,
+    #[prost(uint64, optional, tag = "8")]
+    pub expected_generation: Option<u64>,
+    #[prost(uint64, tag = "9")]
+    pub new_generation: u64,
+    #[prost(string, tag = "10")]
+    pub writer_node_id: String,
+    #[prost(uint64, tag = "11")]
+    pub writer_fence: u64,
+    #[prost(string, optional, tag = "12")]
+    pub idempotency_key: Option<String>,
+    #[prost(string, tag = "13")]
+    pub record_digest: String,
+    #[prost(string, tag = "14")]
+    pub created_at: String,
+}
+
+pub struct ControlMutationHeaderInput<'a> {
+    pub schema: &'a str,
+    pub mesh_id: &'a str,
+    pub stream_family: &'a str,
+    pub partition: &'a str,
+    pub sequence: ControlStreamSequence,
+    pub record_key: &'a str,
+    pub operation: &'a str,
+    pub expected_generation: Option<u64>,
+    pub new_generation: u64,
+    pub writer_node_id: &'a str,
+    pub writer_fence: u64,
+    pub idempotency_key: Option<&'a str>,
+    pub record_digest: &'a ControlRecordDigest,
+    pub created_at: &'a str,
+}
+
+pub fn encode_control_mutation_header(input: ControlMutationHeaderInput<'_>) -> Vec<u8> {
+    ControlFrameHeaderProto {
+        schema: input.schema.to_string(),
+        mesh_id: input.mesh_id.to_string(),
+        stream_family: input.stream_family.to_string(),
+        partition: input.partition.to_string(),
+        sequence: input.sequence.get(),
+        record_key: input.record_key.to_string(),
+        operation: input.operation.to_string(),
+        expected_generation: input.expected_generation,
+        new_generation: input.new_generation,
+        writer_node_id: input.writer_node_id.to_string(),
+        writer_fence: input.writer_fence,
+        idempotency_key: input.idempotency_key.map(str::to_string),
+        record_digest: input.record_digest.as_str().to_string(),
+        created_at: input.created_at.to_string(),
+    }
+    .encode_to_vec()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,6 +352,28 @@ impl ControlCheckpointRecord {
             updated_at: updated_at.into(),
         }
     }
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ControlCheckpointProto {
+    #[prost(message, optional, tag = "1")]
+    common: Option<crate::core_store::CoreMetaRowCommonProto>,
+    #[prost(string, tag = "2")]
+    schema: String,
+    #[prost(string, tag = "3")]
+    mesh_id: String,
+    #[prost(string, tag = "4")]
+    region: String,
+    #[prost(string, tag = "5")]
+    stream_family: String,
+    #[prost(string, tag = "6")]
+    partition: String,
+    #[prost(uint64, tag = "7")]
+    last_sequence: u64,
+    #[prost(string, tag = "8")]
+    last_digest: String,
+    #[prost(string, tag = "9")]
+    updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -373,7 +468,7 @@ pub async fn diagnose_control_stream_projection(
         }
         expected_sequence = sequence.saturating_add(1);
 
-        let header = match control_mutation_header(&record.frame.header_json) {
+        let header = match decode_control_mutation_header(&record.frame.header_proto) {
             Ok(header) => header,
             Err(err) => {
                 diagnostics.push(ControlProjectionDiagnostic {
@@ -397,21 +492,19 @@ pub async fn diagnose_control_stream_projection(
             }
         };
 
-        if header.stream_family.as_deref() != Some(stream_family)
-            || header.partition.as_deref() != Some(partition)
-        {
+        if header.stream_family != stream_family || header.partition != partition {
             diagnostics.push(ControlProjectionDiagnostic {
                 stream_family: stream_family.to_string(),
                 partition: partition.to_string(),
-                record_key: header.record_key.clone().unwrap_or_default(),
+                record_key: header.record_key.clone(),
                 severity: "error",
                 code: "mesh_control_stream_header_scope_mismatch",
                 message: format!(
-                    "control stream header scope {:?}/{:?} does not match path {stream_family}/{partition}",
+                    "control stream header scope {}/{} does not match path {stream_family}/{partition}",
                     header.stream_family, header.partition
                 ),
                 stream_sequence: Some(sequence),
-                stream_generation: header.new_generation,
+                stream_generation: Some(header.new_generation),
                 stream_digest: Some(record.metadata.record_digest.to_string()),
                 projection_generation: None,
                 projection_digest: None,
@@ -420,11 +513,8 @@ pub async fn diagnose_control_stream_projection(
             });
         }
 
-        let Some(record_key) = header
-            .record_key
-            .clone()
-            .filter(|record_key| !record_key.trim().is_empty())
-        else {
+        let record_key = header.record_key.clone();
+        if record_key.trim().is_empty() {
             diagnostics.push(ControlProjectionDiagnostic {
                 stream_family: stream_family.to_string(),
                 partition: partition.to_string(),
@@ -435,7 +525,7 @@ pub async fn diagnose_control_stream_projection(
                     "control stream {stream_family}/{partition} sequence {sequence} is missing record_key"
                 ),
                 stream_sequence: Some(sequence),
-                stream_generation: header.new_generation,
+                stream_generation: Some(header.new_generation),
                 stream_digest: Some(record.metadata.record_digest.to_string()),
                 projection_generation: None,
                 projection_digest: None,
@@ -443,9 +533,9 @@ pub async fn diagnose_control_stream_projection(
                 proposed_action: "manual_review_rebuild_not_implemented",
             });
             continue;
-        };
+        }
 
-        let payload_digest = ControlRecordDigest::blake3(&record.frame.payload_json);
+        let payload_digest = ControlRecordDigest::blake3(&record.frame.payload_proto);
         if payload_digest.as_str() != record.metadata.record_digest.as_str() {
             diagnostics.push(ControlProjectionDiagnostic {
                 stream_family: stream_family.to_string(),
@@ -457,7 +547,7 @@ pub async fn diagnose_control_stream_projection(
                     "control stream {stream_family}/{partition} sequence {sequence} payload digest does not match header digest"
                 ),
                 stream_sequence: Some(sequence),
-                stream_generation: header.new_generation,
+                stream_generation: Some(header.new_generation),
                 stream_digest: Some(record.metadata.record_digest.to_string()),
                 projection_generation: None,
                 projection_digest: Some(payload_digest.to_string()),
@@ -466,14 +556,42 @@ pub async fn diagnose_control_stream_projection(
             });
         }
 
+        let payload_json = match control_payload_operator_json(
+            stream_family,
+            &record_key,
+            &record.frame.payload_proto,
+        ) {
+            Ok(payload_json) => payload_json,
+            Err(err) => {
+                diagnostics.push(ControlProjectionDiagnostic {
+                    stream_family: stream_family.to_string(),
+                    partition: partition.to_string(),
+                    record_key: record_key.clone(),
+                    severity: "error",
+                    code: "mesh_control_stream_payload_invalid",
+                    message: format!(
+                        "control stream {stream_family}/{partition} sequence {sequence} has invalid protobuf payload: {err}"
+                    ),
+                    stream_sequence: Some(sequence),
+                    stream_generation: Some(header.new_generation),
+                    stream_digest: Some(record.metadata.record_digest.to_string()),
+                    projection_generation: None,
+                    projection_digest: None,
+                    repair_safe: false,
+                    proposed_action: "manual_review_rebuild_not_implemented",
+                });
+                continue;
+            }
+        };
+
         latest_by_key.insert(
             record_key,
             StreamProjectionEntry {
                 sequence,
-                generation: header.new_generation,
+                generation: Some(header.new_generation),
                 digest: record.metadata.record_digest.to_string(),
-                operation: header.operation.unwrap_or_default(),
-                payload_json: record.frame.payload_json.clone(),
+                operation: header.operation,
+                payload_json,
             },
         );
     }
@@ -615,27 +733,25 @@ pub async fn latest_projected_record_from_control_stream(
 
     let mut latest = None;
     for record in &log.records {
-        let header = control_mutation_header(&record.frame.header_json)?;
-        if header.stream_family.as_deref() != Some(stream_family)
-            || header.partition.as_deref() != Some(partition)
-        {
+        let header = decode_control_mutation_header(&record.frame.header_proto)?;
+        if header.stream_family != stream_family || header.partition != partition {
             return Err(anyhow!(
-                "control stream header scope {:?}/{:?} does not match path {stream_family}/{partition}",
+                "control stream header scope {}/{} does not match path {stream_family}/{partition}",
                 header.stream_family,
                 header.partition
             ));
         }
-        if header.record_key.as_deref() != Some(record_key) {
+        if header.record_key != record_key {
             continue;
         }
-        if header.operation.as_deref().is_some_and(is_delete_operation) {
+        if is_delete_operation(&header.operation) {
             latest = None;
             continue;
         }
         latest = Some(ControlProjectionRecord::new(
             record_key,
-            header.new_generation.unwrap_or_default(),
-            record.frame.payload_json.clone(),
+            header.new_generation,
+            control_payload_operator_json(stream_family, record_key, &record.frame.payload_proto)?,
         ));
     }
     Ok(latest)
@@ -646,19 +762,24 @@ pub async fn write_control_checkpoint(
     checkpoint: &ControlCheckpointRecord,
 ) -> AnyhowResult<()> {
     validate_control_checkpoint(checkpoint)?;
-    let ref_name = control_checkpoint_ref_name(
+    let row_key = control_checkpoint_row_key(
         &checkpoint.region,
         &checkpoint.stream_family,
         &checkpoint.partition,
     )?;
-    if let Some(existing) = read_control_checkpoint(
-        storage,
-        &checkpoint.region,
-        &checkpoint.stream_family,
-        &checkpoint.partition,
-    )
-    .await?
+    let store = CoreStore::new(storage.clone()).await?;
+    let current_payload = store.read_coremeta_row(CF_MESH, TABLE_MESH_PARTITION_ROW, &row_key)?;
+    if let Some(existing) = current_payload
+        .as_deref()
+        .map(decode_control_checkpoint_proto)
+        .transpose()?
     {
+        ensure_control_checkpoint_scope(
+            &existing,
+            &checkpoint.region,
+            &checkpoint.stream_family,
+            &checkpoint.partition,
+        )?;
         if checkpoint.last_sequence < existing.last_sequence {
             return Err(anyhow!(
                 "control checkpoint cannot move backwards for {}/{}/{}: existing sequence {}, new sequence {}",
@@ -684,45 +805,41 @@ pub async fn write_control_checkpoint(
             return Ok(());
         }
     }
-    let store = CoreStore::new(storage.clone()).await?;
-    let current = store.read_ref(&ref_name).await?;
-    let bytes = serde_json::to_vec_pretty(checkpoint)?;
-    let manifest = store
-        .write_logical_file(WriteLogicalFileRequest {
-            writer_family: "mesh_control".to_string(),
-            generation: current
-                .as_ref()
-                .map(|value| value.generation + 1)
-                .unwrap_or(1),
-            logical_file_id: ref_name.clone(),
-            source: bytes,
-            range_hints: Vec::new(),
-            pipeline_policy: CorePipelinePolicy::default(),
-            trace_context: CoreTraceContext::default(),
-            boundary_values: Vec::new(),
-            mutation_id: format!(
-                "mesh-control-checkpoint:{}:{}:{}:{}",
+    let payload = encode_control_checkpoint_proto(checkpoint)?;
+    let partition_id = control_checkpoint_partition_id(
+        &checkpoint.region,
+        &checkpoint.stream_family,
+        &checkpoint.partition,
+    )?;
+    store
+        .commit_mutation_batch(CoreMutationBatch {
+            transaction_id: format!(
+                "mesh-control-checkpoint:{}:{}:{}:{}:{}",
                 checkpoint.mesh_id,
                 checkpoint.region,
                 checkpoint.stream_family,
-                checkpoint.partition
+                checkpoint.partition,
+                checkpoint.last_sequence.get()
             ),
-            region_id: "local".to_string(),
-        })
-        .await?;
-    let object_ref = core_object_ref_from_logical_file_manifest(&manifest);
-    store
-        .compare_and_swap_ref(CompareAndSwapRef {
-            ref_name,
-            expected_generation: current.as_ref().map(|value| value.generation),
-            expected_target: current.as_ref().map(|value| value.target.clone()),
-            require_absent: current.is_none(),
-            require_present: current.is_some(),
-            fence: None,
-            authz_revision: None,
-            source_watch_cursor: None,
-            new_target: encode_core_object_ref_target(&object_ref)?,
-            transaction_id: None,
+            scope_partition: partition_id.clone(),
+            committed_by_principal: "mesh-control-checkpoint".to_string(),
+            preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
+                cf: CF_MESH.to_string(),
+                table_id: TABLE_MESH_PARTITION_ROW,
+                tuple_key: row_key.clone(),
+                expected_payload_hash: current_payload
+                    .as_ref()
+                    .map(|payload| core_meta_payload_digest(TABLE_MESH_PARTITION_ROW, payload)),
+                require_absent: current_payload.is_none(),
+                require_present: current_payload.is_some(),
+            }],
+            operations: vec![CoreMutationOperation::CoreMetaPut {
+                partition_id,
+                cf: CF_MESH.to_string(),
+                table_id: TABLE_MESH_PARTITION_ROW,
+                tuple_key: row_key,
+                payload,
+            }],
         })
         .await?;
     Ok(())
@@ -734,15 +851,23 @@ pub async fn read_control_checkpoint(
     stream_family: &str,
     partition: &str,
 ) -> AnyhowResult<Option<ControlCheckpointRecord>> {
-    let ref_name = control_checkpoint_ref_name(region, stream_family, partition)?;
+    let row_key = control_checkpoint_row_key(region, stream_family, partition)?;
     let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store.read_ref(&ref_name).await? else {
+    let Some(payload) = store.read_coremeta_row(CF_MESH, TABLE_MESH_PARTITION_ROW, &row_key)?
+    else {
         return Ok(None);
     };
-    let object_ref = decode_core_object_ref_target(&ref_value.target)?;
-    let bytes = store.get_blob(GetBlob { object_ref }).await?;
-    let checkpoint: ControlCheckpointRecord = serde_json::from_slice(&bytes)?;
-    validate_control_checkpoint(&checkpoint)?;
+    let checkpoint = decode_control_checkpoint_proto(&payload)?;
+    ensure_control_checkpoint_scope(&checkpoint, region, stream_family, partition)?;
+    Ok(Some(checkpoint))
+}
+
+fn ensure_control_checkpoint_scope(
+    checkpoint: &ControlCheckpointRecord,
+    region: &str,
+    stream_family: &str,
+    partition: &str,
+) -> AnyhowResult<()> {
     if checkpoint.region != region
         || checkpoint.stream_family != stream_family
         || checkpoint.partition != partition
@@ -754,7 +879,7 @@ pub async fn read_control_checkpoint(
             checkpoint.partition
         ));
     }
-    Ok(Some(checkpoint))
+    Ok(())
 }
 
 fn validate_control_checkpoint(checkpoint: &ControlCheckpointRecord) -> AnyhowResult<()> {
@@ -783,29 +908,88 @@ fn validate_control_checkpoint(checkpoint: &ControlCheckpointRecord) -> AnyhowRe
     Ok(())
 }
 
+fn encode_control_checkpoint_proto(checkpoint: &ControlCheckpointRecord) -> AnyhowResult<Vec<u8>> {
+    validate_control_checkpoint(checkpoint)?;
+    Ok(encode_deterministic_proto(&ControlCheckpointProto {
+        common: Some(core_meta_committed_row_common(
+            "mesh",
+            core_meta_root_key_hash(&format!(
+                "mesh/control-checkpoint/{}/{}/{}",
+                checkpoint.region, checkpoint.stream_family, checkpoint.partition
+            )),
+            checkpoint.last_sequence.get(),
+            format!(
+                "mesh-control-checkpoint:{}:{}:{}:{}",
+                checkpoint.mesh_id,
+                checkpoint.region,
+                checkpoint.stream_family,
+                checkpoint.partition
+            ),
+            0,
+        )),
+        schema: checkpoint.schema.clone(),
+        mesh_id: checkpoint.mesh_id.clone(),
+        region: checkpoint.region.clone(),
+        stream_family: checkpoint.stream_family.clone(),
+        partition: checkpoint.partition.clone(),
+        last_sequence: checkpoint.last_sequence.get(),
+        last_digest: checkpoint.last_digest.to_string(),
+        updated_at: checkpoint.updated_at.clone(),
+    }))
+}
+
+fn decode_control_checkpoint_proto(bytes: &[u8]) -> AnyhowResult<ControlCheckpointRecord> {
+    let proto = decode_deterministic_proto::<ControlCheckpointProto>(
+        bytes,
+        "control checkpoint CoreMeta row",
+    )?;
+    proto
+        .common
+        .as_ref()
+        .ok_or_else(|| anyhow!("control checkpoint CoreMeta row is missing common metadata"))?;
+    let checkpoint = ControlCheckpointRecord {
+        schema: proto.schema,
+        mesh_id: proto.mesh_id,
+        region: proto.region,
+        stream_family: proto.stream_family,
+        partition: proto.partition,
+        last_sequence: ControlStreamSequence::new(proto.last_sequence)?,
+        last_digest: ControlRecordDigest::new(proto.last_digest)?,
+        updated_at: proto.updated_at,
+    };
+    validate_control_checkpoint(&checkpoint)?;
+    Ok(checkpoint)
+}
+
 pub fn encode_control_stream_frame(
-    header_json: &[u8],
-    payload_json: &[u8],
+    header_proto: &[u8],
+    payload_proto: &[u8],
 ) -> std::result::Result<Vec<u8>, ControlStreamFrameError> {
-    let header_len = u32::try_from(header_json.len()).map_err(|_| {
+    let header_len = u32::try_from(header_proto.len()).map_err(|_| {
         ControlStreamFrameError::InvalidDeclaredLength {
-            context: "control stream frame header_json",
+            context: "control stream frame header_proto",
         }
     })?;
-    let payload_len = u64::try_from(payload_json.len()).map_err(|_| {
+    if payload_proto.len() > MAX_CONTROL_PROTO_PAYLOAD_LEN {
+        return Err(ControlStreamFrameError::PayloadTooLarge {
+            actual: payload_proto.len(),
+            max: MAX_CONTROL_PROTO_PAYLOAD_LEN,
+        });
+    }
+    let payload_len = u64::try_from(payload_proto.len()).map_err(|_| {
         ControlStreamFrameError::InvalidDeclaredLength {
-            context: "control stream frame payload_json",
+            context: "control stream frame payload_proto",
         }
     })?;
-    let mut out = Vec::with_capacity(encoded_frame_len(header_json.len(), payload_json.len())?);
+    let mut out = Vec::with_capacity(encoded_frame_len(header_proto.len(), payload_proto.len())?);
     out.extend_from_slice(CONTROL_STREAM_MAGIC);
     out.extend_from_slice(&CONTROL_STREAM_VERSION.to_be_bytes());
     out.extend_from_slice(&header_len.to_be_bytes());
     out.extend_from_slice(&payload_len.to_be_bytes());
-    out.extend_from_slice(&crc32(header_json).to_be_bytes());
-    out.extend_from_slice(&crc32(payload_json).to_be_bytes());
-    out.extend_from_slice(header_json);
-    out.extend_from_slice(payload_json);
+    out.extend_from_slice(&crc32(header_proto).to_be_bytes());
+    out.extend_from_slice(&crc32(payload_proto).to_be_bytes());
+    out.extend_from_slice(header_proto);
+    out.extend_from_slice(payload_proto);
     Ok(out)
 }
 
@@ -816,32 +1000,38 @@ pub fn decode_control_stream_frame(
     let header_start = CONTROL_STREAM_FIXED_HEADER_LEN;
     let header_end = header_start.checked_add(fixed.header_len).ok_or(
         ControlStreamFrameError::InvalidDeclaredLength {
-            context: "control stream frame header_json",
+            context: "control stream frame header_proto",
         },
     )?;
     let payload_end = header_end.checked_add(fixed.payload_len).ok_or(
         ControlStreamFrameError::InvalidDeclaredLength {
-            context: "control stream frame payload_json",
+            context: "control stream frame payload_proto",
         },
     )?;
     if input.len() < payload_end {
         return Err(ControlStreamFrameError::TooShort {
-            context: "control stream frame payload_json",
+            context: "control stream frame payload_proto",
             needed: payload_end,
             actual: input.len(),
         });
     }
 
-    let header_json = input[header_start..header_end].to_vec();
-    let payload_json = input[header_end..payload_end].to_vec();
-    let actual_header_crc32 = crc32(&header_json);
+    let header_proto = input[header_start..header_end].to_vec();
+    let payload_proto = input[header_end..payload_end].to_vec();
+    if payload_proto.len() > MAX_CONTROL_PROTO_PAYLOAD_LEN {
+        return Err(ControlStreamFrameError::PayloadTooLarge {
+            actual: payload_proto.len(),
+            max: MAX_CONTROL_PROTO_PAYLOAD_LEN,
+        });
+    }
+    let actual_header_crc32 = crc32(&header_proto);
     if actual_header_crc32 != fixed.header_crc32 {
         return Err(ControlStreamFrameError::HeaderCrc32Mismatch {
             expected: fixed.header_crc32,
             actual: actual_header_crc32,
         });
     }
-    let actual_payload_crc32 = crc32(&payload_json);
+    let actual_payload_crc32 = crc32(&payload_proto);
     if actual_payload_crc32 != fixed.payload_crc32 {
         return Err(ControlStreamFrameError::PayloadCrc32Mismatch {
             expected: fixed.payload_crc32,
@@ -851,8 +1041,8 @@ pub fn decode_control_stream_frame(
 
     Ok((
         ControlStreamFrame {
-            header_json,
-            payload_json,
+            header_proto,
+            payload_proto,
         },
         payload_end,
     ))
@@ -970,6 +1160,7 @@ pub async fn append_control_stream_frame(
 
     let encoded = frame.encode()?;
     let metadata = frame.metadata()?;
+    let mutation_header = decode_control_mutation_header(&frame.header_proto)?;
     let store = CoreStore::new(storage.clone()).await?;
     let receipt = store
         .commit_mutation_batch(CoreMutationBatch {
@@ -1013,9 +1204,29 @@ pub async fn append_control_stream_frame(
             metadata.sequence.get()
         ));
     }
+    let encoded_len = encoded.len();
+    crate::mesh_control_segment::write_mesh_control_segment(
+        storage,
+        crate::mesh_control_segment::MeshControlSegmentWrite {
+            mesh_id: &mutation_header.mesh_id,
+            stream_family,
+            partition,
+            generation: visible_sequence,
+            event_kind: &mutation_header.operation,
+            source_cursor: visible_sequence,
+            placement_epoch: mutation_header.writer_fence,
+            boundary_values: &[],
+            records: &[crate::mesh_control_segment::MeshControlSegmentRecord {
+                key: mutation_header.record_key.as_bytes().to_vec(),
+                value: encoded,
+            }],
+        },
+    )
+    .await
+    .with_context(|| format!("write CoreStore mesh-control segment for {stream_id}"))?;
     Ok(ControlStreamAppend {
         offset: existing.complete_len,
-        encoded_len: encoded.len(),
+        encoded_len,
         position: metadata.into(),
     })
 }
@@ -1024,9 +1235,16 @@ pub async fn list_control_stream_partitions(
     storage: &Storage,
     stream_family: &str,
 ) -> AnyhowResult<Vec<String>> {
+    let store = CoreStore::new(storage.clone()).await?;
+    list_control_stream_partitions_with_store(&store, stream_family).await
+}
+
+pub async fn list_control_stream_partitions_with_store(
+    store: &CoreStore,
+    stream_family: &str,
+) -> AnyhowResult<Vec<String>> {
     validate_control_stream_scope(stream_family, "control stream family")?;
     let prefix = control_stream_prefix(stream_family);
-    let store = CoreStore::new(storage.clone()).await?;
     let mut partitions = Vec::new();
     for stream_id in store.list_stream_ids(&prefix).await? {
         let Some(partition) = stream_id.strip_prefix(&prefix) else {
@@ -1060,7 +1278,7 @@ fn decode_fixed_header(
     let header_len = u32::from_be_bytes(input[10..14].try_into().unwrap()) as usize;
     let payload_len = usize::try_from(u64::from_be_bytes(input[14..22].try_into().unwrap()))
         .map_err(|_| ControlStreamFrameError::InvalidDeclaredLength {
-            context: "control stream frame payload_json",
+            context: "control stream frame payload_proto",
         })?;
     Ok(FixedControlFrameHeader {
         header_len,
@@ -1082,21 +1300,21 @@ fn encoded_frame_len(
         })
 }
 
-fn metadata_from_header_json(
-    header_json: &[u8],
+fn metadata_from_header_proto(
+    header_proto: &[u8],
 ) -> std::result::Result<ControlFrameMetadata, ControlStreamFrameError> {
-    let raw: RawControlFrameMetadata = serde_json::from_slice(header_json)
-        .map_err(|err| ControlStreamFrameError::InvalidHeaderJson(err.to_string()))?;
-    let sequence = raw
-        .sequence
-        .ok_or(ControlStreamFrameError::MissingHeaderField { field: "sequence" })?;
-    let sequence = ControlStreamSequence::new(sequence)?;
-    let record_digest = raw
-        .record_digest
-        .ok_or(ControlStreamFrameError::MissingHeaderField {
+    let raw = ControlFrameHeaderProto::decode(header_proto)
+        .map_err(|_| ControlStreamFrameError::InvalidHeaderProtobuf)?;
+    if raw.encode_to_vec() != header_proto {
+        return Err(ControlStreamFrameError::NonDeterministicHeaderProtobuf);
+    }
+    let sequence = ControlStreamSequence::new(raw.sequence)?;
+    if raw.record_digest.is_empty() {
+        return Err(ControlStreamFrameError::MissingHeaderField {
             field: "record_digest",
-        })?;
-    let record_digest = ControlRecordDigest::new(record_digest)?;
+        });
+    }
+    let record_digest = ControlRecordDigest::new(raw.record_digest)?;
     Ok(ControlFrameMetadata {
         sequence,
         record_digest,
@@ -1134,21 +1352,6 @@ struct FixedControlFrameHeader {
     payload_crc32: u32,
 }
 
-#[derive(Debug, Deserialize)]
-struct RawControlFrameMetadata {
-    sequence: Option<u64>,
-    record_digest: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawControlMutationHeader {
-    stream_family: Option<String>,
-    partition: Option<String>,
-    record_key: Option<String>,
-    operation: Option<String>,
-    new_generation: Option<u64>,
-}
-
 #[derive(Debug, Clone)]
 struct StreamProjectionEntry {
     sequence: u64,
@@ -1158,17 +1361,54 @@ struct StreamProjectionEntry {
     payload_json: Vec<u8>,
 }
 
-fn control_mutation_header(header_json: &[u8]) -> AnyhowResult<RawControlMutationHeader> {
-    serde_json::from_slice(header_json).context("parse control mutation header")
+pub fn decode_control_mutation_header(
+    header_proto: &[u8],
+) -> AnyhowResult<ControlFrameHeaderProto> {
+    let header =
+        ControlFrameHeaderProto::decode(header_proto).context("parse control mutation header")?;
+    if header.encode_to_vec() != header_proto {
+        return Err(anyhow!(
+            "control mutation header protobuf is not deterministic or contains unknown fields"
+        ));
+    }
+    Ok(header)
 }
 
 fn semantic_json(payload_json: &[u8]) -> AnyhowResult<serde_json::Value> {
     serde_json::from_slice(payload_json).context("parse projected control payload")
 }
 
+fn control_payload_operator_json(
+    stream_family: &str,
+    record_key: &str,
+    payload_proto: &[u8],
+) -> AnyhowResult<Vec<u8>> {
+    if let Some(family) =
+        crate::mesh_directory::RoutingRecordFamily::from_stream_family(stream_family)
+    {
+        return crate::mesh_directory::control_payload_operator_json(
+            family,
+            record_key,
+            payload_proto,
+        )
+        .map_err(Into::into);
+    }
+    if crate::mesh_lifecycle::lifecycle_control_stream_families().contains(&stream_family) {
+        return crate::mesh_lifecycle::control_payload_operator_json(
+            stream_family,
+            record_key,
+            payload_proto,
+        )
+        .map_err(Into::into);
+    }
+    Err(anyhow!(
+        "unknown mesh control stream family {stream_family}"
+    ))
+}
+
 fn projection_digest(payload_json: &[u8]) -> AnyhowResult<String> {
-    let value = semantic_json(payload_json)?;
-    Ok(ControlRecordDigest::blake3(&serde_json::to_vec(&value)?).to_string())
+    semantic_json(payload_json)?;
+    Ok(ControlRecordDigest::blake3(payload_json).to_string())
 }
 
 fn is_delete_operation(operation: &str) -> bool {
@@ -1187,7 +1427,23 @@ fn control_stream_prefix(stream_family: &str) -> String {
     format!("{CONTROL_STREAM_ID_PREFIX}{stream_family}:")
 }
 
-fn control_checkpoint_ref_name(
+fn control_checkpoint_row_key(
+    region: &str,
+    stream_family: &str,
+    partition: &str,
+) -> AnyhowResult<Vec<u8>> {
+    validate_control_stream_scope(region, "control checkpoint region")?;
+    validate_control_stream_scope(stream_family, "control checkpoint stream family")?;
+    validate_control_stream_partition(partition)?;
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(CONTROL_CHECKPOINT_ROW_PREFIX),
+        CoreMetaTuplePart::Utf8(region),
+        CoreMetaTuplePart::Utf8(stream_family),
+        CoreMetaTuplePart::Utf8(partition),
+    ])
+}
+
+fn control_checkpoint_partition_id(
     region: &str,
     stream_family: &str,
     partition: &str,
@@ -1196,7 +1452,7 @@ fn control_checkpoint_ref_name(
     validate_control_stream_scope(stream_family, "control checkpoint stream family")?;
     validate_control_stream_partition(partition)?;
     Ok(format!(
-        "{CONTROL_CHECKPOINT_REF_PREFIX}region:{region}:stream:{stream_family}:partition:{partition}"
+        "mesh-control-checkpoint:{region}:{stream_family}:{partition}"
     ))
 }
 
@@ -1228,70 +1484,76 @@ fn validate_control_stream_partition(value: &str) -> AnyhowResult<()> {
     Ok(())
 }
 
-fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> AnyhowResult<String> {
-    Ok(format!(
-        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
-    ))
-}
-
-fn decode_core_object_ref_target(target: &str) -> AnyhowResult<CoreObjectRef> {
-    let encoded = target
-        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
-        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
-    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core_store::PutBlob;
     use tempfile::tempdir;
 
     fn sample_header(sequence: u64) -> Vec<u8> {
-        serde_json::json!({
-            "schema": "anvil.mesh.control_mutation.v1",
-            "mesh_id": "mesh_01",
-            "stream_family": "bucket_locator",
-            "partition": "0a7f",
-            "sequence": sequence,
-            "record_key": "tenant_acme/releases",
-            "operation": "upsert",
-            "expected_generation": 18,
-            "new_generation": 19,
-            "writer_node_id": "node_01J0",
-            "writer_fence": 44,
-            "idempotency_key": "req-123",
-            "record_digest": ControlRecordDigest::blake3(b"record").as_str(),
-            "created_at": "2026-07-02T00:00:00Z"
+        encode_control_mutation_header(ControlMutationHeaderInput {
+            schema: "anvil.mesh.control_mutation.v1",
+            mesh_id: "mesh_01",
+            stream_family: "bucket_locator",
+            partition: "0a7f",
+            sequence: ControlStreamSequence::new(sequence).unwrap(),
+            record_key: "tenant_acme/releases",
+            operation: "upsert",
+            expected_generation: Some(18),
+            new_generation: 19,
+            writer_node_id: "node_01J0",
+            writer_fence: 44,
+            idempotency_key: Some("req-123"),
+            record_digest: &ControlRecordDigest::blake3(b"record"),
+            created_at: "2026-07-02T00:00:00Z",
         })
-        .to_string()
-        .into_bytes()
     }
 
     fn sample_payload() -> Vec<u8> {
         br#"{"tenant_id":"tenant_acme","bucket":"releases"}"#.to_vec()
     }
 
+    fn bucket_locator_operator_json(home_region: &str) -> Vec<u8> {
+        let descriptor = crate::mesh_directory::BucketLocatorDescriptor::active(
+            crate::mesh_directory::MeshId::new("mesh_01").unwrap(),
+            crate::mesh_directory::TenantId::new("tenant_acme").unwrap(),
+            crate::mesh_directory::BucketName::canonicalize("releases").unwrap(),
+            crate::mesh_directory::BucketId::new("bucket_01HY").unwrap(),
+            crate::mesh_directory::RegionName::new(home_region).unwrap(),
+            crate::mesh_directory::CellId::new("cell_a").unwrap(),
+            "regional-primary",
+            "objects/tenant_acme/releases/",
+            "2026-07-02T00:00:00Z",
+        )
+        .unwrap();
+        serde_json::to_vec(&descriptor).unwrap()
+    }
+
+    fn bucket_locator_payload_proto(home_region: &str) -> Vec<u8> {
+        let operator_json = bucket_locator_operator_json(home_region);
+        crate::mesh_directory::encode_control_payload_from_operator_json(
+            crate::mesh_directory::RoutingRecordFamily::BucketLocator,
+            &operator_json,
+        )
+        .unwrap()
+    }
+
     fn sample_header_for_payload(sequence: u64, payload: &[u8]) -> Vec<u8> {
-        serde_json::json!({
-            "schema": "anvil.mesh.control_mutation.v1",
-            "mesh_id": "mesh_01",
-            "stream_family": "bucket_locator",
-            "partition": "0a7f",
-            "sequence": sequence,
-            "record_key": "tenant_acme/releases",
-            "operation": "upsert",
-            "expected_generation": null,
-            "new_generation": 1,
-            "writer_node_id": "node_01J0",
-            "writer_fence": 44,
-            "idempotency_key": "req-123",
-            "record_digest": ControlRecordDigest::blake3(payload).as_str(),
-            "created_at": "2026-07-02T00:00:00Z"
+        encode_control_mutation_header(ControlMutationHeaderInput {
+            schema: "anvil.mesh.control_mutation.v1",
+            mesh_id: "mesh_01",
+            stream_family: "bucket_locator",
+            partition: "0a7f",
+            sequence: ControlStreamSequence::new(sequence).unwrap(),
+            record_key: "tenant_acme/releases",
+            operation: "upsert",
+            expected_generation: None,
+            new_generation: 1,
+            writer_node_id: "node_01J0",
+            writer_fence: 44,
+            idempotency_key: Some("req-123"),
+            record_digest: &ControlRecordDigest::blake3(payload),
+            created_at: "2026-07-02T00:00:00Z",
         })
-        .to_string()
-        .into_bytes()
     }
 
     #[test]
@@ -1311,19 +1573,19 @@ mod tests {
         );
         assert_eq!(
             u32::from_be_bytes(encoded[10..14].try_into().unwrap()),
-            frame.header_json.len() as u32
+            frame.header_proto.len() as u32
         );
         assert_eq!(
             u64::from_be_bytes(encoded[14..22].try_into().unwrap()),
-            frame.payload_json.len() as u64
+            frame.payload_proto.len() as u64
         );
         assert_eq!(
             u32::from_be_bytes(encoded[22..26].try_into().unwrap()),
-            crc32(&frame.header_json)
+            crc32(&frame.header_proto)
         );
         assert_eq!(
             u32::from_be_bytes(encoded[26..30].try_into().unwrap()),
-            crc32(&frame.payload_json)
+            crc32(&frame.payload_proto)
         );
 
         let (decoded, used) = ControlStreamFrame::decode(&encoded).unwrap();
@@ -1347,7 +1609,7 @@ mod tests {
         ));
 
         let mut bad_payload = encoded;
-        let payload_offset = CONTROL_STREAM_FIXED_HEADER_LEN + frame.header_json.len();
+        let payload_offset = CONTROL_STREAM_FIXED_HEADER_LEN + frame.header_proto.len();
         bad_payload[payload_offset] ^= 1;
         assert!(matches!(
             ControlStreamFrame::decode(&bad_payload).unwrap_err(),
@@ -1383,23 +1645,29 @@ mod tests {
 
     #[test]
     fn metadata_requires_sequence_and_digest() {
-        let missing_digest = br#"{"sequence":1}"#;
+        let mut missing_digest = ControlFrameHeaderProto::decode(&sample_header(1)[..]).unwrap();
+        missing_digest.record_digest.clear();
+        let missing_digest = missing_digest.encode_to_vec();
         assert_eq!(
-            metadata_from_header_json(missing_digest).unwrap_err(),
+            metadata_from_header_proto(&missing_digest).unwrap_err(),
             ControlStreamFrameError::MissingHeaderField {
                 field: "record_digest"
             }
         );
 
-        let zero_sequence = br#"{"sequence":0,"record_digest":"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+        let mut zero_sequence = ControlFrameHeaderProto::decode(&sample_header(1)[..]).unwrap();
+        zero_sequence.sequence = 0;
+        let zero_sequence = zero_sequence.encode_to_vec();
         assert_eq!(
-            metadata_from_header_json(zero_sequence).unwrap_err(),
+            metadata_from_header_proto(&zero_sequence).unwrap_err(),
             ControlStreamFrameError::InvalidSequence
         );
 
-        let bad_digest = br#"{"sequence":1,"record_digest":"sha256:abc"}"#;
+        let mut bad_digest = ControlFrameHeaderProto::decode(&sample_header(1)[..]).unwrap();
+        bad_digest.record_digest = "sha256:abc".to_string();
+        let bad_digest = bad_digest.encode_to_vec();
         assert_eq!(
-            metadata_from_header_json(bad_digest).unwrap_err(),
+            metadata_from_header_proto(&bad_digest).unwrap_err(),
             ControlStreamFrameError::InvalidDigest
         );
     }
@@ -1481,30 +1749,35 @@ mod tests {
             "2026-07-02T00:00:00Z",
         );
         let store = CoreStore::new(storage.clone()).await.unwrap();
-        let ref_name = control_checkpoint_ref_name("eu-west-1", "bucket_locator", "0a7f").unwrap();
-        let current = store.read_ref(&ref_name).await.unwrap();
-        let object_ref = store
-            .put_blob(PutBlob {
-                logical_name: ref_name.clone(),
-                bytes: serde_json::to_vec_pretty(&mismatched_body).unwrap(),
-                boundary_values: Vec::new(),
-                region_id: "local".to_string(),
-                mutation_id: "mismatched-checkpoint-test".to_string(),
-            })
-            .await
+        let row_key = control_checkpoint_row_key("eu-west-1", "bucket_locator", "0a7f").unwrap();
+        let current = store
+            .read_coremeta_row(CF_MESH, TABLE_MESH_PARTITION_ROW, &row_key)
             .unwrap();
+        let payload = encode_control_checkpoint_proto(&mismatched_body).unwrap();
+        let partition_id =
+            control_checkpoint_partition_id("eu-west-1", "bucket_locator", "0a7f").unwrap();
         store
-            .compare_and_swap_ref(CompareAndSwapRef {
-                ref_name,
-                expected_generation: current.as_ref().map(|value| value.generation),
-                expected_target: current.as_ref().map(|value| value.target.clone()),
-                require_absent: current.is_none(),
-                require_present: current.is_some(),
-                fence: None,
-                authz_revision: None,
-                source_watch_cursor: None,
-                new_target: encode_core_object_ref_target(&object_ref).unwrap(),
-                transaction_id: None,
+            .commit_mutation_batch(CoreMutationBatch {
+                transaction_id: "mismatched-checkpoint-test".to_string(),
+                scope_partition: partition_id.clone(),
+                committed_by_principal: "mesh-control-checkpoint-test".to_string(),
+                preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
+                    cf: CF_MESH.to_string(),
+                    table_id: TABLE_MESH_PARTITION_ROW,
+                    tuple_key: row_key.clone(),
+                    expected_payload_hash: current
+                        .as_ref()
+                        .map(|payload| core_meta_payload_digest(TABLE_MESH_PARTITION_ROW, payload)),
+                    require_absent: current.is_none(),
+                    require_present: current.is_some(),
+                }],
+                operations: vec![CoreMutationOperation::CoreMetaPut {
+                    partition_id,
+                    cf: CF_MESH.to_string(),
+                    table_id: TABLE_MESH_PARTITION_ROW,
+                    tuple_key: row_key,
+                    payload,
+                }],
             })
             .await
             .unwrap();
@@ -1626,13 +1899,12 @@ mod tests {
     async fn projection_diagnostic_detects_stream_projection_payload_mismatch() {
         let dir = tempdir().unwrap();
         let storage = Storage::new_at(dir.path()).await.unwrap();
-        let stream_payload =
-            br#"{"tenant_id":"tenant_acme","bucket_name":"releases","home_region":"eu-west-1"}"#;
-        let projection_payload =
-            br#"{"tenant_id":"tenant_acme","bucket_name":"releases","home_region":"us-east-1"}"#;
+        let stream_payload_proto = bucket_locator_payload_proto("eu-west-1");
+        let stream_payload_json = bucket_locator_operator_json("eu-west-1");
+        let projection_payload_json = bucket_locator_operator_json("us-east-1");
         let frame = ControlStreamFrame::new(
-            sample_header_for_payload(1, stream_payload),
-            stream_payload.to_vec(),
+            sample_header_for_payload(1, &stream_payload_proto),
+            stream_payload_proto,
         );
         append_control_stream_frame(&storage, "bucket_locator", "0a7f", &frame, None)
             .await
@@ -1645,7 +1917,7 @@ mod tests {
             &[ControlProjectionRecord::new(
                 "tenant_acme/releases",
                 1,
-                stream_payload.to_vec(),
+                stream_payload_json,
             )],
         )
         .await
@@ -1659,7 +1931,7 @@ mod tests {
             &[ControlProjectionRecord::new(
                 "tenant_acme/releases",
                 1,
-                projection_payload.to_vec(),
+                projection_payload_json,
             )],
         )
         .await

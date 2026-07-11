@@ -7,17 +7,16 @@ use crate::{
     config::Config,
     error_codes::AnvilErrorCode,
     formats::{
-        full_text::{Bm25Config, FullTextIndexDefinition, FullTextQueryError},
+        full_text::{Bm25Config, FullTextIndexDefinition, FullTextQueryError, tokenize_text},
         hash32,
         vector::VectorMetric,
     },
-    full_text_segment, index_journal, index_partition_watch,
+    full_text_segment, index_coremeta, index_journal, index_partition_watch,
     permissions::AnvilAction,
     search_query,
     services::watch_envelope::{self, WatchEnvelopeParts},
     typed_field_segment, validation, vector_segment,
 };
-use base64::Engine;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -33,14 +32,20 @@ type HmacSha256 = Hmac<Sha256>;
 const INDEX_PAGE_TOKEN_VERSION: u8 = 1;
 const INDEX_PAGE_TOKEN_DOMAIN: &[u8] = b"anvil-index-page-token-v1";
 const INDEX_PAGE_TOKEN_TTL_SECONDS: i64 = 15 * 60;
-const QUERY_PERMISSION_PREFIX_OBJECT_CAP: i32 = 10_000;
-
 mod operations;
 mod query;
+mod query_boundary;
+mod query_candidates;
+mod query_hybrid;
+mod query_page_token;
 mod rpc;
 mod validation_helpers;
 
 use query::*;
+use query_boundary::*;
+use query_candidates::*;
+use query_hybrid::*;
+use query_page_token::*;
 pub(crate) use validation_helpers::index_kind_value_from_str;
 use validation_helpers::*;
 

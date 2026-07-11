@@ -53,6 +53,8 @@ pub(super) struct AnvilQueryConsistency {
 #[derive(Debug, Clone)]
 pub(super) struct QuerySpecShape {
     pub(super) source_kind: String,
+    pub(super) authz_scope: Option<JsonValue>,
+    pub(super) boundary_predicates: Vec<JsonValue>,
     pub(super) path_prefix: Option<String>,
     pub(super) typed_predicates: Vec<JsonValue>,
     pub(super) typed_order: Vec<TypedOrder>,
@@ -69,6 +71,7 @@ pub(super) struct QuerySpecShape {
 pub(super) struct QuerySpecPlan {
     pub(super) index: crate::persistence::IndexDefinition,
     pub(super) typed_filter_index: Option<crate::persistence::IndexDefinition>,
+    pub(super) authz_scope: QueryAuthzScope,
     pub(super) canonical_query_hash: String,
     pub(super) plan_json: String,
     pub(super) diagnostics: Vec<String>,
@@ -76,6 +79,7 @@ pub(super) struct QuerySpecPlan {
     pub(super) query_vector: Vec<f32>,
     pub(super) phrase: bool,
     pub(super) path_prefix: String,
+    pub(super) boundary_predicates: Vec<JsonValue>,
     pub(super) typed_predicates: Vec<JsonValue>,
     pub(super) typed_order: Vec<TypedOrder>,
     pub(super) limit: u32,
@@ -86,6 +90,33 @@ pub(super) struct QuerySpecPlan {
 pub(super) struct QuerySpecIndexSelection {
     pub(super) primary: crate::persistence::IndexDefinition,
     pub(super) typed_filter: Option<crate::persistence::IndexDefinition>,
+}
+
+impl QuerySpecIndexSelection {
+    pub(super) fn requires_object_authorization(&self) -> bool {
+        self.primary.authorization_mode == "inherit_object"
+            || self
+                .typed_filter
+                .as_ref()
+                .is_some_and(|index| index.authorization_mode == "inherit_object")
+    }
+
+    pub(super) fn effective_authorization_mode(&self) -> &str {
+        if self.primary.authorization_mode == "inherit_object" {
+            return &self.primary.authorization_mode;
+        }
+        let Some(filter) = self.typed_filter.as_ref() else {
+            return &self.primary.authorization_mode;
+        };
+        if filter.authorization_mode == "inherit_object"
+            || (self.primary.authorization_mode == "public"
+                && filter.authorization_mode == "index_only")
+        {
+            &filter.authorization_mode
+        } else {
+            &self.primary.authorization_mode
+        }
+    }
 }
 
 impl QuerySpecPlan {
@@ -104,6 +135,8 @@ impl QuerySpecPlan {
             phrase: self.phrase,
             path_prefix: self.path_prefix.clone(),
             metadata_filters_json: String::new(),
+            boundary_predicates_json: serde_json::to_string(&self.boundary_predicates)
+                .map_err(|e| Status::internal(e.to_string()))?,
             typed_predicates_json: serde_json::to_string(&self.typed_predicates)
                 .map_err(|e| Status::internal(e.to_string()))?,
             typed_order_json: serde_json::to_string(&self.typed_order)
@@ -151,6 +184,7 @@ impl AnvilQuerySpec {
 
     pub(super) fn shape(&self) -> Result<QuerySpecShape, Status> {
         let mut path_prefix = None;
+        let mut boundary_predicates = Vec::new();
         let mut typed_predicates = Vec::new();
         let mut query_text = None;
         let mut query_vector = None;
@@ -160,6 +194,15 @@ impl AnvilQuerySpec {
         for predicate in &self.predicates.all {
             if let Some(value) = predicate.get("path_prefix").and_then(JsonValue::as_str) {
                 path_prefix = Some(value.to_string());
+                continue;
+            }
+            if let Some(boundary) = predicate.get("boundary") {
+                if !boundary.is_object() {
+                    return Err(Status::invalid_argument(
+                        "QuerySpec boundary predicate must be an object",
+                    ));
+                }
+                boundary_predicates.push(page_token_canonical_json(boundary));
                 continue;
             }
             if let Some(field) = predicate.get("field").and_then(JsonValue::as_str) {
@@ -252,6 +295,8 @@ impl AnvilQuerySpec {
 
         Ok(QuerySpecShape {
             source_kind: self.source_kind.clone(),
+            authz_scope: self.scope.authz_scope.clone(),
+            boundary_predicates,
             path_prefix,
             typed_predicates,
             typed_order,
@@ -297,7 +342,9 @@ pub(super) fn select_query_spec_indexes(
     shape: &QuerySpecShape,
     accept_degraded: bool,
 ) -> Result<QuerySpecIndexSelection, Status> {
-    let needs_typed = !shape.typed_predicates.is_empty() || !shape.typed_order.is_empty();
+    let needs_typed = !shape.typed_predicates.is_empty()
+        || !shape.boundary_predicates.is_empty()
+        || !shape.typed_order.is_empty();
     let needs_text = shape.query_text.is_some();
     let needs_vector = shape.query_vector.is_some();
     let needs_path_only =
@@ -367,30 +414,35 @@ pub(super) fn select_query_spec_indexes(
     if needs_path_only {
         let primary = indexes
             .iter()
-            .find(|index| index.enabled && matches!(index.kind.as_str(), "path" | "typed_json"))
+            .find(|index| index.enabled && index.kind == "path")
             .cloned()
-            .ok_or_else(|| Status::failed_precondition("QuerySpec has no path-capable index"))?;
+            .ok_or_else(|| Status::failed_precondition("QuerySpec has no path index"))?;
         return Ok(QuerySpecIndexSelection {
             primary,
             typed_filter: None,
         });
     }
     if accept_degraded {
-        let primary = indexes
-            .iter()
-            .find(|index| index.enabled && index.kind == "path")
-            .cloned()
-            .ok_or_else(|| {
-                Status::failed_precondition("QuerySpec has no bounded primitive index")
-            })?;
-        return Ok(QuerySpecIndexSelection {
-            primary,
-            typed_filter: None,
-        });
+        return Err(Status::failed_precondition(
+            "QuerySpec degraded full-scan fallback is forbidden",
+        ));
     }
     Err(Status::failed_precondition(
         "QuerySpec requires at least one bounded primitive predicate",
     ))
+}
+
+pub(super) fn typed_json_index_has_field(
+    index: &crate::persistence::IndexDefinition,
+    field_name: &str,
+) -> Result<bool, Status> {
+    if index.kind != "typed_json" {
+        return Ok(false);
+    }
+    Ok(TypedJsonIndexDefinition::from_index(index)?
+        .fields
+        .iter()
+        .any(|field| field.name == field_name))
 }
 
 pub(super) fn typed_json_index_covers(
@@ -414,6 +466,14 @@ pub(super) fn typed_json_index_covers(
             return Ok(false);
         }
     }
+    for predicate in &shape.boundary_predicates {
+        let Some(field) = boundary_predicate_field(predicate) else {
+            return Ok(false);
+        };
+        if !fields.contains(field) {
+            return Ok(false);
+        }
+    }
     for order in &shape.typed_order {
         if !fields.contains(order.field.as_str()) {
             return Ok(false);
@@ -424,6 +484,28 @@ pub(super) fn typed_json_index_covers(
 
 pub(super) fn query_spec_overfetch_limit(requested: u32) -> u32 {
     requested.saturating_mul(10).clamp(100, 1000)
+}
+
+pub(super) fn boundary_predicate_field(predicate: &JsonValue) -> Option<&str> {
+    let direct = predicate
+        .get("dimension")
+        .and_then(JsonValue::as_str)
+        .or_else(|| predicate.get("name").and_then(JsonValue::as_str))
+        .or_else(|| predicate.get("field").and_then(JsonValue::as_str));
+    if direct.is_some() {
+        return direct;
+    }
+    for key in ["eq", "in", "range", "prefix", "exists"] {
+        if let Some(node) = predicate.get(key) {
+            if let Some(field) = node.as_str() {
+                return Some(field);
+            }
+            if let Some(field) = boundary_predicate_field(node) {
+                return Some(field);
+            }
+        }
+    }
+    None
 }
 
 pub(super) fn composite_query_spec_index_name(
@@ -454,16 +536,21 @@ pub(super) fn composite_query_spec_predicate_hash(
         "typed_filter_index": plan.typed_filter_index.as_ref().map(|index| index.name.as_str()),
         "typed_generation": typed_generation,
     });
-    blake3::hash(shape.to_string().as_bytes())
-        .to_hex()
-        .to_string()
+    authz_aware_query_scope_hash("predicate", &plan.authz_scope, shape)
 }
 
 pub(super) fn composite_query_spec_order_hash(plan: &QuerySpecPlan) -> String {
     if plan.typed_order.is_empty() {
-        score_order_hash()
+        score_order_hash(&plan.authz_scope)
     } else {
-        stable_json_hash(&serde_json::to_string(&plan.typed_order).unwrap_or_default())
+        authz_aware_query_scope_hash(
+            "order",
+            &plan.authz_scope,
+            serde_json::json!({
+                "schema": "anvil.query.order.v1",
+                "terms": plan.typed_order,
+            }),
+        )
     }
 }
 
@@ -592,51 +679,101 @@ impl QueryObjectRef {
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct QueryPermissionFilter {
+    pub(super) allow_all: bool,
     pub(super) object_keys: BTreeSet<String>,
     pub(super) authorized_labels: BTreeSet<[u8; 32]>,
 }
 
 impl QueryPermissionFilter {
+    pub(super) fn all() -> Self {
+        Self {
+            allow_all: true,
+            object_keys: BTreeSet::new(),
+            authorized_labels: BTreeSet::new(),
+        }
+    }
+
     pub(super) fn allows_object_key(&self, object_key: &str) -> bool {
-        self.object_keys.contains(object_key)
+        self.allow_all || self.object_keys.contains(object_key)
     }
 }
 
-pub(super) fn collect_object_scope(
-    scope: &str,
-    bucket_name: &str,
-    object_keys: &mut BTreeSet<String>,
-    object_key_prefixes: &mut BTreeSet<String>,
-    grants_bucket_read: &mut bool,
-) {
-    let Some((action, resource)) = scope.split_once('|') else {
-        return;
-    };
-    if !matches!(action, "object:read" | "object:*" | "*") {
-        return;
-    }
-    if resource == "*" {
-        *grants_bucket_read = true;
-        return;
-    }
-    let bucket_prefix = format!("{bucket_name}/");
-    let Some(key_pattern) = resource.strip_prefix(&bucket_prefix) else {
-        return;
-    };
-    if key_pattern.is_empty() {
-        *grants_bucket_read = true;
-        return;
-    }
-    if key_pattern.ends_with('*') {
-        let prefix = key_pattern.trim_end_matches('*');
-        if prefix.is_empty() {
-            *grants_bucket_read = true;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct QueryAuthzScope {
+    pub(super) realm_id: String,
+    pub(super) object_namespace: String,
+    pub(super) relation: String,
+    pub(super) authorization_mode: String,
+    pub(super) principal_hash: String,
+    pub(super) scope_hash: String,
+    pub(super) revision: u64,
+}
+
+impl QueryAuthzScope {
+    pub(super) fn for_bucket(
+        config: &Config,
+        claims: &auth::Claims,
+        bucket: &crate::persistence::Bucket,
+        authorization_mode: &str,
+        requested_relation: &str,
+        explicit_scope: Option<&JsonValue>,
+        revision: u64,
+    ) -> Self {
+        let relation = if requested_relation == "read" {
+            "reader"
         } else {
-            object_key_prefixes.insert(prefix.to_string());
+            requested_relation
+        };
+        let object_namespace = encode_realm_namespace(DEFAULT_AUTHZ_REALM_ID, "object");
+        let principal_hash = stable_string_hash(&claims.sub);
+        let scope_shape = serde_json::json!({
+            "schema": "anvil.query.authz_scope.v1",
+            "mesh_id": config.mesh_id,
+            "realm_id": DEFAULT_AUTHZ_REALM_ID,
+            "object_namespace": object_namespace,
+            "relation": relation,
+            "authorization_mode": authorization_mode,
+            "tenant_id": claims.tenant_id,
+            "bucket_id": bucket.id,
+            "bucket_name": bucket.name,
+            "principal_hash": principal_hash,
+            "explicit_scope": explicit_scope.cloned().unwrap_or(JsonValue::Null),
+            "revision": revision,
+        });
+        Self {
+            realm_id: DEFAULT_AUTHZ_REALM_ID.to_string(),
+            object_namespace,
+            relation: relation.to_string(),
+            authorization_mode: authorization_mode.to_string(),
+            principal_hash,
+            scope_hash: stable_prefixed_json_hash(&scope_shape),
+            revision,
         }
-        return;
     }
-    object_keys.insert(key_pattern.to_string());
+
+    pub(super) fn trace_json(&self) -> JsonValue {
+        serde_json::json!({
+            "realm_id": self.realm_id.clone(),
+            "object_namespace": self.object_namespace.clone(),
+            "relation": self.relation.clone(),
+            "authorization_mode": self.authorization_mode.clone(),
+            "principal_hash": self.principal_hash.clone(),
+            "scope_hash": self.scope_hash.clone(),
+            "revision": self.revision,
+        })
+    }
+}
+
+pub(super) fn authz_label_filter_for_index_candidate_set<'a>(
+    _authorization_mode: &str,
+    _permission_filter: Option<&'a QueryPermissionFilter>,
+    _indexed_authz_revision: u64,
+    _query_authz_revision: u64,
+) -> Result<Option<&'a BTreeSet<[u8; 32]>>, Status> {
+    // Label filters are an optimisation hint only and must not replace Zanzibar
+    // visibility checks. Returning None keeps the candidate set broad; callers
+    // must run query_hit_visible() before returning a hit.
+    Ok(None)
 }
 
 pub(super) fn query_object_authz_label_hash(
@@ -886,269 +1023,6 @@ impl TypedOrder {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct IndexPageToken {
-    pub(super) version: u8,
-    pub(super) token_kind: String,
-    pub(super) mesh_id: String,
-    pub(super) anvil_storage_tenant_id: String,
-    pub(super) authz_realm_id: String,
-    pub(super) tenant_id: i64,
-    pub(super) bucket_name: String,
-    pub(super) index_name: String,
-    pub(super) index_generation: u64,
-    pub(super) index_definition_version: u64,
-    pub(super) index_inputs: Vec<IndexPageTokenInput>,
-    pub(super) authz_revision: u64,
-    pub(super) caller_principal_hash: String,
-    pub(super) query_hash: String,
-    pub(super) predicate_hash: String,
-    pub(super) order_hash: String,
-    pub(super) last_source_identity: String,
-    #[serde(default)]
-    pub(super) last_sort_values: BTreeMap<String, JsonValue>,
-    pub(super) expires_at: String,
-    pub(super) signature: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(super) struct IndexPageTokenInput {
-    pub(super) index_id: String,
-    pub(super) definition_hash: String,
-    pub(super) generation: u64,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct IndexPageTokenBinding {
-    pub(super) token_kind: String,
-    pub(super) mesh_id: String,
-    pub(super) anvil_storage_tenant_id: String,
-    pub(super) authz_realm_id: String,
-    pub(super) tenant_id: i64,
-    pub(super) bucket_name: String,
-    pub(super) index_name: String,
-    pub(super) index_generation: u64,
-    pub(super) index_definition_version: u64,
-    pub(super) index_inputs: Vec<IndexPageTokenInput>,
-    pub(super) authz_revision: u64,
-    pub(super) caller_principal_hash: String,
-    pub(super) query_hash: String,
-    pub(super) predicate_hash: String,
-    pub(super) order_hash: String,
-}
-
-impl IndexPageToken {
-    pub(super) fn for_cursor(
-        binding: &IndexPageTokenBinding,
-        last_source_identity: String,
-        last_sort_values: BTreeMap<String, JsonValue>,
-    ) -> Self {
-        Self {
-            version: INDEX_PAGE_TOKEN_VERSION,
-            token_kind: binding.token_kind.clone(),
-            mesh_id: binding.mesh_id.clone(),
-            anvil_storage_tenant_id: binding.anvil_storage_tenant_id.clone(),
-            authz_realm_id: binding.authz_realm_id.clone(),
-            tenant_id: binding.tenant_id,
-            bucket_name: binding.bucket_name.clone(),
-            index_name: binding.index_name.clone(),
-            index_generation: binding.index_generation,
-            index_definition_version: binding.index_definition_version,
-            index_inputs: binding.index_inputs.clone(),
-            authz_revision: binding.authz_revision,
-            caller_principal_hash: binding.caller_principal_hash.clone(),
-            query_hash: binding.query_hash.clone(),
-            predicate_hash: binding.predicate_hash.clone(),
-            order_hash: binding.order_hash.clone(),
-            last_source_identity,
-            last_sort_values,
-            expires_at: (chrono::Utc::now()
-                + chrono::Duration::seconds(INDEX_PAGE_TOKEN_TTL_SECONDS))
-            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
-            signature: String::new(),
-        }
-    }
-
-    pub(super) fn decode(raw: &str, signing_key: &[u8]) -> Result<Option<Self>, Status> {
-        if raw.trim().is_empty() {
-            return Ok(None);
-        }
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(raw)
-            .map_err(|_| Status::invalid_argument("InvalidPageToken"))?;
-        let token: Self = serde_json::from_slice(&bytes)
-            .map_err(|_| Status::invalid_argument("InvalidPageToken"))?;
-        if token.version != INDEX_PAGE_TOKEN_VERSION {
-            return Err(Status::invalid_argument("InvalidPageToken"));
-        }
-        let expected = token.sign(signing_key)?;
-        if !constant_time_eq::constant_time_eq(token.signature.as_bytes(), expected.as_bytes()) {
-            return Err(Status::invalid_argument("InvalidPageToken"));
-        }
-        Ok(Some(token))
-    }
-
-    pub(super) fn encode(mut self, signing_key: &[u8]) -> Result<String, Status> {
-        self.signature = self.sign(signing_key)?;
-        let bytes = serde_json::to_vec(&self)
-            .map_err(|e| Status::internal(format!("Serialize page token: {e}")))?;
-        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
-    }
-
-    pub(super) fn validate(&self, binding: &IndexPageTokenBinding) -> Result<(), Status> {
-        let expires_at = chrono::DateTime::parse_from_rfc3339(&self.expires_at)
-            .map_err(|_| Status::invalid_argument("InvalidPageToken"))?
-            .with_timezone(&chrono::Utc);
-        if expires_at <= chrono::Utc::now() {
-            return Err(Status::invalid_argument("PageTokenExpired"));
-        }
-        if self.token_kind != binding.token_kind
-            || self.mesh_id != binding.mesh_id
-            || self.anvil_storage_tenant_id != binding.anvil_storage_tenant_id
-            || self.authz_realm_id != binding.authz_realm_id
-            || self.tenant_id != binding.tenant_id
-            || self.bucket_name != binding.bucket_name
-            || self.index_name != binding.index_name
-            || self.index_generation != binding.index_generation
-            || self.index_definition_version != binding.index_definition_version
-            || self.index_inputs != binding.index_inputs
-            || self.authz_revision != binding.authz_revision
-            || self.caller_principal_hash != binding.caller_principal_hash
-            || self.query_hash != binding.query_hash
-            || self.predicate_hash != binding.predicate_hash
-            || self.order_hash != binding.order_hash
-        {
-            return Err(Status::invalid_argument("InvalidPageToken"));
-        }
-        Ok(())
-    }
-
-    pub(super) fn sign(&self, signing_key: &[u8]) -> Result<String, Status> {
-        let mut mac = HmacSha256::new_from_slice(signing_key)
-            .map_err(|_| Status::internal("Invalid index page token signing key"))?;
-        mac.update(INDEX_PAGE_TOKEN_DOMAIN);
-        mac.update(&[self.version]);
-        update_mac_part(&mut mac, self.token_kind.as_bytes());
-        update_mac_part(&mut mac, self.mesh_id.as_bytes());
-        update_mac_part(&mut mac, self.anvil_storage_tenant_id.as_bytes());
-        update_mac_part(&mut mac, self.authz_realm_id.as_bytes());
-        mac.update(&self.tenant_id.to_le_bytes());
-        update_mac_part(&mut mac, self.bucket_name.as_bytes());
-        update_mac_part(&mut mac, self.index_name.as_bytes());
-        mac.update(&self.index_generation.to_le_bytes());
-        mac.update(&self.index_definition_version.to_le_bytes());
-        let index_inputs = serde_json::to_vec(&self.index_inputs)
-            .map_err(|_| Status::internal("Failed to encode index page token index inputs"))?;
-        update_mac_part(&mut mac, &index_inputs);
-        mac.update(&self.authz_revision.to_le_bytes());
-        update_mac_part(&mut mac, self.caller_principal_hash.as_bytes());
-        update_mac_part(&mut mac, self.query_hash.as_bytes());
-        update_mac_part(&mut mac, self.predicate_hash.as_bytes());
-        update_mac_part(&mut mac, self.order_hash.as_bytes());
-        update_mac_part(&mut mac, self.last_source_identity.as_bytes());
-        let sort_values = serde_json::to_vec(&self.last_sort_values)
-            .map_err(|_| Status::internal("Failed to encode index page token sort values"))?;
-        update_mac_part(&mut mac, &sort_values);
-        update_mac_part(&mut mac, self.expires_at.as_bytes());
-        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
-    }
-}
-
-impl IndexPageTokenBinding {
-    pub(super) fn single_index(
-        config: &Config,
-        claims: &auth::Claims,
-        token_kind: &str,
-        bucket_name: &str,
-        index_name: &str,
-        index_generation: u64,
-        index_definition_version: u64,
-        authz_revision: u64,
-        predicate_hash: String,
-        order_hash: String,
-    ) -> Self {
-        let index_inputs = vec![IndexPageTokenInput {
-            index_id: index_name.to_string(),
-            definition_hash: stable_string_hash(&format!(
-                "{index_name}:{index_definition_version}"
-            )),
-            generation: index_generation,
-        }];
-        Self::with_index_inputs(
-            config,
-            claims,
-            token_kind,
-            bucket_name,
-            index_name,
-            index_generation,
-            index_definition_version,
-            index_inputs,
-            authz_revision,
-            predicate_hash,
-            order_hash,
-        )
-    }
-
-    pub(super) fn with_index_inputs(
-        config: &Config,
-        claims: &auth::Claims,
-        token_kind: &str,
-        bucket_name: &str,
-        index_name: &str,
-        index_generation: u64,
-        index_definition_version: u64,
-        index_inputs: Vec<IndexPageTokenInput>,
-        authz_revision: u64,
-        predicate_hash: String,
-        order_hash: String,
-    ) -> Self {
-        let anvil_storage_tenant_id = claims.tenant_id.to_string();
-        let authz_realm_id = DEFAULT_AUTHZ_REALM_ID.to_string();
-        let caller_principal_hash = stable_string_hash(&claims.sub);
-        let query_hash = stable_string_hash(
-            &serde_json::json!({
-                "token_kind": token_kind,
-                "mesh_id": config.mesh_id,
-                "anvil_storage_tenant_id": anvil_storage_tenant_id,
-                "authz_realm_id": authz_realm_id,
-                "tenant_id": claims.tenant_id,
-                "bucket_name": bucket_name,
-                "index_name": index_name,
-                "index_generation": index_generation,
-                "index_definition_version": index_definition_version,
-                "index_inputs": index_inputs,
-                "authz_revision": authz_revision,
-                "caller_principal_hash": caller_principal_hash,
-                "predicate_hash": predicate_hash,
-                "order_hash": order_hash,
-            })
-            .to_string(),
-        );
-        Self {
-            token_kind: token_kind.to_string(),
-            mesh_id: config.mesh_id.clone(),
-            anvil_storage_tenant_id,
-            authz_realm_id,
-            tenant_id: claims.tenant_id,
-            bucket_name: bucket_name.to_string(),
-            index_name: index_name.to_string(),
-            index_generation,
-            index_definition_version,
-            index_inputs,
-            authz_revision,
-            caller_principal_hash,
-            query_hash,
-            predicate_hash,
-            order_hash,
-        }
-    }
-}
-
-pub(super) fn update_mac_part(mac: &mut HmacSha256, value: &[u8]) {
-    mac.update(&(value.len() as u64).to_le_bytes());
-    mac.update(value);
-}
-
 pub(super) fn compare_typed_rows(
     left: &TypedIndexRow,
     right: &TypedIndexRow,
@@ -1277,22 +1151,135 @@ pub(super) fn stable_json_hash(raw: &str) -> String {
         .to_string()
 }
 
-pub(super) fn stable_string_hash(value: &str) -> String {
-    blake3::hash(value.as_bytes()).to_hex().to_string()
+pub(super) fn stable_prefixed_json_hash(value: &JsonValue) -> String {
+    let canonical = page_token_canonical_json(value);
+    format!(
+        "blake3:{}",
+        blake3::hash(canonical.to_string().as_bytes()).to_hex()
+    )
 }
 
-pub(super) fn metadata_backed_predicate_hash(index_kind: &str, req: &QueryIndexRequest) -> String {
+pub(super) fn stable_string_hash(value: &str) -> String {
+    format!("blake3:{}", blake3::hash(value.as_bytes()).to_hex())
+}
+
+pub(super) fn stable_json_hash_checked(raw: &str, field_name: &str) -> Result<String, Status> {
+    let canonical = if raw.trim().is_empty() {
+        JsonValue::Null
+    } else {
+        serde_json::from_str(raw)
+            .map_err(|e| Status::invalid_argument(format!("Invalid {field_name}: {e}")))?
+    };
+    Ok(stable_prefixed_json_hash(&canonical))
+}
+
+pub(super) fn authz_aware_query_scope_hash(
+    hash_kind: &str,
+    authz_scope: &QueryAuthzScope,
+    shape: JsonValue,
+) -> String {
+    stable_prefixed_json_hash(&serde_json::json!({
+        "schema": "anvil.query.scope_hash.v1",
+        "hash_kind": hash_kind,
+        "authz": {
+            "realm_id": authz_scope.realm_id.clone(),
+            "object_namespace": authz_scope.object_namespace.clone(),
+            "relation": authz_scope.relation.clone(),
+            "authorization_mode": authz_scope.authorization_mode.clone(),
+            "principal_hash": authz_scope.principal_hash.clone(),
+            "scope_hash": authz_scope.scope_hash.clone(),
+            "revision": authz_scope.revision,
+        },
+        "shape": shape,
+    }))
+}
+
+pub(super) fn ensure_algorithm_prefixed_hash(value: &str, field_name: &str) -> Result<(), Status> {
+    let Some((algorithm, digest)) = value.split_once(':') else {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} must be algorithm-prefixed"
+        )));
+    };
+    let expected_len = match algorithm {
+        "blake3" | "sha256" => 64,
+        _ => {
+            return Err(Status::invalid_argument(format!(
+                "{field_name} uses unsupported hash algorithm"
+            )));
+        }
+    };
+    if digest.len() != expected_len
+        || !digest
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} has invalid hash digest"
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn ensure_no_direct_boundary_predicates(req: &QueryIndexRequest) -> Result<(), Status> {
+    if BoundaryPredicate::parse_list(&req.boundary_predicates_json)?.is_empty() {
+        Ok(())
+    } else {
+        Err(Status::failed_precondition("IndexCapabilityMissing"))
+    }
+}
+
+pub(super) fn metadata_backed_predicate_hash(
+    index_kind: &str,
+    req: &QueryIndexRequest,
+    authz_scope: &QueryAuthzScope,
+) -> Result<String, Status> {
     let shape = serde_json::json!({
         "index_kind": index_kind,
         "path_prefix": req.path_prefix,
-        "metadata_filters_hash": stable_json_hash(&req.metadata_filters_json),
+        "metadata_filters_hash": stable_json_hash_checked(
+            &req.metadata_filters_json,
+            "metadata_filters_json"
+        )?,
+        "boundary_predicates_hash": stable_json_hash_checked(
+            &req.boundary_predicates_json,
+            "boundary_predicates_json"
+        )?,
     });
-    blake3::hash(shape.to_string().as_bytes())
-        .to_hex()
-        .to_string()
+    Ok(authz_aware_query_scope_hash(
+        "predicate",
+        authz_scope,
+        shape,
+    ))
 }
 
-pub(super) fn score_based_predicate_hash(index_kind: &str, req: &QueryIndexRequest) -> String {
+pub(super) fn typed_json_predicate_hash(
+    req: &QueryIndexRequest,
+    authz_scope: &QueryAuthzScope,
+) -> Result<String, Status> {
+    let shape = serde_json::json!({
+        "path_prefix": req.path_prefix,
+        "typed_predicates_hash": stable_json_hash_checked(
+            &req.typed_predicates_json,
+            "typed_predicates_json"
+        )?,
+        "boundary_predicates_hash": stable_json_hash_checked(
+            &req.boundary_predicates_json,
+            "boundary_predicates_json"
+        )?,
+    });
+    Ok(authz_aware_query_scope_hash(
+        "predicate",
+        authz_scope,
+        shape,
+    ))
+}
+
+pub(super) fn score_based_predicate_hash(
+    index_kind: &str,
+    req: &QueryIndexRequest,
+    authz_scope: &QueryAuthzScope,
+) -> Result<String, Status> {
     let query_vector_bits = req
         .query_vector
         .iter()
@@ -1304,16 +1291,179 @@ pub(super) fn score_based_predicate_hash(index_kind: &str, req: &QueryIndexReque
         "query_vector_bits": query_vector_bits,
         "phrase": req.phrase,
         "path_prefix": req.path_prefix,
-        "metadata_filters_hash": stable_json_hash(&req.metadata_filters_json),
-        "typed_predicates_hash": stable_json_hash(&req.typed_predicates_json),
+        "metadata_filters_hash": stable_json_hash_checked(
+            &req.metadata_filters_json,
+            "metadata_filters_json"
+        )?,
+        "boundary_predicates_hash": stable_json_hash_checked(
+            &req.boundary_predicates_json,
+            "boundary_predicates_json"
+        )?,
+        "typed_predicates_hash": stable_json_hash_checked(
+            &req.typed_predicates_json,
+            "typed_predicates_json"
+        )?,
     });
-    blake3::hash(shape.to_string().as_bytes())
-        .to_hex()
-        .to_string()
+    Ok(authz_aware_query_scope_hash(
+        "predicate",
+        authz_scope,
+        shape,
+    ))
 }
 
-pub(super) fn score_order_hash() -> String {
-    stable_string_hash("score:desc,object_version_id:asc")
+pub(super) fn score_order_hash(authz_scope: &QueryAuthzScope) -> String {
+    authz_aware_query_scope_hash(
+        "order",
+        authz_scope,
+        serde_json::json!({
+            "schema": "anvil.query.order.v1",
+            "terms": [
+                {"field": "score", "direction": "desc"},
+                {"field": "object_version_id", "direction": "asc"},
+            ],
+        }),
+    )
+}
+
+pub(super) fn object_key_order_hash(authz_scope: &QueryAuthzScope) -> String {
+    authz_aware_query_scope_hash(
+        "order",
+        authz_scope,
+        serde_json::json!({
+            "schema": "anvil.query.order.v1",
+            "terms": [
+                {"field": "object_key", "direction": "asc"},
+                {"field": "source_identity", "direction": "asc"},
+            ],
+        }),
+    )
+}
+
+pub(super) fn typed_order_hash(
+    order: &[TypedOrder],
+    authz_scope: &QueryAuthzScope,
+) -> Result<String, Status> {
+    Ok(authz_aware_query_scope_hash(
+        "order",
+        authz_scope,
+        serde_json::json!({
+            "schema": "anvil.query.order.v1",
+            "terms": serde_json::to_value(order)
+                .map_err(|e| Status::internal(format!("Serialize typed order: {e}")))?,
+        }),
+    ))
+}
+
+pub(super) fn record_query_plan_metrics(
+    index_kind: &str,
+    authz_mode: &str,
+    input_candidate_count: u64,
+    boundary_candidate_count: u64,
+    authz_candidate_count: u64,
+    intersection_candidate_count: u64,
+) {
+    let labels = [("index_kind", index_kind), ("authz_mode", authz_mode)];
+    crate::perf::record_counter(
+        "anvil_query_input_candidate_count",
+        &labels,
+        input_candidate_count,
+    );
+    crate::perf::record_counter(
+        "anvil_query_boundary_candidate_count",
+        &labels,
+        boundary_candidate_count,
+    );
+    crate::perf::record_counter(
+        "anvil_query_authz_candidate_count",
+        &labels,
+        authz_candidate_count,
+    );
+    crate::perf::record_counter(
+        "anvil_query_intersection_candidate_count",
+        &labels,
+        intersection_candidate_count,
+    );
+    crate::perf::record_duration(
+        "anvil_query_plan_duration_ms",
+        &[
+            ("index_kind", index_kind),
+            (
+                "authz_pruned",
+                if authz_candidate_count < boundary_candidate_count {
+                    "true"
+                } else {
+                    "false"
+                },
+            ),
+            (
+                "boundary_pruned",
+                if boundary_candidate_count < input_candidate_count {
+                    "true"
+                } else {
+                    "false"
+                },
+            ),
+        ],
+        Duration::ZERO,
+    );
+    crate::perf::record_float_gauge(
+        "anvil_boundary_prune_ratio",
+        &[
+            ("boundary_dimension", "query"),
+            ("writer_family", index_kind),
+            ("index_kind", index_kind),
+        ],
+        prune_ratio(input_candidate_count, boundary_candidate_count),
+    );
+    crate::perf::record_float_gauge(
+        "anvil_authz_candidate_prune_ratio",
+        &[
+            ("object_namespace", "object"),
+            ("relation", authz_mode),
+            ("index_kind", index_kind),
+        ],
+        prune_ratio(boundary_candidate_count, authz_candidate_count),
+    );
+    crate::perf::record_trace_event(crate::perf::TraceEvent {
+        trace_id: "query-plan",
+        span_id: "boundary-prune",
+        parent_span_id: None,
+        request_id: None,
+        component: "query",
+        operation: "query.boundary_prune",
+        writer_family: Some(index_kind),
+        bucket_hash: None,
+        boundary_schema_generation: None,
+        duration: Duration::ZERO,
+        bytes_in: input_candidate_count,
+        bytes_out: boundary_candidate_count,
+        fsync_count: 0,
+        status: "ok",
+    });
+    crate::perf::record_trace_event(crate::perf::TraceEvent {
+        trace_id: "query-plan",
+        span_id: "authz-prune",
+        parent_span_id: Some("boundary-prune"),
+        request_id: None,
+        component: "query",
+        operation: "query.authz_prune",
+        writer_family: Some(index_kind),
+        bucket_hash: None,
+        boundary_schema_generation: None,
+        duration: Duration::ZERO,
+        bytes_in: boundary_candidate_count,
+        bytes_out: authz_candidate_count,
+        fsync_count: 0,
+        status: "ok",
+    });
+}
+
+fn prune_ratio(before: u64, after: u64) -> f64 {
+    if before == 0 {
+        return 0.0;
+    }
+    let pruned = before.saturating_sub(after);
+    pruned as f64 / before as f64
 }
 
 pub(super) fn score_sort_values(
@@ -1418,106 +1568,5 @@ pub(super) fn metadata_filter_value<'a>(
         metadata.pointer(field)
     } else {
         metadata.get(field)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct HybridAccum {
-    pub(super) object_version_id: [u8; 16],
-    pub(super) text_score: f32,
-    pub(super) vector_score: f32,
-    pub(super) score: f32,
-    pub(super) normalized_text_score: f32,
-    pub(super) normalized_vector_score: f32,
-    pub(super) freshness_score: f32,
-    pub(super) document_id: u64,
-    pub(super) field_id: u32,
-    pub(super) vector_id: u64,
-    pub(super) chunk_id: u32,
-    pub(super) source_start: u64,
-    pub(super) source_len: u32,
-}
-
-impl HybridAccum {
-    pub(super) fn new(object_version_id: [u8; 16]) -> Self {
-        Self {
-            object_version_id,
-            text_score: 0.0,
-            vector_score: 0.0,
-            score: 0.0,
-            normalized_text_score: 0.0,
-            normalized_vector_score: 0.0,
-            freshness_score: 0.0,
-            document_id: 0,
-            field_id: 0,
-            vector_id: 0,
-            chunk_id: 0,
-            source_start: 0,
-            source_len: 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct HybridCandidate {
-    pub(super) item: HybridAccum,
-    pub(super) object_ref: QueryObjectRef,
-}
-
-pub(super) fn score_hybrid_candidates(
-    candidates: &mut [HybridCandidate],
-    has_text: bool,
-    has_vector: bool,
-    text_weight: f32,
-    vector_weight: f32,
-    freshness_weight: f32,
-) {
-    let max_text_score = candidates
-        .iter()
-        .map(|candidate| candidate.item.text_score.max(0.0))
-        .fold(0.0_f32, f32::max);
-    let max_vector_score = candidates
-        .iter()
-        .map(|candidate| candidate.item.vector_score.max(0.0))
-        .fold(0.0_f32, f32::max);
-    let (min_created_at, max_created_at) =
-        candidates
-            .iter()
-            .fold((i64::MAX, i64::MIN), |(min_seen, max_seen), candidate| {
-                (
-                    min_seen.min(candidate.object_ref.created_at_nanos),
-                    max_seen.max(candidate.object_ref.created_at_nanos),
-                )
-            });
-    let created_range = max_created_at.saturating_sub(min_created_at);
-
-    for candidate in candidates {
-        candidate.item.normalized_text_score = if has_text && max_text_score > f32::EPSILON {
-            candidate.item.text_score.max(0.0) / max_text_score
-        } else {
-            0.0
-        };
-        candidate.item.normalized_vector_score = if has_vector && max_vector_score > f32::EPSILON {
-            candidate.item.vector_score.max(0.0) / max_vector_score
-        } else {
-            0.0
-        };
-        candidate.item.freshness_score = if freshness_weight > 0.0 {
-            if created_range <= 0 {
-                1.0
-            } else {
-                candidate
-                    .object_ref
-                    .created_at_nanos
-                    .saturating_sub(min_created_at) as f32
-                    / created_range as f32
-            }
-        } else {
-            0.0
-        };
-        candidate.item.score = candidate.item.normalized_text_score.mul_add(
-            text_weight,
-            candidate.item.normalized_vector_score * vector_weight,
-        ) + candidate.item.freshness_score * freshness_weight;
     }
 }

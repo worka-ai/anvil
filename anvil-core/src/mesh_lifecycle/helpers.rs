@@ -1,3 +1,4 @@
+use super::record_proto;
 use super::*;
 
 pub(super) fn lifecycle_state_for_host_alias(state: HostAliasState) -> LifecycleState {
@@ -240,29 +241,24 @@ pub(super) async fn bucket_locators_blocking_region_drain(
     storage: &Storage,
     region: &str,
 ) -> LifecycleResult<Vec<String>> {
-    let records = mesh_directory::list_routing_records(
-        storage,
-        Some(mesh_directory::RoutingRecordFamily::BucketLocator),
-    )
-    .await
-    .map_err(|err| {
-        LifecycleError::InvalidArgument(format!(
-            "could not inspect bucket locators for region drain: {err}"
-        ))
-    })?;
+    let locators = mesh_directory::list_bucket_locators(storage)
+        .await
+        .map_err(|err| {
+            LifecycleError::InvalidArgument(format!(
+                "could not inspect bucket locators for region drain: {err}"
+            ))
+        })?;
     let mut blockers = Vec::new();
-    for record in records {
-        let locator: BucketLocatorDescriptor =
-            serde_json::from_str(&record.payload_json).map_err(|err| {
-                LifecycleError::InvalidArgument(format!(
-                    "bucket locator {} is invalid: {err}",
-                    record.record_key
-                ))
-            })?;
+    for locator in locators {
         if locator.home_region.as_str() == region
             && bucket_locator_blocks_region_drain(locator.status)
         {
-            blockers.push(format!("{}:{:?}", record.record_key, locator.status));
+            blockers.push(format!(
+                "{}/{}:{:?}",
+                locator.tenant_id.as_str(),
+                locator.bucket_name.as_str(),
+                locator.status
+            ));
         }
     }
     Ok(blockers)
@@ -277,30 +273,25 @@ pub(super) async fn bucket_locators_without_valid_drain_exception(
     region: &str,
 ) -> LifecycleResult<Vec<String>> {
     let state = read_state(storage).await?;
-    let records = mesh_directory::list_routing_records(
-        storage,
-        Some(mesh_directory::RoutingRecordFamily::BucketLocator),
-    )
-    .await
-    .map_err(|err| {
-        LifecycleError::InvalidArgument(format!(
-            "could not inspect bucket locators for region drain: {err}"
-        ))
-    })?;
+    let locators = mesh_directory::list_bucket_locators(storage)
+        .await
+        .map_err(|err| {
+            LifecycleError::InvalidArgument(format!(
+                "could not inspect bucket locators for region drain: {err}"
+            ))
+        })?;
     let mut blockers = Vec::new();
-    for record in records {
-        let locator: BucketLocatorDescriptor =
-            serde_json::from_str(&record.payload_json).map_err(|err| {
-                LifecycleError::InvalidArgument(format!(
-                    "bucket locator {} is invalid: {err}",
-                    record.record_key
-                ))
-            })?;
+    for locator in locators {
         if locator.home_region.as_str() != region
             || !bucket_locator_blocks_region_drain(locator.status)
         {
             continue;
         }
+        let record_key = format!(
+            "{}/{}",
+            locator.tenant_id.as_str(),
+            locator.bucket_name.as_str()
+        );
         let exception_key = bucket_drain_exception_key(
             region,
             locator.tenant_id.as_str(),
@@ -309,21 +300,21 @@ pub(super) async fn bucket_locators_without_valid_drain_exception(
         let Some(exception) = state.bucket_drain_exceptions.get(&exception_key) else {
             blockers.push(format!(
                 "{}:{:?}:missing_exception",
-                record.record_key, locator.status
+                record_key, locator.status
             ));
             continue;
         };
         if locator.status != BucketLocatorStatus::ReadOnly {
             blockers.push(format!(
                 "{}:{:?}:exception_requires_read_only_locator",
-                record.record_key, locator.status
+                record_key, locator.status
             ));
             continue;
         }
         if !exception.disposition.allows_drained_exception() {
             blockers.push(format!(
                 "{}:{:?}:invalid_exception_disposition:{}",
-                record.record_key,
+                record_key,
                 locator.status,
                 exception.disposition.as_str()
             ));
@@ -355,7 +346,7 @@ pub fn lifecycle_control_stream_families() -> [&'static str; 3] {
     ]
 }
 
-pub(super) async fn append_lifecycle_control_mutation<T: Serialize>(
+pub(super) async fn append_lifecycle_control_mutation<T: record_proto::LifecycleControlPayload>(
     storage: &Storage,
     stream_family: &str,
     partition: &str,
@@ -384,7 +375,7 @@ pub(super) async fn append_lifecycle_control_mutation<T: Serialize>(
                 .to_string(),
         ));
     }
-    let partition_precondition = partition_fence::partition_write_ref_precondition(
+    let partition_precondition = partition_fence::partition_write_precondition(
         storage,
         authority.permit,
         authority.signing_key,
@@ -406,26 +397,29 @@ pub(super) async fn append_lifecycle_control_mutation<T: Serialize>(
         .last()
         .map(|record| record.metadata.sequence.get().saturating_add(1))
         .unwrap_or(1);
-    let payload_json = serde_json::to_vec(payload)?;
-    let digest = ControlRecordDigest::blake3(&payload_json);
-    let header_json = serde_json::to_vec(&serde_json::json!({
-        "schema": CONTROL_MUTATION_SCHEMA,
-        "mesh_id": mesh_id,
-        "stream_family": stream_family,
-        "partition": partition,
-        "sequence": ControlStreamSequence::new(sequence)
-            .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?,
-        "record_key": record_key,
-        "operation": operation,
-        "expected_generation": expected_generation,
-        "new_generation": new_generation,
-        "writer_node_id": authority.permit.owner_node_id.as_str(),
-        "writer_fence": authority.permit.fence_token,
-        "idempotency_key": null,
-        "record_digest": digest.as_str(),
-        "created_at": Utc::now().to_rfc3339(),
-    }))?;
-    let frame = ControlStreamFrame::new(header_json, payload_json);
+    let payload_proto = record_proto::encode_lifecycle_control_payload(payload, stream_family)?;
+    let digest = ControlRecordDigest::blake3(&payload_proto);
+    let sequence = ControlStreamSequence::new(sequence)
+        .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?;
+    let created_at = Utc::now().to_rfc3339();
+    let header_proto =
+        crate::mesh_control_stream::encode_control_mutation_header(ControlMutationHeaderInput {
+            schema: CONTROL_MUTATION_SCHEMA,
+            mesh_id,
+            stream_family,
+            partition,
+            sequence,
+            record_key,
+            operation,
+            expected_generation,
+            new_generation,
+            writer_node_id: authority.permit.owner_node_id.as_str(),
+            writer_fence: authority.permit.fence_token,
+            idempotency_key: None,
+            record_digest: &digest,
+            created_at: &created_at,
+        });
+    let frame = ControlStreamFrame::new(header_proto, payload_proto);
     crate::mesh_control_stream::append_control_stream_frame(
         storage,
         stream_family,
@@ -694,28 +688,29 @@ pub(super) fn require_nonempty(value: &str, field: &str) -> LifecycleResult<()> 
     Ok(())
 }
 
+pub(crate) fn capacity_json_hash(input: &str) -> LifecycleResult<String> {
+    let trimmed = input.trim();
+    if trimmed.len() > 64 * 1024 {
+        return Err(LifecycleError::InvalidArgument(
+            "node capacity JSON exceeds 64 KiB".to_string(),
+        ));
+    }
+    if trimmed.is_empty() {
+        return Ok(blake3::hash(b"{}").to_hex().to_string());
+    }
+
+    let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|err| {
+        LifecycleError::InvalidArgument(format!("node capacity JSON is invalid: {err}"))
+    })?;
+    if !value.is_object() {
+        return Err(LifecycleError::InvalidArgument(
+            "node capacity JSON must be an object".to_string(),
+        ));
+    }
+    let canonical = serde_json::to_vec(&value)?;
+    Ok(blake3::hash(&canonical).to_hex().to_string())
+}
+
 pub(super) fn timestamp_now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
-}
-
-pub(super) fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> LifecycleResult<String> {
-    Ok(format!(
-        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
-    ))
-}
-
-pub(super) fn decode_core_object_ref_target(target: &str) -> LifecycleResult<CoreObjectRef> {
-    let encoded = target
-        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
-        .ok_or_else(|| {
-            LifecycleError::InvalidArgument(
-                "CoreStore ref target is not a CoreObjectRef".to_string(),
-            )
-        })?;
-    Ok(serde_json::from_slice(
-        &URL_SAFE_NO_PAD.decode(encoded).map_err(|err| {
-            LifecycleError::InvalidArgument(format!("CoreStore ref target is invalid: {err}"))
-        })?,
-    )?)
 }

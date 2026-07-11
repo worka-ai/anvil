@@ -4,27 +4,41 @@ pub mod audit;
 pub mod auth;
 pub mod bucket;
 pub mod coordination;
+pub mod corestore_internal;
 pub mod git_source;
 pub mod huggingface;
 pub mod index;
 pub mod internal_proxy;
+pub mod mesh_control;
 pub mod object;
 pub mod personaldb;
+pub mod registry;
 pub mod repair;
+pub mod stream;
+pub mod transaction;
 pub(crate) mod watch_envelope;
 
 use crate::anvil_api::{
-    admin_service_server::AdminServiceServer, audit_service_server::AuditServiceServer,
-    auth_service_server::AuthServiceServer, bucket_service_server::BucketServiceServer,
+    admin_service_server::AdminServiceServer,
+    anti_entropy_internal_server::AntiEntropyInternalServer,
+    audit_service_server::AuditServiceServer, auth_service_server::AuthServiceServer,
+    block_store_internal_server::BlockStoreInternalServer,
+    bucket_service_server::BucketServiceServer,
     coordination_service_server::CoordinationServiceServer,
+    core_meta_replication_internal_server::CoreMetaReplicationInternalServer,
+    cross_region_proxy_internal_server::CrossRegionProxyInternalServer,
     git_source_service_server::GitSourceServiceServer,
     hf_ingestion_service_server::HfIngestionServiceServer,
     hugging_face_key_service_server::HuggingFaceKeyServiceServer,
     index_service_server::IndexServiceServer,
     internal_proxy_service_server::InternalProxyServiceServer,
+    mesh_control_service_server::MeshControlServiceServer,
     object_service_server::ObjectServiceServer,
     personal_db_service_server::PersonalDbServiceServer,
-    repair_service_server::RepairServiceServer,
+    registry_service_server::RegistryServiceServer, repair_service_server::RepairServiceServer,
+    root_register_internal_server::RootRegisterInternalServer,
+    stream_service_server::StreamServiceServer,
+    transaction_service_server::TransactionServiceServer,
 };
 use crate::{AppState, middleware};
 use tonic::service::Routes;
@@ -84,7 +98,19 @@ pub fn create_grpc_router(state: AppState, auth_interceptor: AuthInterceptorFn) 
         state.clone(),
         auth_closure.clone(),
     ))
+    .add_service(RegistryServiceServer::with_interceptor(
+        state.clone(),
+        auth_closure.clone(),
+    ))
+    .add_service(StreamServiceServer::with_interceptor(
+        state.clone(),
+        auth_closure.clone(),
+    ))
     .add_service(RepairServiceServer::with_interceptor(
+        state.clone(),
+        auth_closure.clone(),
+    ))
+    .add_service(TransactionServiceServer::with_interceptor(
         state.clone(),
         auth_closure.clone(),
     ))
@@ -93,6 +119,26 @@ pub fn create_grpc_router(state: AppState, auth_interceptor: AuthInterceptorFn) 
         auth_closure.clone(),
     ))
     .add_service(InternalProxyServiceServer::with_interceptor(
+        state.clone(),
+        auth_closure.clone(),
+    ))
+    .add_service(BlockStoreInternalServer::with_interceptor(
+        state.clone(),
+        auth_closure.clone(),
+    ))
+    .add_service(CoreMetaReplicationInternalServer::with_interceptor(
+        state.clone(),
+        auth_closure.clone(),
+    ))
+    .add_service(RootRegisterInternalServer::with_interceptor(
+        state.clone(),
+        auth_closure.clone(),
+    ))
+    .add_service(AntiEntropyInternalServer::with_interceptor(
+        state.clone(),
+        auth_closure.clone(),
+    ))
+    .add_service(CrossRegionProxyInternalServer::with_interceptor(
         state.clone(),
         auth_closure.clone(),
     ))
@@ -111,7 +157,14 @@ pub fn create_admin_grpc_router(state: AppState, auth_interceptor: AuthIntercept
         let f = auth_interceptor.clone();
         move |req| f.call(req)
     };
-    tonic::service::Routes::new(AdminServiceServer::with_interceptor(state, auth_closure))
+    tonic::service::Routes::new(AdminServiceServer::with_interceptor(
+        state.clone(),
+        auth_closure.clone(),
+    ))
+    .add_service(MeshControlServiceServer::with_interceptor(
+        state,
+        auth_closure,
+    ))
 }
 
 pub fn create_axum_router(grpc_router: Routes) -> axum::Router {

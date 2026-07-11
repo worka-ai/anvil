@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use chrono::Utc;
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
@@ -8,6 +8,7 @@ use libp2p::{
     mdns,
     swarm::{NetworkBehaviour, SwarmEvent},
 };
+use prost::{Message, Oneof};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -17,6 +18,7 @@ use tokio::sync::RwLock;
 use tracing::{error, info};
 
 use crate::cache::MetadataCache;
+use crate::core_store::{decode_deterministic_proto, encode_deterministic_proto};
 
 // Rich information about a peer in the cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,7 +46,107 @@ pub struct ClusterMessage {
 pub enum MetadataEvent {
     BucketUpdated { tenant_id: i64, name: String },
     TenantUpdated { api_key: String },
-    PolicyUpdated { app_id: i64 },
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ClusterMessageProto {
+    #[prost(string, tag = "1")]
+    peer_id: String,
+    #[prost(string, repeated, tag = "2")]
+    p2p_addrs: Vec<String>,
+    #[prost(string, tag = "3")]
+    grpc_addr: String,
+    #[prost(int64, tag = "4")]
+    timestamp: i64,
+    #[prost(bytes = "vec", tag = "5")]
+    signature: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct MetadataEventProto {
+    #[prost(oneof = "metadata_event_proto::Event", tags = "1, 2")]
+    event: Option<metadata_event_proto::Event>,
+}
+
+mod metadata_event_proto {
+    use prost::{Message, Oneof};
+
+    #[derive(Clone, PartialEq, Message)]
+    pub(super) struct BucketUpdated {
+        #[prost(int64, tag = "1")]
+        pub tenant_id: i64,
+        #[prost(string, tag = "2")]
+        pub name: String,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub(super) struct TenantUpdated {
+        #[prost(string, tag = "1")]
+        pub api_key: String,
+    }
+
+    #[derive(Clone, PartialEq, Oneof)]
+    pub(super) enum Event {
+        #[prost(message, tag = "1")]
+        BucketUpdated(BucketUpdated),
+        #[prost(message, tag = "2")]
+        TenantUpdated(TenantUpdated),
+    }
+}
+
+fn encode_cluster_message(message: &ClusterMessage) -> Vec<u8> {
+    encode_deterministic_proto(&ClusterMessageProto {
+        peer_id: message.peer_id.to_base58(),
+        p2p_addrs: message.p2p_addrs.clone(),
+        grpc_addr: message.grpc_addr.clone(),
+        timestamp: message.timestamp,
+        signature: message.signature.clone(),
+    })
+}
+
+fn decode_cluster_message(bytes: &[u8]) -> Result<ClusterMessage> {
+    let proto = decode_deterministic_proto::<ClusterMessageProto>(bytes, "cluster gossip message")?;
+    Ok(ClusterMessage {
+        peer_id: proto
+            .peer_id
+            .parse()
+            .map_err(|err| anyhow!("cluster gossip peer_id is invalid: {err}"))?,
+        p2p_addrs: proto.p2p_addrs,
+        grpc_addr: proto.grpc_addr,
+        timestamp: proto.timestamp,
+        signature: proto.signature,
+    })
+}
+
+fn encode_metadata_event(event: &MetadataEvent) -> Vec<u8> {
+    use metadata_event_proto::{BucketUpdated, Event, TenantUpdated};
+
+    let event = match event {
+        MetadataEvent::BucketUpdated { tenant_id, name } => Event::BucketUpdated(BucketUpdated {
+            tenant_id: *tenant_id,
+            name: name.clone(),
+        }),
+        MetadataEvent::TenantUpdated { api_key } => Event::TenantUpdated(TenantUpdated {
+            api_key: api_key.clone(),
+        }),
+    };
+    encode_deterministic_proto(&MetadataEventProto { event: Some(event) })
+}
+
+fn decode_metadata_event(bytes: &[u8]) -> Result<MetadataEvent> {
+    use metadata_event_proto::Event;
+
+    let proto = decode_deterministic_proto::<MetadataEventProto>(bytes, "cluster metadata event")?;
+    match proto.event {
+        Some(Event::BucketUpdated(event)) => Ok(MetadataEvent::BucketUpdated {
+            tenant_id: event.tenant_id,
+            name: event.name,
+        }),
+        Some(Event::TenantUpdated(event)) => Ok(MetadataEvent::TenantUpdated {
+            api_key: event.api_key,
+        }),
+        None => Err(anyhow!("cluster metadata event payload is empty")),
+    }
 }
 
 impl ClusterMessage {
@@ -139,9 +241,9 @@ impl From<mdns::Event> for ClusterEvent {
 }
 
 pub async fn create_swarm(config: Arc<crate::config::Config>) -> Result<Swarm<ClusterBehaviour>> {
-    let local_key = crate::cluster_identity::load_or_create_cluster_keypair(
-        config.resolved_cluster_keypair_path(),
-    )?;
+    let local_key = crate::cluster_identity::load_or_create_cluster_identity(&config.storage_path)
+        .await?
+        .cluster_keypair;
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
         .with_tokio()
@@ -229,20 +331,18 @@ pub async fn run_gossip(
                     }
                 }
 
-                if let Ok(encoded_message) = serde_json::to_vec(&message) {
-                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(cluster_topic.clone(), encoded_message) {
-                        info!("[GOSSIP] Failed to publish gossip message: {:?}", e);
-                    }
+                let encoded_message = encode_cluster_message(&message);
+                if let Err(e) = swarm.behaviour_mut().gossipsub.publish(cluster_topic.clone(), encoded_message) {
+                    info!("[GOSSIP] Failed to publish gossip message: {:?}", e);
                 }
             }
 
             Some(event) = outbound_events.recv() => {
-                 if let Ok(encoded_event) = serde_json::to_vec(&event) {
-                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(metadata_topic.clone(), encoded_event) {
-                        error!("[GOSSIP] Failed to publish metadata event: {:?}", e);
-                    } else {
-                        info!("[GOSSIP] Published metadata event: {:?}", event);
-                    }
+                let encoded_event = encode_metadata_event(&event);
+                if let Err(e) = swarm.behaviour_mut().gossipsub.publish(metadata_topic.clone(), encoded_event) {
+                    error!("[GOSSIP] Failed to publish metadata event: {:?}", e);
+                } else {
+                    info!("[GOSSIP] Published metadata event: {:?}", event);
                 }
             }
 
@@ -302,8 +402,7 @@ pub async fn handle_swarm_event(
             ..
         })) => {
             if message.topic == cluster_topic.hash() {
-                if let Ok(cluster_message) = serde_json::from_slice::<ClusterMessage>(&message.data)
-                {
+                if let Ok(cluster_message) = decode_cluster_message(&message.data) {
                     if let Some(secret) = cluster_secret {
                         if let Err(e) = cluster_message.verify(secret) {
                             info!(
@@ -341,7 +440,7 @@ pub async fn handle_swarm_event(
                     }
                 }
             } else if message.topic == metadata_topic.hash() {
-                if let Ok(event) = serde_json::from_slice::<MetadataEvent>(&message.data) {
+                if let Ok(event) = decode_metadata_event(&message.data) {
                     info!("[GOSSIP] Received metadata event: {:?}", event);
                     match event {
                         MetadataEvent::BucketUpdated { tenant_id, name } => {
@@ -349,9 +448,6 @@ pub async fn handle_swarm_event(
                         }
                         MetadataEvent::TenantUpdated { api_key } => {
                             metadata_cache.invalidate_tenant(&api_key).await;
-                        }
-                        MetadataEvent::PolicyUpdated { app_id } => {
-                            metadata_cache.invalidate_app_policies(app_id).await;
                         }
                     }
                 }

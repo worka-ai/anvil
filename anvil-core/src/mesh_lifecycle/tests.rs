@@ -1,5 +1,5 @@
+use super::record_proto;
 use super::*;
-use serde::Serialize;
 use std::collections::BTreeMap;
 use tempfile::tempdir;
 
@@ -325,6 +325,7 @@ async fn lifecycle_store_persists_descriptors_and_enforces_transitions() {
             region: "eu-west-1".to_string(),
             cell_id: "cell-a".to_string(),
             placement_weight: 100,
+            failure_domain: "rack-a".to_string(),
         },
     )
     .await
@@ -358,9 +359,13 @@ async fn lifecycle_store_persists_descriptors_and_enforces_transitions() {
             region: "eu-west-1".to_string(),
             cell_id: "cell-a".to_string(),
             libp2p_peer_id: "peer-a".to_string(),
+            receipt_signing_public_key_proto: libp2p::identity::Keypair::generate_ed25519()
+                .public()
+                .encode_protobuf(),
             public_api_addr: "http://127.0.0.1:50051".to_string(),
             public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
             capabilities: vec![NodeCapability::Object, NodeCapability::Admin],
+            capacity_json: "{}".to_string(),
         },
     )
     .await
@@ -473,6 +478,7 @@ async fn lifecycle_read_model_replays_control_streams_as_source_of_truth() {
         cell_id: "cell-a".to_string(),
         state: LifecycleState::Active,
         placement_weight: 100,
+        failure_domain: "rack-a".to_string(),
         created_at: "2026-07-02T00:00:00Z".to_string(),
         updated_at: "2026-07-02T00:01:00Z".to_string(),
         generation: 2,
@@ -493,9 +499,13 @@ async fn lifecycle_read_model_replays_control_streams_as_source_of_truth() {
         region: "eu-west-1".to_string(),
         cell_id: "cell-a".to_string(),
         libp2p_peer_id: "peer-a".to_string(),
+        receipt_signing_public_key_proto: libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .encode_protobuf(),
         public_api_addr: "http://127.0.0.1:50051".to_string(),
         public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
         capabilities: vec![NodeCapability::Object, NodeCapability::Admin],
+        capacity_json_hash: blake3::hash(b"{}").to_hex().to_string(),
         state: LifecycleState::Active,
         drain: None,
         last_heartbeat_at: Some("2026-07-02T00:01:00Z".to_string()),
@@ -561,6 +571,7 @@ async fn register_test_cell(storage: &Storage) -> CellDescriptor {
             region: "eu-west-1".to_string(),
             cell_id: "cell-a".to_string(),
             placement_weight: 100,
+            failure_domain: "rack-a".to_string(),
         },
     )
     .await
@@ -576,9 +587,13 @@ async fn register_test_node(storage: &Storage) -> NodeDescriptor {
             region: "eu-west-1".to_string(),
             cell_id: "cell-a".to_string(),
             libp2p_peer_id: "peer-a".to_string(),
+            receipt_signing_public_key_proto: libp2p::identity::Keypair::generate_ed25519()
+                .public()
+                .encode_protobuf(),
             public_api_addr: "http://127.0.0.1:50051".to_string(),
             public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
             capabilities: vec![NodeCapability::Object, NodeCapability::Admin],
+            capacity_json: "{}".to_string(),
         },
     )
     .await
@@ -608,6 +623,7 @@ async fn create_active_placement_model(
             region: "eu-west-1".to_string(),
             cell_id: "cell-a".to_string(),
             placement_weight: 100,
+            failure_domain: "rack-a".to_string(),
         },
     )
     .await
@@ -637,9 +653,13 @@ async fn create_active_placement_model(
             region: "eu-west-1".to_string(),
             cell_id: "cell-a".to_string(),
             libp2p_peer_id: "peer-a".to_string(),
+            receipt_signing_public_key_proto: libp2p::identity::Keypair::generate_ed25519()
+                .public()
+                .encode_protobuf(),
             public_api_addr: "http://127.0.0.1:50051".to_string(),
             public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
             capabilities: vec![NodeCapability::Object, NodeCapability::Admin],
+            capacity_json: "{}".to_string(),
         },
     )
     .await
@@ -687,30 +707,30 @@ async fn append_control_record(
     sequence: u64,
     digest: ControlRecordDigest,
 ) {
-    let header_json = serde_json::json!({
-        "schema": "anvil.mesh.control_mutation.v1",
-        "mesh_id": "mesh-a",
-        "stream_family": stream_family,
-        "partition": partition,
-        "sequence": sequence,
-        "record_key": "tenant_acme/releases",
-        "operation": "upsert",
-        "expected_generation": 1,
-        "new_generation": 2,
-        "writer_node_id": "node-a",
-        "writer_fence": 1,
-        "idempotency_key": "idem-a",
-        "record_digest": digest.as_str(),
-        "created_at": "2026-07-02T00:00:00Z"
-    })
-    .to_string()
-    .into_bytes();
+    let header_proto = crate::mesh_control_stream::encode_control_mutation_header(
+        crate::mesh_control_stream::ControlMutationHeaderInput {
+            schema: "anvil.mesh.control_mutation.v1",
+            mesh_id: "mesh-a",
+            stream_family,
+            partition,
+            sequence: ControlStreamSequence::new(sequence).unwrap(),
+            record_key: "tenant_acme/releases",
+            operation: "upsert",
+            expected_generation: Some(1),
+            new_generation: 2,
+            writer_node_id: "node-a",
+            writer_fence: 1,
+            idempotency_key: Some("idem-a"),
+            record_digest: &digest,
+            created_at: "2026-07-02T00:00:00Z",
+        },
+    );
     crate::mesh_control_stream::append_control_stream_frame(
         storage,
         stream_family,
         partition,
         &crate::mesh_control_stream::ControlStreamFrame::new(
-            header_json,
+            header_proto,
             br#"{"ok":true}"#.to_vec(),
         ),
         None,
@@ -743,7 +763,7 @@ async fn write_control_checkpoint_record(
     .unwrap();
 }
 
-async fn append_lifecycle_descriptor<T: Serialize>(
+async fn append_lifecycle_descriptor<T: record_proto::LifecycleControlPayload>(
     storage: &Storage,
     stream_family: &str,
     record_key: &str,
@@ -751,31 +771,32 @@ async fn append_lifecycle_descriptor<T: Serialize>(
     descriptor: &T,
 ) {
     let partition = lifecycle_control_partition(stream_family, record_key);
-    let payload_json = serde_json::to_vec(descriptor).unwrap();
-    let digest = ControlRecordDigest::blake3(&payload_json);
-    let header_json = serde_json::json!({
-        "schema": "anvil.mesh.control_mutation.v1",
-        "mesh_id": "mesh-a",
-        "stream_family": stream_family,
-        "partition": partition,
-        "sequence": sequence,
-        "record_key": record_key,
-        "operation": "upsert",
-        "expected_generation": sequence.saturating_sub(1),
-        "new_generation": sequence,
-        "writer_node_id": "node-a",
-        "writer_fence": 1,
-        "idempotency_key": "idem-a",
-        "record_digest": digest.as_str(),
-        "created_at": "2026-07-02T00:00:00Z"
-    })
-    .to_string()
-    .into_bytes();
+    let payload_proto =
+        record_proto::encode_lifecycle_control_payload(descriptor, stream_family).unwrap();
+    let digest = ControlRecordDigest::blake3(&payload_proto);
+    let header_proto = crate::mesh_control_stream::encode_control_mutation_header(
+        crate::mesh_control_stream::ControlMutationHeaderInput {
+            schema: "anvil.mesh.control_mutation.v1",
+            mesh_id: "mesh-a",
+            stream_family,
+            partition: &partition,
+            sequence: ControlStreamSequence::new(sequence).unwrap(),
+            record_key,
+            operation: "upsert",
+            expected_generation: Some(sequence.saturating_sub(1)),
+            new_generation: sequence,
+            writer_node_id: "node-a",
+            writer_fence: 1,
+            idempotency_key: Some("idem-a"),
+            record_digest: &digest,
+            created_at: "2026-07-02T00:00:00Z",
+        },
+    );
     crate::mesh_control_stream::append_control_stream_frame(
         storage,
         stream_family,
         &partition,
-        &crate::mesh_control_stream::ControlStreamFrame::new(header_json, payload_json),
+        &crate::mesh_control_stream::ControlStreamFrame::new(header_proto, payload_proto),
         None,
     )
     .await
