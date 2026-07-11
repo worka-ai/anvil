@@ -884,6 +884,7 @@ fn rfc_0007_conformance_audit_authz_and_query_visibility_have_external_coverage(
         "anvil-core/src/services/index/operations.rs",
         "anvil-core/src/services/index/query.rs",
         "anvil-core/src/services/index/query_candidates.rs",
+        "anvil-core/src/services/index/query_planner_adapter.rs",
         "anvil-core/src/object_manager/read.rs",
     ]
     .into_iter()
@@ -894,13 +895,13 @@ fn rfc_0007_conformance_audit_authz_and_query_visibility_have_external_coverage(
         "query/index authz visibility enforcement",
         &index_operations,
         &[
-            "query_permission_filter",
+            "AuthzSegmentCandidateReader",
             "query_hit_visible",
             "validation::is_reserved_internal_key(object_key)",
-            "validation::is_reserved_internal_key(&row.object_key)",
-            "validation::is_reserved_internal_key(&object_key)",
+            "tenant_reader.candidate_set(request.clone()).await",
+            "IndexCapabilityMissing: object listing requires a planner-backed path/object-list candidate reader",
             "validation::is_reserved_internal_key(prefix)",
-            "validation::is_reserved_internal_key(&object.key)",
+            "validation::is_reserved_internal_key(object_key)",
         ],
     );
 

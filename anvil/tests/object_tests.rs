@@ -389,5 +389,7 @@ mod copy_private_watch_stream;
 mod native_delete_listing;
 #[path = "object_tests/patch_and_list.rs"]
 mod patch_and_list;
+#[path = "object_tests/planner_listing.rs"]
+mod planner_listing;
 #[path = "object_tests/reserved_head_core.rs"]
 mod reserved_head_core;

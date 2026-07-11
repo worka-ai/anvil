@@ -110,12 +110,9 @@ fn hybrid_scoring_disables_freshness_for_single_source_queries() {
 }
 
 #[test]
-fn score_index_candidate_limit_ignores_authorisation_shape() {
-    let filter = QueryPermissionFilter::default();
-
-    assert_eq!(score_index_candidate_limit(20, 250, Some(&filter)), 20);
-    assert_eq!(score_index_candidate_limit(20, 5, Some(&filter)), 20);
-    assert_eq!(score_index_candidate_limit(20, 250, None), 20);
+fn score_index_candidate_limit_is_bound_by_request_size() {
+    assert_eq!(score_index_candidate_limit(20, 250), 20);
+    assert_eq!(score_index_candidate_limit(20, 5), 20);
 }
 
 #[test]

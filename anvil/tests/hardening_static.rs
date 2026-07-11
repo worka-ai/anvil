@@ -445,17 +445,21 @@ fn index_queries_use_zanzibar_final_visibility_not_label_authorisation() {
             && operations.contains("system_realm_relationship_allows"),
         "index queries must final-check visible hits through the Zanzibar relationship engine"
     );
-    let filter_start = operations
-        .find("pub(super) async fn query_permission_filter")
-        .expect("missing query_permission_filter");
-    let filter_body = &operations[filter_start..];
-    let filter_body = filter_body.split("    }\n}").next().unwrap_or(filter_body);
     assert!(
-        filter_body.contains("QueryPermissionFilter::all()"),
-        "candidate authz filters must not be treated as the authorisation decision"
+        !operations.contains("pub(super) async fn query_permission_filter"),
+        "index queries must not keep a permission-filter shortcut alongside planner authz"
+    );
+    let adapter = std::fs::read_to_string(
+        repo_root().join("anvil-core/src/services/index/query_planner_adapter.rs"),
+    )
+    .unwrap();
+    assert!(
+        adapter.contains("AuthzSegmentCandidateReader")
+            && adapter.contains("tenant_reader.candidate_set(request.clone()).await"),
+        "planner authz candidates must come from revision-bound authz writer segments"
     );
     assert!(
-        !filter_body.contains("list_current_authz_objects_at_revision"),
+        !adapter.contains("list_current_authz_objects_at_revision"),
         "candidate authz filters must not use a direct-tuple-only list as a Zanzibar substitute"
     );
 

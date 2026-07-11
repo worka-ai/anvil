@@ -888,7 +888,11 @@ fn rfc_0007_query_tokens_and_plans_bind_authz_scope() {
         production_source("anvil-core/src/services/index/query.rs"),
         production_source("anvil-core/src/services/index/query_page_token.rs")
     );
-    let operations = production_source("anvil-core/src/services/index/operations.rs");
+    let operations = format!(
+        "{}\n{}",
+        production_source("anvil-core/src/services/index/operations.rs"),
+        production_source("anvil-core/src/services/index/query_planner_adapter.rs")
+    );
 
     assert_contains_all(
         "index query authz scope token binding",
@@ -910,7 +914,7 @@ fn rfc_0007_query_tokens_and_plans_bind_authz_scope() {
             "QueryAuthzScope::for_bucket",
             "\"authz_scope\": authz_scope.trace_json()",
             "&authz_scope",
-            "query_permission_filter",
+            "AuthzSegmentCandidateReader",
             "query_hit_visible",
         ],
     );

@@ -255,3 +255,67 @@ async fn core_store_internal_control_records_written_by_store_are_binary_not_jso
         latest_anchor.root_generation
     );
 }
+
+#[tokio::test]
+async fn large_stream_payloads_use_locator_rows_not_rocksdb_inline_payloads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let store = CoreStore::new(storage).await.unwrap();
+    let stream_id = "tenant:t/bucket:b/large-stream-payload".to_string();
+    let payload = vec![0x5a; CORE_META_STREAM_RECORD_INDEX_MAX_PAYLOAD_BYTES * 8];
+
+    let appended = store
+        .append_stream(AppendStreamRecord {
+            stream_id: stream_id.clone(),
+            partition_id: "tenant:t/bucket:b".to_string(),
+            record_kind: "large.payload".to_string(),
+            payload: payload.clone(),
+            content_type: Some("application/octet-stream".to_string()),
+            user_metadata_json: "{}".to_string(),
+            fence: None,
+            transaction_id: None,
+            idempotency_key: Some("large-stream-payload-1".to_string()),
+        })
+        .await
+        .unwrap();
+
+    let stream_index_bytes = store
+        .meta
+        .get(
+            CF_STREAM_RECORDS,
+            TABLE_STREAM_RECORD_INDEX_ROW,
+            &stream_record_key(&stream_id, appended.sequence),
+        )
+        .unwrap()
+        .expect("stream index row");
+    assert!(
+        stream_index_bytes.len() <= CORE_META_STREAM_RECORD_INDEX_MAX_PAYLOAD_BYTES,
+        "stream metadata row must stay bounded; got {} bytes",
+        stream_index_bytes.len()
+    );
+    let row = decode_stream_record_index_row(&stream_index_bytes).unwrap();
+    assert_eq!(row.payload_len, payload.len() as u64);
+    assert!(
+        row.inline_payload.is_none(),
+        "large payload must not be inlined"
+    );
+    assert!(
+        row.payload_locator.is_some(),
+        "large payload must be represented by a byte-pipeline locator"
+    );
+
+    let records = store
+        .read_stream(ReadStream {
+            stream_id,
+            after_sequence: 0,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].payload, payload);
+    assert_eq!(
+        records[0].payload_hash,
+        format!("sha256:{}", sha256_hex(&payload))
+    );
+}

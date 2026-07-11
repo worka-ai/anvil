@@ -13,20 +13,25 @@ use anvil::anvil_api::{
 };
 use anvil::authz_scope::{DEFAULT_AUTHZ_REALM_ID, encode_realm_namespace};
 use anvil::authz_userset_index::{DEFAULT_DERIVED_USERSET_INDEX_ID, read_derived_userset_index};
+use anvil::core_store::{AuthzScopeRef as CoreAuthzScopeRef, SourceId, SourceKind};
 use anvil::formats::full_text::{FullTextDocument, build_full_text_postings};
 use anvil::formats::vector::{
     VECTOR_INDEX_SCHEMA, VectorMetric, VectorModality, VectorPayload, VectorRecord,
 };
-use anvil::full_text_segment::{FullTextSegmentWrite, write_full_text_segment};
+use anvil::full_text_segment::{
+    FullTextDocumentTableRow, FullTextSegmentWrite, encode_full_text_document_table,
+    write_full_text_segment,
+};
 use anvil::partition_fence::{
     AcquireOwnership, MAX_OWNERSHIP_LEASE_MS, OwnershipPrincipal, OwnershipResource,
     OwnershipResourceKind, acquire_ownership,
 };
 use anvil::search_query::{FullTextSegmentQuery, query_full_text_segment};
+use anvil::typed_field_segment::source_id_binary;
 use anvil::vector_segment::{VectorSegmentEntry, VectorSegmentWrite, write_vector_segment};
 use anvil_test_utils::*;
 use futures_util::StreamExt;
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 use tonic::Request;
 
 fn authorized<T>(message: T, token: &str) -> Request<T> {
@@ -65,6 +70,21 @@ fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
         idempotency_key: format!("{tag}-{nonce}-idempotency"),
         transaction_id: None,
     }
+}
+
+fn test_full_text_document_table(rows: &[(u64, u16, &str, uuid::Uuid)]) -> Vec<u8> {
+    let rows = rows
+        .iter()
+        .map(
+            |(document_id, field_id, object_key, version_id)| FullTextDocumentTableRow {
+                document_id: *document_id,
+                field_id: *field_id,
+                object_key: (*object_key).to_string(),
+                version_id: *version_id,
+            },
+        )
+        .collect::<Vec<_>>();
+    encode_full_text_document_table(&rows).expect("test full-text document table should encode")
 }
 
 fn rfc_vector_policy(
@@ -537,28 +557,49 @@ fn test_object_authz_label_hash(
 }
 
 fn vector_entry_with_authz_label(
+    bucket: &anvil::persistence::Bucket,
+    object: &anvil::persistence::Object,
     vector_id: u64,
-    object_version_id: [u8; 16],
     values: Vec<f32>,
     authz_label_hash: [u8; 32],
 ) -> VectorSegmentEntry {
-    let mut entry = vector_entry(vector_id, object_version_id, values);
+    let mut entry = vector_entry(bucket, object, vector_id, values);
     entry.record.authz_label_hash = authz_label_hash;
     entry
 }
 
 fn vector_entry(
+    bucket: &anvil::persistence::Bucket,
+    object: &anvil::persistence::Object,
     vector_id: u64,
-    object_version_id: [u8; 16],
     values: Vec<f32>,
 ) -> VectorSegmentEntry {
+    let source_id = SourceId {
+        schema: "anvil.query.source_id.v1".to_string(),
+        mesh_id: "default".to_string(),
+        anvil_storage_tenant_id: bucket.tenant_id.to_string(),
+        authz_scope: CoreAuthzScopeRef {
+            anvil_storage_tenant_id: bucket.tenant_id.to_string(),
+            authz_realm_id: format!("tenant:{}", bucket.tenant_id),
+        },
+        kind: SourceKind::ObjectCurrent,
+        resource_namespace: "anvil_object".to_string(),
+        resource_id: format!("{}/{}/{}", bucket.tenant_id, bucket.name, object.key),
+        generation: object.id.max(0) as u64,
+        tombstone: object.deleted_at.is_some(),
+        variant: BTreeMap::from([
+            ("bucket_id".to_string(), bucket.id.to_string()),
+            ("version_id".to_string(), object.version_id.to_string()),
+        ]),
+    };
+
     VectorSegmentEntry {
-        source_id_binary: vec![vector_id as u8],
+        source_id_binary: source_id_binary(&source_id).expect("test source id should encode"),
         source_generation: vector_id,
         labels: Vec::new(),
         record: VectorRecord {
             vector_id,
-            object_version_id,
+            object_version_id: *object.version_id.as_bytes(),
             chunk_id: vector_id as u32,
             modality: VectorModality::Text as u8,
             metric: VectorMetric::Cosine as u8,

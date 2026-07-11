@@ -668,6 +668,7 @@ async fn test_query_full_text_index_reads_latest_segment() {
         b"alpha beta beta",
     )
     .await;
+    let missing_version = uuid::Uuid::from_bytes([22; 16]);
     let postings = build_full_text_postings(
         &[
             FullTextDocument {
@@ -680,13 +681,17 @@ async fn test_query_full_text_index_reads_latest_segment() {
             FullTextDocument {
                 document_id: 22,
                 field_id: 1,
-                object_version_id: [22; 16],
+                object_version_id: *missing_version.as_bytes(),
                 authz_label_hash: [2; 32],
                 text: "gamma delta",
             },
         ],
         &Default::default(),
     );
+    let document_table = test_full_text_document_table(&[
+        (11, 1, "docs/alpha.txt", indexed_object.version_id),
+        (22, 1, "docs/missing.txt", missing_version),
+    ]);
     write_full_text_segment(
         &cluster.states[0].storage,
         FullTextSegmentWrite {
@@ -698,7 +703,7 @@ async fn test_query_full_text_index_reads_latest_segment() {
             authz_revision: 55,
             boundary_values: &[],
             built_postings: &postings,
-            document_table: b"",
+            document_table: &document_table,
         },
     )
     .await
@@ -797,16 +802,19 @@ async fn test_query_full_text_phrase_requires_position_enabled_index() {
         bucket.id,
         created.index_id as i64,
     );
+    let phrase_version = uuid::Uuid::from_bytes([11; 16]);
     let postings = build_full_text_postings(
         &[FullTextDocument {
             document_id: 11,
             field_id: 1,
-            object_version_id: [11; 16],
+            object_version_id: *phrase_version.as_bytes(),
             authz_label_hash: [1; 32],
             text: "quick brown fox",
         }],
         &Default::default(),
     );
+    let document_table =
+        test_full_text_document_table(&[(11, 1, "docs/phrase.txt", phrase_version)]);
     write_full_text_segment(
         &cluster.states[0].storage,
         FullTextSegmentWrite {
@@ -818,7 +826,7 @@ async fn test_query_full_text_phrase_requires_position_enabled_index() {
             authz_revision: 1,
             boundary_values: &[],
             built_postings: &postings,
-            document_table: b"",
+            document_table: &document_table,
         },
     )
     .await
@@ -965,8 +973,8 @@ async fn test_query_vector_index_reads_latest_segment() {
             authz_revision: manual_authz_revision,
             boundary_values: &[],
             entries: &[
-                vector_entry(1, *first_object.version_id.as_bytes(), vec![1.0, 0.0]),
-                vector_entry(2, *second_object.version_id.as_bytes(), vec![0.0, 1.0]),
+                vector_entry(&bucket, &first_object, 1, vec![1.0, 0.0]),
+                vector_entry(&bucket, &second_object, 2, vec![0.0, 1.0]),
             ],
             deleted_bitset: &[0],
         },
@@ -1159,6 +1167,10 @@ async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
         ],
         &Default::default(),
     );
+    let document_table = test_full_text_document_table(&[
+        (101, 1, "docs/hybrid-a.txt", first_object.version_id),
+        (202, 1, "docs/hybrid-b.txt", second_object.version_id),
+    ]);
     write_full_text_segment(
         &cluster.states[0].storage,
         FullTextSegmentWrite {
@@ -1170,7 +1182,7 @@ async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
             authz_revision: 31,
             boundary_values: &[],
             built_postings: &postings,
-            document_table: b"",
+            document_table: &document_table,
         },
     )
     .await
@@ -1197,8 +1209,8 @@ async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
             authz_revision: 32,
             boundary_values: &[],
             entries: &[
-                vector_entry(1, *first_object.version_id.as_bytes(), vec![1.0, 0.0]),
-                vector_entry(2, *second_object.version_id.as_bytes(), vec![0.0, 1.0]),
+                vector_entry(&bucket, &first_object, 1, vec![1.0, 0.0]),
+                vector_entry(&bucket, &second_object, 2, vec![0.0, 1.0]),
             ],
             deleted_bitset: &[0],
         },
@@ -1397,14 +1409,16 @@ async fn test_query_inherit_object_vector_filters_results_by_object_read_scope()
             boundary_values: &[],
             entries: &[
                 vector_entry_with_authz_label(
+                    &bucket,
+                    &allowed_object,
                     1,
-                    *allowed_object.version_id.as_bytes(),
                     vec![0.99, 0.0],
                     test_object_authz_label_hash(&bucket, &allowed_object),
                 ),
                 vector_entry_with_authz_label(
+                    &bucket,
+                    &denied_object,
                     2,
-                    *denied_object.version_id.as_bytes(),
                     vec![1.0, 0.0],
                     test_object_authz_label_hash(&bucket, &denied_object),
                 ),
@@ -1540,6 +1554,7 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
         bucket.id,
         created.index_id as i64,
     );
+    let missing_version = uuid::Uuid::from_bytes([9; 16]);
     let postings = build_full_text_postings(
         &[
             FullTextDocument {
@@ -1559,13 +1574,18 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
             FullTextDocument {
                 document_id: 3,
                 field_id: 1,
-                object_version_id: [9; 16],
+                object_version_id: *missing_version.as_bytes(),
                 authz_label_hash: [3; 32],
                 text: "alpha missing metadata",
             },
         ],
         &Default::default(),
     );
+    let document_table = test_full_text_document_table(&[
+        (1, 1, "docs/allowed.txt", allowed_object.version_id),
+        (2, 1, "docs/denied.txt", denied_object.version_id),
+        (3, 1, "docs/missing.txt", missing_version),
+    ]);
     write_full_text_segment(
         &cluster.states[0].storage,
         FullTextSegmentWrite {
@@ -1577,7 +1597,7 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
             authz_revision: 4,
             boundary_values: &[],
             built_postings: &postings,
-            document_table: b"",
+            document_table: &document_table,
         },
     )
     .await

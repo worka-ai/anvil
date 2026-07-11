@@ -777,3 +777,261 @@ async fn test_query_path_and_metadata_filter_indexes_from_object_metadata() {
     assert_eq!(hit_metadata["user_metadata"]["tenant"], "alpha");
     assert_eq!(hit_metadata["user_metadata"]["nested"]["state"], "open");
 }
+
+#[tokio::test]
+async fn test_live_metadata_query_uses_planner_authz_candidates_and_scoped_page_tokens() {
+    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    cluster.start_and_converge(Duration::from_secs(5)).await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
+
+    let bucket_name = format!("planner-authz-metadata-{}", uuid::Uuid::new_v4());
+    bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: "test-region-1".to_string(),
+
+                options: None,
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    index_client
+        .create_index(authorized(
+            CreateIndexRequest {
+                bucket_name: bucket_name.clone(),
+                name: "by-metadata".to_string(),
+                kind: IndexKind::MetadataFilter as i32,
+                selector_json: serde_json::json!({}).to_string(),
+                extractor_json: serde_json::json!({}).to_string(),
+                authorization_mode: "inherit_object".to_string(),
+                build_policy_json: serde_json::json!({}).to_string(),
+
+                options: None,
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    persist_index_object(
+        &cluster,
+        &bucket_name,
+        "tenant-a/allowed-1.json",
+        Some(serde_json::json!({"tenant": "a", "kind": "invoice"})),
+    )
+    .await;
+    persist_index_object(
+        &cluster,
+        &bucket_name,
+        "tenant-a/allowed-2.json",
+        Some(serde_json::json!({"tenant": "a", "kind": "invoice"})),
+    )
+    .await;
+    persist_index_object(
+        &cluster,
+        &bucket_name,
+        "tenant-a/denied.json",
+        Some(serde_json::json!({"tenant": "a", "kind": "invoice"})),
+    )
+    .await;
+    persist_index_object(
+        &cluster,
+        &bucket_name,
+        "tenant-b/allowed.json",
+        Some(serde_json::json!({"tenant": "b", "kind": "invoice"})),
+    )
+    .await;
+    wait_for_index_build_task(&cluster, Duration::from_secs(60)).await;
+
+    let claims = cluster.states[0].jwt_manager.verify_token(&token).unwrap();
+    let limited_token = cluster.states[0]
+        .jwt_manager
+        .mint_token("planner-metadata-reader".to_string(), claims.tenant_id)
+        .unwrap();
+    let no_object_token = cluster.states[0]
+        .jwt_manager
+        .mint_token("planner-no-object-reader".to_string(), claims.tenant_id)
+        .unwrap();
+
+    grant_bucket_index_query_for_principal(&cluster, &bucket_name, "planner-metadata-reader").await;
+    grant_bucket_index_query_for_principal(&cluster, &bucket_name, "planner-no-object-reader")
+        .await;
+    grant_tenant_object_reader_for_principal(
+        &cluster,
+        &bucket_name,
+        "tenant-a/allowed-1.json",
+        "planner-metadata-reader",
+    )
+    .await;
+    grant_tenant_object_reader_for_principal(
+        &cluster,
+        &bucket_name,
+        "tenant-a/allowed-2.json",
+        "planner-metadata-reader",
+    )
+    .await;
+    grant_tenant_object_reader_for_principal(
+        &cluster,
+        &bucket_name,
+        "tenant-b/allowed.json",
+        "planner-metadata-reader",
+    )
+    .await;
+
+    let first_page = query_index_until_hits(
+        &mut index_client,
+        &limited_token,
+        QueryIndexRequest {
+            bucket_name: bucket_name.clone(),
+            index_name: "by-metadata".to_string(),
+            query_text: String::new(),
+            query_vector: vec![],
+            limit: 1,
+            phrase: false,
+            path_prefix: "tenant-a/".to_string(),
+            metadata_filters_json: serde_json::json!({
+                "tenant": "a",
+                "kind": "invoice"
+            })
+            .to_string(),
+            boundary_predicates_json: String::new(),
+            typed_predicates_json: String::new(),
+            typed_order_json: String::new(),
+            page_token: String::new(),
+            require_caught_up_to_watch_cursor: String::new(),
+            lag_timeout_ms: 0,
+        },
+        1,
+        Duration::from_secs(30),
+    )
+    .await;
+    assert_eq!(first_page.hits[0].object_key, "tenant-a/allowed-1.json");
+    assert!(!first_page.next_page_token.is_empty());
+
+    let second_page = query_index_until_hits(
+        &mut index_client,
+        &limited_token,
+        QueryIndexRequest {
+            bucket_name: bucket_name.clone(),
+            index_name: "by-metadata".to_string(),
+            query_text: String::new(),
+            query_vector: vec![],
+            limit: 10,
+            phrase: false,
+            path_prefix: "tenant-a/".to_string(),
+            metadata_filters_json: serde_json::json!({
+                "tenant": "a",
+                "kind": "invoice"
+            })
+            .to_string(),
+            boundary_predicates_json: String::new(),
+            typed_predicates_json: String::new(),
+            typed_order_json: String::new(),
+            page_token: first_page.next_page_token.clone(),
+            require_caught_up_to_watch_cursor: first_page.source_watch_cursor_high.to_string(),
+            lag_timeout_ms: 0,
+        },
+        1,
+        Duration::from_secs(30),
+    )
+    .await;
+    assert_eq!(second_page.hits[0].object_key, "tenant-a/allowed-2.json");
+
+    let no_object_results = index_client
+        .query_index(authorized(
+            QueryIndexRequest {
+                bucket_name: bucket_name.clone(),
+                index_name: "by-metadata".to_string(),
+                query_text: String::new(),
+                query_vector: vec![],
+                limit: 10,
+                phrase: false,
+                path_prefix: "tenant-a/".to_string(),
+                metadata_filters_json: serde_json::json!({
+                    "tenant": "a",
+                    "kind": "invoice"
+                })
+                .to_string(),
+                boundary_predicates_json: String::new(),
+                typed_predicates_json: String::new(),
+                typed_order_json: String::new(),
+                page_token: String::new(),
+                require_caught_up_to_watch_cursor: String::new(),
+                lag_timeout_ms: 0,
+            },
+            &no_object_token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(no_object_results.hits.is_empty());
+
+    let wrong_scope = index_client
+        .query_index(authorized(
+            QueryIndexRequest {
+                bucket_name: bucket_name.clone(),
+                index_name: "by-metadata".to_string(),
+                query_text: String::new(),
+                query_vector: vec![],
+                limit: 10,
+                phrase: false,
+                path_prefix: "tenant-b/".to_string(),
+                metadata_filters_json: serde_json::json!({
+                    "tenant": "b",
+                    "kind": "invoice"
+                })
+                .to_string(),
+                boundary_predicates_json: String::new(),
+                typed_predicates_json: String::new(),
+                typed_order_json: String::new(),
+                page_token: first_page.next_page_token,
+                require_caught_up_to_watch_cursor: String::new(),
+                lag_timeout_ms: 0,
+            },
+            &limited_token,
+        ))
+        .await;
+    assert_eq!(
+        wrong_scope.unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
+
+    let stale_cursor = index_client
+        .query_index(authorized(
+            QueryIndexRequest {
+                bucket_name,
+                index_name: "by-metadata".to_string(),
+                query_text: String::new(),
+                query_vector: vec![],
+                limit: 10,
+                phrase: false,
+                path_prefix: "tenant-a/".to_string(),
+                metadata_filters_json: serde_json::json!({
+                    "tenant": "a",
+                    "kind": "invoice"
+                })
+                .to_string(),
+                boundary_predicates_json: String::new(),
+                typed_predicates_json: String::new(),
+                typed_order_json: String::new(),
+                page_token: String::new(),
+                require_caught_up_to_watch_cursor: u64::MAX.to_string(),
+                lag_timeout_ms: 1,
+            },
+            &limited_token,
+        ))
+        .await;
+    assert_eq!(
+        stale_cursor.unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+}
