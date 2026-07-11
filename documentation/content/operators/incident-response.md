@@ -215,7 +215,7 @@ This proves the restored or running server can inspect known encrypted envelopes
 
 Disk pressure is a source-integrity risk. It can turn a normal write burst into object write failures, stream append failures, compaction backlog, repair failures, or corrupted partial writes if the host behaves badly. First reduce write pressure and preserve evidence: storage free bytes/inodes, filesystem errors, node logs, recent CoreStore error messages, compaction backlog, and request ids.
 
-Do not delete files under `STORAGE_PATH` by hand. Unknown files may be staging, identity material, manifests, stream records, or evidence of a bug. Free space by moving traffic away, expanding the volume, pausing non-critical rebuilds, or restoring in a controlled environment. If source reads fail with manifest or hash errors, treat it as integrity and recovery work, not an authorisation problem.
+Do not delete files under `STORAGE_PATH` by hand. Unknown files may be staging, manifests, stream records, or evidence of a bug. Free space by moving traffic away, expanding the volume, pausing non-critical rebuilds, or restoring in a controlled environment. If source reads fail with manifest or hash errors, treat it as integrity and recovery work, not an authorisation problem.
 
 A tenant object source read can distinguish storage failure from stale search:
 

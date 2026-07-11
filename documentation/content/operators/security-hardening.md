@@ -139,7 +139,7 @@ A source-review check helps catch accidental filesystem side stores:
 rg -n "tokio::fs|std::fs|OpenOptions|File::create|write_all" anvil-core/src anvil/src
 ```
 
-This proves only that you looked for direct filesystem write paths. It does not prove the remaining writes are safe. Review each hit: temporary upload staging, node identity, cluster keypair, and first-admin credential output have different handling from feature source records, which should be CoreStore-backed.
+This proves only that you looked for direct filesystem write paths. It does not prove the remaining writes are safe. Review each hit: temporary upload staging, operator identity paths outside `STORAGE_PATH`, and first-admin credential output have different handling from feature source records, which should be CoreStore-backed.
 
 ## Gateways must translate, not weaken
 

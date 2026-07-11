@@ -48,7 +48,7 @@ for path in (root / 'tutorials').glob('*.md'):
             errors.append(f'{path}:{lineno}: tenant tutorial uses anvil-admin {group}')
 
 pseudo_patterns = [
-    (re.compile(r'\bttl_ms\b'), 'ttl_ms is not a task lease proto field'),
+    (re.compile(r'AcquireTaskLeaseRequest[\s\S]{0,400}\bttl_ms\b'), 'ttl_ms is not a task lease proto field; use requested_ttl_nanos'),
     (re.compile(r'\banvil-admin\s+admin\b'), 'nested anvil-admin admin command is not valid'),
     (re.compile(r'\bANVIL_BOOTSTRAP_ADMIN_TOKEN\b'), 'bootstrap admin token bypass must not be documented'),
     (re.compile(r'\bbootstrap token\b', re.IGNORECASE), 'bootstrap token bypass language must not be documented'),

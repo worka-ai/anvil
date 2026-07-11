@@ -13,7 +13,7 @@ Read this page with [CoreStore Operations](/operators/corestore-operations/), [S
 
 ## The backup boundary
 
-The primary backup unit is each Anvil node's durable storage directory. In the Docker image this is normally `/var/lib/anvil`, because the image sets `STORAGE_PATH=/var/lib/anvil`. In raw binary or custom deployments it is whatever `STORAGE_PATH` points to. That path holds CoreStore records and, by default, the node identity and cluster keypair files.
+The primary backup unit is each Anvil node's durable storage directory. In the Docker image this is normally `/var/lib/anvil`, because the image sets `STORAGE_PATH=/var/lib/anvil`. In raw binary or custom deployments it is whatever `STORAGE_PATH` points to. That path holds CoreStore records. Node identity and cluster keypair files live beside it by default and must be backed up with the volume.
 
 CoreStore-backed state includes object bodies, object metadata journals, bucket records, refs, streams, transactions, tenant records, app credential envelopes, public policy state, relationship authorisation records, indexes and index definitions, watch evidence, append streams, task and lease state, gateway records, PersonalDB groups and commits, repair findings, diagnostics, routing and lifecycle records, and audit records. Some of those are source records. Others are derived state. Both live in the backup, but they have different recovery meaning.
 
@@ -26,7 +26,7 @@ A complete recovery set also includes material outside the volume:
 | `ANVIL_SECRET_ENCRYPTION_KEY_ID` | Labels the active key used for new envelopes. It tells you which key protected records at backup time. |
 | `ANVIL_SECRET_ENCRYPTION_PREVIOUS_KEYS` | Required when the backup contains envelopes still labelled with older key ids. |
 | `CLUSTER_SECRET` | Required for nodes in the same mesh to accept each other's signed cluster metadata. |
-| `NODE_ID_PATH` and `CLUSTER_KEYPAIR_PATH` when configured outside `STORAGE_PATH` | Preserve stable node and libp2p identity. The defaults live below `STORAGE_PATH`, but custom paths must be backed up separately. |
+| `NODE_ID_PATH` and `CLUSTER_KEYPAIR_PATH` | Preserve stable node and libp2p identity. The defaults live in an operator identity directory beside `STORAGE_PATH`; configured paths must also stay outside `STORAGE_PATH` and be backed up separately. |
 | First-admin and named admin credentials | Needed to manage the restored system through the normal admin API. Store them in a secret manager, not only inside the Anvil volume. |
 | Tenant/app client secrets where the service owns them | Needed for applications to mint new public API tokens after restore. Rotate deliberately if exposure is suspected. |
 | Redacted configuration snapshot | Captures image digest, env names, secret key ids, region/cell/node settings, ports, proxy settings, and volume mappings. |
@@ -98,7 +98,7 @@ This asks the restored server to inspect known encrypted envelopes using the con
 
 ## Identity, bootstrap, and admin access
 
-The default `node-id` and `cluster-keypair.pb` paths are below `STORAGE_PATH`. If you leave the defaults, the storage backup captures them. If you set `NODE_ID_PATH` or `CLUSTER_KEYPAIR_PATH` outside the storage path, include those files in the node recovery set. Losing or duplicating identity material can confuse topology, peer trust, audit evidence, and drain/replacement workflows.
+The default `node-id` and `cluster-keypair.pb` paths live in an operator identity directory beside `STORAGE_PATH`, and Anvil rejects configured identity paths below `STORAGE_PATH`. Include those files in the node recovery set. Losing or duplicating identity material can confuse topology, peer trust, audit evidence, and drain/replacement workflows.
 
 Restoring a node identity into an isolated drill is safe only if the drill cannot join production. Restoring the same identity while the old production node is still running is a split-brain risk. For production node replacement, decide whether you are restoring the same logical node from backup or registering a new node and moving placement/routing through the admin lifecycle. Do not solve an identity mismatch by editing CoreStore files.
 

@@ -81,6 +81,6 @@ If a current public CLI or admin CLI command does not expose a workflow at that 
 
 ## Production invariants
 
-Keep these invariants true during normal operation: one server process owns each writable storage path; admin traffic stays private; tenant traffic uses public APIs; server secrets are not mounted into tenant jobs; node identity files persist across restarts; and backups restore the full storage path together with the secret-manager state required to decrypt it.
+Keep these invariants true during normal operation: one server process owns each writable storage path; admin traffic stays private; tenant traffic uses public APIs; server secrets are not mounted into tenant jobs; node identity files persist outside `STORAGE_PATH`; and backups restore the full storage path plus identity files together with the secret-manager state required to decrypt it.
 
 When an incident response action would break one of those invariants, treat it as a break-glass action. Capture evidence first and document how the deployment returns to the normal model.

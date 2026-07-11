@@ -45,7 +45,7 @@ A ref CAS failure is not automatically a storage outage. It usually means anothe
 - transaction records;
 - staging and lock files used while writes are being coordinated.
 
-By default, node identity files such as `node-id` and `cluster-keypair.pb` also live below `STORAGE_PATH` unless configured elsewhere. Those are not tenant feature records, but they are operationally important: losing them can change node identity and cluster behaviour.
+By default, node identity files such as `node-id` and `cluster-keypair.pb` live in an operator identity directory beside `STORAGE_PATH`; configured identity paths must also stay outside `STORAGE_PATH`. Those are not tenant feature records, but they are operationally important: losing them can change node identity and cluster behaviour.
 
 Treat `STORAGE_PATH` as a stateful volume, not a cache. It needs persistent storage, backup, free-space alerts, inode alerts, permissions that prevent ordinary application containers from writing it, and placement on disks that match your durability expectations. It should not be shared as a writable directory between unrelated Anvil processes unless the deployment model is explicitly designed and tested for that access pattern.
 

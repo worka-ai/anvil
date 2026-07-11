@@ -92,7 +92,7 @@ The current server environment variable is `CLUSTER_SECRET`; older snippets that
 
 The blast radius is mesh coordination, peer metadata, and routing freshness rather than direct tenant API credentials. If two nodes use different cluster secrets, signed cluster messages can be rejected and the mesh may look split or stale even though each process still answers local requests. If the secret leaks, rotate it with a planned rolling deployment that keeps peer compatibility in mind for the version you operate. Also check network policy; a cluster secret is not a substitute for private node-to-node reachability.
 
-Do not confuse `CLUSTER_SECRET` with the persisted libp2p cluster keypair. The cluster keypair defaults below `STORAGE_PATH` as `cluster-keypair.pb`; it is part of stable node identity. `CLUSTER_SECRET` is configuration supplied to server processes.
+Do not confuse `CLUSTER_SECRET` with the persisted libp2p cluster keypair. The cluster keypair defaults to an operator identity directory beside `STORAGE_PATH`, not below it; it is part of stable node identity. `CLUSTER_SECRET` is configuration supplied to server processes.
 
 ## Bootstrap First-Admin Credential
 

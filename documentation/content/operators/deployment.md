@@ -11,7 +11,7 @@ This page is Docker-first because the repository ships a Dockerfile that builds 
 
 ## Phase 1: Prepare Storage, Secrets, And Networks
 
-Start with the storage boundary. `STORAGE_PATH` is the directory where Anvil writes durable server state: CoreStore records, object data, metadata journals, indexes, manifests, node identity, cluster keypair, system-realm records, audit evidence, and other Anvil-owned state. In the Docker image it defaults to `/var/lib/anvil`. Mount that path on a durable volume. Do not run production nodes on an ephemeral container filesystem, and do not share one mounted storage directory between multiple live Anvil nodes.
+Start with the storage boundary. `STORAGE_PATH` is the directory where Anvil writes durable server state: CoreStore records, object data, metadata journals, indexes, manifests, system-realm records, audit evidence, and other Anvil-owned state. In the Docker image it defaults to `/var/lib/anvil`. Mount that path on a durable volume and back up the adjacent operator identity directory that holds `node-id` and `cluster-keypair.pb` by default. Do not run production nodes on an ephemeral container filesystem, and do not share one mounted storage directory between multiple live Anvil nodes.
 
 Prepare server secret material before the container starts. `JWT_SECRET` signs Anvil bearer tokens, so nodes that need to accept the same tokens must use compatible secret configuration. `ANVIL_SECRET_ENCRYPTION_KEY` is a 32-byte hex key used to encrypt stored server-side secrets and encrypted shard payloads. `ANVIL_SECRET_ENCRYPTION_KEY_ID` labels new encrypted envelopes, and `ANVIL_SECRET_ENCRYPTION_PREVIOUS_KEYS` keeps old key ids readable during rotation. `CLUSTER_SECRET` protects node-to-node cluster traffic. These values belong in a secret manager or orchestrator secret, not in source control, shell history, image layers, or a public Compose file.
 
@@ -83,7 +83,7 @@ That file contains long-lived client credential material. The CLI exchanges it f
 
 ## Phase 4: Add Subsequent Nodes
 
-A subsequent node needs its own durable storage volume, the same server secret configuration where it must accept the same tokens, encrypted records, and cluster peers, its own stable node identity path, its own cluster keypair path, and cluster addresses other nodes can reach. The defaults store node identity and cluster keypair below `STORAGE_PATH`; that is convenient, but it also means the volume must remain attached to the same logical node across restarts.
+A subsequent node needs its own durable storage volume, the same server secret configuration where it must accept the same tokens, encrypted records, and cluster peers, its own stable node identity path, its own cluster keypair path, and cluster addresses other nodes can reach. The defaults store node identity and cluster keypair in an operator identity directory beside `STORAGE_PATH`; keep that directory attached to the same logical node across restarts.
 
 Do not set `INIT_CLUSTER=true` on joining nodes. Set `BOOTSTRAP_ADDRS` to one or more existing peers and set `PUBLIC_CLUSTER_ADDRS` to the addresses other nodes should dial for the joining node:
 
