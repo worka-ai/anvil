@@ -119,10 +119,13 @@ impl TestCluster {
         let cluster_permit = acquire_test_cluster_permit().await;
 
         INIT_LOGGER.call_once(|| {
+            let filter = std::env::var("ANVIL_TEST_LOG")
+                .or_else(|_| std::env::var("RUST_LOG"))
+                .unwrap_or_else(|_| {
+                    "warn,anvil=debug,anvil_core=debug,anvil_core::cluster=warn".to_string()
+                });
             let _ = tracing_subscriber::fmt()
-                .with_env_filter(EnvFilter::new(
-                    "warn,anvil=debug,anvil_core=debug,anvil_core::cluster=warn",
-                ))
+                .with_env_filter(EnvFilter::new(filter))
                 .try_init();
         });
 
@@ -154,7 +157,7 @@ impl TestCluster {
             personaldb_snapshot_entry_threshold: 1024,
             personaldb_snapshot_payload_bytes_threshold: 64 * 1024 * 1024,
             allow_test_only_embedding_provider: true,
-            run_background_worker: false,
+            run_background_worker: true,
             ..anvil_core::config::Config::default()
         };
         configure(&mut config);
@@ -753,6 +756,9 @@ fn is_local_derived_coremeta_row(row: &anvil_core::core_store::CoreMetaEncodedOw
 }
 
 fn contains_local_corestore_locator(row: &anvil_core::core_store::CoreMetaEncodedOwnedRow) -> bool {
+    if row.cf == anvil_core::core_store::CF_ROOT_CACHE {
+        return false;
+    }
     row.value_envelope
         .windows(b"local-node".len())
         .any(|window| window == b"local-node")

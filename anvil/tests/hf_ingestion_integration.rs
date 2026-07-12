@@ -5,10 +5,13 @@ use std::time::Duration;
 async fn hf_ingestion_single_file_integration() {
     // Use the same harness patterns as other tests (TestCluster handles dotenv + DB)
     // Spin up a single-node cluster with isolated DBs
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    let mut cluster = TestCluster::new_with_config(&["test-region-1"], |config| {
+        config.public_region_base_domain = "anvil-storage.test".to_string();
+    })
+    .await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
 
-    let token = get_auth_token(&cluster.admin_state_path, &cluster.grpc_addrs[0]).await;
+    let token = cluster.token.clone();
 
     // Create a bucket via gRPC
     let mut bucket_client = anvil::anvil_api::bucket_service_client::BucketServiceClient::connect(
@@ -124,8 +127,17 @@ async fn hf_ingestion_single_file_integration() {
 
     // Verify object is not public initially
     let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
-    let url = format!("{}/{}/gpt-oss-20b/config.json", http_base, bucket_name);
-    let resp_before = reqwest::get(&url).await.unwrap();
+    let url = format!(
+        "{}/default/{}/gpt-oss-20b/config.json",
+        http_base, bucket_name
+    );
+    let http_client = reqwest::Client::new();
+    let resp_before = http_client
+        .get(&url)
+        .header(reqwest::header::HOST, "test-region-1.anvil-storage.test")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(
         resp_before.status(),
         403,
@@ -149,7 +161,21 @@ async fn hf_ingestion_single_file_integration() {
     auth_client.set_public_access(req).await.unwrap();
 
     // Verify object is now public
-    let resp_after = reqwest::get(&url).await.unwrap();
+    let mut resp_after = None;
+    for _ in 0..5 {
+        let resp = http_client
+            .get(&url)
+            .header(reqwest::header::HOST, "test-region-1.anvil-storage.test")
+            .send()
+            .await
+            .unwrap();
+        if resp.status() == 200 {
+            resp_after = Some(resp);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let resp_after = resp_after.expect("Object should be public after setting policy");
     assert_eq!(
         resp_after.status(),
         200,
@@ -167,10 +193,7 @@ async fn hf_ingestion_permission_denied() {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
 
-    let ok_token = cluster.states[0]
-        .jwt_manager
-        .mint_token("test-app".into(), 1)
-        .unwrap();
+    let ok_token = cluster.token.clone();
 
     // Create bucket
     let mut bucket_client = anvil::anvil_api::bucket_service_client::BucketServiceClient::connect(

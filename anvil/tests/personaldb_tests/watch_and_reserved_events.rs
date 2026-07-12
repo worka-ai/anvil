@@ -6,6 +6,12 @@ async fn personaldb_group_watch_streams_reserved_internal_events_through_native_
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
+    let token = cluster.token.clone();
+    let mut setup_client = PersonalDbServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    create_group(&mut setup_client, &token, &database_id).await;
+
     let payload = PersonalDbGroupWatchPayload {
         database_id: database_id.clone(),
         event_type: "commit".to_string(),
@@ -39,7 +45,7 @@ async fn personaldb_group_watch_streams_reserved_internal_events_through_native_
                 after_cursor_low: 0,
                 after_cursor_high: 0,
             },
-            &cluster.token,
+            &token,
         ))
         .await
         .unwrap();

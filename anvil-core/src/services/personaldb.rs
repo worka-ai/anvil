@@ -23,7 +23,7 @@ use crate::{
     },
     personaldb_control::{PersonalDbCommitCertificate, PersonalDbGroupManifest},
     personaldb_envelope::{
-        PersonalDbEnvelopeDerivationInput, VerifiedMutationEnvelope,
+        PersonalDbEnvelopeDerivationInput, TableOperation, VerifiedMutationEnvelope,
         derive_verified_mutation_envelope,
     },
     personaldb_heads::{
@@ -1192,6 +1192,10 @@ impl AppState {
         .await
         .map_err(internal_status)?;
 
+        materialize_personaldb_row_owner_grants(&self.persistence, &envelope, &actor)
+            .await
+            .map_err(internal_status)?;
+
         append_personaldb_group_watch_record(
             &self.storage,
             actor.tenant_id,
@@ -1500,12 +1504,13 @@ async fn authorize_personaldb_row_effects(
     envelope: &VerifiedMutationEnvelope,
     actor: &PersonalDbCommitActor,
 ) -> Result<(), Status> {
+    if !actor.require_public_commit_authorization {
+        return Ok(());
+    }
+
     for effect in &envelope.table_effects {
         let binding = &effect.source_resource_binding;
-        let resource = format!(
-            "tenant-{}/{}/{}/{}",
-            actor.tenant_id, envelope.database_id, binding.resource_type, binding.resource_id
-        );
+        let resource = personaldb_row_resource_id(actor.tenant_id, &envelope.database_id, binding);
         for permission in &effect.required_permissions {
             let revision = i64::try_from(envelope.authz_revision)
                 .map_err(|_| Status::internal("Invalid PersonalDB authz revision"))?;
@@ -1522,14 +1527,75 @@ async fn authorize_personaldb_row_effects(
             )
             .await
             .map_err(internal_status)?;
-            if !allowed {
-                return Err(Status::permission_denied(
-                    "PersonalDB row/resource mutation is not authorized",
-                ));
+            if allowed || insert_effect_creates_owned_row(effect, actor) {
+                continue;
             }
+            return Err(Status::permission_denied(
+                "PersonalDB row/resource mutation is not authorized",
+            ));
         }
     }
     Ok(())
+}
+
+async fn materialize_personaldb_row_owner_grants(
+    persistence: &crate::persistence::Persistence,
+    envelope: &VerifiedMutationEnvelope,
+    actor: &PersonalDbCommitActor,
+) -> anyhow::Result<()> {
+    let mut mutations = Vec::new();
+    for row in &envelope.row_metadata_delta.upserts {
+        if row.owner_principal.as_deref() != Some(actor.principal.as_str()) {
+            continue;
+        }
+        let resource = format!(
+            "tenant-{}/{}/{}/{}",
+            actor.tenant_id, envelope.database_id, row.resource_type, row.resource_id
+        );
+        for relation in [
+            "personaldb:insert",
+            "personaldb:update",
+            "personaldb:delete",
+        ] {
+            mutations.push(crate::persistence::AuthzTupleBatchMutation {
+                namespace: encode_realm_namespace(DEFAULT_AUTHZ_REALM_ID, "personaldb_row"),
+                object_id: resource.clone(),
+                relation: relation.to_string(),
+                subject_kind: access_control::APP_SUBJECT_KIND.to_string(),
+                subject_id: actor.principal.clone(),
+                caveat_hash: String::new(),
+                operation: "add".to_string(),
+                reason: "PersonalDB row owner grant".to_string(),
+            });
+        }
+    }
+    if mutations.is_empty() {
+        return Ok(());
+    }
+    persistence
+        .write_authz_tuple_batch(actor.tenant_id, mutations, &actor.principal)
+        .await?;
+    Ok(())
+}
+
+fn insert_effect_creates_owned_row(
+    effect: &crate::personaldb_envelope::TableEffect,
+    actor: &PersonalDbCommitActor,
+) -> bool {
+    effect.operation == TableOperation::Insert
+        && effect.source_resource_binding.owner_principal.as_deref()
+            == Some(actor.principal.as_str())
+}
+
+fn personaldb_row_resource_id(
+    tenant_id: i64,
+    database_id: &str,
+    binding: &crate::personaldb_envelope::ResourceBinding,
+) -> String {
+    format!(
+        "tenant-{}/{}/{}/{}",
+        tenant_id, database_id, binding.resource_type, binding.resource_id
+    )
 }
 
 mod helpers;

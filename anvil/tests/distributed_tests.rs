@@ -27,7 +27,10 @@ fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
 #[tokio::test]
 async fn test_distributed_reconstruction_on_node_failure() {
     //let num_nodes = 6;
-    let mut cluster = TestCluster::new(&["test-region-1"; 6]).await;
+    let mut cluster = TestCluster::new_with_config(&["test-region-1"; 6], |config| {
+        config.run_background_worker = false;
+    })
+    .await;
     cluster.start_and_converge(Duration::from_secs(20)).await;
 
     let primary_addr = cluster.grpc_addrs[0].clone(); // already includes /grpc

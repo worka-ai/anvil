@@ -562,6 +562,32 @@ pub async fn resolve_permission_at_revision(
         }
     }
 
+    resolve_permission_from_current_view_at_revision(
+        storage,
+        tenant_id,
+        namespace,
+        object_id,
+        relation,
+        subject_kind,
+        subject_id,
+        caveat_hash,
+        revision,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_permission_from_current_view_at_revision(
+    storage: &Storage,
+    tenant_id: i64,
+    namespace: &str,
+    object_id: &str,
+    relation: &str,
+    subject_kind: &str,
+    subject_id: &str,
+    caveat_hash: &str,
+    revision: i64,
+) -> Result<bool> {
     let current = current_authz_view_at_revision(storage, tenant_id, revision).await?;
     let subject = resolver::SubjectRef {
         kind: subject_kind.to_string(),

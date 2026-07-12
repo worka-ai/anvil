@@ -170,9 +170,6 @@ impl CoreStore {
                 Ok(receipt) => prepare_receipts.push(receipt),
                 Err(error) => prepare_errors.push(format!("{}: {error}", replica.node_id)),
             }
-            if prepare_receipts.len() >= profile.prepare_quorum {
-                break;
-            }
         }
         if prepare_receipts.len() < profile.prepare_quorum {
             record_corestore_trace_event("coremeta.replicate_pending", "quorum_failed");
@@ -271,9 +268,6 @@ impl CoreStore {
             }) {
                 Ok(receipt) => persist_receipts.push(receipt),
                 Err(error) => persist_errors.push(format!("{}: {error}", replica.node_id)),
-            }
-            if persist_receipts.len() >= profile.certificate_persist_quorum {
-                break;
             }
         }
         if persist_receipts.len() < profile.certificate_persist_quorum {
@@ -474,10 +468,10 @@ impl CoreStore {
             bootstrap_candidates.push(placement);
         }
         if active_candidates.len() >= prepare_quorum {
-            sort_coremeta_candidates(&mut active_candidates);
+            Self::sort_coremeta_candidates(&mut active_candidates);
             Ok(active_candidates)
         } else {
-            sort_coremeta_candidates(&mut bootstrap_candidates);
+            Self::sort_coremeta_candidates(&mut bootstrap_candidates);
             Ok(bootstrap_candidates)
         }
     }

@@ -259,13 +259,31 @@ fn submit_request_at_base(
     session_token: &str,
     changeset_bytes: Vec<u8>,
 ) -> SubmitPersonalDbChangesetRequest {
+    submit_request_at_base_for_principal(
+        database_id,
+        base_log_index,
+        base_log_hash,
+        "2",
+        session_token,
+        changeset_bytes,
+    )
+}
+
+fn submit_request_at_base_for_principal(
+    database_id: &str,
+    base_log_index: u64,
+    base_log_hash: &str,
+    principal: &str,
+    session_token: &str,
+    changeset_bytes: Vec<u8>,
+) -> SubmitPersonalDbChangesetRequest {
     SubmitPersonalDbChangesetRequest {
         tenant_id: 1,
         database_id: database_id.to_string(),
-        principal: "2".to_string(),
+        principal: principal.to_string(),
         session_token: session_token.to_string(),
-        request_id: format!("request-{base_log_index}"),
-        idempotency_key: format!("idem-{base_log_index}"),
+        request_id: format!("request-{principal}-{base_log_index}"),
+        idempotency_key: format!("idem-{principal}-{base_log_index}"),
         base_log_index,
         base_log_hash: base_log_hash.to_string(),
         client_log_epoch: base_log_index.saturating_add(1),
@@ -305,6 +323,24 @@ fn sqlite_insert_changeset_with_item(id: i64, name: &str, payload: &[u8]) -> Vec
         rusqlite::params![id, name, payload],
     )
     .unwrap();
+    let mut output = Vec::new();
+    session.changeset_strm(&mut output).unwrap();
+    assert!(!output.is_empty());
+    output
+}
+
+fn sqlite_item_update_changeset() -> Vec<u8> {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch(PERSONALDB_TEST_SCHEMA_SQL).unwrap();
+    db.execute(
+        "INSERT INTO items (id, name, payload) VALUES (1, 'alpha', x'010203')",
+        [],
+    )
+    .unwrap();
+    let mut session = Session::new(&db).unwrap();
+    session.attach::<&str>(None).unwrap();
+    db.execute("UPDATE items SET name = 'beta' WHERE id = 1", [])
+        .unwrap();
     let mut output = Vec::new();
     session.changeset_strm(&mut output).unwrap();
     assert!(!output.is_empty());

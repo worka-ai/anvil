@@ -260,7 +260,7 @@ async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable(
     assert_eq!(response.watch_cursor_low, 1);
     assert_eq!(response.watch_cursor_high, 0);
     assert!(response.index_path.starts_with("git_source_index:"));
-    let index_scope = "tenant:1:repository:repo-alpha";
+    let index_scope = "tenant/1/repository/repo-alpha";
     assert!(
         read_writer_segment_catalog_record(
             &cluster.states[0].storage,

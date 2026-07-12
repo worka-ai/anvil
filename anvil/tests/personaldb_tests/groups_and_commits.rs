@@ -729,20 +729,47 @@ async fn personaldb_row_mutation_can_be_authorized_by_relationship_tuple() {
         .await
         .unwrap();
 
-    let commit_only_token = cluster.states[0]
+    let inserted = personaldb
+        .submit_personal_db_changeset(authorized(
+            valid_submit_request(&database_id, &genesis_hash, &token),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(inserted.log_index, 1);
+
+    let delegate_principal = "delegate-app";
+    let delegate_token = cluster.states[0]
         .jwt_manager
-        .mint_token("test-app".to_string(), 1)
+        .mint_token(delegate_principal.to_string(), 1)
         .unwrap();
-    let changeset_bytes = sqlite_insert_changeset();
+    anvil::access_control::write_delegated_action_tuple(
+        &cluster.states[0].storage,
+        &cluster.states[0].persistence,
+        1,
+        delegate_principal,
+        anvil::permissions::AnvilAction::PersonalDbCommit,
+        &database_id,
+        "add",
+        "test",
+        "grant delegate PersonalDB group commit",
+    )
+    .await
+    .unwrap();
+
+    let changeset_bytes = sqlite_item_update_changeset();
     let denied = personaldb
         .submit_personal_db_changeset(authorized(
-            submit_request(
+            submit_request_at_base_for_principal(
                 &database_id,
-                &genesis_hash,
-                &commit_only_token,
+                inserted.log_index,
+                &inserted.log_hash,
+                delegate_principal,
+                &delegate_token,
                 changeset_bytes.clone(),
             ),
-            &commit_only_token,
+            &delegate_token,
         ))
         .await
         .unwrap_err();
@@ -752,9 +779,9 @@ async fn personaldb_row_mutation_can_be_authorized_by_relationship_tuple() {
     let envelope = derive_verified_mutation_envelope(PersonalDbEnvelopeDerivationInput {
         tenant_id: 1,
         database_id: &database_id,
-        principal: "2",
-        base_log_index: 0,
-        proposed_log_index: 1,
+        principal: delegate_principal,
+        base_log_index: inserted.log_index,
+        proposed_log_index: inserted.log_index + 1,
         changeset_payload_hash: hash32(&changeset_bytes),
         schema_hash: &personaldb_test_schema_hash(),
         policy_epoch: 1,
@@ -766,7 +793,7 @@ async fn personaldb_row_mutation_can_be_authorized_by_relationship_tuple() {
     let effect = envelope
         .table_effects
         .first()
-        .expect("insert changeset should derive one effect");
+        .expect("update changeset should derive one effect");
     let binding = &effect.source_resource_binding;
     let resource = format!(
         "tenant-1/{}/{}/{}",
@@ -785,7 +812,7 @@ async fn personaldb_row_mutation_can_be_authorized_by_relationship_tuple() {
                 object_id: resource,
                 relation: permission,
                 subject_kind: "app".to_string(),
-                subject_id: "test-app".to_string(),
+                subject_id: delegate_principal.to_string(),
                 caveat_hash: String::new(),
                 operation: "add".to_string(),
                 reason: "test".to_string(),
@@ -798,18 +825,20 @@ async fn personaldb_row_mutation_can_be_authorized_by_relationship_tuple() {
 
     let committed = personaldb
         .submit_personal_db_changeset(authorized(
-            submit_request(
+            submit_request_at_base_for_principal(
                 &database_id,
-                &genesis_hash,
-                &commit_only_token,
+                inserted.log_index,
+                &inserted.log_hash,
+                delegate_principal,
+                &delegate_token,
                 changeset_bytes,
             ),
-            &commit_only_token,
+            &delegate_token,
         ))
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(committed.log_index, 1);
+    assert_eq!(committed.log_index, 2);
     assert_eq!(committed.verified_envelope_hash.len(), 64);
 }
 

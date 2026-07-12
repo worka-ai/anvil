@@ -123,9 +123,6 @@ impl CoreStore {
                 Ok(receipt) => prepare_receipts.push(receipt),
                 Err(error) => prepare_errors.push(format!("{}: {error}", replica.node_id)),
             }
-            if prepare_receipts.len() >= profile.prepare_quorum {
-                break;
-            }
         }
         if prepare_receipts.len() < profile.prepare_quorum {
             crate::perf::record_root_register_cas_duration(
@@ -205,9 +202,6 @@ impl CoreStore {
             match result {
                 Ok(()) => write_count += 1,
                 Err(error) => write_errors.push(format!("{}: {error}", replica.node_id)),
-            }
-            if write_count >= profile.certificate_persist_quorum {
-                break;
             }
         }
         if write_count < profile.certificate_persist_quorum {

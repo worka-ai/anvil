@@ -224,7 +224,12 @@ pub async fn check_admin_relation(
 ) -> Result<bool> {
     let object_id = system_mesh_object_id(mesh_id);
     let revision = authz_journal::latest_authz_revision(storage, SYSTEM_STORAGE_TENANT_ID).await?;
-    authz_journal::resolve_permission_at_revision(
+    // Internal CoreStore services call this path while serving shard/root/meta
+    // requests. Use the revision-aware row resolver directly so authorising an
+    // internal storage RPC cannot recursively issue more storage RPCs through
+    // the derived-userset acceleration path. This still uses the Zanzibar
+    // schema and tuple model; it only bypasses the optional derived cache.
+    authz_journal::resolve_permission_from_current_view_at_revision(
         storage,
         SYSTEM_STORAGE_TENANT_ID,
         &system_namespace(),
