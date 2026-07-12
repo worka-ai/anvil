@@ -7,10 +7,10 @@ use crate::{
     storage::Storage,
     system_realm::{
         SYSTEM_AUTHZ_REALM_NAMESPACE, SYSTEM_BUCKET_NAMESPACE, SYSTEM_CELL_NAMESPACE,
-        SYSTEM_INDEX_NAMESPACE, SYSTEM_NODE_NAMESPACE, SYSTEM_OBJECT_NAMESPACE,
-        SYSTEM_PERSONALDB_GROUP_NAMESPACE, SYSTEM_REALM_ID, SYSTEM_REGION_NAMESPACE,
-        SYSTEM_REGISTRY_NAMESPACE, SYSTEM_STORAGE_TENANT_ID, SYSTEM_STORAGE_TENANT_NAMESPACE,
-        SYSTEM_STREAM_NAMESPACE,
+        SYSTEM_INDEX_NAMESPACE, SYSTEM_NAMESPACE, SYSTEM_NODE_NAMESPACE, SYSTEM_OBJECT_ID,
+        SYSTEM_OBJECT_NAMESPACE, SYSTEM_PERSONALDB_GROUP_NAMESPACE, SYSTEM_REALM_ID,
+        SYSTEM_REGION_NAMESPACE, SYSTEM_REGISTRY_NAMESPACE, SYSTEM_STORAGE_TENANT_ID,
+        SYSTEM_STORAGE_TENANT_NAMESPACE, SYSTEM_STREAM_NAMESPACE,
     },
 };
 use anyhow::Result;
@@ -1498,6 +1498,70 @@ pub async fn grant_node_defaults(
             reason,
         )
         .await?;
+    Ok(())
+}
+
+pub async fn grant_internal_node_system_access(
+    persistence: &Persistence,
+    node_id: &str,
+    written_by: &str,
+    reason: &str,
+) -> Result<()> {
+    persistence
+        .write_authz_tuple(
+            SYSTEM_STORAGE_TENANT_ID,
+            &system_realm_namespace(SYSTEM_NAMESPACE),
+            SYSTEM_OBJECT_ID,
+            "manage_nodes",
+            APP_SUBJECT_KIND,
+            node_id,
+            "",
+            "add",
+            written_by,
+            reason,
+        )
+        .await?;
+    Ok(())
+}
+
+pub async fn grant_node_defaults_batch(
+    persistence: &Persistence,
+    nodes: &[(String, String, String)],
+    written_by: &str,
+    reason: &str,
+) -> Result<()> {
+    let mut mutations = Vec::with_capacity(nodes.len() * 2);
+    for (region, cell_id, node_id) in nodes {
+        mutations.push(AuthzTupleBatchMutation {
+            namespace: system_realm_namespace(SYSTEM_NODE_NAMESPACE),
+            object_id: node_object_id(region, cell_id, node_id),
+            relation: "parent_cell".to_string(),
+            subject_kind: USERSET_SUBJECT_KIND.to_string(),
+            subject_id: userset_subject(
+                SYSTEM_CELL_NAMESPACE,
+                &cell_object_id(region, cell_id),
+                "manage",
+            ),
+            caveat_hash: String::new(),
+            operation: "add".to_string(),
+            reason: reason.to_string(),
+        });
+        mutations.push(AuthzTupleBatchMutation {
+            namespace: system_realm_namespace(SYSTEM_NAMESPACE),
+            object_id: SYSTEM_OBJECT_ID.to_string(),
+            relation: "manage_nodes".to_string(),
+            subject_kind: APP_SUBJECT_KIND.to_string(),
+            subject_id: node_id.clone(),
+            caveat_hash: String::new(),
+            operation: "add".to_string(),
+            reason: reason.to_string(),
+        });
+    }
+    if !mutations.is_empty() {
+        persistence
+            .write_authz_tuple_batch(SYSTEM_STORAGE_TENANT_ID, mutations, written_by)
+            .await?;
+    }
     Ok(())
 }
 

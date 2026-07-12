@@ -154,6 +154,7 @@ impl TestCluster {
             personaldb_snapshot_entry_threshold: 1024,
             personaldb_snapshot_payload_bytes_threshold: 64 * 1024 * 1024,
             allow_test_only_embedding_provider: true,
+            run_background_worker: false,
             ..anvil_core::config::Config::default()
         };
         configure(&mut config);
@@ -315,25 +316,9 @@ impl TestCluster {
             cfg.public_api_addr = self.grpc_addrs[i].clone();
             cfg.corestore_internal_bearer_token = self.states[i]
                 .jwt_manager
-                .mint_token("admin-principal".to_string(), 0)
+                .mint_token(cfg.node_id.clone(), 0)
                 .unwrap();
-            self.states[i].config = Arc::new(cfg.clone());
-            self.states[i].core_store =
-                anvil_core::core_store::CoreStore::new_with_pipeline_keyring_and_identity(
-                    self.states[i].storage.clone(),
-                    cfg.core_pipeline_keyring().unwrap(),
-                    anvil_core::core_store::CoreStoreNodeIdentity {
-                        mesh_id: cfg.mesh_id.clone(),
-                        node_id: cfg.node_id.clone(),
-                        region_id: cfg.region.clone(),
-                        cell_id: cfg.cell_id.clone(),
-                        public_api_addr: cfg.public_api_addr.clone(),
-                        internal_bearer_token: (!cfg.corestore_internal_bearer_token.is_empty())
-                            .then_some(cfg.corestore_internal_bearer_token.clone()),
-                    },
-                )
-                .await
-                .unwrap();
+            self.states[i] = AppState::new(cfg, None).await.unwrap();
         }
 
         for i in 0..self.states.len() {
@@ -380,37 +365,19 @@ impl TestCluster {
         );
 
         let start = Instant::now();
-        while start.elapsed() < timeout {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            let mut all_converged = true;
-            for state in &self.states {
-                let cluster_state = state.cluster.read().await;
-                if cluster_state.len() < self.nodes.len() {
-                    all_converged = false;
+        loop {
+            let mut all_ports_ready = true;
+            for addr_str in self.grpc_addrs.iter().chain(self.admin_addrs.iter()) {
+                let addr: SocketAddr = addr_str.replace("http://", "").parse().unwrap();
+                if !is_port_open(addr).await {
+                    all_ports_ready = false;
                     break;
                 }
             }
-            if all_converged {
-                emit_test_timing(
-                    format!("start_and_converge convergence_poll nodes={node_count}"),
-                    start.elapsed(),
-                );
-                let port_start = Instant::now();
-                for addr_str in &self.grpc_addrs {
-                    let addr: SocketAddr = addr_str.replace("http://", "").parse().unwrap();
-                    if !wait_for_port(addr, Duration::from_secs(5)).await {
-                        panic!("gRPC port {} did not open in time", addr);
-                    }
-                }
-                for addr_str in &self.admin_addrs {
-                    let addr: SocketAddr = addr_str.replace("http://", "").parse().unwrap();
-                    if !wait_for_port(addr, Duration::from_secs(5)).await {
-                        panic!("admin gRPC port {} did not open in time", addr);
-                    }
-                }
+            if all_ports_ready {
                 emit_test_timing(
                     format!("start_and_converge port_ready nodes={node_count}"),
-                    port_start.elapsed(),
+                    start.elapsed(),
                 );
                 let lifecycle_seed_start = Instant::now();
                 self.seed_corestore_mesh_lifecycle(&peer_ids, &listen_addrs)
@@ -431,8 +398,18 @@ impl TestCluster {
                 );
                 return;
             }
+            if start.elapsed() >= timeout {
+                let mut cluster_sizes = Vec::with_capacity(self.states.len());
+                for state in &self.states {
+                    cluster_sizes.push(state.cluster.read().await.len());
+                }
+                panic!(
+                    "Cluster ports did not become ready in time; observed gossip membership sizes: {:?}",
+                    cluster_sizes
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        panic!("Cluster did not converge in time");
     }
 
     async fn seed_corestore_mesh_lifecycle(
@@ -498,23 +475,50 @@ impl TestCluster {
             nodes,
         };
 
-        for target in &self.states {
-            for source in &self.states {
-                target
-                    .core_store
-                    .register_node_receipt_signing_public_key(
-                        &source.config.node_id,
-                        &source.core_store.local_receipt_signing_public_key_proto(),
-                    )
-                    .unwrap();
-            }
-            anvil_core::mesh_lifecycle::install_bootstrap_lifecycle_projection(
-                &target.storage,
-                &target.core_store,
-                projection.clone(),
-            )
-            .unwrap();
+        let node_default_grants = self
+            .states
+            .iter()
+            .map(|source| {
+                (
+                    source.config.region.clone(),
+                    source.config.cell_id.clone(),
+                    source.config.node_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let Some(canonical) = self.states.first() else {
+            return;
+        };
+        for source in &self.states {
+            canonical
+                .core_store
+                .register_node_receipt_signing_public_key(
+                    &source.config.node_id,
+                    &source.core_store.local_receipt_signing_public_key_proto(),
+                )
+                .unwrap();
         }
+        anvil_core::access_control::grant_node_defaults_batch(
+            &canonical.persistence,
+            &node_default_grants,
+            "test-cluster",
+            "test cluster node bootstrap",
+        )
+        .await
+        .unwrap_or_else(|err| {
+            panic!(
+                "grant_node_defaults_batch target={}: {err:?}",
+                canonical.config.node_id
+            )
+        });
+        anvil_core::mesh_lifecycle::install_bootstrap_lifecycle_projection(
+            &canonical.storage,
+            &canonical.core_store,
+            projection,
+        )
+        .unwrap();
+        install_canonical_coremeta_bootstrap_snapshot(&self.states);
     }
 
     #[allow(unused)]
@@ -698,6 +702,8 @@ fn install_canonical_coremeta_bootstrap_snapshot(states: &[AppState]) {
         .expect("export canonical CoreMeta bootstrap snapshot")
         .into_iter()
         .filter(|row| !is_node_local_coremeta_row(row))
+        .filter(|row| !is_local_derived_coremeta_row(row))
+        .filter(|row| !contains_local_corestore_locator(row))
         .collect::<Vec<_>>();
 
     for target in states.iter().skip(1) {
@@ -709,10 +715,57 @@ fn install_canonical_coremeta_bootstrap_snapshot(states: &[AppState]) {
 }
 
 fn is_node_local_coremeta_row(row: &anvil_core::core_store::CoreMetaEncodedOwnedRow) -> bool {
-    row.cf == anvil_core::core_store::CF_MESH
-        && row.core_meta_key.len() >= 3
-        && u16::from_le_bytes([row.core_meta_key[1], row.core_meta_key[2]])
-            == anvil_core::core_store::TABLE_NODE_SIGNING_KEYPAIR_ROW
+    if row.cf != anvil_core::core_store::CF_MESH
+        || coremeta_table_id(row) != Some(anvil_core::core_store::TABLE_NODE_SIGNING_KEYPAIR_ROW)
+    {
+        return false;
+    }
+    let Ok(tuple_key) = anvil_core::core_store::core_meta_record_tuple_key(&row.core_meta_key)
+    else {
+        return false;
+    };
+    let local_tuples = [
+        anvil_core::core_store::core_meta_tuple_key(&[
+            anvil_core::core_store::CoreMetaTuplePart::Raw(b"node-signing-keypair"),
+        ]),
+        anvil_core::core_store::core_meta_tuple_key(&[
+            anvil_core::core_store::CoreMetaTuplePart::Utf8("cluster-identity"),
+            anvil_core::core_store::CoreMetaTuplePart::Utf8("local"),
+        ]),
+    ];
+    local_tuples
+        .iter()
+        .filter_map(|result| result.as_ref().ok())
+        .any(|local_tuple| tuple_key == local_tuple.as_slice())
+}
+
+fn is_local_derived_coremeta_row(row: &anvil_core::core_store::CoreMetaEncodedOwnedRow) -> bool {
+    matches!(
+        (row.cf.as_str(), coremeta_table_id(row)),
+        (
+            anvil_core::core_store::CF_MATERIALISATION,
+            Some(anvil_core::core_store::TABLE_MATERIALISATION_CURSOR_ROW)
+        ) | (
+            anvil_core::core_store::CF_MATERIALISATION,
+            Some(anvil_core::core_store::TABLE_WRITER_SEGMENT_ROW)
+        )
+    )
+}
+
+fn contains_local_corestore_locator(row: &anvil_core::core_store::CoreMetaEncodedOwnedRow) -> bool {
+    row.value_envelope
+        .windows(b"local-node".len())
+        .any(|window| window == b"local-node")
+}
+
+fn coremeta_table_id(row: &anvil_core::core_store::CoreMetaEncodedOwnedRow) -> Option<u16> {
+    if row.core_meta_key.len() < 3 {
+        return None;
+    }
+    Some(u16::from_le_bytes([
+        row.core_meta_key[1],
+        row.core_meta_key[2],
+    ]))
 }
 
 impl Drop for TestCluster {
@@ -733,6 +786,17 @@ impl Drop for TestCluster {
 }
 
 #[allow(dead_code)]
+pub async fn is_port_open(addr: SocketAddr) -> bool {
+    matches!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            tokio::net::TcpStream::connect(addr)
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
 pub async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {

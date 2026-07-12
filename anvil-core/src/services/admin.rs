@@ -1278,6 +1278,14 @@ impl AdminService for AppState {
         )
         .await
         .map_err(|err| Status::internal(err.to_string()))?;
+        crate::access_control::grant_internal_node_system_access(
+            &self.persistence,
+            &node.node_id,
+            &principal.principal_id,
+            "admin node activate",
+        )
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
         let audit_event_id = record_admin_audit_event(
             self,
             &principal,

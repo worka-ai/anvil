@@ -854,9 +854,10 @@ impl RootRegisterInternal for AppState {
         {
             Ok(current) => {
                 if current.generation != req.expected_generation {
-                    return Err(Status::failed_precondition(
-                        "root expected generation mismatch",
-                    ));
+                    return Err(Status::failed_precondition(format!(
+                        "root expected generation mismatch: root_key_hash={} expected={} current={}",
+                        req.root_key_hash, req.expected_generation, current.generation
+                    )));
                 }
                 if !req.expected_root_hash.is_empty()
                     && current.root_anchor_hash != req.expected_root_hash

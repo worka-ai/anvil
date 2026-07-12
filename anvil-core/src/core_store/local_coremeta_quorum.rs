@@ -474,10 +474,24 @@ impl CoreStore {
             bootstrap_candidates.push(placement);
         }
         if active_candidates.len() >= prepare_quorum {
+            sort_coremeta_candidates(&mut active_candidates);
             Ok(active_candidates)
         } else {
+            sort_coremeta_candidates(&mut bootstrap_candidates);
             Ok(bootstrap_candidates)
         }
+    }
+
+    fn sort_coremeta_candidates(candidates: &mut [LocalShardPlacement]) {
+        candidates.sort_by(|a, b| {
+            b.region_weight
+                .cmp(&a.region_weight)
+                .then_with(|| b.cell_weight.cmp(&a.cell_weight))
+                .then_with(|| a.region_id.cmp(&b.region_id))
+                .then_with(|| a.failure_domain.cmp(&b.failure_domain))
+                .then_with(|| a.cell_id.cmp(&b.cell_id))
+                .then_with(|| a.node_id.cmp(&b.node_id))
+        });
     }
 
     fn replicate_coremeta_batch_locally(
@@ -554,7 +568,14 @@ impl CoreStore {
         let receipt = client
             .replicate_pending_batch(request)
             .await
-            .with_context(|| format!("replicate CoreMeta batch to {}", replica.node_id))?
+            .map_err(|status| {
+                anyhow!(
+                    "replicate CoreMeta batch to {} failed: code={:?} message={}",
+                    replica.node_id,
+                    status.code(),
+                    status.message()
+                )
+            })?
             .into_inner();
         api_prepare_receipt_to_core(receipt)
     }
@@ -631,7 +652,14 @@ impl CoreStore {
         let receipt = client
             .persist_commit_certificate(request)
             .await
-            .with_context(|| format!("persist CoreMeta certificate on {}", replica.node_id))?
+            .map_err(|status| {
+                anyhow!(
+                    "persist CoreMeta certificate on {} failed: code={:?} message={}",
+                    replica.node_id,
+                    status.code(),
+                    status.message()
+                )
+            })?
             .into_inner();
         api_persist_receipt_to_core(receipt)
     }

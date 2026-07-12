@@ -534,8 +534,8 @@ pub async fn resolve_permission_at_revision(
     caveat_hash: &str,
     revision: i64,
 ) -> Result<bool> {
-    if revision >= 0
-        && let Some(true) = lookup_derived_userset_index_at_revision(
+    if revision >= 0 {
+        match lookup_derived_userset_index_at_revision(
             storage,
             tenant_id,
             DEFAULT_DERIVED_USERSET_INDEX_ID,
@@ -547,9 +547,19 @@ pub async fn resolve_permission_at_revision(
             caveat_hash,
             revision as u64,
         )
-        .await?
-    {
-        return Ok(true);
+        .await
+        {
+            Ok(Some(true)) => return Ok(true),
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    tenant_id,
+                    revision,
+                    error = %error,
+                    "derived userset index lookup failed; falling back to revision resolver"
+                );
+            }
+        }
     }
 
     let current = current_authz_view_at_revision(storage, tenant_id, revision).await?;
@@ -630,8 +640,8 @@ pub async fn list_current_authz_objects_at_revision(
     revision: i64,
 ) -> Result<Vec<String>> {
     let mut objects = BTreeSet::new();
-    if revision >= 0
-        && let Some(index_objects) = list_derived_userset_objects_at_revision(
+    if revision >= 0 {
+        match list_derived_userset_objects_at_revision(
             storage,
             tenant_id,
             DEFAULT_DERIVED_USERSET_INDEX_ID,
@@ -642,9 +652,19 @@ pub async fn list_current_authz_objects_at_revision(
             caveat_hash,
             revision as u64,
         )
-        .await?
-    {
-        objects.extend(index_objects);
+        .await
+        {
+            Ok(Some(index_objects)) => objects.extend(index_objects),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    tenant_id,
+                    revision,
+                    error = %error,
+                    "derived userset object listing failed; falling back to revision resolver"
+                );
+            }
+        }
     }
 
     let filter = AuthzTupleFilter {

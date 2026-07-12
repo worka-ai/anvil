@@ -168,6 +168,14 @@ impl MeshControlService for AppState {
                 )
                 .await
                 .map_err(mesh_status)?;
+                crate::access_control::grant_internal_node_system_access(
+                    &self.persistence,
+                    &req.node_id,
+                    &claims.sub,
+                    "mesh control node creation",
+                )
+                .await
+                .map_err(mesh_status)?;
             }
             req.node_id
         };

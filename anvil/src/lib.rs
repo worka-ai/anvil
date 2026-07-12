@@ -51,20 +51,22 @@ pub async fn start_node_with_admin_listener(
         swarm.dial(multiaddr)?;
     }
 
-    let worker_state = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = anvil_core::worker::run(
-            worker_state.persistence.clone(),
-            worker_state.cluster.clone(),
-            worker_state.jwt_manager.clone(),
-            worker_state.object_manager.clone(),
-            worker_state.secret_keyring.clone(),
-        )
-        .await
-        {
-            error!("Worker process failed: {}", e);
-        }
-    });
+    if state.config.run_background_worker {
+        let worker_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = anvil_core::worker::run(
+                worker_state.persistence.clone(),
+                worker_state.cluster.clone(),
+                worker_state.jwt_manager.clone(),
+                worker_state.object_manager.clone(),
+                worker_state.secret_keyring.clone(),
+            )
+            .await
+            {
+                error!("Worker process failed: {}", e);
+            }
+        });
+    }
 
     // --- Services ---
     let state_clone = state.clone();

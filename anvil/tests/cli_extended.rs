@@ -139,7 +139,13 @@ async fn test_cli_auth_grant() {
     let (_grantee_client_id, _) = create_app(&cluster, &grantee_app_name).await;
 
     let output = run_cli(
-        &["auth", "grant", &grantee_app_name, "bucket:read", &bucket_name],
+        &[
+            "auth",
+            "grant",
+            &grantee_app_name,
+            "bucket:read",
+            &bucket_name,
+        ],
         config_dir.path(),
     )
     .await;
@@ -167,7 +173,13 @@ async fn test_cli_auth_revoke() {
     let (_grantee_client_id, _) = create_app(&cluster, &grantee_app_name).await;
 
     let output = run_cli(
-        &["auth", "grant", &grantee_app_name, "bucket:read", &bucket_name],
+        &[
+            "auth",
+            "grant",
+            &grantee_app_name,
+            "bucket:read",
+            &bucket_name,
+        ],
         config_dir.path(),
     )
     .await;
