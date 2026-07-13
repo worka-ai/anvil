@@ -5,57 +5,73 @@ use anvil::anvil_api::{
     ObjectMetadata, PutObjectRequest,
 };
 use futures_util::StreamExt;
-use std::path::Path;
 use std::time::Duration;
 use tonic::Code;
 
 use anvil_test_utils::*;
 
-fn count_corestore_shard_files(root: &Path, object_hash: &str) -> usize {
-    let _ = object_hash;
-    count_shard_files(&root.join("corestore").join("blocks").join("local-cache"))
-}
-
-fn count_shard_files(root: &Path) -> usize {
-    let mut count = 0;
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return 0;
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            count += count_shard_files(&path);
-        } else if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("shard-") && name.ends_with(".anb"))
-        {
-            count += 1;
-        }
+async fn count_docker_corestore_shard_files(cluster: &DockerTestCluster) -> usize {
+    let mut count = 0_usize;
+    for node in 1..=6 {
+        let output = cluster
+            .exec_node_output(
+                node,
+                &[
+                    "sh",
+                    "-lc",
+                    "find /var/lib/anvil/corestore/blocks/local-cache -name 'shard-*.anb' 2>/dev/null | wc -l",
+                ],
+            )
+            .await;
+        assert!(
+            output.status.success(),
+            "failed to count Docker shard files on node {node}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        count += String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<usize>()
+            .unwrap_or(0);
     }
-
     count
 }
 
-fn count_corestore_object_manifest_sidecars(root: &Path) -> usize {
-    let replicas_root = root.join("corestore").join("meta").join("replicas");
-    let Ok(entries) = std::fs::read_dir(&replicas_root) else {
-        return 0;
-    };
-
-    entries
-        .flatten()
-        .filter(|entry| entry.path().join("manifests").exists())
-        .count()
+async fn count_docker_corestore_object_manifest_sidecars(cluster: &DockerTestCluster) -> usize {
+    let mut count = 0_usize;
+    for node in 1..=6 {
+        let output = cluster
+            .exec_node_output(
+                node,
+                &[
+                    "sh",
+                    "-lc",
+                    "find /var/lib/anvil/corestore/meta/replicas -type d -name manifests 2>/dev/null | wc -l",
+                ],
+            )
+            .await;
+        assert!(
+            output.status.success(),
+            "failed to count Docker manifest sidecars on node {node}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        count += String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<usize>()
+            .unwrap_or(0);
+    }
+    count
 }
 
-fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
+fn native_mutation_context(
+    actor: &DockerTestStorageActor,
+    bucket_id: i64,
+    tag: &str,
+) -> NativeMutationContext {
     let nonce = uuid::Uuid::new_v4();
     NativeMutationContext {
-        tenant_id: 1,
+        tenant_id: actor.tenant_id,
         bucket_id,
-        principal: "2".to_string(),
+        principal: actor.app_id.clone(),
         request_id: format!("{tag}-{nonce}-request"),
         precondition: "none".to_string(),
         authz_zookie_optional: String::new(),
@@ -66,21 +82,18 @@ fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
 
 #[tokio::test]
 async fn test_distributed_put_and_get() {
-    let regions = ["test-region-1"; 6];
-    let mut cluster = TestCluster::new(&regions).await;
-    cluster.start_and_converge(Duration::from_secs(20)).await;
-
-    let token = cluster.token.clone();
-    let client_addr = cluster.grpc_addrs[0].clone();
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_storage_test_actor(&cluster, "grpc-distributed").await;
+    let token = actor.token.clone();
+    let client_addr = actor.grpc_addr.clone();
 
     let mut bucket_client = BucketServiceClient::connect(client_addr.clone())
         .await
         .unwrap();
-    let bucket_name = format!("test-bucket-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("dist-bucket");
     let mut create_bucket_req = tonic::Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
-        region: "test-region-1".to_string(),
-
+        region: actor.region.clone(),
         options: None,
     });
     create_bucket_req.metadata_mut().insert(
@@ -101,7 +114,11 @@ async fn test_distributed_put_and_get() {
     let metadata = ObjectMetadata {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
-        mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+        mutation_context: Some(native_mutation_context(
+            &actor,
+            bucket_id,
+            "object-metadata",
+        )),
         content_type: None,
         user_metadata_json: String::new(),
         storage_class: None,
@@ -134,7 +151,6 @@ async fn test_distributed_put_and_get() {
         object_key,
         version_id: Some(response.version_id),
         range: None,
-
         ..Default::default()
     };
     let mut get_object_req = tonic::Request::new(get_request);
@@ -163,24 +179,42 @@ async fn test_distributed_put_and_get() {
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let shards_found = count_corestore_shard_files(&cluster.storage_path, &object_hash);
-    let manifest_sidecars = count_corestore_object_manifest_sidecars(&cluster.storage_path);
+    let shards_found = count_docker_corestore_shard_files(&cluster).await;
+    let manifest_sidecars = count_docker_corestore_object_manifest_sidecars(&cluster).await;
     assert!(
         shards_found >= 6,
-        "expected CoreStore erasure shards for {object_hash} under {}",
-        cluster.storage_path.display()
+        "expected CoreStore erasure shards for {object_hash} in Docker cluster"
     );
     assert_eq!(
-        manifest_sidecars,
-        0,
-        "CoreStore object manifests must be reconstructed from shard placement, not final sidecar JSON under {}",
-        cluster.storage_path.display()
+        manifest_sidecars, 0,
+        "CoreStore object manifests must be reconstructed from shard placement, not final sidecar JSON"
     );
 }
 
+fn legacy_native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
+    let nonce = uuid::Uuid::new_v4();
+    NativeMutationContext {
+        tenant_id: 1,
+        bucket_id,
+        principal: "2".to_string(),
+        request_id: format!("{tag}-{nonce}-request"),
+        precondition: "none".to_string(),
+        authz_zookie_optional: String::new(),
+        idempotency_key: format!("{tag}-{nonce}-idempotency"),
+        transaction_id: None,
+    }
+}
+
+// Internal-only until the Docker harness has a one-node topology profile.
 #[tokio::test]
 async fn test_single_node_put() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    // Keep isolated: this covers the one-node tiny-object/inline write path;
+    // the shared default cluster is intentionally a six-node topology.
+    let mut cluster = isolated_test_cluster(
+        "verifies native object writes on a single-node topology",
+        &["test-region-1"],
+    )
+    .await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let token = cluster.token.clone();
@@ -189,7 +223,7 @@ async fn test_single_node_put() {
     let mut bucket_client = BucketServiceClient::connect(client_addr.clone())
         .await
         .unwrap();
-    let bucket_name = "single-node-bucket".to_string();
+    let bucket_name = unique_test_name("single-bucket");
     let mut create_bucket_req = tonic::Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
         region: "test-region-1".to_string(),
@@ -214,7 +248,7 @@ async fn test_single_node_put() {
     let metadata = ObjectMetadata {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
-        mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+        mutation_context: Some(legacy_native_mutation_context(bucket_id, "object-metadata")),
         content_type: None,
         user_metadata_json: String::new(),
         storage_class: None,
@@ -242,12 +276,22 @@ async fn test_single_node_put() {
 
 #[tokio::test]
 async fn test_multi_region_list_and_isolation() {
-    let mut cluster_east = TestCluster::new(&["us-east-1"]).await;
+    // Keep isolated: this test intentionally compares two independent regional
+    // clusters and asserts the west cluster has no east-cluster bucket state.
+    let mut cluster_east = isolated_test_cluster(
+        "compares two independent one-node regional clusters",
+        &["us-east-1"],
+    )
+    .await;
     cluster_east
         .start_and_converge(Duration::from_secs(5))
         .await;
 
-    let mut cluster_west = TestCluster::new(&["eu-west-1"]).await;
+    let mut cluster_west = isolated_test_cluster(
+        "compares two independent one-node regional clusters",
+        &["eu-west-1"],
+    )
+    .await;
     cluster_west
         .start_and_converge(Duration::from_secs(5))
         .await;
@@ -266,7 +310,7 @@ async fn test_multi_region_list_and_isolation() {
         .await
         .unwrap();
 
-    let bucket_name = "regional-bucket".to_string();
+    let bucket_name = unique_test_name("regional-bucket");
     let mut create_bucket_req = tonic::Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
         region: "us-east-1".to_string(),
@@ -288,7 +332,7 @@ async fn test_multi_region_list_and_isolation() {
     let metadata = ObjectMetadata {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
-        mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+        mutation_context: Some(legacy_native_mutation_context(bucket_id, "object-metadata")),
         content_type: None,
         user_metadata_json: String::new(),
         storage_class: None,

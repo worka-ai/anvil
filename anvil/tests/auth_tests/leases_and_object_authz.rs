@@ -2,15 +2,15 @@ use super::*;
 
 #[tokio::test]
 async fn test_coordination_task_lease_grpc_flow() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_storage_test_actor(&cluster, "lease-flow").await;
 
-    let token = cluster.token.clone();
-    let mut coordination_client = CoordinationServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let token = actor.token.clone();
+    let mut coordination_client = CoordinationServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
 
-    let task_id = "posthorn-delivery-alpha";
+    let task_id = unique_test_name("posthorn-delivery");
     let mut acquire = Request::new(AcquireTaskLeaseRequest {
         task_id: task_id.to_string(),
         task_kind: "posthorn_delivery".to_string(),
@@ -33,12 +33,9 @@ async fn test_coordination_task_lease_grpc_flow() {
     assert_eq!(acquired.fence_token, 1);
     assert_eq!(acquired.source_cursor_low, 10);
     assert_eq!(acquired.owner_label, "posthorn-worker-a");
-    assert_eq!(acquired.owner_tenant_id, 1);
+    assert_eq!(acquired.owner_tenant_id, actor.tenant_id);
     assert_eq!(acquired.owner_principal_kind, "app");
-    assert_eq!(
-        acquired.owner_principal_id.as_str(),
-        default_test_app_id(&cluster).await.as_str()
-    );
+    assert_eq!(acquired.owner_principal_id.as_str(), actor.app_id.as_str());
     assert!(!acquired.owner_actor_instance_id.is_empty());
     assert!(!acquired.lease_hash.is_empty());
 
@@ -106,11 +103,17 @@ async fn test_coordination_task_lease_grpc_flow() {
     );
 }
 
+// This test stays in-process because it needs a per-test task lease TTL config
+// that the shared Docker cluster cannot change for one test.
 #[tokio::test]
 async fn test_coordination_task_lease_security_invariants() {
-    let mut cluster = TestCluster::new_with_config(&["test-region-1"], |config| {
-        config.task_lease_ttl_secs = 30;
-    })
+    let mut cluster = isolated_test_cluster_with_config(
+        "uses a custom task lease TTL and asserts cross-tenant lease security invariants",
+        &["test-region-1"],
+        |config| {
+            config.task_lease_ttl_secs = 30;
+        },
+    )
     .await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
@@ -452,9 +455,15 @@ async fn test_coordination_task_lease_security_invariants() {
     assert_eq!(loser.message(), "LeaseHeld");
 }
 
+// This test stays in-process because it verifies rejected caveats do not
+// advance the storage-layer authz revision via cluster.states.persistence.
 #[tokio::test]
 async fn test_authz_tuple_rejects_invalid_caveat_hash_before_writing() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    let mut cluster = isolated_test_cluster(
+        "asserts invalid caveats leave a fresh authz revision at zero",
+        &["test-region-1"],
+    )
+    .await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let token = cluster.token.clone();
@@ -509,11 +518,12 @@ async fn test_authz_tuple_rejects_invalid_caveat_hash_before_writing() {
 
 #[tokio::test]
 async fn test_authz_permission_resolves_nested_usersets() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_storage_test_actor(&cluster, "authz-nested-usersets").await;
+    grant_docker_authz_realm(&cluster, &actor, "default").await;
 
-    let token = cluster.token.clone();
-    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let token = actor.token.clone();
+    let mut auth_client = AuthServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
     let tuples = [
@@ -642,18 +652,18 @@ async fn test_authz_permission_resolves_nested_usersets() {
 
 #[tokio::test]
 async fn test_object_read_uses_relationship_authorization_before_streaming_bytes() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_storage_test_actor(&cluster, "relationship-read").await;
 
-    let token = cluster.token.clone();
-    let bucket_name = "relationship-read-bucket".to_string();
+    let token = actor.token.clone();
+    let bucket_name = unique_test_name("rel-read");
     let object_key = "private/report.txt".to_string();
     let payload = b"relationship authorized object".to_vec();
 
-    let mut bucket_client = BucketServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut bucket_client = BucketServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
-    let mut object_client = ObjectServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut object_client = ObjectServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
     let mut create_bucket = Request::new(CreateBucketRequest {
@@ -677,8 +687,9 @@ async fn test_object_read_uses_relationship_authorization_before_streaming_bytes
                     bucket_name: bucket_name.clone(),
                     object_key: object_key.clone(),
                     mutation_context: Some(native_mutation_context(
+                        actor.tenant_id,
                         bucket_id,
-                        "2",
+                        &actor.app_id,
                         "object-metadata",
                     )),
                     content_type: None,
@@ -697,14 +708,10 @@ async fn test_object_read_uses_relationship_authorization_before_streaming_bytes
     add_bearer(&mut put_request, &token);
     object_client.put_object(put_request).await.unwrap();
 
-    let (_reader_app_id, reader_client_id, reader_client_secret) =
-        create_app_with_id(&cluster, "relationship-reader-app").await;
-    let reader_token = get_token(
-        &cluster.grpc_addrs[0],
-        &reader_client_id,
-        &reader_client_secret,
-    )
-    .await;
+    let reader = cluster
+        .create_actor_in_tenant(actor.tenant_id, "rel-reader", &[])
+        .await;
+    let reader_token = reader.token.clone();
 
     let mut denied_get = Request::new(GetObjectRequest {
         bucket_name: bucket_name.clone(),
@@ -718,9 +725,9 @@ async fn test_object_read_uses_relationship_authorization_before_streaming_bytes
     let denied = object_client.get_object(denied_get).await.unwrap_err();
     assert_eq!(denied.code(), tonic::Code::PermissionDenied);
 
-    grant_policy(
+    grant_docker_actor_policy(
         &cluster,
-        "relationship-reader-app",
+        &reader,
         "object:read",
         &format!("{bucket_name}/{object_key}"),
     )

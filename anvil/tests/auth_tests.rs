@@ -43,12 +43,10 @@ use anvil_test_utils::*;
 
 #[tokio::test]
 async fn grpc_error_responses_include_server_request_id() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let grpc_addr = cluster.grpc_addr_for_test("grpc-error-request-id");
 
-    let mut bucket_client = BucketServiceClient::connect(cluster.grpc_addrs[0].clone())
-        .await
-        .unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr).await.unwrap();
     let err = bucket_client
         .list_buckets(Request::new(ListBucketsRequest {}))
         .await
@@ -80,6 +78,43 @@ async fn create_app_with_id(cluster: &TestCluster, app_name: &str) -> (String, S
 async fn grant_policy(cluster: &TestCluster, app_name: &str, action: &str, resource: &str) {
     cluster
         .grant_application_policy("default", app_name, action, resource)
+        .await;
+}
+
+async fn grant_docker_actor_policy(
+    cluster: &DockerTestCluster,
+    actor: &DockerTestStorageActor,
+    action: &str,
+    resource: &str,
+) {
+    cluster
+        .grant_application_policy(actor.tenant_id, &actor.app_name, action, resource)
+        .await;
+}
+
+async fn grant_docker_authz_realm(
+    cluster: &DockerTestCluster,
+    actor: &DockerTestStorageActor,
+    realm_id: &str,
+) {
+    // Docker actors are provisioned with the complete default-realm grant set.
+    // Avoid replaying those six durable mutations in every authz test.
+    if realm_id == "default" {
+        return;
+    }
+    let policies = [
+        "authz:tuple_write",
+        "authz:tuple_read",
+        "authz:check",
+        "authz:watch",
+        "authz:schema_read",
+        "authz:schema_write",
+    ]
+    .into_iter()
+    .map(|action| (action.to_string(), realm_id.to_string()))
+    .collect::<Vec<_>>();
+    cluster
+        .grant_application_policies(actor.tenant_id, &actor.app_name, &policies)
         .await;
 }
 
@@ -144,36 +179,6 @@ async fn create_tenant(cluster: &TestCluster, tenant_name: &str) -> String {
         .tenant_id
 }
 
-async fn create_tenant_app_token(
-    cluster: &TestCluster,
-    tenant_name: &str,
-    app_name: &str,
-) -> (String, String, String) {
-    let tenant_id = create_tenant(cluster, tenant_name).await;
-    let (app_id, client_id, client_secret) = cluster
-        .create_application_with_id(&tenant_id, app_name)
-        .await;
-    let token = get_token(&cluster.grpc_addrs[0], &client_id, &client_secret).await;
-    (tenant_id, app_id, token)
-}
-
-async fn create_tenant_app_with_policy(
-    cluster: &TestCluster,
-    tenant_id: &str,
-    app_name: &str,
-    action: &str,
-    resource: &str,
-) -> (String, String, String, String) {
-    let (app_id, client_id, client_secret) = cluster
-        .create_application_with_id(tenant_id, app_name)
-        .await;
-    cluster
-        .grant_application_policy(tenant_id, app_name, action, resource)
-        .await;
-    let token = get_token(&cluster.grpc_addrs[0], &client_id, &client_secret).await;
-    (app_id, client_id, client_secret, token)
-}
-
 fn add_bearer<T>(request: &mut Request<T>, token: &str) {
     request.metadata_mut().insert(
         "authorization",
@@ -181,10 +186,15 @@ fn add_bearer<T>(request: &mut Request<T>, token: &str) {
     );
 }
 
-fn native_mutation_context(bucket_id: i64, principal: &str, tag: &str) -> NativeMutationContext {
+fn native_mutation_context(
+    tenant_id: i64,
+    bucket_id: i64,
+    principal: &str,
+    tag: &str,
+) -> NativeMutationContext {
     let nonce = uuid::Uuid::new_v4();
     NativeMutationContext {
-        tenant_id: 1,
+        tenant_id,
         bucket_id,
         principal: principal.to_string(),
         request_id: format!("{tag}-{nonce}-request"),
@@ -210,7 +220,9 @@ fn public_mutation_context(
 async fn put_test_object(
     object_client: &mut ObjectServiceClient<tonic::transport::Channel>,
     token: &str,
+    tenant_id: i64,
     bucket_id: i64,
+    principal_id: &str,
     bucket_name: &str,
     object_key: &str,
     payload: &[u8],
@@ -222,8 +234,9 @@ async fn put_test_object(
                     bucket_name: bucket_name.to_string(),
                     object_key: object_key.to_string(),
                     mutation_context: Some(native_mutation_context(
+                        tenant_id,
                         bucket_id,
-                        "2",
+                        principal_id,
                         "put-test-object",
                     )),
                     content_type: None,

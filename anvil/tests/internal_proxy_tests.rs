@@ -1,13 +1,14 @@
-use std::time::Duration;
-
 use anvil::anvil_api::internal_proxy_service_client::InternalProxyServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::{
-    GetObjectRequest, ProxyHeader, ProxyRequestChunk, ProxyRequestHeader, proxy_request_chunk,
-    proxy_response_chunk,
+    CreateBucketRequest, GetObjectRequest, ProxyHeader, ProxyRequestChunk, ProxyRequestHeader,
+    bucket_service_client::BucketServiceClient, proxy_request_chunk, proxy_response_chunk,
 };
 use anvil::auth::Claims;
-use anvil_test_utils::TestCluster;
+use anvil_test_utils::{
+    DockerTestCluster, DockerTestStorageActor, create_docker_storage_test_actor,
+    shared_docker_test_cluster, unique_test_name,
+};
 use futures_util::StreamExt;
 use tokio_stream::iter;
 
@@ -29,42 +30,67 @@ fn proxy_authz_context(claims: &Claims) -> Vec<u8> {
     anvil::services::internal_proxy::encode_proxy_authz_context(claims).unwrap()
 }
 
-async fn seeded_test_app_claims(cluster: &TestCluster, jti: Option<&str>) -> Claims {
-    let app = cluster.states[0]
-        .persistence
-        .get_app_by_client_id("test-app")
+fn canonical_proxy_host(
+    cluster: &DockerTestCluster,
+    actor: &DockerTestStorageActor,
+    bucket_name: &str,
+) -> String {
+    format!(
+        "{bucket_name}.{}.{}",
+        actor.tenant_id, cluster.public_region_host
+    )
+}
+
+async fn create_proxy_bucket(actor: &DockerTestStorageActor, prefix: &str) -> String {
+    let bucket_name = unique_test_name(prefix);
+    let mut bucket_client = BucketServiceClient::connect(actor.grpc_addr.clone())
         .await
-        .unwrap()
-        .expect("test-app is seeded before cluster start");
+        .unwrap();
+    bucket_client
+        .create_bucket(with_bearer(
+            tonic::Request::new(CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: actor.region.clone(),
+                options: None,
+            }),
+            &actor.token,
+        ))
+        .await
+        .unwrap();
+    bucket_name
+}
+
+fn actor_claims(actor: &DockerTestStorageActor, jti: Option<&str>) -> Claims {
     Claims {
-        sub: app.id.to_string(),
+        sub: actor.app_id.clone(),
         exp: usize::MAX,
-        tenant_id: app.tenant_id,
+        tenant_id: actor.tenant_id,
         jti: jti.map(ToOwned::to_owned),
     }
 }
 
 #[tokio::test]
 async fn internal_proxy_put_and_get_preserve_original_principal_authority() {
-    let mut cluster = TestCluster::new(&["eu-west-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(10)).await;
-    cluster.create_bucket("proxy-bucket", "eu-west-1").await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_storage_test_actor(&cluster, "proxy-bucket").await;
+    let bucket_name = create_proxy_bucket(&actor, "proxy-bucket").await;
 
-    let original_claims = seeded_test_app_claims(&cluster, Some("original-jti")).await;
+    let original_claims = actor_claims(&actor, Some("original-jti"));
     let internal_token = cluster.admin_token();
 
-    let mut proxy_client = InternalProxyServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut proxy_client = InternalProxyServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
+    let put_request_id = unique_test_name("proxy-put");
     let put_header = ProxyRequestHeader {
-        request_id: "proxy-put-1".to_string(),
-        idempotency_key: "proxy-put-1".to_string(),
+        request_id: put_request_id.clone(),
+        idempotency_key: put_request_id,
         principal_id: original_claims.sub.clone(),
         tenant_id: original_claims.tenant_id.to_string(),
-        bucket_name: "proxy-bucket".to_string(),
+        bucket_name: bucket_name.clone(),
         object_key: "via-proxy.txt".to_string(),
         method: "PUT".to_string(),
-        canonical_host: "proxy-bucket.tenant.eu-west-1.anvil-storage.test".to_string(),
+        canonical_host: canonical_proxy_host(&cluster, &actor, &bucket_name),
         canonical_path: "/via-proxy.txt".to_string(),
         bucket_locator_generation: 1,
         headers: vec![proxy_header("content-type", "text/plain")],
@@ -98,14 +124,14 @@ async fn internal_proxy_put_and_get_preserve_original_principal_authority() {
     assert!(put_response.next().await.is_none());
 
     let get_header = ProxyRequestHeader {
-        request_id: "proxy-get-1".to_string(),
+        request_id: unique_test_name("proxy-get"),
         idempotency_key: "".to_string(),
         principal_id: original_claims.sub.clone(),
         tenant_id: original_claims.tenant_id.to_string(),
-        bucket_name: "proxy-bucket".to_string(),
+        bucket_name: bucket_name.clone(),
         object_key: "via-proxy.txt".to_string(),
         method: "GET".to_string(),
-        canonical_host: "proxy-bucket.tenant.eu-west-1.anvil-storage.test".to_string(),
+        canonical_host: canonical_proxy_host(&cluster, &actor, &bucket_name),
         canonical_path: "/via-proxy.txt".to_string(),
         bucket_locator_generation: 1,
         headers: vec![],
@@ -145,20 +171,20 @@ async fn internal_proxy_put_and_get_preserve_original_principal_authority() {
     }
     assert_eq!(body, b"written through proxy");
 
-    let mut object_client = ObjectServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut object_client = ObjectServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
     let normal_get = object_client
         .get_object(with_bearer(
             tonic::Request::new(GetObjectRequest {
-                bucket_name: "proxy-bucket".to_string(),
+                bucket_name,
                 object_key: "via-proxy.txt".to_string(),
                 version_id: None,
                 range: None,
 
                 ..Default::default()
             }),
-            &cluster.token,
+            &actor.token,
         ))
         .await
         .unwrap()
@@ -176,27 +202,25 @@ async fn internal_proxy_put_and_get_preserve_original_principal_authority() {
 
 #[tokio::test]
 async fn internal_proxy_rejects_mismatched_original_principal() {
-    let mut cluster = TestCluster::new(&["eu-west-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(10)).await;
-    cluster
-        .create_bucket("proxy-auth-bucket", "eu-west-1")
-        .await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_storage_test_actor(&cluster, "proxy-auth-bucket").await;
+    let bucket_name = create_proxy_bucket(&actor, "proxy-auth-bucket").await;
 
-    let original_claims = seeded_test_app_claims(&cluster, None).await;
+    let original_claims = actor_claims(&actor, None);
     let internal_token = cluster.admin_token();
 
-    let mut proxy_client = InternalProxyServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut proxy_client = InternalProxyServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
     let get_header = ProxyRequestHeader {
-        request_id: "proxy-bad-principal".to_string(),
+        request_id: unique_test_name("proxy-bad-principal"),
         idempotency_key: "".to_string(),
         principal_id: "other-app".to_string(),
         tenant_id: original_claims.tenant_id.to_string(),
-        bucket_name: "proxy-auth-bucket".to_string(),
+        bucket_name: bucket_name.clone(),
         object_key: "missing.txt".to_string(),
         method: "GET".to_string(),
-        canonical_host: "proxy-auth-bucket.tenant.eu-west-1.anvil-storage.test".to_string(),
+        canonical_host: canonical_proxy_host(&cluster, &actor, &bucket_name),
         canonical_path: "/missing.txt".to_string(),
         bucket_locator_generation: 1,
         headers: vec![],
@@ -213,32 +237,28 @@ async fn internal_proxy_rejects_mismatched_original_principal() {
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
 }
+
 #[tokio::test]
 async fn internal_proxy_rejects_magic_internal_principal_without_system_realm_authority() {
-    let mut cluster = TestCluster::new(&["eu-west-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(10)).await;
-    cluster
-        .create_bucket("proxy-no-magic-bucket", "eu-west-1")
-        .await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_storage_test_actor(&cluster, "proxy-no-magic-bucket").await;
+    let bucket_name = create_proxy_bucket(&actor, "proxy-no-magic-bucket").await;
 
-    let original_claims = seeded_test_app_claims(&cluster, None).await;
-    let unauthorised_internal_token = cluster.states[0]
-        .jwt_manager
-        .mint_token("internal".to_string(), 0)
-        .unwrap();
+    let original_claims = actor_claims(&actor, None);
+    let unauthorised_internal_token = actor.token.clone();
 
-    let mut proxy_client = InternalProxyServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut proxy_client = InternalProxyServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
     let get_header = ProxyRequestHeader {
-        request_id: "proxy-no-magic".to_string(),
+        request_id: unique_test_name("proxy-no-magic"),
         idempotency_key: "".to_string(),
         principal_id: original_claims.sub.clone(),
         tenant_id: original_claims.tenant_id.to_string(),
-        bucket_name: "proxy-no-magic-bucket".to_string(),
+        bucket_name: bucket_name.clone(),
         object_key: "missing.txt".to_string(),
         method: "GET".to_string(),
-        canonical_host: "proxy-no-magic-bucket.tenant.eu-west-1.anvil-storage.test".to_string(),
+        canonical_host: canonical_proxy_host(&cluster, &actor, &bucket_name),
         canonical_path: "/missing.txt".to_string(),
         bucket_locator_generation: 1,
         headers: vec![],

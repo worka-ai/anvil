@@ -2,18 +2,24 @@ use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::{CreateBucketRequest, GetAccessTokenRequest};
 use anvil::auth::JwtManager;
-use std::time::Duration;
-
 use anvil_test_utils::*;
 
 #[tokio::test]
 async fn token_identifies_principal_and_zanzibar_grants_authorise_runtime_actions() {
-    let mut cluster = TestCluster::new(&["auth-test"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let (client_id, client_secret) = cluster
-        .create_application_with_policy("default", "auth-app", "bucket:create", "auth-test-*")
+    let grpc_addr = cluster.grpc_addr_for_test("auth-zanzibar");
+    let app_name = unique_test_name("auth-app");
+    let ungranted_app_name = unique_test_name("ungranted-app");
+    let bucket_name = unique_test_name("auth-bucket");
+    let tenant_id = cluster
+        .create_tenant(&unique_test_name("auth-tenant"))
+        .await;
+    let (app_id, client_id, client_secret) = cluster
+        .create_application_with_id(tenant_id, &app_name)
+        .await;
+    cluster
+        .grant_application_policy(tenant_id, &app_name, "bucket:create", &bucket_name)
         .await;
 
     let mut auth_client = AuthServiceClient::connect(grpc_addr.clone()).await.unwrap();
@@ -26,18 +32,18 @@ async fn token_identifies_principal_and_zanzibar_grants_authorise_runtime_action
         .unwrap()
         .into_inner();
     let token = token_res.access_token;
-    let claims = JwtManager::new(cluster.config.jwt_secret.clone())
+    let claims = JwtManager::new("docker-test-secret".to_string())
         .verify_token(&token)
         .unwrap();
-    assert!(claims.sub.parse::<i64>().is_ok());
-    assert_eq!(claims.tenant_id, 1);
+    assert_eq!(claims.sub, app_id);
+    assert_eq!(claims.tenant_id, tenant_id);
 
     let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
     let mut req_good = tonic::Request::new(CreateBucketRequest {
-        bucket_name: "auth-test-bucket".to_string(),
-        region: "auth-test".to_string(),
+        bucket_name: bucket_name.clone(),
+        region: "test-region-1".to_string(),
 
         options: None,
     });
@@ -51,8 +57,9 @@ async fn token_identifies_principal_and_zanzibar_grants_authorise_runtime_action
         "bucket creation should succeed through the Zanzibar grant written by the admin plane"
     );
 
-    let (unauthorised_client_id, unauthorised_client_secret) =
-        cluster.create_application("default", "ungranted-app").await;
+    let (_, unauthorised_client_id, unauthorised_client_secret) = cluster
+        .create_application_with_id(tenant_id, &ungranted_app_name)
+        .await;
     let unauthorised_token = auth_client
         .get_access_token(GetAccessTokenRequest {
             client_id: unauthorised_client_id,
@@ -63,8 +70,8 @@ async fn token_identifies_principal_and_zanzibar_grants_authorise_runtime_action
         .into_inner()
         .access_token;
     let mut req_bad = tonic::Request::new(CreateBucketRequest {
-        bucket_name: "unauthorized-bucket".to_string(),
-        region: "auth-test".to_string(),
+        bucket_name: unique_test_name("unauth-bucket"),
+        region: "test-region-1".to_string(),
         options: None,
     });
     req_bad.metadata_mut().insert(

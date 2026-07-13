@@ -2,20 +2,20 @@ use super::*;
 
 #[tokio::test]
 async fn test_object_list_and_versions_filter_entries_by_read_relationship() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_storage_test_actor(&cluster, "object-list-authz").await;
 
-    let token = cluster.token.clone();
-    let bucket_name = "relationship-list-bucket".to_string();
+    let token = actor.token.clone();
+    let bucket_name = unique_test_name("rel-list");
     let allowed_key = "docs/allowed.txt".to_string();
     let denied_key = "docs/denied.txt".to_string();
     let visible_nested_key = "visible/nested.txt".to_string();
     let hidden_nested_key = "hidden/nested.txt".to_string();
 
-    let mut bucket_client = BucketServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut bucket_client = BucketServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
-    let mut object_client = ObjectServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut object_client = ObjectServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
     let mut create_bucket = Request::new(CreateBucketRequest {
@@ -35,7 +35,9 @@ async fn test_object_list_and_versions_filter_entries_by_read_relationship() {
     put_test_object(
         &mut object_client,
         &token,
+        actor.tenant_id,
         bucket_id,
+        &actor.app_id,
         &bucket_name,
         &allowed_key,
         b"allowed-v1",
@@ -44,7 +46,9 @@ async fn test_object_list_and_versions_filter_entries_by_read_relationship() {
     put_test_object(
         &mut object_client,
         &token,
+        actor.tenant_id,
         bucket_id,
+        &actor.app_id,
         &bucket_name,
         &denied_key,
         b"denied",
@@ -53,7 +57,9 @@ async fn test_object_list_and_versions_filter_entries_by_read_relationship() {
     put_test_object(
         &mut object_client,
         &token,
+        actor.tenant_id,
         bucket_id,
+        &actor.app_id,
         &bucket_name,
         &allowed_key,
         b"allowed-v2",
@@ -62,7 +68,9 @@ async fn test_object_list_and_versions_filter_entries_by_read_relationship() {
     put_test_object(
         &mut object_client,
         &token,
+        actor.tenant_id,
         bucket_id,
+        &actor.app_id,
         &bucket_name,
         &visible_nested_key,
         b"visible",
@@ -71,28 +79,23 @@ async fn test_object_list_and_versions_filter_entries_by_read_relationship() {
     put_test_object(
         &mut object_client,
         &token,
+        actor.tenant_id,
         bucket_id,
+        &actor.app_id,
         &bucket_name,
         &hidden_nested_key,
         b"hidden",
     )
     .await;
 
-    let (_reader_app_id, reader_client_id, reader_client_secret) =
-        create_app_with_id(&cluster, "relationship-list-reader-app").await;
-    grant_policy(
-        &cluster,
-        "relationship-list-reader-app",
-        "object:list",
-        &bucket_name,
-    )
-    .await;
-    let reader_token = get_token(
-        &cluster.grpc_addrs[0],
-        &reader_client_id,
-        &reader_client_secret,
-    )
-    .await;
+    let reader = cluster
+        .create_actor_in_tenant(
+            actor.tenant_id,
+            "rel-list-reader",
+            &[("object:list", bucket_name.as_str())],
+        )
+        .await;
+    let reader_token = reader.token.clone();
 
     let mut ungranted_list = Request::new(ListObjectsRequest {
         bucket_name: bucket_name.clone(),
@@ -113,9 +116,9 @@ async fn test_object_list_and_versions_filter_entries_by_read_relationship() {
     assert!(ungranted_list.common_prefixes.is_empty());
 
     for key in [&allowed_key, &visible_nested_key] {
-        grant_policy(
+        grant_docker_actor_policy(
             &cluster,
-            "relationship-list-reader-app",
+            &reader,
             "object:read",
             &format!("{bucket_name}/{key}"),
         )
@@ -200,9 +203,15 @@ async fn test_object_list_and_versions_filter_entries_by_read_relationship() {
     assert!(!list_versions.is_truncated);
 }
 
+// This test stays in-process because it injects namespace watch records through
+// cluster.states.storage and asserts exact watch cursor positions.
 #[tokio::test]
 async fn test_authz_namespace_watch_streams_snapshot_and_new_events() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    let mut cluster = isolated_test_cluster(
+        "injects namespace watch records and asserts exact cursor positions",
+        &["test-region-1"],
+    )
+    .await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     append_authz_namespace_watch_record(
@@ -265,10 +274,11 @@ async fn test_authz_namespace_watch_streams_snapshot_and_new_events() {
 
 #[tokio::test]
 async fn test_apply_authz_schema_persists_and_emits_namespace_watch() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_storage_test_actor(&cluster, "authz-schema-apply").await;
+    grant_docker_authz_realm(&cluster, &actor, "default").await;
 
-    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut auth_client = AuthServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
     let schema = AuthzNamespaceSchema {
@@ -302,7 +312,7 @@ async fn test_apply_authz_schema_persists_and_emits_namespace_watch() {
         namespaces: vec![schema],
         reason: "test schema apply".to_string(),
     });
-    add_bearer(&mut apply, &cluster.token);
+    add_bearer(&mut apply, &actor.token);
     let applied = auth_client
         .apply_authz_schema(apply)
         .await
@@ -320,7 +330,7 @@ async fn test_apply_authz_schema_persists_and_emits_namespace_watch() {
         schema_id: String::new(),
         schema_revision: None,
     });
-    add_bearer(&mut get_one, &cluster.token);
+    add_bearer(&mut get_one, &actor.token);
     let fetched = auth_client
         .get_authz_schema(get_one)
         .await
@@ -337,7 +347,7 @@ async fn test_apply_authz_schema_persists_and_emits_namespace_watch() {
         after_cursor_low: 0,
         after_cursor_high: 0,
     });
-    add_bearer(&mut watch_req, &cluster.token);
+    add_bearer(&mut watch_req, &actor.token);
     let mut stream = auth_client
         .watch_authz_namespace(watch_req)
         .await
@@ -356,18 +366,25 @@ async fn test_apply_authz_schema_persists_and_emits_namespace_watch() {
 
 #[tokio::test]
 async fn test_authz_schema_put_bind_and_realm_scoped_tuples() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_storage_test_actor(&cluster, "authz-schema-realm").await;
+    let tenant_resource = format!("tenant:{}", actor.tenant_id);
+    grant_docker_actor_policy(&cluster, &actor, "tenant:manage", &tenant_resource).await;
+    grant_docker_actor_policy(&cluster, &actor, "authz:schema_write", "schema:default").await;
+    grant_docker_actor_policy(&cluster, &actor, "authz:schema_read", "schema:default").await;
+    grant_docker_authz_realm(&cluster, &actor, "realm_a").await;
+    grant_docker_authz_realm(&cluster, &actor, "realm_b").await;
 
-    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut auth_client = AuthServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
+    let tenant_id = actor.tenant_id.to_string();
     let scope_a = AuthzScope {
-        anvil_storage_tenant_id: "1".to_string(),
+        anvil_storage_tenant_id: tenant_id.clone(),
         authz_realm_id: "realm_a".to_string(),
     };
     let scope_b = AuthzScope {
-        anvil_storage_tenant_id: "1".to_string(),
+        anvil_storage_tenant_id: tenant_id.clone(),
         authz_realm_id: "realm_b".to_string(),
     };
     let schema = AuthzNamespaceSchema {
@@ -384,12 +401,12 @@ async fn test_authz_schema_put_bind_and_realm_scoped_tuples() {
     };
 
     let mut put = Request::new(PutAuthzSchemaRequest {
-        anvil_storage_tenant_id: "1".to_string(),
+        anvil_storage_tenant_id: tenant_id,
         schema_id: "default".to_string(),
         namespaces: vec![schema],
         reason: "realm schema test".to_string(),
     });
-    add_bearer(&mut put, &cluster.token);
+    add_bearer(&mut put, &actor.token);
     let schema_ref = auth_client
         .put_authz_schema(put)
         .await
@@ -408,7 +425,7 @@ async fn test_authz_schema_put_bind_and_realm_scoped_tuples() {
             expected_binding_generation: None,
             reason: "bind test schema".to_string(),
         });
-        add_bearer(&mut bind, &cluster.token);
+        add_bearer(&mut bind, &actor.token);
         let binding = auth_client
             .bind_authz_schema(bind)
             .await
@@ -420,7 +437,7 @@ async fn test_authz_schema_put_bind_and_realm_scoped_tuples() {
     let mut get_binding = Request::new(GetAuthzSchemaBindingRequest {
         scope: Some(scope_a.clone()),
     });
-    add_bearer(&mut get_binding, &cluster.token);
+    add_bearer(&mut get_binding, &actor.token);
     let binding = auth_client
         .get_authz_schema_binding(get_binding)
         .await
@@ -442,7 +459,7 @@ async fn test_authz_schema_put_bind_and_realm_scoped_tuples() {
         reason: "realm tuple".to_string(),
         scope: Some(scope_a.clone()),
     });
-    add_bearer(&mut write, &cluster.token);
+    add_bearer(&mut write, &actor.token);
     auth_client.write_authz_tuple(write).await.unwrap();
 
     let mut check_a = Request::new(CheckPermissionRequest {
@@ -456,7 +473,7 @@ async fn test_authz_schema_put_bind_and_realm_scoped_tuples() {
         zookie: String::new(),
         scope: Some(scope_a),
     });
-    add_bearer(&mut check_a, &cluster.token);
+    add_bearer(&mut check_a, &actor.token);
     assert!(
         auth_client
             .check_permission(check_a)
@@ -477,7 +494,7 @@ async fn test_authz_schema_put_bind_and_realm_scoped_tuples() {
         zookie: String::new(),
         scope: Some(scope_b),
     });
-    add_bearer(&mut check_b, &cluster.token);
+    add_bearer(&mut check_b, &actor.token);
     assert!(
         !auth_client
             .check_permission(check_b)
@@ -488,9 +505,9 @@ async fn test_authz_schema_put_bind_and_realm_scoped_tuples() {
     );
 }
 
-fn reserved_system_realm_scope() -> AuthzScope {
+fn reserved_system_realm_scope(tenant_id: i64) -> AuthzScope {
     AuthzScope {
-        anvil_storage_tenant_id: "1".to_string(),
+        anvil_storage_tenant_id: tenant_id.to_string(),
         authz_realm_id: "_anvil/system".to_string(),
     }
 }
@@ -509,13 +526,13 @@ fn assert_reserved_authz_status<T>(result: Result<tonic::Response<T>, tonic::Sta
 
 #[tokio::test]
 async fn test_public_authz_apis_reject_reserved_system_realm_scope() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_storage_test_actor(&cluster, "authz-reserved-realm").await;
 
-    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut auth_client = AuthServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
-    let scope = reserved_system_realm_scope();
+    let scope = reserved_system_realm_scope(actor.tenant_id);
 
     let mut write = Request::new(WriteAuthzTupleRequest {
         namespace: "document".to_string(),
@@ -528,7 +545,7 @@ async fn test_public_authz_apis_reject_reserved_system_realm_scope() {
         reason: "reserved realm test".to_string(),
         scope: Some(scope.clone()),
     });
-    add_bearer(&mut write, &cluster.token);
+    add_bearer(&mut write, &actor.token);
     assert_reserved_authz_status(auth_client.write_authz_tuple(write).await);
 
     let mut write_batch = Request::new(WriteAuthzTuplesRequest {
@@ -537,7 +554,7 @@ async fn test_public_authz_apis_reject_reserved_system_realm_scope() {
         )],
         scope: Some(scope.clone()),
     });
-    add_bearer(&mut write_batch, &cluster.token);
+    add_bearer(&mut write_batch, &actor.token);
     assert_reserved_authz_status(auth_client.write_authz_tuples(write_batch).await);
 
     let mut read = Request::new(ReadAuthzTuplesRequest {
@@ -553,14 +570,14 @@ async fn test_public_authz_apis_reject_reserved_system_realm_scope() {
         page_token: String::new(),
         scope: Some(scope.clone()),
     });
-    add_bearer(&mut read, &cluster.token);
+    add_bearer(&mut read, &actor.token);
     assert_reserved_authz_status(auth_client.read_authz_tuples(read).await);
 
     let mut check = Request::new(CheckPermissionRequest {
         scope: Some(scope.clone()),
         ..check_permission_request("document", "alpha", "viewer", "user", "alice", "latest", "")
     });
-    add_bearer(&mut check, &cluster.token);
+    add_bearer(&mut check, &actor.token);
     assert_reserved_authz_status(auth_client.check_permission(check).await);
 
     let mut check_many = Request::new(CheckPermissionsRequest {
@@ -569,7 +586,7 @@ async fn test_public_authz_apis_reject_reserved_system_realm_scope() {
             ..check_permission_request("document", "alpha", "viewer", "user", "alice", "latest", "")
         }],
     });
-    add_bearer(&mut check_many, &cluster.token);
+    add_bearer(&mut check_many, &actor.token);
     assert_reserved_authz_status(auth_client.check_permissions(check_many).await);
 
     let mut list_objects = Request::new(ListAuthzObjectsRequest {
@@ -584,7 +601,7 @@ async fn test_public_authz_apis_reject_reserved_system_realm_scope() {
         page_token: String::new(),
         scope: Some(scope.clone()),
     });
-    add_bearer(&mut list_objects, &cluster.token);
+    add_bearer(&mut list_objects, &actor.token);
     assert_reserved_authz_status(auth_client.list_authz_objects(list_objects).await);
 
     let mut list_subjects = Request::new(ListAuthzSubjectsRequest {
@@ -598,7 +615,7 @@ async fn test_public_authz_apis_reject_reserved_system_realm_scope() {
         page_token: String::new(),
         scope: Some(scope.clone()),
     });
-    add_bearer(&mut list_subjects, &cluster.token);
+    add_bearer(&mut list_subjects, &actor.token);
     assert_reserved_authz_status(auth_client.list_authz_subjects(list_subjects).await);
 
     let mut bind = Request::new(BindAuthzSchemaRequest {
@@ -607,13 +624,13 @@ async fn test_public_authz_apis_reject_reserved_system_realm_scope() {
         expected_binding_generation: None,
         reason: "reserved realm test".to_string(),
     });
-    add_bearer(&mut bind, &cluster.token);
+    add_bearer(&mut bind, &actor.token);
     assert_reserved_authz_status(auth_client.bind_authz_schema(bind).await);
 
     let mut get_binding = Request::new(GetAuthzSchemaBindingRequest {
         scope: Some(scope.clone()),
     });
-    add_bearer(&mut get_binding, &cluster.token);
+    add_bearer(&mut get_binding, &actor.token);
     assert_reserved_authz_status(auth_client.get_authz_schema_binding(get_binding).await);
 
     let mut watch = Request::new(WatchAuthzTupleLogRequest {
@@ -621,13 +638,19 @@ async fn test_public_authz_apis_reject_reserved_system_realm_scope() {
         namespace: "document".to_string(),
         scope: Some(scope),
     });
-    add_bearer(&mut watch, &cluster.token);
+    add_bearer(&mut watch, &actor.token);
     assert_reserved_authz_status(auth_client.watch_authz_tuple_log(watch).await);
 }
 
+// This test stays in-process because it injects derived-lag watch records
+// through cluster.states.storage and asserts exact watch cursor positions.
 #[tokio::test]
 async fn test_authz_derived_lag_watch_streams_snapshot_and_new_events() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    let mut cluster = isolated_test_cluster(
+        "injects derived lag watch records and asserts exact cursor positions",
+        &["test-region-1"],
+    )
+    .await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     append_authz_derived_lag_watch_record(
@@ -691,9 +714,15 @@ async fn test_authz_derived_lag_watch_streams_snapshot_and_new_events() {
     assert_eq!(live.generation, 2);
 }
 
+// This test stays in-process because it opens the local CoreMetaStore path and
+// deletes a derived-userset row to force repair.
 #[tokio::test]
 async fn test_repair_authz_derived_index_rebuilds_from_tuple_log() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    let mut cluster = isolated_test_cluster(
+        "deletes the global derived-userset index row and asserts exact repair revisions",
+        &["test-region-1"],
+    )
+    .await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let token = cluster.token.clone();

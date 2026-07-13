@@ -1,9 +1,10 @@
 use super::*;
 
+// This test stays in-process because it reads bucket state through
+// cluster.states.persistence and directly toggles the generated public tuple.
 #[tokio::test]
 async fn test_set_public_access_and_get() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
     let route_tenant_id = cluster.states[0]
         .persistence
         .get_tenant_by_name("default")
@@ -12,6 +13,7 @@ async fn test_set_public_access_and_get() {
         .unwrap()
         .id
         .to_string();
+    let route_tenant_i64 = route_tenant_id.parse().unwrap();
 
     let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
         .await
@@ -25,7 +27,7 @@ async fn test_set_public_access_and_get() {
 
     let token = cluster.token.clone();
     let principal_id = default_test_app_id(&cluster).await;
-    let bucket_name = "public-access-bucket".to_string();
+    let bucket_name = unique_test_name("public-access");
     let object_key = "public-object".to_string();
 
     let mut create_bucket_req = tonic::Request::new(CreateBucketRequest {
@@ -50,6 +52,7 @@ async fn test_set_public_access_and_get() {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         mutation_context: Some(native_mutation_context(
+            route_tenant_i64,
             bucket_id,
             &principal_id,
             "object-metadata",
@@ -188,21 +191,29 @@ async fn test_set_public_access_and_get() {
     assert!(res_2.is_err());
 }
 
+// This test stays in-process because it starts without a new token and restarts
+// the cluster to verify rotated secrets survive local persistence.
 #[tokio::test]
 async fn test_reset_app_secret() {
-    let mut cluster = TestCluster::new(&["eu-west-1"]).await;
+    let mut cluster = isolated_test_cluster(
+        "uses no-new-token startup and restarts the cluster after rotating a secret",
+        &["eu-west-1"],
+    )
+    .await;
     cluster
         .start_and_converge_no_new_token(Duration::from_secs(5), false)
         .await;
 
-    let app_name = "app-to-reset";
+    let app_name = unique_test_name("app-reset");
 
     // 1. Create an app and get original credentials
-    let (client_id, original_secret) = create_app(&cluster, app_name).await;
+    let (client_id, original_secret) = create_app(&cluster, &app_name).await;
 
     // Grant it permissions and rotate the secret through the network admin API.
-    grant_policy(&cluster, app_name, "bucket:list", "buckets").await;
-    let (_client_id, new_secret) = cluster.rotate_application_secret("default", app_name).await;
+    grant_policy(&cluster, &app_name, "bucket:list", "buckets").await;
+    let (_client_id, new_secret) = cluster
+        .rotate_application_secret("default", &app_name)
+        .await;
 
     // 3. Verify the secret has changed
     assert_ne!(original_secret, new_secret);
@@ -234,31 +245,28 @@ async fn test_reset_app_secret() {
 
 #[tokio::test]
 async fn test_service_set_public_access() {
-    let mut cluster = TestCluster::new_with_config(&["test-region-1"], |config| {
-        config.public_region_base_domain = "anvil-storage.test".to_string();
-    })
-    .await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_storage_test_actor(&cluster, "service-public-access").await;
 
-    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut auth_client = AuthServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
-    let mut bucket_client = BucketServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut bucket_client = BucketServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
-    let mut object_client = ObjectServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut object_client = ObjectServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
 
-    let token = cluster.token.clone();
-    let principal_id = default_test_app_id(&cluster).await;
-    let bucket_name = "cli-public-bucket".to_string();
+    let token = actor.token.clone();
+    let principal_id = actor.app_id.clone();
+    let bucket_name = unique_test_name("cli-public");
     let object_key = "cli-public-object".to_string();
 
     // 1. Create a bucket and upload an object to it.
     let mut create_bucket_req = tonic::Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
-        region: "test-region-1".to_string(),
+        region: actor.region.clone(),
 
         options: None,
     });
@@ -277,6 +285,7 @@ async fn test_service_set_public_access() {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         mutation_context: Some(native_mutation_context(
+            actor.tenant_id,
             bucket_id,
             &principal_id,
             "object-metadata",
@@ -306,13 +315,19 @@ async fn test_service_set_public_access() {
 
     // 2. Verify the object is NOT public yet.
     let object_url = format!(
-        "{}/default/{}/{}",
-        cluster.grpc_addrs[0], bucket_name, object_key
+        "{}/{}/{}/{}",
+        actor.grpc_addr,
+        actor
+            .tenant_name
+            .as_deref()
+            .expect("new Docker storage actor has a routeable tenant name"),
+        bucket_name,
+        object_key
     );
     let http_client = reqwest::Client::new();
     let resp_before = http_client
         .get(&object_url)
-        .header("host", "test-region-1.anvil-storage.test")
+        .header("host", &cluster.public_region_host)
         .send()
         .await
         .unwrap();
@@ -335,13 +350,12 @@ async fn test_service_set_public_access() {
     );
     auth_client.set_public_access(set_public_req).await.unwrap();
 
-    // 4. Verify the object IS public now, with retries for cache consistency.
+    // 4. Verify the object IS public now, polling briefly for cache consistency.
     let mut resp_after = None;
-    for i in 0..5 {
-        // Retry up to 5 times
+    for _ in 0..20 {
         let resp = http_client
             .get(&object_url)
-            .header("host", "test-region-1.anvil-storage.test")
+            .header("host", &cluster.public_region_host)
             .send()
             .await
             .unwrap();
@@ -349,8 +363,7 @@ async fn test_service_set_public_access() {
             resp_after = Some(resp);
             break;
         }
-        tokio::time::sleep(Duration::from_millis(500)).await; // Wait 500ms before retrying
-        println!("Retry {} for public access check...", i + 1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let resp_after =
         resp_after.expect("Object should be public after CLI command, but never became public");

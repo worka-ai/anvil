@@ -318,14 +318,10 @@ fn admin_rpc_relation_mapping_covers_every_admin_rpc() {
         })
         .collect();
 
-    let admin =
-        std::fs::read_to_string(repo_root().join("anvil-core/src/services/admin.rs")).unwrap();
-    let mapping_body = admin
-        .split("pub fn admin_rpc_relation_mapping")
-        .nth(1)
-        .and_then(|tail| tail.split("\n}").next())
-        .expect("admin_rpc_relation_mapping body");
-    let mapped: std::collections::BTreeSet<_> = mapping_body
+    let mapping =
+        std::fs::read_to_string(repo_root().join("anvil-core/src/services/admin/rpc_mapping.rs"))
+            .unwrap();
+    let mapped: std::collections::BTreeSet<_> = mapping
         .split('"')
         .skip(1)
         .step_by(2)

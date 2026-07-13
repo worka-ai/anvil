@@ -7,33 +7,41 @@ use anvil::anvil_api::{
 
 #[tokio::test]
 async fn stream_capabilities_are_zanzibar_grants_not_object_or_scope_bypasses() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
-    cluster
-        .create_bucket("stream-auth-bucket", "test-region-1")
-        .await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_storage_test_actor(&cluster, "stream-auth").await;
+    let bucket_name = unique_test_name("stream-auth");
+    let stream_key = "events/audit".to_string();
 
-    let bucket = cluster.states[0]
-        .persistence
-        .get_bucket_by_name(1, "stream-auth-bucket")
+    let mut bucket_client = BucketServiceClient::connect(actor.grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut create_bucket = Request::new(CreateBucketRequest {
+        bucket_name: bucket_name.clone(),
+        region: actor.region.clone(),
+        options: None,
+    });
+    add_bearer(&mut create_bucket, &actor.token);
+    let bucket_id = bucket_client
+        .create_bucket(create_bucket)
         .await
         .unwrap()
-        .expect("bucket exists");
+        .into_inner()
+        .bucket_id;
 
-    let owner_app_id = default_test_app_id(&cluster).await;
-    let mut owner_stream = StreamServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut owner_stream = StreamServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
     let mut create = Request::new(CreateAppendStreamRequest {
-        bucket_name: "stream-auth-bucket".to_string(),
-        stream_key: "events/audit".to_string(),
+        bucket_name: bucket_name.clone(),
+        stream_key: stream_key.clone(),
         mutation_context: Some(native_mutation_context(
-            bucket.id,
-            &owner_app_id,
+            actor.tenant_id,
+            bucket_id,
+            &actor.app_id,
             "create-stream-auth",
         )),
     });
-    add_bearer(&mut create, &cluster.token);
+    add_bearer(&mut create, &actor.token);
     let created = owner_stream
         .create_stream(create)
         .await
@@ -41,22 +49,23 @@ async fn stream_capabilities_are_zanzibar_grants_not_object_or_scope_bypasses() 
         .into_inner();
     assert!(!created.stream_id.is_empty());
 
-    let (limited_app_id, limited_client_id, limited_secret) =
-        create_app_with_id(&cluster, "stream-limited-app").await;
-    let limited_token =
-        get_token(&cluster.grpc_addrs[0], &limited_client_id, &limited_secret).await;
-    let mut limited_stream = StreamServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let limited = cluster
+        .create_actor_in_tenant(actor.tenant_id, "stream-limited", &[])
+        .await;
+    let limited_token = limited.token.clone();
+    let mut limited_stream = StreamServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
 
     let mut denied_append = Request::new(AppendStreamRecordRequest {
-        bucket_name: "stream-auth-bucket".to_string(),
-        stream_key: "events/audit".to_string(),
+        bucket_name: bucket_name.clone(),
+        stream_key: stream_key.clone(),
         stream_id: created.stream_id.clone(),
         payload: b"not yet".to_vec(),
         mutation_context: Some(native_mutation_context(
-            bucket.id,
-            &limited_app_id,
+            limited.tenant_id,
+            bucket_id,
+            &limited.app_id,
             "denied-stream-append",
         )),
         content_type: Some("text/plain".to_string()),
@@ -71,8 +80,8 @@ async fn stream_capabilities_are_zanzibar_grants_not_object_or_scope_bypasses() 
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
 
     let mut denied_read = Request::new(ReadAppendStreamRequest {
-        bucket_name: "stream-auth-bucket".to_string(),
-        stream_key: "events/audit".to_string(),
+        bucket_name: bucket_name.clone(),
+        stream_key: stream_key.clone(),
         stream_id: created.stream_id.clone(),
         after_sequence: 0,
         limit: 10,
@@ -87,22 +96,23 @@ async fn stream_capabilities_are_zanzibar_grants_not_object_or_scope_bypasses() 
         .expect_err("limited app must not read before stream grant");
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
 
-    grant_policy(
+    grant_docker_actor_policy(
         &cluster,
-        "stream-limited-app",
+        &limited,
         "stream:append",
-        "stream-auth-bucket/events/audit",
+        &format!("{bucket_name}/{stream_key}"),
     )
     .await;
 
     let mut append = Request::new(AppendStreamRecordRequest {
-        bucket_name: "stream-auth-bucket".to_string(),
-        stream_key: "events/audit".to_string(),
+        bucket_name: bucket_name.clone(),
+        stream_key: stream_key.clone(),
         stream_id: created.stream_id.clone(),
         payload: b"granted append".to_vec(),
         mutation_context: Some(native_mutation_context(
-            bucket.id,
-            &limited_app_id,
+            limited.tenant_id,
+            bucket_id,
+            &limited.app_id,
             "granted-stream-append",
         )),
         content_type: Some("text/plain".to_string()),
@@ -118,8 +128,8 @@ async fn stream_capabilities_are_zanzibar_grants_not_object_or_scope_bypasses() 
     assert_eq!(appended.record_sequence, 1);
 
     let mut still_denied_read = Request::new(ReadAppendStreamRequest {
-        bucket_name: "stream-auth-bucket".to_string(),
-        stream_key: "events/audit".to_string(),
+        bucket_name: bucket_name.clone(),
+        stream_key: stream_key.clone(),
         stream_id: created.stream_id.clone(),
         after_sequence: 0,
         limit: 10,
@@ -134,17 +144,17 @@ async fn stream_capabilities_are_zanzibar_grants_not_object_or_scope_bypasses() 
         .expect_err("append authority must not imply read authority");
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
 
-    grant_policy(
+    grant_docker_actor_policy(
         &cluster,
-        "stream-limited-app",
+        &limited,
         "stream:read",
-        "stream-auth-bucket/events/audit",
+        &format!("{bucket_name}/{stream_key}"),
     )
     .await;
 
     let mut read = Request::new(ReadAppendStreamRequest {
-        bucket_name: "stream-auth-bucket".to_string(),
-        stream_key: "events/audit".to_string(),
+        bucket_name: bucket_name.clone(),
+        stream_key: stream_key.clone(),
         stream_id: created.stream_id.clone(),
         after_sequence: 0,
         limit: 10,
@@ -158,12 +168,13 @@ async fn stream_capabilities_are_zanzibar_grants_not_object_or_scope_bypasses() 
     assert_eq!(read.records[0].payload, b"granted append".to_vec());
 
     let mut denied_seal = Request::new(SealAppendStreamSegmentRequest {
-        bucket_name: "stream-auth-bucket".to_string(),
-        stream_key: "events/audit".to_string(),
+        bucket_name: bucket_name.clone(),
+        stream_key: stream_key.clone(),
         stream_id: created.stream_id.clone(),
         mutation_context: Some(native_mutation_context(
-            bucket.id,
-            &limited_app_id,
+            limited.tenant_id,
+            bucket_id,
+            &limited.app_id,
             "denied-stream-seal",
         )),
         precondition: None,
@@ -175,21 +186,22 @@ async fn stream_capabilities_are_zanzibar_grants_not_object_or_scope_bypasses() 
         .expect_err("append and read authority must not imply seal authority");
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
 
-    grant_policy(
+    grant_docker_actor_policy(
         &cluster,
-        "stream-limited-app",
+        &limited,
         "stream:seal_segment",
-        "stream-auth-bucket/events/audit",
+        &format!("{bucket_name}/{stream_key}"),
     )
     .await;
 
     let mut seal = Request::new(SealAppendStreamSegmentRequest {
-        bucket_name: "stream-auth-bucket".to_string(),
-        stream_key: "events/audit".to_string(),
+        bucket_name,
+        stream_key,
         stream_id: created.stream_id,
         mutation_context: Some(native_mutation_context(
-            bucket.id,
-            &limited_app_id,
+            limited.tenant_id,
+            bucket_id,
+            &limited.app_id,
             "granted-stream-seal",
         )),
         precondition: None,

@@ -2,52 +2,59 @@ use super::*;
 
 #[tokio::test]
 async fn test_grant_and_revoke_access() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_storage_test_actor(&cluster, "grant-revoke").await;
 
-    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut auth_client = AuthServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
 
-    let mut bucket_client = BucketServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut bucket_client = BucketServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
-    let mut object_client = ObjectServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut object_client = ObjectServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
 
-    let bucket_name = "grant-test-bucket".to_string();
+    let bucket_name = unique_test_name("grant-bucket");
     let mut create_bucket = Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
         region: "test-region-1".to_string(),
 
         options: None,
     });
-    add_bearer(&mut create_bucket, &cluster.token);
+    add_bearer(&mut create_bucket, &actor.token);
     bucket_client.create_bucket(create_bucket).await.unwrap();
-
-    let (granter_client_id, granter_client_secret) = create_app(&cluster, "granter-app").await;
 
     // Delegation is non-escalating: the granter must already hold the
     // capability it delegates, in addition to policy management authority.
-    grant_policy(&cluster, "granter-app", "policy:grant", "tenant:1").await;
-    grant_policy(&cluster, "granter-app", "policy:revoke", "tenant:1").await;
-    grant_policy(&cluster, "granter-app", "bucket:read", &bucket_name).await;
+    let tenant_resource = format!("tenant:{}", actor.tenant_id);
+    let granter = cluster
+        .create_actor_in_tenant(
+            actor.tenant_id,
+            "granter-app",
+            &[
+                ("policy:grant", tenant_resource.as_str()),
+                ("policy:revoke", tenant_resource.as_str()),
+                ("bucket:read", bucket_name.as_str()),
+            ],
+        )
+        .await;
 
-    let granter_token = get_token(
-        &cluster.grpc_addrs[0],
-        &granter_client_id,
-        &granter_client_secret,
-    )
-    .await;
+    let grantee = cluster
+        .create_actor_in_tenant(actor.tenant_id, "grantee-app", &[])
+        .await;
 
-    let (grantee_client_id, grantee_client_secret) = create_app(&cluster, "grantee-app").await;
+    let granter_token = granter.token;
+
+    let grantee_token =
+        get_token(&actor.grpc_addr, &grantee.client_id, &grantee.client_secret).await;
 
     let resource = bucket_name.clone();
 
     // 2. Grant access
     let mut grant_req = Request::new(GrantAccessRequest {
-        grantee_app_id: "grantee-app".to_string(),
+        grantee_app_id: grantee.app_name.clone(),
         resource: resource.clone(),
         action: "bucket:read".to_string(),
     });
@@ -57,13 +64,7 @@ async fn test_grant_and_revoke_access() {
     );
     auth_client.grant_access(grant_req).await.unwrap();
 
-    // 3. Verify grantee can now get a token and use the granted relationship.
-    let grantee_token = get_token(
-        &cluster.grpc_addrs[0],
-        &grantee_client_id,
-        &grantee_client_secret,
-    )
-    .await;
+    // 3. Verify grantee can use the granted relationship.
     let mut allowed_list = Request::new(ListObjectsRequest {
         bucket_name: bucket_name.clone(),
         prefix: String::new(),
@@ -78,7 +79,7 @@ async fn test_grant_and_revoke_access() {
 
     // 4. Revoke access
     let mut revoke_req = Request::new(RevokeAccessRequest {
-        grantee_app_id: "grantee-app".to_string(),
+        grantee_app_id: grantee.app_name,
         resource: resource.clone(),
         action: "bucket:read".to_string(),
     });
@@ -106,14 +107,15 @@ async fn test_grant_and_revoke_access() {
 
 #[tokio::test]
 async fn test_authz_tuple_write_check_and_watch() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_storage_test_actor(&cluster, "authz-tuple-watch").await;
+    grant_docker_authz_realm(&cluster, &actor, "default").await;
 
-    let token = cluster.token.clone();
-    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let token = actor.token.clone();
+    let mut auth_client = AuthServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
-    let mut watch_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut watch_client = AuthServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
 
@@ -341,11 +343,12 @@ async fn test_authz_tuple_write_check_and_watch() {
 
 #[tokio::test]
 async fn test_authz_batch_read_and_list_operations() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_storage_test_actor(&cluster, "authz-batch-read").await;
+    grant_docker_authz_realm(&cluster, &actor, "default").await;
 
-    let token = cluster.token.clone();
-    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let token = actor.token.clone();
+    let mut auth_client = AuthServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
 
@@ -477,11 +480,12 @@ async fn test_authz_batch_read_and_list_operations() {
 
 #[tokio::test]
 async fn test_authz_batch_watch_and_pagination_are_revision_bound() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_storage_test_actor(&cluster, "authz-batch-watch").await;
+    grant_docker_authz_realm(&cluster, &actor, "default").await;
 
-    let token = cluster.token.clone();
-    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let token = actor.token.clone();
+    let mut auth_client = AuthServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
     let mut first_batch = Request::new(WriteAuthzTuplesRequest {
@@ -501,7 +505,7 @@ async fn test_authz_batch_watch_and_pagination_are_revision_bound() {
     assert_eq!(first_batch.revision, 1);
     assert_eq!(first_batch.results.len(), 3);
 
-    let mut watch_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut watch_client = AuthServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
     let mut watch_req = Request::new(WatchAuthzTupleLogRequest {
@@ -611,9 +615,15 @@ async fn test_authz_batch_watch_and_pagination_are_revision_bound() {
     );
 }
 
+// This test stays in-process because it asserts the storage-layer authz revision
+// does not advance after rejected batches via cluster.states.persistence.
 #[tokio::test]
 async fn test_authz_tuple_batch_failure_is_atomic() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    let mut cluster = isolated_test_cluster(
+        "asserts failed authz batches do not advance a fresh tenant revision",
+        &["test-region-1"],
+    )
+    .await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let token = cluster.token.clone();
@@ -696,11 +706,12 @@ async fn test_authz_tuple_batch_failure_is_atomic() {
 
 #[tokio::test]
 async fn test_authz_accepts_arbitrary_safe_subject_kind() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_storage_test_actor(&cluster, "authz-safe-subject").await;
+    grant_docker_authz_realm(&cluster, &actor, "default").await;
 
-    let token = cluster.token.clone();
-    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let token = actor.token.clone();
+    let mut auth_client = AuthServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
 
