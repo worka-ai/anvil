@@ -429,6 +429,12 @@ pub async fn list_tasks(storage: &Storage) -> Result<Vec<TaskRecord>> {
     Ok(read_task_queue_state(storage).await?.tasks())
 }
 
+pub(crate) async fn has_due_tasks(storage: &Storage) -> Result<bool> {
+    Ok(read_task_queue_state(storage)
+        .await?
+        .has_due_tasks(Utc::now()))
+}
+
 #[cfg(test)]
 async fn update_task_status(storage: &Storage, task_id: i64, status: TaskStatus) -> Result<()> {
     update_task_status_inner(storage, task_id, status, 0, None).await
@@ -1233,6 +1239,13 @@ impl TaskQueueState {
 
     fn tasks(&self) -> Vec<TaskRecord> {
         self.tasks.values().cloned().collect()
+    }
+
+    fn has_due_tasks(&self, now: DateTime<Utc>) -> bool {
+        self.tasks.values().any(|task| {
+            matches!(task.status, TaskStatus::Pending | TaskStatus::Failed)
+                && task.scheduled_at <= now
+        })
     }
 
     fn has_live_task(&self, task_type: &TaskType, payload: &JsonValue) -> bool {

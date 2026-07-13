@@ -951,6 +951,97 @@ pub(super) fn validate_policy_parts(action: &str, resource: &str) -> Result<(), 
     Ok(())
 }
 
+pub(super) fn parse_application_policy_batch(
+    policies: &[ApplicationPolicyMutation],
+) -> Result<Vec<(crate::permissions::AnvilAction, String)>, Status> {
+    if policies.is_empty() {
+        return Err(Status::invalid_argument(
+            "At least one application policy is required",
+        ));
+    }
+    if policies.len() > 256 {
+        return Err(Status::invalid_argument(
+            "Application policy batches are limited to 256 entries",
+        ));
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut parsed = Vec::with_capacity(policies.len());
+    for policy in policies {
+        validate_policy_parts(&policy.action, &policy.resource)?;
+        if !seen.insert((policy.action.clone(), policy.resource.clone())) {
+            return Err(Status::invalid_argument(
+                "Application policy batches must not contain duplicates",
+            ));
+        }
+        let action = policy
+            .action
+            .parse::<crate::permissions::AnvilAction>()
+            .map_err(|_| Status::invalid_argument("Invalid delegated action"))?;
+        parsed.push((action, policy.resource.clone()));
+    }
+    Ok(parsed)
+}
+
+pub(super) async fn mutate_application_policy_batch(
+    state: &AppState,
+    request: Request<ApplicationPoliciesRequest>,
+    operation: &'static str,
+    audit_action: &'static str,
+    reason: &'static str,
+) -> Result<Response<ApplicationPoliciesResponse>, Status> {
+    let principal = require_admin(&request, state, SystemAdminRelation::ManagePolicies).await?;
+    let req = request.into_inner();
+    let context = require_admin_action_context(req.context.as_ref())?;
+    let tenant_id = resolve_tenant_id(state, &req.tenant_id).await?;
+    let app = resolve_tenant_app(state, tenant_id, &req.app_name).await?;
+    let parsed = parse_application_policy_batch(&req.policies)?;
+    crate::access_control::write_delegated_action_tuple_batch(
+        &state.storage,
+        &state.persistence,
+        tenant_id,
+        &app.id.to_string(),
+        &parsed,
+        operation,
+        &principal.principal_id,
+        reason,
+    )
+    .await?;
+    let policy_details = req
+        .policies
+        .iter()
+        .map(|policy| {
+            json!({
+                "action": policy.action,
+                "resource": policy.resource,
+            })
+        })
+        .collect::<Vec<_>>();
+    let audit_event_id = record_admin_audit_event(
+        state,
+        &principal,
+        context,
+        audit_action,
+        &app_resource_id(tenant_id, &app.name),
+        json!({
+            "resource_kind": "application_policy_batch",
+            "tenant_id": tenant_id,
+            "app_id": app.id,
+            "app_name": &app.name,
+            "client_id": &app.client_id,
+            "policies": policy_details,
+        }),
+    )
+    .await?;
+    Ok(Response::new(ApplicationPoliciesResponse {
+        request_id: context.request_id.clone(),
+        tenant_id: tenant_id.to_string(),
+        app_name: app.name,
+        policies: req.policies,
+        audit_event_id,
+    }))
+}
+
 #[derive(Default)]
 pub(super) struct SecretEncryptionRotationStats {
     pub(super) app_secrets_examined: u64,

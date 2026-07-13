@@ -1012,11 +1012,12 @@ async fn append_control_mutation<T: StoredRoutingRecord>(
             created_at: &created_at,
         });
     let frame = ControlStreamFrame::new(header_proto, payload_proto);
-    mesh_control_stream::append_control_stream_frame(
+    mesh_control_stream::append_control_stream_frame_with_log(
         storage,
         stream_family,
         partition,
         &frame,
+        existing_log,
         Some(partition_precondition),
     )
     .await

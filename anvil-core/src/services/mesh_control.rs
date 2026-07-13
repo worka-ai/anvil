@@ -1,9 +1,10 @@
 use crate::anvil_api::mesh_control_service_server::MeshControlService;
 use crate::anvil_api::*;
 use crate::mesh_lifecycle::{
-    CellDescriptor, CreateRegionDescriptor, LifecycleState as CoreLifecycleState,
-    NodeCapability as CoreNodeCapability, NodeDescriptor, NodeDrainDescriptor, RegionDescriptor,
-    RegisterCellDescriptor, RegisterNodeDescriptor, capacity_json_hash,
+    BootstrapMeshLifecycleProjection, CellDescriptor, CreateRegionDescriptor,
+    LifecycleState as CoreLifecycleState, NodeCapability as CoreNodeCapability, NodeDescriptor,
+    NodeDrainDescriptor, RegionDescriptor, RegisterCellDescriptor, RegisterNodeDescriptor,
+    capacity_json_hash,
 };
 use crate::system_realm::SystemAdminRelation;
 use crate::{AppState, access_control, auth, bucket_journal, middleware};
@@ -21,6 +22,116 @@ fn mesh_transaction_id(options: Option<&WriteOptions>) -> Result<Option<&str>, S
 
 #[tonic::async_trait]
 impl MeshControlService for AppState {
+    async fn bootstrap_mesh_topology(
+        &self,
+        request: Request<BootstrapMeshTopologyRequest>,
+    ) -> Result<Response<BootstrapMeshTopologyResponse>, Status> {
+        require_mesh_admin(&request, self, SystemAdminRelation::ManageNodes).await?;
+        let request_id = request_id(&request);
+        let req = request.into_inner();
+        if req.regions.is_empty() || req.cells.is_empty() || req.nodes.is_empty() {
+            return Err(Status::invalid_argument(
+                "bootstrap topology requires regions, cells, and nodes",
+            ));
+        }
+        if mesh_topology_exists(self).await? {
+            return Ok(Response::new(BootstrapMeshTopologyResponse {
+                write: Some(mesh_write_response(
+                    request_id,
+                    "mesh-topology-already-initialised".to_string(),
+                    None,
+                )),
+                canonical_coremeta_rows: Vec::new(),
+                already_initialised: true,
+            }));
+        }
+
+        let regions = req
+            .regions
+            .into_iter()
+            .map(|region| CreateRegionDescriptor {
+                mesh_id: self.config.mesh_id.clone(),
+                region: region.region_id.clone(),
+                public_base_url: region.endpoint,
+                virtual_host_suffix: format!("{}.anvil-storage.com", region.region_id),
+                placement_weight: 100,
+                default_cell: None,
+            })
+            .collect::<Vec<_>>();
+        let cells = req
+            .cells
+            .into_iter()
+            .map(|cell| RegisterCellDescriptor {
+                mesh_id: self.config.mesh_id.clone(),
+                region: cell.region_id,
+                cell_id: cell.cell_id,
+                placement_weight: 100,
+                failure_domain: cell.failure_domain,
+            })
+            .collect::<Vec<_>>();
+        let nodes = req
+            .nodes
+            .into_iter()
+            .map(|node| {
+                let capabilities = parse_node_capabilities(&node.capabilities)?;
+                Ok(RegisterNodeDescriptor {
+                    mesh_id: self.config.mesh_id.clone(),
+                    node_id: node.node_id,
+                    region: node.region_id,
+                    cell_id: node.cell_id,
+                    libp2p_peer_id: node.libp2p_peer_id,
+                    receipt_signing_public_key_proto: node.receipt_signing_public_key_proto,
+                    public_api_addr: node.advertise_addr,
+                    public_cluster_addrs: node.cluster_addrs,
+                    capabilities,
+                    capacity_json: node.capacity_json,
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        let canonical_coremeta_rows = if req.canonical_coremeta_rows.is_empty() {
+            for node in &nodes {
+                self.core_store
+                    .register_node_receipt_signing_public_key(
+                        &node.node_id,
+                        &node.receipt_signing_public_key_proto,
+                    )
+                    .map_err(mesh_status)?;
+            }
+            crate::mesh_lifecycle::install_bootstrap_lifecycle_projection(
+                &self.storage,
+                &self.core_store,
+                BootstrapMeshLifecycleProjection {
+                    regions: regions.clone(),
+                    cells: cells.clone(),
+                    nodes: nodes.clone(),
+                },
+            )
+            .map_err(mesh_status)?;
+            encode_bootstrap_snapshot_rows(
+                self.core_store
+                    .export_portable_coremeta_bootstrap_rows()
+                    .map_err(mesh_status)?,
+            )
+        } else {
+            let rows = decode_bootstrap_snapshot_rows(req.canonical_coremeta_rows)?;
+            self.core_store
+                .install_portable_coremeta_bootstrap_rows(&rows)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            Vec::new()
+        };
+        ensure_bootstrap_topology_matches(self, &regions, &cells, &nodes).await?;
+
+        Ok(Response::new(BootstrapMeshTopologyResponse {
+            write: Some(mesh_write_response(
+                request_id,
+                "mesh-topology-bootstrap".to_string(),
+                None,
+            )),
+            canonical_coremeta_rows,
+            already_initialised: false,
+        }))
+    }
+
     async fn put_region(
         &self,
         request: Request<PutRegionRequest>,
@@ -799,6 +910,177 @@ fn parse_node_capabilities(values: &[String]) -> Result<Vec<CoreNodeCapability>,
             ))),
         })
         .collect()
+}
+
+async fn mesh_topology_exists(state: &AppState) -> Result<bool, Status> {
+    Ok(!state
+        .persistence
+        .list_region_descriptors()
+        .await
+        .map_err(mesh_status)?
+        .is_empty()
+        || !state
+            .persistence
+            .list_cell_descriptors(None)
+            .await
+            .map_err(mesh_status)?
+            .is_empty()
+        || !state
+            .persistence
+            .list_node_descriptors(None, None)
+            .await
+            .map_err(mesh_status)?
+            .is_empty())
+}
+
+fn encode_bootstrap_snapshot_rows(
+    rows: Vec<crate::core_store::CoreMetaEncodedOwnedRow>,
+) -> Vec<CoreMetaRowMutation> {
+    rows.into_iter()
+        .map(|row| CoreMetaRowMutation {
+            row_hash: crate::core_store::core_meta_encoded_row_hash_with_delete(
+                &row.cf,
+                &row.core_meta_key,
+                &row.value_envelope,
+                row.delete_marker,
+            ),
+            column_family: row.cf,
+            core_meta_key: row.core_meta_key,
+            value_envelope: row.value_envelope,
+            delete_marker: row.delete_marker,
+        })
+        .collect()
+}
+
+fn decode_bootstrap_snapshot_rows(
+    rows: Vec<CoreMetaRowMutation>,
+) -> Result<Vec<crate::core_store::CoreMetaEncodedOwnedRow>, Status> {
+    let mut seen = std::collections::BTreeSet::new();
+    rows.into_iter()
+        .map(|row| {
+            let actual_hash = crate::core_store::core_meta_encoded_row_hash_with_delete(
+                &row.column_family,
+                &row.core_meta_key,
+                &row.value_envelope,
+                row.delete_marker,
+            );
+            if row.row_hash != actual_hash {
+                return Err(Status::invalid_argument(
+                    "bootstrap CoreMeta row_hash mismatch",
+                ));
+            }
+            if !seen.insert((row.column_family.clone(), row.core_meta_key.clone())) {
+                return Err(Status::invalid_argument(
+                    "bootstrap CoreMeta snapshot contains duplicate rows",
+                ));
+            }
+            Ok(crate::core_store::CoreMetaEncodedOwnedRow {
+                cf: row.column_family,
+                core_meta_key: row.core_meta_key,
+                value_envelope: row.value_envelope,
+                delete_marker: row.delete_marker,
+                root_key_hash: String::new(),
+                root_generation: 0,
+                visibility_state: crate::core_store::CoreMetaVisibilityState::Unspecified,
+            })
+        })
+        .collect()
+}
+
+async fn ensure_bootstrap_topology_matches(
+    state: &AppState,
+    expected_regions: &[CreateRegionDescriptor],
+    expected_cells: &[RegisterCellDescriptor],
+    expected_nodes: &[RegisterNodeDescriptor],
+) -> Result<(), Status> {
+    let regions = state
+        .persistence
+        .list_region_descriptors()
+        .await
+        .map_err(mesh_status)?;
+    let cells = state
+        .persistence
+        .list_cell_descriptors(None)
+        .await
+        .map_err(mesh_status)?;
+    let nodes = state
+        .persistence
+        .list_node_descriptors(None, None)
+        .await
+        .map_err(mesh_status)?;
+    if regions.len() != expected_regions.len()
+        || cells.len() != expected_cells.len()
+        || nodes.len() != expected_nodes.len()
+    {
+        return Err(Status::failed_precondition(
+            "bootstrap CoreMeta snapshot topology cardinality mismatch",
+        ));
+    }
+
+    for expected in expected_regions {
+        let Some(actual) = regions
+            .iter()
+            .find(|region| region.region == expected.region)
+        else {
+            return Err(Status::failed_precondition(
+                "bootstrap CoreMeta snapshot is missing a requested region",
+            ));
+        };
+        if actual.mesh_id != expected.mesh_id
+            || actual.state != CoreLifecycleState::Active
+            || actual.public_base_url != expected.public_base_url
+            || actual.virtual_host_suffix != expected.virtual_host_suffix
+            || actual.placement_weight != expected.placement_weight
+            || actual.default_cell != expected.default_cell
+        {
+            return Err(Status::failed_precondition(
+                "bootstrap CoreMeta snapshot region descriptor mismatch",
+            ));
+        }
+    }
+    for expected in expected_cells {
+        let Some(actual) = cells
+            .iter()
+            .find(|cell| cell.region == expected.region && cell.cell_id == expected.cell_id)
+        else {
+            return Err(Status::failed_precondition(
+                "bootstrap CoreMeta snapshot is missing a requested cell",
+            ));
+        };
+        if actual.mesh_id != expected.mesh_id
+            || actual.state != CoreLifecycleState::Active
+            || actual.placement_weight != expected.placement_weight
+            || actual.failure_domain != expected.failure_domain
+        {
+            return Err(Status::failed_precondition(
+                "bootstrap CoreMeta snapshot cell descriptor mismatch",
+            ));
+        }
+    }
+    for expected in expected_nodes {
+        let Some(actual) = nodes.iter().find(|node| node.node_id == expected.node_id) else {
+            return Err(Status::failed_precondition(
+                "bootstrap CoreMeta snapshot is missing a requested node",
+            ));
+        };
+        if actual.mesh_id != expected.mesh_id
+            || actual.region != expected.region
+            || actual.cell_id != expected.cell_id
+            || actual.libp2p_peer_id != expected.libp2p_peer_id
+            || actual.receipt_signing_public_key_proto != expected.receipt_signing_public_key_proto
+            || actual.public_api_addr != expected.public_api_addr
+            || actual.public_cluster_addrs != expected.public_cluster_addrs
+            || actual.capabilities != expected.capabilities
+            || actual.capacity_json_hash
+                != capacity_json_hash(&expected.capacity_json).map_err(mesh_status)?
+            || actual.state != CoreLifecycleState::Active
+        {
+            return Err(Status::failed_precondition(
+                "bootstrap CoreMeta snapshot node descriptor mismatch",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn mesh_write_response(

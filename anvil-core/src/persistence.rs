@@ -20,12 +20,13 @@ use crate::{
     manifest_journal, mesh_control_stream, mesh_directory, metadata_journal, model_journal,
     multipart_journal, object_links,
     partition_fence::{
-        AcquireOwnership, ForceExpireOwnership, MAX_OWNERSHIP_LEASE_MS, OwnershipPrincipal,
-        OwnershipResource, OwnershipResourceKind, PartitionOwnerStatus, PartitionRecoveryAcquire,
-        PartitionWritePermit, RenewOwnership, acquire_ownership, acquire_partition_recovery,
-        force_expire_ownership, force_expire_partition_owner_for_node,
+        AcquireOwnership, ForceExpireOwnership, MAX_OWNERSHIP_LEASE_MS, OWNERSHIP_HELD,
+        OwnershipPrincipal, OwnershipResource, OwnershipResourceKind, PartitionOwnerStatus,
+        PartitionRecoveryAcquire, PartitionWritePermit, RenewOwnership, acquire_ownership,
+        acquire_partition_recovery, force_expire_ownership, force_expire_partition_owner_for_node,
         list_active_ownership_fences_for_node, list_partition_owners_for_node,
-        publish_partition_ready, read_ownership_fence, read_partition_owner, renew_ownership,
+        partition_owner_is_force_expired, publish_partition_ready, read_ownership_fence,
+        read_partition_owner, renew_ownership,
     },
     personaldb_repair, repair_finding,
     storage::Storage,
@@ -84,6 +85,7 @@ pub struct RegionDrainPlanReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct HfKey {
     pub(crate) id: i64,
+    pub(crate) tenant_id: i64,
     pub(crate) name: String,
     pub(crate) token_encrypted: Vec<u8>,
     pub(crate) note: Option<String>,

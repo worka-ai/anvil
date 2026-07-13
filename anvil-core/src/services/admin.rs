@@ -22,60 +22,8 @@ use chrono::Utc;
 use serde_json::json;
 use tonic::{Request, Response, Status};
 
-pub fn admin_rpc_relation_mapping() -> &'static [(&'static str, SystemAdminRelation)] {
-    &[
-        ("CreateTenant", SystemAdminRelation::ManageTenants),
-        ("CreateApplication", SystemAdminRelation::ManageApps),
-        ("RotateApplicationSecret", SystemAdminRelation::ManageApps),
-        (
-            "GrantApplicationPolicy",
-            SystemAdminRelation::ManagePolicies,
-        ),
-        (
-            "RevokeApplicationPolicy",
-            SystemAdminRelation::ManagePolicies,
-        ),
-        (
-            "RotateSecretEncryptionKey",
-            SystemAdminRelation::ManageSecretEncryptionKeys,
-        ),
-        ("CreateBucketAdmin", SystemAdminRelation::ManageBuckets),
-        (
-            "SetBucketPublicAccessAdmin",
-            SystemAdminRelation::ManageBuckets,
-        ),
-        ("CreateHostAlias", SystemAdminRelation::ManageHostAliases),
-        ("ActivateHostAlias", SystemAdminRelation::ManageHostAliases),
-        ("SuspendHostAlias", SystemAdminRelation::ManageHostAliases),
-        ("DeleteHostAlias", SystemAdminRelation::ManageHostAliases),
-        ("ReadHostAlias", SystemAdminRelation::ManageHostAliases),
-        ("ListHostAliases", SystemAdminRelation::ManageHostAliases),
-        ("CreateRegion", SystemAdminRelation::ManageRegions),
-        ("ActivateRegion", SystemAdminRelation::ManageRegions),
-        ("SetRegionReadOnly", SystemAdminRelation::ManageRegions),
-        ("DrainRegion", SystemAdminRelation::ManageRegions),
-        ("RemoveRegion", SystemAdminRelation::ManageRegions),
-        ("ListRegions", SystemAdminRelation::ManageRegions),
-        ("RegisterCell", SystemAdminRelation::ManageRegions),
-        ("ActivateCell", SystemAdminRelation::ManageRegions),
-        ("DrainCell", SystemAdminRelation::ManageRegions),
-        ("RemoveCell", SystemAdminRelation::ManageRegions),
-        ("ListCells", SystemAdminRelation::ManageRegions),
-        ("RegisterNode", SystemAdminRelation::ManageNodes),
-        ("ActivateNode", SystemAdminRelation::ManageNodes),
-        ("DrainNode", SystemAdminRelation::ManageNodes),
-        ("ForceOfflineNode", SystemAdminRelation::ManageNodes),
-        ("RemoveNode", SystemAdminRelation::ManageNodes),
-        ("ListNodes", SystemAdminRelation::ManageNodes),
-        ("ListRoutingRecords", SystemAdminRelation::ManageRouting),
-        ("RepairRoutingRecord", SystemAdminRelation::ManageRouting),
-        ("RunRepair", SystemAdminRelation::RunRepair),
-        ("ListDiagnostics", SystemAdminRelation::ViewDiagnostics),
-        ("ListAuditEvents", SystemAdminRelation::ViewAuditLog),
-        ("ListStorageClasses", SystemAdminRelation::ViewSystem),
-        ("GetStorageClass", SystemAdminRelation::ViewSystem),
-    ]
-}
+mod rpc_mapping;
+pub use rpc_mapping::admin_rpc_relation_mapping;
 
 #[tonic::async_trait]
 impl AdminService for AppState {
@@ -315,6 +263,34 @@ impl AdminService for AppState {
             resource: req.resource,
             audit_event_id,
         }))
+    }
+
+    async fn grant_application_policies(
+        &self,
+        request: Request<ApplicationPoliciesRequest>,
+    ) -> Result<Response<ApplicationPoliciesResponse>, Status> {
+        mutate_application_policy_batch(
+            self,
+            request,
+            "add",
+            "admin.app.policy.batch_grant",
+            "admin access batch grant",
+        )
+        .await
+    }
+
+    async fn revoke_application_policies(
+        &self,
+        request: Request<ApplicationPoliciesRequest>,
+    ) -> Result<Response<ApplicationPoliciesResponse>, Status> {
+        mutate_application_policy_batch(
+            self,
+            request,
+            "remove",
+            "admin.app.policy.batch_revoke",
+            "admin access batch revoke",
+        )
+        .await
     }
 
     async fn rotate_secret_encryption_key(
@@ -1248,6 +1224,79 @@ impl AdminService for AppState {
             request_id: context.request_id.clone(),
             node: Some(node_descriptor_to_proto(node)),
             audit_event_id,
+        }))
+    }
+
+    async fn get_local_node_descriptor(
+        &self,
+        request: Request<GetLocalNodeDescriptorRequest>,
+    ) -> Result<Response<NodeResponse>, Status> {
+        require_admin(&request, self, SystemAdminRelation::ManageNodes).await?;
+        let request_id = request
+            .metadata()
+            .get(crate::middleware::ANVIL_REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        if let Some(node) = self
+            .persistence
+            .list_node_descriptors(None, None)
+            .await
+            .map_err(lifecycle_status)?
+            .into_iter()
+            .find(|node| node.node_id == self.config.node_id)
+        {
+            return Ok(Response::new(NodeResponse {
+                request_id,
+                node: Some(node_descriptor_to_proto(node)),
+                audit_event_id: String::new(),
+            }));
+        }
+
+        let libp2p_peer_id = self
+            .cluster
+            .read()
+            .await
+            .iter()
+            .find_map(|(peer_id, info)| {
+                (info.grpc_addr == self.config.public_api_addr).then(|| peer_id.to_base58())
+            })
+            .ok_or_else(|| Status::unavailable("local cluster identity is not ready"))?;
+        let now = Utc::now().to_rfc3339();
+        let node = mesh_lifecycle::NodeDescriptor {
+            schema: mesh_lifecycle::NODE_DESCRIPTOR_SCHEMA.to_string(),
+            mesh_id: self.config.mesh_id.clone(),
+            node_id: self.config.node_id.clone(),
+            region: self.config.region.clone(),
+            cell_id: self.config.cell_id.clone(),
+            libp2p_peer_id,
+            receipt_signing_public_key_proto: self
+                .core_store
+                .local_receipt_signing_public_key_proto(),
+            public_api_addr: self.config.public_api_addr.clone(),
+            public_cluster_addrs: self.config.public_cluster_addrs.clone(),
+            capabilities: vec![
+                CoreNodeCapability::Object,
+                CoreNodeCapability::Index,
+                CoreNodeCapability::PersonalDb,
+                CoreNodeCapability::Metadata,
+                CoreNodeCapability::Gateway,
+                CoreNodeCapability::Admin,
+            ],
+            capacity_json_hash: mesh_lifecycle::capacity_json_hash("{}")
+                .map_err(lifecycle_status)?,
+            state: CoreLifecycleState::Joining,
+            drain: None,
+            last_heartbeat_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+            generation: 0,
+        };
+        Ok(Response::new(NodeResponse {
+            request_id,
+            node: Some(node_descriptor_to_proto(node)),
+            audit_event_id: String::new(),
         }))
     }
 

@@ -872,7 +872,7 @@ async fn persistence_replays_anvil_owned_state_after_fresh_instance_body() {
         .await
         .unwrap();
     persistence
-        .hf_create_key("primary", b"secret", Some("note"))
+        .hf_create_key(tenant.id, "primary", b"secret", Some("note"))
         .await
         .unwrap();
 
@@ -1041,7 +1041,7 @@ async fn persistence_replays_anvil_owned_state_after_fresh_instance_body() {
             .unwrap()
             .is_some()
     );
-    assert_eq!(replayed.hf_list_keys().await.unwrap().len(), 1);
+    assert_eq!(replayed.hf_list_keys(tenant.id).await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -1541,7 +1541,7 @@ async fn persistence_global_journal_writes_use_current_fence_tokens() {
             .await
             .unwrap();
         persistence
-            .hf_create_key("primary", b"secret", Some("note"))
+            .hf_create_key(1, "primary", b"secret", Some("note"))
             .await
             .unwrap();
 

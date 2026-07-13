@@ -31,6 +31,7 @@ pub const MAX_OWNERSHIP_LEASE_MS: u64 = 120_000;
 const OWNERSHIP_LOCK_RETRY_ATTEMPTS: usize = 200;
 const PARTITION_OWNER_ROW_PREFIX: &str = "partition_owner";
 const OWNERSHIP_FENCE_REF_PREFIX: &str = "ownership_fence";
+const EXPIRED_PARTITION_OWNER_NODE_PREFIX: &str = "__anvil_expired_partition_owner__:";
 static OWNERSHIP_FENCE_META_LOCK: LazyLock<TokioMutex<()>> = LazyLock::new(|| TokioMutex::new(()));
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1013,44 +1014,55 @@ pub async fn force_expire_partition_owner_for_node(
     signing_key: &[u8],
 ) -> Result<Option<PartitionOwnerState>> {
     let failover_started_at = std::time::Instant::now();
-    let Some((ref_value, mut owner)) =
-        read_partition_owner_state(storage, partition_family, partition_id, signing_key).await?
-    else {
-        crate::perf::record_partition_failover_duration(
-            "unknown",
-            "unknown",
-            "owner_absent",
-            failover_started_at.elapsed(),
-        );
-        return Ok(None);
-    };
-    if owner.owner_node_id != owner_node_id {
-        crate::perf::record_partition_failover_duration(
-            "unknown",
-            "unknown",
-            "owner_mismatch",
-            failover_started_at.elapsed(),
-        );
-        return Ok(None);
+    for _ in 0..OWNERSHIP_LOCK_RETRY_ATTEMPTS {
+        let Some((ref_value, mut owner)) =
+            read_partition_owner_state(storage, partition_family, partition_id, signing_key)
+                .await?
+        else {
+            crate::perf::record_partition_failover_duration(
+                "unknown",
+                "unknown",
+                "owner_absent",
+                failover_started_at.elapsed(),
+            );
+            return Ok(None);
+        };
+        if owner.owner_node_id != owner_node_id {
+            crate::perf::record_partition_failover_duration(
+                "unknown",
+                "unknown",
+                "owner_mismatch",
+                failover_started_at.elapsed(),
+            );
+            return Ok(None);
+        }
+        owner.owner_node_id = expired_partition_owner_node_id(owner_node_id);
+        owner.fence_token = owner.fence_token.saturating_add(1);
+        owner.recovery_epoch = owner.recovery_epoch.saturating_add(1);
+        owner.status = PartitionOwnerStatus::Recovering;
+        owner.updated_at_nanos = now_nanos;
+        owner = owner.seal(signing_key)?;
+        match write_partition_owner_state(storage, &owner, Some(&ref_value)).await {
+            Ok(()) => {
+                crate::perf::record_root_generation_in_doubt(
+                    "partition_owner",
+                    partition_id_hash(partition_id),
+                );
+                crate::perf::record_partition_failover_duration(
+                    "unknown",
+                    "unknown",
+                    "forced_expired",
+                    failover_started_at.elapsed(),
+                );
+                return Ok(Some(owner));
+            }
+            Err(err) if is_core_ref_cas_conflict(&err) => continue,
+            Err(err) => return Err(err),
+        }
     }
-    owner.owner_node_id = format!("expired-{owner_node_id}");
-    owner.fence_token = owner.fence_token.saturating_add(1);
-    owner.recovery_epoch = owner.recovery_epoch.saturating_add(1);
-    owner.status = PartitionOwnerStatus::Recovering;
-    owner.updated_at_nanos = now_nanos;
-    owner = owner.seal(signing_key)?;
-    write_partition_owner_state(storage, &owner, Some(&ref_value)).await?;
-    crate::perf::record_root_generation_in_doubt(
-        "partition_owner",
-        partition_id_hash(partition_id),
-    );
-    crate::perf::record_partition_failover_duration(
-        "unknown",
-        "unknown",
-        "forced_expired",
-        failover_started_at.elapsed(),
-    );
-    Ok(Some(owner))
+    Err(anyhow!(
+        "{OWNERSHIP_CAS_CONFLICT}: partition owner force-expire CAS retries exhausted"
+    ))
 }
 
 pub async fn list_ownership_fences(
@@ -1102,54 +1114,92 @@ pub async fn acquire_partition_recovery(
 ) -> Result<PartitionOwnerState> {
     let failover_started_at = std::time::Instant::now();
     validate_recovery_acquire(&request)?;
-    let existing = read_partition_owner_state(
-        storage,
-        &request.partition_family,
-        &request.partition_id,
-        signing_key,
-    )
-    .await?;
-    let existing_state = existing.as_ref().map(|(_, state)| state);
-    let fence_token = existing_state
-        .map(|state| state.fence_token.saturating_add(1))
-        .unwrap_or(1);
-    let recovery_epoch = existing_state
-        .map(|state| state.recovery_epoch.saturating_add(1))
-        .unwrap_or(1);
-    let state = PartitionOwnerState {
-        format_version: 1,
-        partition_family: request.partition_family,
-        partition_id: request.partition_id,
-        owner_node_id: request.owner_node_id,
-        fence_token,
-        recovery_epoch,
-        status: PartitionOwnerStatus::Recovering,
-        recovered_through_sequence: request.recovered_through_sequence,
-        recovered_manifest_hash: request.recovered_manifest_hash,
-        updated_at_nanos: request.now_nanos,
-        owner_hash: None,
-        owner_signature: None,
+    for _ in 0..OWNERSHIP_LOCK_RETRY_ATTEMPTS {
+        let existing = match read_partition_owner_state(
+            storage,
+            &request.partition_family,
+            &request.partition_id,
+            signing_key,
+        )
+        .await
+        {
+            Ok(existing) => existing,
+            Err(err) if is_core_ref_cas_conflict(&err) => continue,
+            Err(err) => return Err(err),
+        };
+        let existing_state = existing.as_ref().map(|(_, state)| state);
+        if let Some(existing_state) = existing_state {
+            if partition_owner_is_current_for_node(existing_state, &request.owner_node_id) {
+                if existing_state.status == PartitionOwnerStatus::Ready
+                    || (existing_state.recovered_through_sequence
+                        == request.recovered_through_sequence
+                        && existing_state.recovered_manifest_hash
+                            == request.recovered_manifest_hash)
+                {
+                    return Ok(existing_state.clone());
+                }
+                return Err(anyhow!(
+                    "{OWNERSHIP_HELD}: partition owner recovery state already exists with a different recovery basis"
+                ));
+            }
+            if !partition_owner_is_force_expired(existing_state) {
+                return Err(anyhow!(
+                    "{OWNERSHIP_HELD}: partition owner is held by active node {}",
+                    existing_state.owner_node_id
+                ));
+            }
+        }
+
+        let fence_token = existing_state
+            .map(|state| state.fence_token.saturating_add(1))
+            .unwrap_or(1);
+        let recovery_epoch = existing_state
+            .map(|state| state.recovery_epoch.saturating_add(1))
+            .unwrap_or(1);
+        let state = PartitionOwnerState {
+            format_version: 1,
+            partition_family: request.partition_family.clone(),
+            partition_id: request.partition_id.clone(),
+            owner_node_id: request.owner_node_id.clone(),
+            fence_token,
+            recovery_epoch,
+            status: PartitionOwnerStatus::Recovering,
+            recovered_through_sequence: request.recovered_through_sequence,
+            recovered_manifest_hash: request.recovered_manifest_hash.clone(),
+            updated_at_nanos: request.now_nanos,
+            owner_hash: None,
+            owner_signature: None,
+        }
+        .seal(signing_key)?;
+        match write_partition_owner_state(
+            storage,
+            &state,
+            existing.as_ref().map(|(ref_value, _)| ref_value),
+        )
+        .await
+        {
+            Ok(()) => {
+                if existing.is_some() {
+                    crate::perf::record_root_generation_in_doubt(
+                        "partition_owner",
+                        partition_id_hash(&state.partition_id),
+                    );
+                }
+                crate::perf::record_partition_failover_duration(
+                    "unknown",
+                    "unknown",
+                    "recovery_acquired",
+                    failover_started_at.elapsed(),
+                );
+                return Ok(state);
+            }
+            Err(err) if is_core_ref_cas_conflict(&err) => continue,
+            Err(err) => return Err(err),
+        }
     }
-    .seal(signing_key)?;
-    write_partition_owner_state(
-        storage,
-        &state,
-        existing.as_ref().map(|(ref_value, _)| ref_value),
-    )
-    .await?;
-    if existing.is_some() {
-        crate::perf::record_root_generation_in_doubt(
-            "partition_owner",
-            partition_id_hash(&state.partition_id),
-        );
-    }
-    crate::perf::record_partition_failover_duration(
-        "unknown",
-        "unknown",
-        "recovery_acquired",
-        failover_started_at.elapsed(),
-    );
-    Ok(state)
+    Err(anyhow!(
+        "{OWNERSHIP_CAS_CONFLICT}: partition owner recovery CAS retries exhausted"
+    ))
 }
 
 pub async fn publish_partition_ready(
@@ -1164,42 +1214,63 @@ pub async fn publish_partition_ready(
     signing_key: &[u8],
 ) -> Result<PartitionOwnerState> {
     let failover_started_at = std::time::Instant::now();
-    let Some((ref_value, mut state)) =
-        read_partition_owner_state(storage, partition_family, partition_id, signing_key).await?
-    else {
-        return Err(FenceRejection {
-            code: AnvilErrorCode::PartitionNotOwned,
-            reason: "partition owner state is absent",
-        }
-        .into());
-    };
-    validate_write_permit_for_state(
-        &state,
-        &PartitionWritePermit {
-            partition_family: partition_family.to_string(),
-            partition_id: partition_id.to_string(),
-            owner_node_id: owner_node_id.to_string(),
-            fence_token,
-        },
-        false,
-    )?;
     validate_hex32(recovered_manifest_hash, "recovered manifest hash")?;
     if now_nanos < 0 {
         return Err(anyhow!("partition owner timestamp must be nonnegative"));
     }
-    state.status = PartitionOwnerStatus::Ready;
-    state.recovered_through_sequence = recovered_through_sequence;
-    state.recovered_manifest_hash = recovered_manifest_hash.to_string();
-    state.updated_at_nanos = now_nanos;
-    state = state.seal(signing_key)?;
-    write_partition_owner_state(storage, &state, Some(&ref_value)).await?;
-    crate::perf::record_partition_failover_duration(
-        "unknown",
-        "unknown",
-        "ready_published",
-        failover_started_at.elapsed(),
-    );
-    Ok(state)
+    for _ in 0..OWNERSHIP_LOCK_RETRY_ATTEMPTS {
+        let Some((ref_value, mut state)) =
+            read_partition_owner_state(storage, partition_family, partition_id, signing_key)
+                .await?
+        else {
+            return Err(FenceRejection {
+                code: AnvilErrorCode::PartitionNotOwned,
+                reason: "partition owner state is absent",
+            }
+            .into());
+        };
+        validate_write_permit_for_state(
+            &state,
+            &PartitionWritePermit {
+                partition_family: partition_family.to_string(),
+                partition_id: partition_id.to_string(),
+                owner_node_id: owner_node_id.to_string(),
+                fence_token,
+            },
+            false,
+        )?;
+        if state.status == PartitionOwnerStatus::Ready {
+            if state.recovered_through_sequence == recovered_through_sequence
+                && state.recovered_manifest_hash == recovered_manifest_hash
+            {
+                return Ok(state);
+            }
+            return Err(anyhow!(
+                "{OWNERSHIP_HELD}: partition owner is already ready with different recovery state"
+            ));
+        }
+        state.status = PartitionOwnerStatus::Ready;
+        state.recovered_through_sequence = recovered_through_sequence;
+        state.recovered_manifest_hash = recovered_manifest_hash.to_string();
+        state.updated_at_nanos = now_nanos;
+        state = state.seal(signing_key)?;
+        match write_partition_owner_state(storage, &state, Some(&ref_value)).await {
+            Ok(()) => {
+                crate::perf::record_partition_failover_duration(
+                    "unknown",
+                    "unknown",
+                    "ready_published",
+                    failover_started_at.elapsed(),
+                );
+                return Ok(state);
+            }
+            Err(err) if is_core_ref_cas_conflict(&err) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(anyhow!(
+        "{OWNERSHIP_CAS_CONFLICT}: partition owner ready CAS retries exhausted"
+    ))
 }
 
 fn partition_id_hash(partition_id: &str) -> u64 {
@@ -1209,6 +1280,25 @@ fn partition_id_hash(partition_id: &str) -> u64 {
             .try_into()
             .expect("hash32 is at least eight bytes"),
     )
+}
+
+fn expired_partition_owner_node_id(owner_node_id: &str) -> String {
+    format!("{EXPIRED_PARTITION_OWNER_NODE_PREFIX}{owner_node_id}")
+}
+
+pub fn partition_owner_is_force_expired(owner: &PartitionOwnerState) -> bool {
+    owner.status == PartitionOwnerStatus::Recovering
+        && owner
+            .owner_node_id
+            .starts_with(EXPIRED_PARTITION_OWNER_NODE_PREFIX)
+}
+
+fn partition_owner_is_current_for_node(owner: &PartitionOwnerState, owner_node_id: &str) -> bool {
+    owner.owner_node_id == owner_node_id
+        && matches!(
+            owner.status,
+            PartitionOwnerStatus::Recovering | PartitionOwnerStatus::Ready
+        )
 }
 
 pub async fn validate_partition_write(
@@ -1680,6 +1770,12 @@ fn validate_recovery_acquire(request: &PartitionRecoveryAcquire) -> Result<()> {
     require_nonempty(&request.partition_family, "partition family")?;
     validate_hex32(&request.partition_id, "partition id")?;
     require_nonempty(&request.owner_node_id, "owner node id")?;
+    if request
+        .owner_node_id
+        .starts_with(EXPIRED_PARTITION_OWNER_NODE_PREFIX)
+    {
+        return Err(anyhow!("owner node id uses an Anvil-reserved prefix"));
+    }
     validate_hex32(&request.recovered_manifest_hash, "recovered manifest hash")?;
     if request.now_nanos < 0 {
         return Err(anyhow!("partition owner timestamp must be nonnegative"));

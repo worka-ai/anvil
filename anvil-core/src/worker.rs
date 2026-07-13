@@ -2,8 +2,12 @@ use crate::auth::JwtManager;
 use crate::cluster::ClusterState;
 use crate::crypto::EncryptionKeyring;
 use crate::object_manager::ObjectManager;
+use crate::partition_fence::{
+    OWNERSHIP_CAS_CONFLICT, OWNERSHIP_HELD, OWNERSHIP_OWNER_MISMATCH, OWNERSHIP_STALE_FENCE,
+};
 use crate::persistence::Object;
 use crate::persistence::Persistence;
+use crate::task_lease::{LEASE_CAS_CONFLICT, LEASE_HELD, LEASE_OWNER_MISMATCH, STALE_FENCE};
 use crate::tasks::{HFIngestionItemState, HFIngestionState, TaskStatus, TaskType};
 use anyhow::{Result, anyhow};
 use futures_util::{Stream, StreamExt};
@@ -11,7 +15,9 @@ use serde::Deserialize;
 use serde_json::json;
 use std::boxed::Box;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::convert::Infallible;
+use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +25,108 @@ use tonic::Status;
 use tracing::{debug, error, info, warn};
 
 type Task = crate::persistence::TaskRecord;
+
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const CLAIM_CONTENTION_BASE_DELAY: Duration = Duration::from_millis(250);
+const CLAIM_CONTENTION_MAX_DELAY: Duration = Duration::from_secs(8);
+const CLAIM_TRANSIENT_MAX_DELAY: Duration = Duration::from_secs(2);
+const CLAIM_FATAL_DELAY: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerClaimError {
+    OwnershipContention,
+    TransientFence,
+    Fatal,
+}
+
+#[derive(Debug, Default)]
+struct WorkerClaimBackoff {
+    consecutive_contentions: u32,
+}
+
+impl WorkerClaimBackoff {
+    fn reset(&mut self) {
+        self.consecutive_contentions = 0;
+    }
+
+    fn next_delay(&mut self, node_id: &str, error: WorkerClaimError) -> Duration {
+        match error {
+            WorkerClaimError::OwnershipContention => {
+                let exponent = self.consecutive_contentions.min(5);
+                self.consecutive_contentions = self.consecutive_contentions.saturating_add(1);
+                let base_ms =
+                    (CLAIM_CONTENTION_BASE_DELAY.as_millis() as u64).saturating_mul(1 << exponent);
+                let capped_ms = base_ms.min(CLAIM_CONTENTION_MAX_DELAY.as_millis() as u64);
+                Duration::from_millis(capped_ms.saturating_add(stable_jitter_ms(
+                    node_id,
+                    self.consecutive_contentions,
+                    capped_ms / 2,
+                )))
+            }
+            WorkerClaimError::TransientFence => {
+                let exponent = self.consecutive_contentions.min(3);
+                self.consecutive_contentions = self.consecutive_contentions.saturating_add(1);
+                let base_ms = 50_u64.saturating_mul(1 << exponent);
+                let capped_ms = base_ms.min(CLAIM_TRANSIENT_MAX_DELAY.as_millis() as u64);
+                Duration::from_millis(capped_ms.saturating_add(stable_jitter_ms(
+                    node_id,
+                    self.consecutive_contentions,
+                    capped_ms,
+                )))
+            }
+            WorkerClaimError::Fatal => CLAIM_FATAL_DELAY,
+        }
+    }
+}
+
+fn stable_jitter_ms(node_id: &str, attempt: u32, max_jitter_ms: u64) -> u64 {
+    if max_jitter_ms == 0 {
+        return 0;
+    }
+    let mut hasher = DefaultHasher::new();
+    node_id.hash(&mut hasher);
+    attempt.hash(&mut hasher);
+    hasher.finish() % max_jitter_ms.saturating_add(1)
+}
+
+fn classify_worker_claim_error(error: &anyhow::Error) -> WorkerClaimError {
+    if error_chain_contains(
+        error,
+        &[OWNERSHIP_HELD, OWNERSHIP_OWNER_MISMATCH, LEASE_HELD],
+    ) {
+        return WorkerClaimError::OwnershipContention;
+    }
+    if error_chain_contains(
+        error,
+        &[
+            OWNERSHIP_CAS_CONFLICT,
+            OWNERSHIP_STALE_FENCE,
+            LEASE_CAS_CONFLICT,
+            LEASE_OWNER_MISMATCH,
+            STALE_FENCE,
+            "generation mismatch",
+            "stale",
+            "CAS conflict",
+        ],
+    ) {
+        return WorkerClaimError::TransientFence;
+    }
+    WorkerClaimError::Fatal
+}
+
+fn error_chain_contains(error: &anyhow::Error, needles: &[&str]) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        needles.iter().any(|needle| message.contains(needle))
+    })
+}
+
+async fn wait_for_task_or_delay(task_notify: &Arc<tokio::sync::Notify>, delay: Duration) {
+    tokio::select! {
+        _ = task_notify.notified() => {}
+        _ = tokio::time::sleep(delay) => {}
+    }
+}
 
 #[derive(Deserialize)]
 struct DeleteObjectPayload {
@@ -52,21 +160,58 @@ pub async fn run(
     keyring: Arc<EncryptionKeyring>,
 ) -> Result<()> {
     let task_notify = persistence.task_notify();
+    let mut claim_backoff = WorkerClaimBackoff::default();
     loop {
+        match persistence.has_due_task_work().await {
+            Ok(true) => {}
+            Ok(false) => {
+                claim_backoff.reset();
+                wait_for_task_or_delay(&task_notify, IDLE_POLL_INTERVAL).await;
+                continue;
+            }
+            Err(error) => {
+                warn!("Failed to inspect due tasks before claiming: {error}");
+                wait_for_task_or_delay(&task_notify, CLAIM_FATAL_DELAY).await;
+                continue;
+            }
+        }
+
         let tasks = match persistence.claim_pending_tasks(10).await {
-            Ok(tasks) => tasks,
-            Err(e) => {
-                error!("Failed to fetch tasks: {}", e);
-                tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(tasks) => {
+                claim_backoff.reset();
+                tasks
+            }
+            Err(error) => {
+                let claim_error = classify_worker_claim_error(&error);
+                let delay = claim_backoff.next_delay(persistence.owner_node_id(), claim_error);
+                match claim_error {
+                    WorkerClaimError::OwnershipContention => {
+                        debug!(
+                            node_id = persistence.owner_node_id(),
+                            delay_ms = delay.as_millis(),
+                            error = %error,
+                            "Task worker is not the current task-queue owner; backing off"
+                        );
+                    }
+                    WorkerClaimError::TransientFence => {
+                        debug!(
+                            node_id = persistence.owner_node_id(),
+                            delay_ms = delay.as_millis(),
+                            error = %error,
+                            "Task worker saw transient task-queue fence contention; backing off"
+                        );
+                    }
+                    WorkerClaimError::Fatal => {
+                        error!("Failed to fetch tasks: {}", error);
+                    }
+                }
+                wait_for_task_or_delay(&task_notify, delay).await;
                 continue;
             }
         };
 
         if tasks.is_empty() {
-            tokio::select! {
-                _ = task_notify.notified() => {}
-                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
-            }
+            wait_for_task_or_delay(&task_notify, IDLE_POLL_INTERVAL).await;
             continue;
         }
 
@@ -240,7 +385,7 @@ async fn handle_hf_ingestion(
         );
 
         let token_encrypted = persistence
-            .hf_get_key_encrypted_by_id(key_id)
+            .hf_get_key_encrypted_by_id(tenant_id, key_id)
             .await?
             .ok_or_else(|| anyhow!("hugging face key not found"))?;
         let token_bytes = keyring.decrypt(&token_encrypted)?;
@@ -600,6 +745,38 @@ mod tests {
             storage_path: storage_path.to_string_lossy().to_string(),
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn worker_claim_error_classification_treats_queue_ownership_as_contention() {
+        let error = anyhow!("{OWNERSHIP_HELD}: partition task_queue is owned by active node");
+        assert_eq!(
+            classify_worker_claim_error(&error),
+            WorkerClaimError::OwnershipContention
+        );
+
+        let error = anyhow!("{LEASE_HELD}: task lease is owned by another active principal");
+        assert_eq!(
+            classify_worker_claim_error(&error),
+            WorkerClaimError::OwnershipContention
+        );
+    }
+
+    #[test]
+    fn worker_claim_backoff_is_bounded_and_jittered() {
+        let mut first = WorkerClaimBackoff::default();
+        let first_delay = first.next_delay("node-a", WorkerClaimError::OwnershipContention);
+        assert!(first_delay >= CLAIM_CONTENTION_BASE_DELAY);
+        assert!(first_delay <= CLAIM_CONTENTION_BASE_DELAY + CLAIM_CONTENTION_BASE_DELAY / 2);
+
+        let mut backoff = WorkerClaimBackoff::default();
+        let mut max_seen = Duration::ZERO;
+        for _ in 0..16 {
+            max_seen = backoff
+                .next_delay("node-a", WorkerClaimError::OwnershipContention)
+                .max(max_seen);
+        }
+        assert!(max_seen <= CLAIM_CONTENTION_MAX_DELAY + CLAIM_CONTENTION_MAX_DELAY / 2);
     }
 
     #[tokio::test]

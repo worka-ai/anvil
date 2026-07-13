@@ -1,4 +1,38 @@
 use super::*;
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    sync::LazyLock,
+};
+use tokio::sync::Mutex as TokioMutex;
+
+const PARTITION_OWNER_ACQUIRE_LOCK_STRIPES: usize = 256;
+const PARTITION_OWNER_ACQUIRE_ATTEMPTS: usize = 32;
+
+static PARTITION_OWNER_ACQUIRE_LOCKS: LazyLock<Vec<TokioMutex<()>>> = LazyLock::new(|| {
+    (0..PARTITION_OWNER_ACQUIRE_LOCK_STRIPES)
+        .map(|_| TokioMutex::new(()))
+        .collect()
+});
+
+fn partition_owner_acquire_lock(
+    partition_family: &str,
+    partition_id: &str,
+) -> &'static TokioMutex<()> {
+    let mut hasher = DefaultHasher::new();
+    partition_family.hash(&mut hasher);
+    partition_id.hash(&mut hasher);
+    let stripe = (hasher.finish() as usize) % PARTITION_OWNER_ACQUIRE_LOCK_STRIPES;
+    &PARTITION_OWNER_ACQUIRE_LOCKS[stripe]
+}
+
+fn is_partition_owner_cas_conflict(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("CoreStore partition owner CAS conflict")
+    })
+}
 
 impl Persistence {
     pub fn new(config: &Config, event_publisher: Option<Sender<MetadataEvent>>) -> Result<Self> {
@@ -42,6 +76,10 @@ impl Persistence {
 
     pub fn task_notify(&self) -> Arc<Notify> {
         self.task_notify.clone()
+    }
+
+    pub(crate) fn owner_node_id(&self) -> &str {
+        &self.owner_node_id
     }
 
     pub(super) fn notify_task_enqueued(&self) {
@@ -526,29 +564,76 @@ impl Persistence {
         }
         self.ensure_owner_node_can_acquire_new_partition(partition_family)
             .await?;
+        let _guard = partition_owner_acquire_lock(partition_family, &partition_id)
+            .lock()
+            .await;
+        let mut last_cas_conflict = None;
+        for attempt in 0..PARTITION_OWNER_ACQUIRE_ATTEMPTS {
+            match self
+                .global_write_permit_locked(partition_family, &partition_id)
+                .await
+            {
+                Ok(permit) => return Ok(permit),
+                Err(err) if is_partition_owner_cas_conflict(&err) => {
+                    last_cas_conflict = Some(err);
+                    let delay_ms = 1 + (attempt as u64 % 8);
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last_cas_conflict.unwrap_or_else(|| {
+            anyhow!("CoreStore partition owner CAS conflict did not resolve after retries")
+        }))
+    }
+
+    async fn global_write_permit_locked(
+        &self,
+        partition_family: &str,
+        partition_id: &str,
+    ) -> Result<PartitionWritePermit> {
+        let now_nanos = Utc::now()
+            .timestamp_nanos_opt()
+            .ok_or_else(|| anyhow!("partition owner timestamp overflow"))?;
         if let Some(owner) = read_partition_owner(
             &self.storage,
             partition_family,
-            &partition_id,
+            partition_id,
             &self.partition_owner_signing_key,
         )
         .await?
         {
-            if owner.status == PartitionOwnerStatus::Ready
-                && owner.owner_node_id == self.owner_node_id
+            if owner.owner_node_id != self.owner_node_id
+                && !partition_owner_is_force_expired(&owner)
             {
+                bail!(
+                    "{OWNERSHIP_HELD}: partition {partition_family}/{partition_id} is owned by active node {}",
+                    owner.owner_node_id
+                );
+            }
+            if owner.status == PartitionOwnerStatus::Ready {
                 return owner.write_permit().map_err(Into::into);
             }
+            let ready = publish_partition_ready(
+                &self.storage,
+                partition_family,
+                partition_id,
+                &self.owner_node_id,
+                owner.fence_token,
+                owner.recovered_through_sequence,
+                &owner.recovered_manifest_hash,
+                now_nanos,
+                &self.partition_owner_signing_key,
+            )
+            .await?;
+            return ready.write_permit().map_err(Into::into);
         }
 
-        let now_nanos = Utc::now()
-            .timestamp_nanos_opt()
-            .ok_or_else(|| anyhow!("partition owner timestamp overflow"))?;
         let recovering = acquire_partition_recovery(
             &self.storage,
             PartitionRecoveryAcquire {
                 partition_family: partition_family.to_string(),
-                partition_id: partition_id.clone(),
+                partition_id: partition_id.to_string(),
                 owner_node_id: self.owner_node_id.clone(),
                 recovered_through_sequence: 0,
                 recovered_manifest_hash: hex::encode([0; 32]),
@@ -557,10 +642,13 @@ impl Persistence {
             &self.partition_owner_signing_key,
         )
         .await?;
+        if recovering.status == PartitionOwnerStatus::Ready {
+            return recovering.write_permit().map_err(Into::into);
+        }
         let ready = publish_partition_ready(
             &self.storage,
             partition_family,
-            &partition_id,
+            partition_id,
             &self.owner_node_id,
             recovering.fence_token,
             0,

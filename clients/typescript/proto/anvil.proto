@@ -8,6 +8,8 @@ service AdminService {
   rpc RotateApplicationSecret(RotateApplicationSecretRequest) returns (ApplicationSecretResponse);
   rpc GrantApplicationPolicy(GrantApplicationPolicyRequest) returns (ApplicationPolicyResponse);
   rpc RevokeApplicationPolicy(RevokeApplicationPolicyRequest) returns (ApplicationPolicyResponse);
+  rpc GrantApplicationPolicies(ApplicationPoliciesRequest) returns (ApplicationPoliciesResponse);
+  rpc RevokeApplicationPolicies(ApplicationPoliciesRequest) returns (ApplicationPoliciesResponse);
   rpc RotateSecretEncryptionKey(RotateSecretEncryptionKeyRequest) returns (SecretEncryptionKeyRotationResponse);
   rpc CreateBucketAdmin(CreateBucketAdminRequest) returns (BucketAdminResponse);
   rpc SetBucketPublicAccessAdmin(SetBucketPublicAccessAdminRequest) returns (BucketAdminResponse);
@@ -34,6 +36,7 @@ service AdminService {
   rpc ListCells(ListCellsRequest) returns (ListCellsResponse);
 
   rpc RegisterNode(RegisterNodeRequest) returns (NodeResponse);
+  rpc GetLocalNodeDescriptor(GetLocalNodeDescriptorRequest) returns (NodeResponse);
   rpc ActivateNode(ActivateNodeRequest) returns (NodeResponse);
   rpc DrainNode(DrainNodeRequest) returns (DrainOperationResponse);
   rpc ForceOfflineNode(ForceOfflineNodeRequest) returns (NodeResponse);
@@ -358,6 +361,26 @@ message ApplicationPolicyResponse {
   string audit_event_id = 6;
 }
 
+message ApplicationPolicyMutation {
+  string action = 1;
+  string resource = 2;
+}
+
+message ApplicationPoliciesRequest {
+  AdminRequestContext context = 1;
+  string tenant_id = 2;
+  string app_name = 3;
+  repeated ApplicationPolicyMutation policies = 4;
+}
+
+message ApplicationPoliciesResponse {
+  string request_id = 1;
+  string tenant_id = 2;
+  string app_name = 3;
+  repeated ApplicationPolicyMutation policies = 4;
+  string audit_event_id = 5;
+}
+
 message RotateSecretEncryptionKeyRequest {
   AdminRequestContext context = 1;
   bool dry_run = 2;
@@ -611,6 +634,8 @@ message RegisterNodeRequest {
   bytes receipt_signing_public_key_proto = 9;
   string capacity_json = 10;
 }
+
+message GetLocalNodeDescriptorRequest {}
 
 message ActivateNodeRequest {
   AdminRequestContext context = 1;
@@ -1361,6 +1386,7 @@ service StreamService {
 
 
 service MeshControlService {
+  rpc BootstrapMeshTopology(BootstrapMeshTopologyRequest) returns (BootstrapMeshTopologyResponse);
   rpc PutRegion(PutRegionRequest) returns (WriteResponse);
   rpc PutCell(PutCellRequest) returns (WriteResponse);
   rpc PutNode(PutNodeRequest) returns (WriteResponse);
@@ -2042,6 +2068,19 @@ message PutNodeRequest {
     bytes receipt_signing_public_key_proto = 9;
     repeated string cluster_addrs = 10;
     repeated string capabilities = 11;
+}
+
+message BootstrapMeshTopologyRequest {
+  repeated PutRegionRequest regions = 1;
+  repeated PutCellRequest cells = 2;
+  repeated PutNodeRequest nodes = 3;
+  repeated CoreMetaRowMutation canonical_coremeta_rows = 4;
+}
+
+message BootstrapMeshTopologyResponse {
+  WriteResponse write = 1;
+  repeated CoreMetaRowMutation canonical_coremeta_rows = 2;
+  bool already_initialised = 3;
 }
 
 message MoveBucketRequest {

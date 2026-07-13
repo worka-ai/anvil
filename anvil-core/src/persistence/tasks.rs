@@ -304,6 +304,10 @@ impl Persistence {
         Err(last_error.unwrap_or_else(|| anyhow!("task claim retry exhausted")))
     }
 
+    pub async fn has_due_task_work(&self) -> Result<bool> {
+        task_journal::has_due_tasks(&self.storage).await
+    }
+
     pub async fn list_tasks(&self) -> Result<Vec<TaskRecord>> {
         task_journal::list_tasks(&self.storage).await
     }
@@ -378,6 +382,7 @@ impl Persistence {
 
     pub async fn hf_create_key(
         &self,
+        tenant_id: i64,
         name: &str,
         token_encrypted: &[u8],
         note: Option<&str>,
@@ -385,6 +390,7 @@ impl Persistence {
         let permit = self.hf_write_permit().await?;
         hf_journal::create_key_with_permit(
             &self.storage,
+            tenant_id,
             name,
             token_encrypted,
             note,
@@ -394,10 +400,11 @@ impl Persistence {
         .await
     }
 
-    pub async fn hf_delete_key(&self, name: &str) -> Result<u64> {
+    pub async fn hf_delete_key(&self, tenant_id: i64, name: &str) -> Result<u64> {
         let permit = self.hf_write_permit().await?;
         hf_journal::delete_key_with_permit(
             &self.storage,
+            tenant_id,
             name,
             &permit,
             &self.partition_owner_signing_key,
@@ -405,12 +412,20 @@ impl Persistence {
         .await
     }
 
-    pub async fn hf_get_key_encrypted(&self, name: &str) -> Result<Option<(i64, Vec<u8>)>> {
-        hf_journal::get_key_encrypted(&self.storage, name).await
+    pub async fn hf_get_key_encrypted(
+        &self,
+        tenant_id: i64,
+        name: &str,
+    ) -> Result<Option<(i64, Vec<u8>)>> {
+        hf_journal::get_key_encrypted(&self.storage, tenant_id, name).await
     }
 
-    pub async fn hf_get_key_encrypted_by_id(&self, id: i64) -> Result<Option<Vec<u8>>> {
-        hf_journal::get_key_encrypted_by_id(&self.storage, id).await
+    pub async fn hf_get_key_encrypted_by_id(
+        &self,
+        tenant_id: i64,
+        id: i64,
+    ) -> Result<Option<Vec<u8>>> {
+        hf_journal::get_key_encrypted_by_id(&self.storage, tenant_id, id).await
     }
 
     pub(crate) async fn hf_list_encrypted_keys(&self) -> Result<Vec<HfKey>> {
@@ -431,8 +446,9 @@ impl Persistence {
 
     pub async fn hf_list_keys(
         &self,
+        tenant_id: i64,
     ) -> Result<Vec<(String, Option<String>, DateTime<Utc>, DateTime<Utc>)>> {
-        hf_journal::list_keys(&self.storage).await
+        hf_journal::list_keys(&self.storage, tenant_id).await
     }
 
     #[allow(clippy::too_many_arguments)]

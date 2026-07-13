@@ -1147,8 +1147,27 @@ pub async fn append_control_stream_frame(
     frame: &ControlStreamFrame,
     precondition: Option<CoreMutationPrecondition>,
 ) -> AnyhowResult<ControlStreamAppend> {
-    let stream_id = control_stream_id(stream_family, partition)?;
     let existing = read_control_stream_log(storage, stream_family, partition).await?;
+    append_control_stream_frame_with_log(
+        storage,
+        stream_family,
+        partition,
+        frame,
+        existing,
+        precondition,
+    )
+    .await
+}
+
+pub(crate) async fn append_control_stream_frame_with_log(
+    storage: &Storage,
+    stream_family: &str,
+    partition: &str,
+    frame: &ControlStreamFrame,
+    existing: ControlStreamLog,
+    precondition: Option<CoreMutationPrecondition>,
+) -> AnyhowResult<ControlStreamAppend> {
+    let stream_id = control_stream_id(stream_family, partition)?;
     if let Some(partial) = existing.partial_final_frame {
         return Err(anyhow!(
             "control stream log has partial final frame at offset {} ({} of {} bytes)",
@@ -1205,25 +1224,32 @@ pub async fn append_control_stream_frame(
         ));
     }
     let encoded_len = encoded.len();
-    crate::mesh_control_segment::write_mesh_control_segment(
-        storage,
-        crate::mesh_control_segment::MeshControlSegmentWrite {
-            mesh_id: &mutation_header.mesh_id,
-            stream_family,
-            partition,
-            generation: visible_sequence,
-            event_kind: &mutation_header.operation,
-            source_cursor: visible_sequence,
-            placement_epoch: mutation_header.writer_fence,
-            boundary_values: &[],
-            records: &[crate::mesh_control_segment::MeshControlSegmentRecord {
-                key: mutation_header.record_key.as_bytes().to_vec(),
-                value: encoded,
-            }],
-        },
-    )
-    .await
-    .with_context(|| format!("write CoreStore mesh-control segment for {stream_id}"))?;
+    if std::env::var_os("ANVIL_MESH_SYNC_SEGMENTS").is_some() {
+        crate::mesh_control_segment::write_mesh_control_segment(
+            storage,
+            crate::mesh_control_segment::MeshControlSegmentWrite {
+                mesh_id: &mutation_header.mesh_id,
+                stream_family,
+                partition,
+                generation: visible_sequence,
+                event_kind: &mutation_header.operation,
+                source_cursor: visible_sequence,
+                placement_epoch: mutation_header.writer_fence,
+                boundary_values: &[],
+                records: &[crate::mesh_control_segment::MeshControlSegmentRecord {
+                    key: mutation_header.record_key.as_bytes().to_vec(),
+                    value: encoded,
+                }],
+            },
+        )
+        .await
+        .with_context(|| format!("write CoreStore mesh-control segment for {stream_id}"))?;
+    } else {
+        crate::emit_test_timing(
+            "mesh_control_stream.append_control_stream_frame deferred_writer_segment",
+            std::time::Duration::ZERO,
+        );
+    }
     Ok(ControlStreamAppend {
         offset: existing.complete_len,
         encoded_len,

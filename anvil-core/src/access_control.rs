@@ -84,6 +84,17 @@ pub async fn action_allows(
     resource: &str,
 ) -> Result<bool, Status> {
     let result = match action {
+        AnvilAction::TenantManage => {
+            system_realm_relationship_allows(
+                storage,
+                claims,
+                SYSTEM_STORAGE_TENANT_NAMESPACE,
+                &storage_tenant_object_id(claims.tenant_id),
+                "manage_tenant",
+                None,
+            )
+            .await
+        }
         AnvilAction::BucketCreate => {
             system_realm_relationship_allows(
                 storage,
@@ -656,6 +667,11 @@ pub async fn delegated_relation_for_action(
             ));
         }
 
+        AnvilAction::TenantManage => Ok(DelegatedSystemRelation {
+            namespace: system_realm_namespace(SYSTEM_STORAGE_TENANT_NAMESPACE),
+            object_id: storage_tenant_object_id(tenant_id),
+            relation: "manage_tenant".to_string(),
+        }),
         AnvilAction::BucketCreate => Ok(DelegatedSystemRelation {
             namespace: system_realm_namespace(SYSTEM_STORAGE_TENANT_NAMESPACE),
             object_id: storage_tenant_object_id(tenant_id),
@@ -930,6 +946,50 @@ pub async fn write_delegated_action_tuple(
             written_by,
             reason,
         )
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?;
+    Ok(())
+}
+
+pub async fn write_delegated_action_tuple_batch(
+    storage: &Storage,
+    persistence: &Persistence,
+    tenant_id: i64,
+    grantee_principal_id: &str,
+    policies: &[(AnvilAction, String)],
+    operation: &str,
+    written_by: &str,
+    reason: &str,
+) -> Result<(), Status> {
+    if policies.is_empty() {
+        return Err(Status::invalid_argument(
+            "At least one application policy is required",
+        ));
+    }
+    if !matches!(operation, "add" | "remove") {
+        return Err(Status::invalid_argument(
+            "Application policy operation must be add or remove",
+        ));
+    }
+
+    let mut mutations = Vec::with_capacity(policies.len());
+    for (action, resource) in policies {
+        let relation =
+            delegated_relation_for_action(storage, tenant_id, action.clone(), resource).await?;
+        mutations.push(AuthzTupleBatchMutation {
+            namespace: relation.namespace,
+            object_id: relation.object_id,
+            relation: relation.relation,
+            subject_kind: APP_SUBJECT_KIND.to_string(),
+            subject_id: grantee_principal_id.to_string(),
+            caveat_hash: String::new(),
+            operation: operation.to_string(),
+            reason: reason.to_string(),
+        });
+    }
+
+    persistence
+        .write_authz_tuple_batch(SYSTEM_STORAGE_TENANT_ID, mutations, written_by)
         .await
         .map_err(|error| Status::internal(error.to_string()))?;
     Ok(())

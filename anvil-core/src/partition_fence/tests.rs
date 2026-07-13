@@ -69,10 +69,31 @@ async fn owner_handoff_rejects_stale_fence_token() {
     .unwrap();
     let stale_permit = first.write_permit().unwrap();
 
+    let blocked = acquire_partition_recovery(&storage, acquire("node-b", 250), KEY)
+        .await
+        .unwrap_err();
+    assert!(blocked.to_string().contains(OWNERSHIP_HELD));
+    validate_partition_write(&storage, &stale_permit, KEY)
+        .await
+        .unwrap();
+
+    let expired = force_expire_partition_owner_for_node(
+        &storage,
+        &first.partition_family,
+        &first.partition_id,
+        "node-a",
+        275,
+        KEY,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(expired.fence_token > first.fence_token);
+
     let second = acquire_partition_recovery(&storage, acquire("node-b", 300), KEY)
         .await
         .unwrap();
-    assert_eq!(second.fence_token, first.fence_token + 1);
+    assert!(second.fence_token > first.fence_token);
     let stale_rejection = validate_partition_write(&storage, &stale_permit, KEY)
         .await
         .unwrap_err();
@@ -101,6 +122,106 @@ async fn owner_handoff_rejects_stale_fence_token() {
         .await
         .unwrap_err();
     assert_eq!(stale_rejection.code, AnvilErrorCode::StaleFenceToken);
+}
+
+#[tokio::test]
+async fn same_node_concurrent_partition_recovery_acquire_is_idempotent() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let request = acquire("node-a", 100);
+    let mut tasks = Vec::new();
+    for _ in 0..32 {
+        let storage = storage.clone();
+        let request = request.clone();
+        tasks.push(tokio::spawn(async move {
+            acquire_partition_recovery(&storage, request, KEY).await
+        }));
+    }
+
+    let mut owners = Vec::new();
+    for task in tasks {
+        owners.push(task.await.unwrap().unwrap());
+    }
+    let first = owners.first().expect("at least one owner");
+    assert_eq!(first.owner_node_id, "node-a");
+    assert_eq!(first.status, PartitionOwnerStatus::Recovering);
+    for owner in &owners {
+        assert_eq!(owner.owner_node_id, first.owner_node_id);
+        assert_eq!(owner.fence_token, first.fence_token);
+        assert_eq!(owner.recovery_epoch, first.recovery_epoch);
+    }
+    let listed = list_partition_owners(&storage, KEY).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].owner_node_id, "node-a");
+    assert_eq!(listed[0].fence_token, first.fence_token);
+}
+
+#[tokio::test]
+async fn same_node_recovery_acquire_rejects_mismatched_basis() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let first = acquire_partition_recovery(&storage, acquire("node-a", 100), KEY)
+        .await
+        .unwrap();
+
+    let mut mismatched = acquire("node-a", 150);
+    mismatched.recovered_through_sequence = first.recovered_through_sequence.saturating_add(1);
+    mismatched.recovered_manifest_hash = hex::encode([8; 32]);
+    let err = acquire_partition_recovery(&storage, mismatched, KEY)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains(OWNERSHIP_HELD));
+
+    let still_owner =
+        read_partition_owner(&storage, &first.partition_family, &first.partition_id, KEY)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(still_owner.owner_node_id, "node-a");
+    assert_eq!(still_owner.fence_token, first.fence_token);
+    assert_eq!(
+        still_owner.recovered_manifest_hash,
+        first.recovered_manifest_hash
+    );
+}
+
+#[tokio::test]
+async fn different_node_recovery_acquire_does_not_steal_ready_owner() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let recovering = acquire_partition_recovery(&storage, acquire("node-a", 100), KEY)
+        .await
+        .unwrap();
+    let ready = publish_partition_ready(
+        &storage,
+        &recovering.partition_family,
+        &recovering.partition_id,
+        "node-a",
+        recovering.fence_token,
+        10,
+        &hex::encode([3; 32]),
+        150,
+        KEY,
+    )
+    .await
+    .unwrap();
+    let permit = ready.write_permit().unwrap();
+
+    let err = acquire_partition_recovery(&storage, acquire("node-b", 200), KEY)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains(OWNERSHIP_HELD));
+
+    let still_owner =
+        read_partition_owner(&storage, &ready.partition_family, &ready.partition_id, KEY)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(still_owner.owner_node_id, "node-a");
+    assert_eq!(still_owner.fence_token, ready.fence_token);
+    validate_partition_write(&storage, &permit, KEY)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

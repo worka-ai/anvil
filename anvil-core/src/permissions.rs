@@ -7,6 +7,9 @@ use std::str::FromStr;
 /// Permissions are structured as `<resource>:<action>`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AnvilAction {
+    // Storage tenant actions
+    TenantManage,
+
     // Bucket actions
     BucketCreate,
     BucketDelete,
@@ -105,6 +108,9 @@ pub enum AnvilAction {
 impl fmt::Display for AnvilAction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
+            // Storage tenant actions
+            AnvilAction::TenantManage => "tenant:manage",
+
             // Bucket actions
             AnvilAction::BucketCreate => "bucket:create",
             AnvilAction::BucketDelete => "bucket:delete",
@@ -208,6 +214,9 @@ impl FromStr for AnvilAction {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            // Storage tenant actions
+            "tenant:manage" => Ok(AnvilAction::TenantManage),
+
             // Bucket actions
             "bucket:create" => Ok(AnvilAction::BucketCreate),
             "bucket:delete" => Ok(AnvilAction::BucketDelete),
@@ -314,6 +323,7 @@ mod tests {
     #[test]
     fn test_action_display_and_from_str() {
         let actions = vec![
+            AnvilAction::TenantManage,
             AnvilAction::BucketCreate,
             AnvilAction::BucketWatch,
             AnvilAction::ObjectWrite,

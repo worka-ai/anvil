@@ -5,6 +5,8 @@ use clap::{Subcommand, ValueEnum};
 
 #[derive(Subcommand)]
 pub enum NodeCommands {
+    /// Read this server's registration descriptor from its private admin API
+    DescribeLocal,
     /// Register a node descriptor
     Register {
         #[clap(flatten)]
@@ -99,6 +101,18 @@ pub(super) async fn handle_node_command(
     token: &str,
 ) -> anyhow::Result<()> {
     match command {
+        NodeCommands::DescribeLocal => {
+            print_rpc_response(
+                "node",
+                None,
+                None,
+                client.get_local_node_descriptor(with_auth(
+                    api::GetLocalNodeDescriptorRequest {},
+                    token,
+                )?),
+            )
+            .await?;
+        }
         NodeCommands::Register {
             context,
             node_id,

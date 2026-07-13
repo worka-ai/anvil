@@ -1,5 +1,13 @@
 use super::*;
 use prost::Message;
+use std::sync::LazyLock;
+use tokio::sync::Mutex as TokioMutex;
+
+static CONTROL_PLANE_MUTATION_LOCK: LazyLock<TokioMutex<()>> =
+    LazyLock::new(|| TokioMutex::new(()));
+// The active global bucket-partition owner sequences numeric bucket IDs locally.
+// Ownership fences reject concurrent allocators on other nodes.
+static BUCKET_ID_ALLOCATION_LOCK: LazyLock<TokioMutex<()>> = LazyLock::new(|| TokioMutex::new(()));
 
 #[derive(Clone, PartialEq, Message)]
 struct ActiveIndexPolicySnapshotProto {
@@ -37,6 +45,7 @@ impl Persistence {
     }
 
     pub async fn create_tenant(&self, name: &str, idempotency_key: &str) -> Result<Tenant> {
+        let _guard = CONTROL_PLANE_MUTATION_LOCK.lock().await;
         let permit = self.control_write_permit().await?;
         let tenant = control_journal::create_tenant_with_permit(
             &self.storage,
@@ -57,6 +66,7 @@ impl Persistence {
         client_id: &str,
         encrypted_secret: &[u8],
     ) -> Result<App> {
+        let _guard = CONTROL_PLANE_MUTATION_LOCK.lock().await;
         let permit = self.control_write_permit().await?;
         control_journal::create_app_with_permit(
             &self.storage,
@@ -89,6 +99,7 @@ impl Persistence {
     }
 
     pub async fn update_app_secret(&self, app_id: i64, new_encrypted_secret: &[u8]) -> Result<()> {
+        let _guard = CONTROL_PLANE_MUTATION_LOCK.lock().await;
         let permit = self.control_write_permit().await?;
         control_journal::update_app_secret_with_permit(
             &self.storage,
@@ -101,6 +112,7 @@ impl Persistence {
     }
 
     pub async fn delete_app(&self, app_id: i64) -> Result<()> {
+        let _guard = CONTROL_PLANE_MUTATION_LOCK.lock().await;
         let permit = self.control_write_permit().await?;
         control_journal::delete_app_with_permit(
             &self.storage,
@@ -131,6 +143,12 @@ impl Persistence {
             "persistence.create_bucket ensure_new_writable_placement",
             step_start.elapsed(),
         );
+        let allocation_start = std::time::Instant::now();
+        let _allocation_guard = BUCKET_ID_ALLOCATION_LOCK.lock().await;
+        crate::emit_test_timing(
+            "persistence.create_bucket bucket_id_allocation_lock",
+            allocation_start.elapsed(),
+        );
         let step_start = std::time::Instant::now();
         if bucket_journal::read_current_bucket(&self.storage, tenant_id, name)
             .await
@@ -160,24 +178,27 @@ impl Persistence {
             "persistence.create_bucket next_bucket_id",
             step_start.elapsed(),
         );
-        let step_start = std::time::Instant::now();
-        let tenant_permit = self
-            .bucket_tenant_write_permit(tenant_id)
-            .await
-            .map_err(|e| tonic::Status::internal(e.to_string()))?;
-        crate::emit_test_timing(
-            "persistence.create_bucket tenant_write_permit",
-            step_start.elapsed(),
-        );
-        let step_start = std::time::Instant::now();
-        let global_permit = self
-            .bucket_global_write_permit()
-            .await
-            .map_err(|e| tonic::Status::internal(e.to_string()))?;
-        crate::emit_test_timing(
-            "persistence.create_bucket global_write_permit",
-            step_start.elapsed(),
-        );
+        let tenant_permit = async {
+            let step_start = std::time::Instant::now();
+            let permit = self.bucket_tenant_write_permit(tenant_id).await;
+            crate::emit_test_timing(
+                "persistence.create_bucket tenant_write_permit",
+                step_start.elapsed(),
+            );
+            permit
+        };
+        let global_permit = async {
+            let step_start = std::time::Instant::now();
+            let permit = self.bucket_global_write_permit().await;
+            crate::emit_test_timing(
+                "persistence.create_bucket global_write_permit",
+                step_start.elapsed(),
+            );
+            permit
+        };
+        let (tenant_permit, global_permit) = tokio::join!(tenant_permit, global_permit);
+        let tenant_permit = tenant_permit.map_err(|e| tonic::Status::internal(e.to_string()))?;
+        let global_permit = global_permit.map_err(|e| tonic::Status::internal(e.to_string()))?;
         let step_start = std::time::Instant::now();
         bucket_journal::append_bucket_mutation_with_permits(
             &self.storage,

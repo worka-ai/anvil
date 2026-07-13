@@ -208,9 +208,15 @@ pub async fn ensure_bootstrapped(
     install_system_schema(storage)
         .await
         .context("install system authz schema")?;
-    write_system_relation_tuples(persistence, &mesh_id, &subject_kind, &subject_id)
-        .await
-        .context("write system relation tuples")?;
+    write_system_relation_tuples(
+        persistence,
+        &mesh_id,
+        &subject_kind,
+        &subject_id,
+        &config.bootstrap_node_ids,
+    )
+    .await
+    .context("write system relation tuples")?;
     write_bootstrap_marker(storage, &mesh_id)
         .await
         .context("write system bootstrap marker")
@@ -1108,21 +1114,40 @@ async fn write_system_relation_tuples(
     _mesh_id: &str,
     subject_kind: &str,
     subject_id: &str,
+    bootstrap_node_ids: &[String],
 ) -> Result<()> {
     let namespace = system_namespace();
+    let mut mutations = vec![AuthzTupleBatchMutation {
+        namespace: namespace.clone(),
+        object_id: SYSTEM_OBJECT_ID.to_string(),
+        relation: "bootstrap_admin".to_string(),
+        subject_kind: subject_kind.to_string(),
+        subject_id: subject_id.to_string(),
+        caveat_hash: String::new(),
+        operation: "add".to_string(),
+        reason: "grant initial system bootstrap administrator".to_string(),
+    }];
+    let mut unique_node_ids = std::collections::BTreeSet::new();
+    for node_id in bootstrap_node_ids {
+        let node_id = node_id.trim();
+        if node_id.is_empty() || !unique_node_ids.insert(node_id) {
+            continue;
+        }
+        mutations.push(AuthzTupleBatchMutation {
+            namespace: namespace.clone(),
+            object_id: SYSTEM_OBJECT_ID.to_string(),
+            relation: "manage_nodes".to_string(),
+            subject_kind: SYSTEM_ADMIN_SUBJECT_KIND_APP.to_string(),
+            subject_id: node_id.to_string(),
+            caveat_hash: String::new(),
+            operation: "add".to_string(),
+            reason: "admit mesh genesis node principal".to_string(),
+        });
+    }
     persistence
         .write_authz_tuple_batch(
             SYSTEM_STORAGE_TENANT_ID,
-            vec![AuthzTupleBatchMutation {
-                namespace,
-                object_id: SYSTEM_OBJECT_ID.to_string(),
-                relation: "bootstrap_admin".to_string(),
-                subject_kind: subject_kind.to_string(),
-                subject_id: subject_id.to_string(),
-                caveat_hash: String::new(),
-                operation: "add".to_string(),
-                reason: "grant initial system bootstrap administrator".to_string(),
-            }],
+            mutations,
             "system-realm-bootstrap",
         )
         .await?;
