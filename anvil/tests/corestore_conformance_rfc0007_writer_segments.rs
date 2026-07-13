@@ -85,7 +85,7 @@ fn format_aware_segments_are_corestore_writer_outputs_not_json_envelopes() {
             "decode_writer_segment(",
             "encode_writer_segment_header",
             "write_format_build_output(WriterBuildOutput",
-            "core_object_ref_from_logical_file_write",
+            "written_object_refs",
         ] {
             assert!(
                 source.contains(required),

@@ -130,9 +130,14 @@ fn native_writes_accept_transaction_id_and_read_committed_source_gates_exist() {
         workspace_file("anvil-core/src/services/object/rpc.rs"),
         workspace_file("anvil-core/src/services/transaction.rs")
     );
+    let object_rpc_with_shared_validation = format!(
+        "{}\n{}",
+        object_rpc,
+        workspace_file("anvil-core/src/services/saga_reserved.rs")
+    );
     assert_contains_all(
         "native write transaction id handling",
-        &object_rpc,
+        &object_rpc_with_shared_validation,
         &[
             "fn native_transaction_id(context: Option<&NativeMutationContext>)",
             "fn write_state_for_transaction(transaction_id: Option<&str>)",
