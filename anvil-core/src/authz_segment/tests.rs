@@ -145,7 +145,7 @@ async fn authz_tuple_segment_candidate_reader_returns_revision_scoped_doc_ids() 
 }
 
 #[tokio::test]
-async fn authz_candidate_reader_lazy_catches_up_deferred_tuple_segments() {
+async fn authz_candidate_reader_merges_revisioned_tuple_segments() {
     let temp = tempdir().unwrap();
     let storage = Storage::new_at(temp.path()).await.unwrap();
     for record in [
@@ -158,24 +158,43 @@ async fn authz_candidate_reader_lazy_catches_up_deferred_tuple_segments() {
             .unwrap();
     }
 
-    assert!(
-        read_latest_authz_tuple_segment(&storage, 7)
-            .await
-            .unwrap()
-            .is_none(),
-        "tuple writes must not synchronously materialize authz writer segments"
-    );
-    assert!(
-        crate::authz_userset_index::read_derived_userset_index(
-            &storage,
-            7,
-            crate::authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID,
-        )
+    let latest = read_latest_authz_tuple_segment(&storage, 7)
         .await
         .unwrap()
-        .is_none(),
-        "tuple writes must coalesce userset materialization instead of rewriting a snapshot"
-    );
+        .expect("tuple writes must synchronously advance authz delta segments");
+    assert_eq!(latest.header.generation, 3);
+    assert_eq!(latest.header.segment_kind, "merged");
+    assert_eq!(latest.records.len(), 3);
+    assert_eq!(latest.revision_checkpoints.len(), 3);
+    assert_eq!(latest.schema_descriptors.len(), 1);
+    let catalog = crate::writer_segment_catalog::list_writer_segment_catalog_records(
+        &storage,
+        AUTHZ_TUPLE_SEGMENT_CATALOG_FAMILY,
+        &authz_tuple_segment_scope(7).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(catalog.len(), 3);
+    for (index, record) in catalog.into_iter().enumerate() {
+        let segment = read_authz_tuple_segment_ref(&storage, 7, &record.segment_ref)
+            .await
+            .unwrap()
+            .unwrap();
+        if index == 0 {
+            assert_eq!(segment.header.segment_kind, "checkpoint");
+            assert_eq!(segment.header.base_revision, 0);
+            assert!(segment.header.schema_replacement);
+            assert!(segment.header.relation_rule_replacement);
+        } else {
+            assert_eq!(segment.header.segment_kind, "delta");
+            assert_eq!(segment.header.base_revision + 1, segment.header.generation);
+            assert!(!segment.header.schema_replacement);
+            assert!(!segment.header.relation_rule_replacement);
+            assert!(segment.schema_descriptors.is_empty());
+            assert!(segment.relation_rules.is_empty());
+        }
+        assert_eq!(segment.records.len(), 1);
+        assert_eq!(segment.revision_checkpoints.len(), 1);
+    }
 
     let scope = CandidateSetScope {
         root_key_hash: test_hash('0'),
@@ -227,17 +246,68 @@ async fn authz_candidate_reader_lazy_catches_up_deferred_tuple_segments() {
     historical_request.candidate_scope.authz_revision = 2;
     let historical = reader.candidate_set(historical_request).await.unwrap();
     assert!(
-        historical.contains_doc_id(
-            ObjectAuthzKey::realm_object("document", "alpha").doc_id(44)
-        )
+        historical.contains_doc_id(ObjectAuthzKey::realm_object("document", "alpha").doc_id(44))
     );
     assert!(
-        !historical.contains_doc_id(
-            ObjectAuthzKey::realm_object("document", "gamma").doc_id(44)
-        )
+        !historical.contains_doc_id(ObjectAuthzKey::realm_object("document", "gamma").doc_id(44))
     );
 
     let mut stale_request = request;
     stale_request.revision = 4;
     assert!(reader.candidate_set(stale_request).await.is_err());
+}
+
+#[tokio::test]
+async fn authz_candidate_reader_applies_remove_delta_without_changing_history() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    for record in [
+        tuple_record(1, "alpha", "alice"),
+        tuple_record(2, "beta", "alice"),
+        record(3, "remove"),
+    ] {
+        crate::authz_journal::append_authz_tuple_record(&storage, &record)
+            .await
+            .unwrap();
+    }
+
+    let scope = CandidateSetScope {
+        root_key_hash: test_hash('0'),
+        root_generation: 9,
+        index_id: "index:documents".to_string(),
+        index_generation: 4,
+        authz_realm_id: "tenant:7".to_string(),
+        authz_scope_hash: test_hash('1'),
+        authz_object_namespace: "document".to_string(),
+        authz_relation: "viewer".to_string(),
+        authz_principal_hash: test_hash('2'),
+        authz_revision: 3,
+        boundary_schema_generation_hash: test_hash('3'),
+        predicate_hash: test_hash('4'),
+        order_hash: test_hash('5'),
+    };
+    let request = AuthzCandidateRequest {
+        authz_scope: "tenant:7".to_string(),
+        candidate_scope: scope,
+        partition_id: 44,
+        subject: "user:alice".to_string(),
+        relation: "viewer".to_string(),
+        object_namespace: "document".to_string(),
+        revision: 3,
+        system_revision: 0,
+        root_generation: 9,
+    };
+    let reader = AuthzSegmentCandidateReader::new(storage.clone(), 7);
+
+    let current = reader.candidate_set(request.clone()).await.unwrap();
+    assert!(!current.contains_doc_id(ObjectAuthzKey::realm_object("document", "alpha").doc_id(44)));
+    assert!(current.contains_doc_id(ObjectAuthzKey::realm_object("document", "beta").doc_id(44)));
+
+    let mut historical_request = request;
+    historical_request.revision = 2;
+    historical_request.candidate_scope.authz_revision = 2;
+    let historical = reader.candidate_set(historical_request).await.unwrap();
+    assert!(
+        historical.contains_doc_id(ObjectAuthzKey::realm_object("document", "alpha").doc_id(44))
+    );
 }

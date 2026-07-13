@@ -1,9 +1,12 @@
+use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::index_service_client::IndexServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::{
-    self, CreateBucketRequest, CreateIndexRequest, GetObjectRequest, IndexKind, ListObjectsRequest,
+    self, CheckPermissionRequest, CreateBucketRequest, CreateIndexRequest, GetAccessTokenRequest,
+    GetObjectRequest, IndexKind, ListAuthzObjectsRequest, ListObjectsRequest,
     NativeMutationContext, ObjectMetadata, PutObjectRequest, QueryIndexRequest, QueryIndexResponse,
+    WriteAuthzTupleRequest,
 };
 use anvil_core::core_store::{
     AcquireFence, AppendStreamRecord, CF_INLINE_PAYLOADS, CoreMetaStore, CoreMetaTuplePart,
@@ -13,7 +16,9 @@ use anvil_core::core_store::{
 };
 use anvil_core::perf_baseline::{BaselineManifest, BaselineRunSummary, BaselineScenarioSummary};
 use anvil_core::storage::Storage;
-use anvil_test_utils::{emit_test_timing, isolated_test_cluster, unique_test_name};
+use anvil_test_utils::{
+    emit_test_timing, isolated_test_cluster, shared_docker_test_cluster, unique_test_name,
+};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -21,6 +26,10 @@ use tonic::Request;
 
 fn perf_enabled() -> bool {
     std::env::var_os("ANVIL_RUN_PERF_TESTS").is_some()
+}
+
+fn docker_latency_enabled() -> bool {
+    std::env::var_os("ANVIL_RUN_DOCKER_LATENCY").is_some()
 }
 
 fn authorized<T>(message: T, token: &str) -> Request<T> {
@@ -166,6 +175,257 @@ impl PerfReport {
         anvil::perf::flush().await;
         eprintln!("[perf] wrote {}", run_dir.display());
     }
+}
+
+#[tokio::test]
+async fn performance_docker_end_user_flow() {
+    if !docker_latency_enabled() {
+        eprintln!("skipping performance_docker_end_user_flow; set ANVIL_RUN_DOCKER_LATENCY=1");
+        return;
+    }
+
+    let mut report = PerfReport {
+        started_at: Some(Instant::now()),
+        ..PerfReport::default()
+    };
+    let cluster = shared_docker_test_cluster().await;
+    let tenant_name = unique_test_name("perf-tenant");
+    let tenant_id = report
+        .measure("docker_create_tenant", || async {
+            cluster.create_tenant(&tenant_name).await
+        })
+        .await;
+    let app_name = unique_test_name("perf-app");
+    let (app_id, client_id, client_secret) = report
+        .measure("docker_create_application", || async {
+            cluster
+                .create_application_with_id(tenant_id, &app_name)
+                .await
+        })
+        .await;
+    let tenant_resource = format!("tenant:{tenant_id}");
+    let mut policies = vec![("tenant:manage".to_string(), tenant_resource)];
+    policies.extend(
+        [
+            "authz:tuple_write",
+            "authz:tuple_read",
+            "authz:check",
+            "authz:watch",
+            "authz:schema_read",
+            "authz:schema_write",
+        ]
+        .into_iter()
+        .map(|action| (action.to_string(), "default".to_string())),
+    );
+    report
+        .measure("docker_grant_seven_policies", || async {
+            cluster
+                .grant_application_policies(tenant_id, &app_name, &policies)
+                .await
+        })
+        .await;
+
+    let grpc_addr = cluster.grpc_addrs[0].clone();
+    let token = report
+        .measure("docker_get_access_token", || async {
+            AuthServiceClient::connect(grpc_addr.clone())
+                .await
+                .unwrap()
+                .get_access_token(GetAccessTokenRequest {
+                    client_id: client_id.clone(),
+                    client_secret: client_secret.clone(),
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .access_token
+        })
+        .await;
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut auth_client = AuthServiceClient::connect(grpc_addr).await.unwrap();
+    let bucket_name = unique_test_name("perf-bucket");
+    let bucket_id = report
+        .measure("docker_create_bucket", || async {
+            bucket_client
+                .create_bucket(authorized(
+                    CreateBucketRequest {
+                        bucket_name: bucket_name.clone(),
+                        region: cluster.region.clone(),
+                        options: None,
+                    },
+                    &token,
+                ))
+                .await
+                .unwrap()
+                .into_inner()
+                .bucket_id
+        })
+        .await;
+
+    let object_key = "latency/sample.txt".to_string();
+    let payload = b"anvil docker latency sample".to_vec();
+    report
+        .measure("docker_put_27_byte_object", || async {
+            let context = NativeMutationContext {
+                tenant_id,
+                bucket_id,
+                principal: app_id.clone(),
+                request_id: unique_test_name("perf-put-request"),
+                precondition: "none".to_string(),
+                authz_zookie_optional: String::new(),
+                idempotency_key: unique_test_name("perf-put-idempotency"),
+                transaction_id: None,
+            };
+            let metadata = PutObjectRequest {
+                data: Some(anvil_api::put_object_request::Data::Metadata(
+                    ObjectMetadata {
+                        bucket_name: bucket_name.clone(),
+                        object_key: object_key.clone(),
+                        mutation_context: Some(context),
+                        content_type: Some("text/plain".to_string()),
+                        user_metadata_json: String::new(),
+                        storage_class: None,
+                    },
+                )),
+            };
+            let chunk = PutObjectRequest {
+                data: Some(anvil_api::put_object_request::Data::Chunk(payload.clone())),
+            };
+            object_client
+                .put_object(authorized(
+                    tokio_stream::iter(vec![metadata, chunk]),
+                    &token,
+                ))
+                .await
+                .unwrap();
+        })
+        .await;
+
+    report
+        .measure("docker_get_27_byte_object", || async {
+            let mut stream = object_client
+                .get_object(authorized(
+                    GetObjectRequest {
+                        bucket_name: bucket_name.clone(),
+                        object_key: object_key.clone(),
+                        ..Default::default()
+                    },
+                    &token,
+                ))
+                .await
+                .unwrap()
+                .into_inner();
+            let mut downloaded = Vec::new();
+            while let Some(message) = stream.message().await.unwrap() {
+                if let Some(anvil_api::get_object_response::Data::Chunk(bytes)) = message.data {
+                    downloaded.extend(bytes);
+                }
+            }
+            assert_eq!(downloaded, payload);
+        })
+        .await;
+
+    report
+        .measure("docker_write_authz_tuple", || async {
+            auth_client
+                .write_authz_tuple(authorized(
+                    WriteAuthzTupleRequest {
+                        namespace: "document".to_string(),
+                        object_id: "latency-object".to_string(),
+                        relation: "viewer".to_string(),
+                        subject_kind: "user".to_string(),
+                        subject_id: "latency-user".to_string(),
+                        caveat_hash: String::new(),
+                        operation: "add".to_string(),
+                        reason: "latency measurement".to_string(),
+                        scope: None,
+                    },
+                    &token,
+                ))
+                .await
+                .unwrap();
+        })
+        .await;
+    report
+        .measure("docker_check_permission", || async {
+            let response = auth_client
+                .check_permission(authorized(
+                    CheckPermissionRequest {
+                        namespace: "document".to_string(),
+                        object_id: "latency-object".to_string(),
+                        relation: "viewer".to_string(),
+                        subject_kind: "user".to_string(),
+                        subject_id: "latency-user".to_string(),
+                        caveat_hash: String::new(),
+                        consistency: "latest".to_string(),
+                        zookie: String::new(),
+                        scope: None,
+                    },
+                    &token,
+                ))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(response.allowed);
+        })
+        .await;
+    report
+        .measure("docker_list_authz_objects", || async {
+            let response = auth_client
+                .list_authz_objects(authorized(
+                    ListAuthzObjectsRequest {
+                        namespace: "document".to_string(),
+                        relation: "viewer".to_string(),
+                        subject_kind: "user".to_string(),
+                        subject_id: "latency-user".to_string(),
+                        caveat_hash: String::new(),
+                        consistency: "latest".to_string(),
+                        zookie: String::new(),
+                        page_size: 100,
+                        page_token: String::new(),
+                        scope: None,
+                    },
+                    &token,
+                ))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(response.object_ids, vec!["latency-object"]);
+        })
+        .await;
+    for name in ["docker_list_objects_cold", "docker_list_objects_warm"] {
+        report
+            .measure(name, || async {
+                let response = object_client
+                    .list_objects(authorized(
+                        ListObjectsRequest {
+                            bucket_name: bucket_name.clone(),
+                            prefix: String::new(),
+                            delimiter: String::new(),
+                            start_after: String::new(),
+                            max_keys: 100,
+                            ..Default::default()
+                        },
+                        &token,
+                    ))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(response.objects.len(), 1);
+            })
+            .await;
+    }
+
+    eprintln!(
+        "[perf-table] {}",
+        serde_json::to_string_pretty(&report.samples).unwrap()
+    );
+    report.write().await;
 }
 
 fn workspace_perf_path(file_name: &str) -> PathBuf {

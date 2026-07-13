@@ -278,12 +278,7 @@ impl DockerTestCluster {
         let compose_file = docker_compose_file();
         let project_name = docker_compose_project_name();
         let compose_env = vec![("ANVIL_IMAGE".to_string(), docker_image)];
-        docker_compose_with_env(
-            &compose_file,
-            &project_name,
-            &["up", "-d", "--remove-orphans"],
-            &compose_env,
-        );
+        docker_compose_create_then_start(&compose_file, &project_name, &compose_env);
 
         let grpc_addrs = (1_u8..=docker_node_count())
             .map(docker_host_api_url)
@@ -341,12 +336,7 @@ impl DockerTestCluster {
                 port.to_string(),
             ));
         }
-        docker_compose_with_env(
-            &compose_file,
-            &project_name,
-            &["up", "-d", "--remove-orphans"],
-            &compose_env,
-        );
+        docker_compose_create_then_start(&compose_file, &project_name, &compose_env);
 
         let grpc_addrs = api_ports
             .iter()
@@ -582,35 +572,19 @@ impl DockerTestCluster {
     }
 
     pub async fn stop_node(&self, node: u8) {
-        let service = docker_node_service(node);
-        let compose_file = self.compose_file.clone();
         let project_name = self.project_name.clone();
-        let compose_env = self.compose_env.clone();
         tokio::task::spawn_blocking(move || {
-            docker_compose_with_env(
-                &compose_file,
-                &project_name,
-                &["stop", service.as_str()],
-                &compose_env,
-            )
+            docker_container_command(&project_name, node, "stop");
         })
         .await
         .expect("Docker stop node command panicked");
     }
 
     pub async fn start_node(&self, node: u8) {
-        let service = docker_node_service(node);
-        let compose_file = self.compose_file.clone();
         let project_name = self.project_name.clone();
-        let compose_env = self.compose_env.clone();
         let addr = self.grpc_addrs[(node - 1) as usize].clone();
         tokio::task::spawn_blocking(move || {
-            docker_compose_with_env(
-                &compose_file,
-                &project_name,
-                &["start", service.as_str()],
-                &compose_env,
-            )
+            docker_container_command(&project_name, node, "start");
         })
         .await
         .expect("Docker start node command panicked");
@@ -895,6 +869,10 @@ fn shared_cluster_runtime_threads() -> usize {
 
 fn docker_command_with_env(extra_env: &[(String, String)]) -> std::process::Command {
     let mut command = command_with_docker_env("docker");
+    // Docker Desktop can deadlock concurrent container starts for the shared
+    // six-node cluster. Serialising Compose's control-plane operations does not
+    // serialise the cluster or any test workload once the nodes are running.
+    command.env("COMPOSE_PARALLEL_LIMIT", "1");
     for node in 1..=docker_node_count() {
         command.env(
             format!("ANVIL_TEST_NODE{node}_TOKEN"),
@@ -1017,6 +995,96 @@ fn docker_compose_with_env(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn docker_compose_create_then_start(
+    compose_file: &std::path::Path,
+    project_name: &str,
+    compose_env: &[(String, String)],
+) {
+    docker_compose_with_env(
+        compose_file,
+        project_name,
+        &["create", "--remove-orphans"],
+        compose_env,
+    );
+    for node in 1..=docker_node_count() {
+        docker_container_command(project_name, node, "start");
+    }
+}
+
+fn docker_container_command(project_name: &str, node: u8, operation: &str) {
+    let service = docker_node_service(node);
+    let output = command_with_docker_env("docker")
+        .args([
+            "ps",
+            "-aq",
+            "--filter",
+            &format!("label=com.docker.compose.project={project_name}"),
+            "--filter",
+            &format!("label=com.docker.compose.service={service}"),
+        ])
+        .output()
+        .expect("failed to locate Docker test node");
+    assert!(
+        output.status.success(),
+        "failed to locate Docker test node {node}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let ids = String::from_utf8(output.stdout).expect("Docker container id is utf-8");
+    let ids = ids.lines().filter(|id| !id.is_empty()).collect::<Vec<_>>();
+    assert_eq!(
+        ids.len(),
+        1,
+        "expected one container for Docker test node {node}"
+    );
+    if operation == "start" && docker_container_is_running(ids[0]) {
+        return;
+    }
+    let mut last_failure = String::new();
+    for _ in 0..3 {
+        let mut child = command_with_docker_env("docker")
+            .args([operation, ids[0]])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to control Docker test node");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match child.try_wait().expect("poll Docker test node command") {
+                Some(status) if status.success() => return,
+                Some(status) => {
+                    let output = child
+                        .wait_with_output()
+                        .expect("collect failed Docker test node command");
+                    last_failure = format!(
+                        "status={status}, stderr={}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    break;
+                }
+                None if Instant::now() >= deadline => {
+                    child.kill().expect("kill stalled Docker test node command");
+                    let _ = child.wait();
+                    last_failure = "Docker Engine start/stop request stalled for 10s".to_string();
+                    break;
+                }
+                None => std::thread::sleep(Duration::from_millis(25)),
+            }
+        }
+        if operation == "start" && docker_container_is_running(ids[0]) {
+            return;
+        }
+    }
+    panic!("docker {operation} failed for node {node}: {last_failure}");
+}
+
+fn docker_container_is_running(container_id: &str) -> bool {
+    command_with_docker_env("docker")
+        .args(["inspect", "--format", "{{.State.Running}}", container_id])
+        .output()
+        .map(|output| output.status.success() && output.stdout == b"true\n")
+        .unwrap_or(false)
 }
 
 fn docker_compose_output_with_env(

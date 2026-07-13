@@ -712,7 +712,14 @@ async fn authz_tuple_writes_materialize_userset_and_reverse_lookup_segments() {
         .unwrap();
     assert_eq!(segment.header.generation, 3);
     assert_eq!(segment.records.len(), 3);
-    assert_eq!(segment.revision_checkpoints[0].tuple_record_count, 3);
+    assert_eq!(
+        segment
+            .revision_checkpoints
+            .last()
+            .expect("latest revision checkpoint")
+            .tuple_record_count,
+        3
+    );
     assert!(segment.userset_edges.iter().any(|row| {
         row.namespace == "document"
             && row.object_id == "alpha"

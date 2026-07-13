@@ -27,6 +27,116 @@ async fn core_store_node_signing_keypair_is_rocksdb_metadata_not_sidecar() {
 }
 
 #[tokio::test]
+async fn unchanged_receipt_signing_key_registration_is_a_storage_noop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let store = CoreStore::new(storage).await.unwrap();
+    let node_id = "receipt-node-a";
+    let keypair = identity::Keypair::generate_ed25519();
+    let public_key = keypair.public().encode_protobuf();
+
+    store
+        .register_node_receipt_signing_public_key(node_id, &public_key)
+        .unwrap();
+    let tuple_key = node_receipt_signing_public_key_key(node_id);
+    let first = store
+        .meta
+        .get(CF_MESH, TABLE_NODE_SIGNING_KEYPAIR_ROW, &tuple_key)
+        .unwrap()
+        .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    store
+        .register_node_receipt_signing_public_key(node_id, &public_key)
+        .unwrap();
+    let second = store
+        .meta
+        .get(CF_MESH, TABLE_NODE_SIGNING_KEYPAIR_ROW, &tuple_key)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        first, second,
+        "registering an unchanged key must not rewrite its RocksDB row"
+    );
+}
+
+#[tokio::test]
+async fn coremeta_quorum_commits_independent_roots_as_one_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let store = CoreStore::new(storage).await.unwrap();
+    let first_key = core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("group-first")]).unwrap();
+    let second_key = core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("group-second")]).unwrap();
+    let first_payload = encode_core_meta_inline_payload_row(
+        b"first",
+        core_meta_committed_row_common(
+            "test/group",
+            core_meta_root_key_hash("test/group/first"),
+            1,
+            "grouped-root-commit",
+            1,
+        ),
+    )
+    .unwrap();
+    let second_payload = encode_core_meta_inline_payload_row(
+        b"second",
+        core_meta_committed_row_common(
+            "test/group",
+            core_meta_root_key_hash("test/group/second"),
+            1,
+            "grouped-root-commit",
+            1,
+        ),
+    )
+    .unwrap();
+    let operations = [
+        CoreMetaBatchOp {
+            cf: CF_INLINE_PAYLOADS,
+            table_id: TABLE_INLINE_PAYLOAD_ROW,
+            tuple_key: &first_key,
+            common: None,
+            kind: CoreMetaBatchOpKind::Put(&first_payload),
+        },
+        CoreMetaBatchOp {
+            cf: CF_INLINE_PAYLOADS,
+            table_id: TABLE_INLINE_PAYLOAD_ROW,
+            tuple_key: &second_key,
+            common: None,
+            kind: CoreMetaBatchOpKind::Put(&second_payload),
+        },
+    ];
+
+    let outcomes = store
+        .commit_coremeta_batch_by_embedded_roots("grouped-root-commit", &operations)
+        .await
+        .unwrap();
+
+    assert_eq!(outcomes.len(), 2);
+    assert_ne!(outcomes[0].root_key_hash, outcomes[1].root_key_hash);
+    assert!(outcomes.iter().all(|outcome| {
+        outcome.post_root_generation == 1
+            && !outcome.certificate_hash.is_empty()
+            && outcome.certificate_persist_receipt_hashes.len()
+                >= crate::core_store::CORE_META_DEFAULT_QUORUM
+    }));
+    assert!(
+        store
+            .meta
+            .get(CF_INLINE_PAYLOADS, TABLE_INLINE_PAYLOAD_ROW, &first_key)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .meta
+            .get(CF_INLINE_PAYLOADS, TABLE_INLINE_PAYLOAD_ROW, &second_key)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn core_store_put_get_blob_verifies_hash() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = Storage::new_at(tmp.path()).await.unwrap();

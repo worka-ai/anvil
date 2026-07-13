@@ -88,6 +88,15 @@ pub(super) async fn ensure_docker_topology(
     region: &str,
 ) {
     let descriptors = local_node_descriptors(admin_addrs, admin_token).await;
+    if std::env::var_os("ANVIL_TEST_TIMINGS").is_some() {
+        eprintln!(
+            "[timing] docker_topology local_nodes={:?}",
+            descriptors
+                .iter()
+                .map(|descriptor| (&descriptor.node_id, &descriptor.public_api_addr))
+                .collect::<Vec<_>>()
+        );
+    }
     let topology = bootstrap_topology_request(region, &descriptors);
 
     // Genesis is installed directly into each node's local CoreMeta before any
