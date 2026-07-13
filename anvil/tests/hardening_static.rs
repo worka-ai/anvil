@@ -164,6 +164,26 @@ fn release_workflow_uses_shared_release_gates() {
         "release workflow must call the shared release gate script"
     );
     assert!(
+        release.contains("./scripts/build-image.sh"),
+        "release workflow must build the release image through scripts/build-image.sh"
+    );
+    assert!(
+        release.contains("linux/amd64") && release.contains("linux/arm64"),
+        "release workflow must build both amd64 and arm64 images"
+    );
+    assert!(
+        release.contains("anvil-test-image-amd64") && release.contains("anvil-test-image-arm64"),
+        "release workflow must pass both architecture image artifacts forward"
+    );
+    assert!(
+        release.contains("docker buildx imagetools create"),
+        "release workflow must publish a multi-arch Docker manifest"
+    );
+    assert!(
+        !release.contains("build-test-image-fast.sh"),
+        "release workflow must not use the old test-only image build script name"
+    );
+    assert!(
         release.contains("cargo publish -p anvil-storage"),
         "release workflow must publish the anvil-storage Rust client crate"
     );
@@ -182,6 +202,22 @@ fn release_workflow_uses_shared_release_gates() {
     assert!(
         ci.contains("./scripts/release-gates.sh"),
         "PR CI workflow must call the shared release gate script"
+    );
+    assert!(
+        ci.contains("./scripts/build-image.sh"),
+        "PR CI workflow must build the same release-shaped image as release workflow"
+    );
+    assert!(
+        ci.contains("linux/amd64") && ci.contains("linux/arm64"),
+        "PR CI workflow must build both amd64 and arm64 images"
+    );
+    assert!(
+        ci.contains("anvil-test-image-amd64") && ci.contains("anvil-test-image-arm64"),
+        "PR CI workflow must upload both architecture image artifacts"
+    );
+    assert!(
+        !ci.contains("build-test-image-fast.sh"),
+        "PR CI workflow must not use the old test-only image build script name"
     );
 }
 

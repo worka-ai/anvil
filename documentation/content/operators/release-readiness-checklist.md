@@ -17,7 +17,7 @@ Start by deciding what a release contains. In the current repository the support
 
 | Surface | Current release shape | What to verify |
 | --- | --- | --- |
-| Server | Docker image built from `anvil/Dockerfile`; the server binary is `anvil-server`. | Image tag, image digest, healthcheck, runtime configuration, storage compatibility, public/admin listeners. |
+| Server | Docker image built by `scripts/build-image.sh` from host-built Linux binaries and packaged with `anvil/Dockerfile.prebuilt`; the server binary is `anvil-server`. | Image tag, image digest, healthcheck, runtime configuration, storage compatibility, public/admin listeners. |
 | Public CLI | `anvil`, built into the Docker image from `anvil-storage-cli`. | Version matches the image and public API examples in the docs. |
 | Admin CLI | `anvil-admin`, built into the Docker image from `anvil-storage-cli`. | Version matches the image and admin API examples in the docs. |
 | Rust client crate | `anvil-storage`, published to crates.io by the release workflow when the version is not already present. | Crate version, generated protobuf bindings, public API compatibility. |
@@ -34,10 +34,11 @@ Run fast, source-level checks before building a release image. Formatting is a m
 
 ```bash
 cargo fmt --all -- --check
-cargo test --workspace -- --nocapture
+ANVIL_IMAGE=anvil:test ./scripts/build-image.sh
+./scripts/release-gates.sh
 ```
 
-The formatting command proves the Rust formatter would not rewrite the workspace. It does not prove the code is correct. The workspace test command proves the Rust tests that can run in the local environment passed. It does not prove Docker image startup, S3 gateway behaviour through a real reverse proxy, production secret rotation, or storage rollback safety.
+The formatting command proves the Rust formatter would not rewrite the workspace. It does not prove the code is correct. The image build proves the release-shaped container can be assembled from host-built Linux binaries. The release gate proves the configured Rust, server-core, and Docker integration groups passed. None of those commands prove a production mesh can roll safely without the operator evidence described later in this checklist.
 
 The repository's shared release gate is:
 
@@ -45,7 +46,7 @@ The repository's shared release gate is:
 ./scripts/release-gates.sh
 ```
 
-That script currently runs checks for accidental external-database dependence, public unfenced journal writes, documentation hardening, release-note rendering tests, Fission site check/build, a dry-run publish of `anvil-storage`, and the workspace test suite. Passing it proves the release candidate survives the repository's common local gates. It does not publish anything, does not build the Docker image, does not prove the production mesh can roll, and does not prove a particular tenant workload is healthy.
+That script currently runs checks for accidental external-database dependence, public unfenced journal writes, documentation hardening, release-note rendering tests, Fission site check/build, a dry-run publish of `anvil-storage`, Rust unit tests, server core integration tests, and Docker-backed integration groups. Each step emits start/finish timing lines. On runners with GNU `timeout`, each step is bounded by `ANVIL_GATE_STEP_TIMEOUT_SECONDS`, which defaults to 1800 seconds so a stuck test reports the stuck gate instead of consuming an entire release run. CI runs those groups in parallel against one built image artifact; local maintainers can still run the full script sequentially. Passing it proves the release candidate survives the repository's common local gates. It does not publish anything, does not build the Docker image, does not prove the production mesh can roll, and does not prove a particular tenant workload is healthy.
 
 Security-sensitive changes should also carry focused tests for the path they touch. A change to reserved namespace handling should include read and write negative tests. A change to task leases should prove stale fence rejection. A change to authz should prove both allowed and denied checks. A change to S3 signing should include canonical-request and host-forwarding cases. The full workspace test suite catches regressions only where tests exist.
 
@@ -92,31 +93,30 @@ Good release notes tell operators what changed and how to verify it. They should
 
 ## Docker image gate
 
-The release workflow builds a Docker image from `anvil/Dockerfile`, loads it as `anvil:test`, runs Docker end-to-end tests against that exact image, then pushes the tested image under the tag and `latest`. The Dockerfile builds `anvil-server`, `anvil`, and `anvil-admin`, then ships them in a runtime image without the Rust toolchain.
+The release workflow builds Docker images with `scripts/build-image.sh` for `linux/amd64` and `linux/arm64`. The `linux/amd64` image is loaded as `anvil:test-amd64` and driven through the Docker end-to-end groups on GitHub's standard runner. The `linux/arm64` image is built and smoke-checked so architecture-specific build failures are caught before publication. Publication pushes architecture-specific tags, then creates the public release tag and `latest` as a multi-architecture manifest list. The script builds `anvil-server`, `anvil`, and `anvil-admin` on the host for the requested Linux target, then `anvil/Dockerfile.prebuilt` ships them in a runtime image without the Rust toolchain.
 
 A local image check should use the same shape as CI where possible:
 
 ```bash
-docker buildx build --load --tag anvil:test --file anvil/Dockerfile .
+ANVIL_IMAGE=anvil:test ./scripts/build-image.sh
 
 docker run --rm anvil:test anvil-server --version
 docker run --rm anvil:test anvil --version
 docker run --rm anvil:test anvil-admin --version
 ```
 
-The build command proves the Dockerfile can produce a local image from the current checkout. The three version commands prove the server, public CLI, and admin CLI binaries exist in the image and can start far enough for Clap to report their versions. They do not prove the server can boot with real secrets, read an existing `STORAGE_PATH`, authenticate a tenant, or serve traffic behind your proxy.
+The build command proves the production image packaging path can produce a local image from the current checkout for the current host-selected target. To build the second architecture locally, set `ANVIL_DOCKER_PLATFORM=linux/amd64` or `ANVIL_DOCKER_PLATFORM=linux/arm64` and use a distinct `ANVIL_IMAGE` tag. Cross-architecture builds require Zig, `cargo-zigbuild`, and Docker/QEMU support for the non-native image smoke checks. The three version commands prove the server, public CLI, and admin CLI binaries exist in the image and can start far enough for Clap to report their versions. They do not prove the server can boot with real secrets, read an existing `STORAGE_PATH`, authenticate a tenant, or serve traffic behind your proxy.
 
 The release workflow's Docker end-to-end gate is:
 
 ```bash
-ANVIL_IMAGE=anvil:test \
-ANVIL_RUN_DOCKER_E2E=1 \
-ANVIL_RUN_HF_E2E=1 \
-cargo test -p anvil-server --test docker_cluster_test --test hf_ingestion_e2e -- \
-  --nocapture --test-threads=1
+ANVIL_IMAGE=anvil:test-amd64 ./scripts/release-gates.sh docker-auth
+ANVIL_IMAGE=anvil:test-amd64 ./scripts/release-gates.sh docker-storage
+ANVIL_IMAGE=anvil:test-amd64 ./scripts/release-gates.sh docker-index
+ANVIL_IMAGE=anvil:test-amd64 ./scripts/release-gates.sh docker-mesh
 ```
 
-This proves the test suite can drive the image through the Docker cluster and Hugging Face ingestion end-to-end tests expected by CI. It does not prove every deployment environment has a configured production embedding provider, that vector results are production quality without provider configuration, or that a multi-region production topology is safe to roll. Treat it as image evidence, not production-readiness evidence.
+This proves the test suite can drive the image through the Docker cluster, authz, object storage, S3 gateway, indexing, PersonalDB, Hugging Face ingestion, internal proxy, and mesh/failure integration groups expected by CI. It does not prove every deployment environment has a configured production embedding provider, that vector results are production quality without provider configuration, or that a multi-region production topology is safe to roll. Treat it as image evidence, not production-readiness evidence.
 
 After CI pushes the image, verify the immutable digest rather than relying only on a mutable tag:
 

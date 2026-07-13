@@ -20,7 +20,7 @@ Prepare networks as separate trust surfaces. The public listener receives tenant
 Build or pull a pinned image for the release you intend to operate. A local build from this repository looks like this:
 
 ```bash
-docker build -f anvil/Dockerfile -t local/anvil:operator .
+ANVIL_IMAGE=local/anvil:operator ./scripts/build-image.sh
 ```
 
 That command produces an image containing `anvil-server`, `anvil`, and `anvil-admin`. It does not create storage, generate secrets, or configure topology. If you pull an image from your registry instead, pin it to an immutable release tag or digest and keep the matching CLI and documentation with that release.

@@ -33,7 +33,7 @@ pub(super) fn require_docker_image() -> String {
     let output = last_output.expect("Docker image inspection attempted at least once");
     panic!(
         "Docker-backed Anvil tests require prebuilt Docker image `{image}`. Build it with \
-         `./scripts/build-test-image-fast.sh` or set ANVIL_IMAGE to an existing local tag or image ID.\nstdout: {}\nstderr: {}",
+         `./scripts/build-image.sh` or set ANVIL_IMAGE to an existing local tag or image ID.\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

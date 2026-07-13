@@ -102,10 +102,13 @@ Run these before changing core behaviour or opening a release PR:
 
 ```sh
 cargo fmt --all -- --check
+ANVIL_IMAGE=anvil:test ./scripts/build-image.sh
 ./scripts/release-gates.sh
 ```
 
-`release-gates.sh` includes storage hardening checks, docs hardening, release-note rendering, the Fission documentation build, the Rust client publish dry run, and the workspace test suite. Security-sensitive changes should also include focused tests for the affected path before the full gate.
+`release-gates.sh` includes storage hardening checks, docs hardening, release-note rendering, the Fission documentation build, the Rust client publish dry run, Rust unit tests, server core integration tests, and Docker-backed integration groups. Each gate step prints start/finish timings and, where GNU `timeout` is available, is bounded by `ANVIL_GATE_STEP_TIMEOUT_SECONDS` (default `1800`). `build-image.sh` builds the release-shaped Docker image from host-built Linux binaries so CI and release jobs do not pay the Docker source-build cost. Security-sensitive changes should also include focused tests for the affected path before the full gate.
+
+CI and release builds run `build-image.sh` for both `linux/amd64` and `linux/arm64`. Docker integration tests run against the `linux/amd64` artifact on GitHub's standard runner, while the `linux/arm64` artifact is still built and smoke-checked before release. The release workflow publishes architecture-specific GHCR tags and then creates the public multi-architecture tag from those tested artifacts.
 
 ## Release Process
 

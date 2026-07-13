@@ -11,58 +11,237 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
+  packages: read
 
 jobs:
-  build-and-test:
+  build-image:
+    name: Build Anvil image (${{ matrix.platform }})
     runs-on: ubuntu-latest
-
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            image: anvil:test-amd64
+            artifact: anvil-test-image-amd64
+          - platform: linux/arm64
+            arch: arm64
+            image: anvil:test-arm64
+            artifact: anvil-test-image-arm64
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Setup Rust
-      uses: dtolnay/rust-toolchain@stable
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
 
-    - name: Install Protoc
-      uses: arduino/setup-protoc@v2
-      with:
-        version: "25.x"
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v2
+        with:
+          version: "25.x"
 
-    - name: Cache Cargo dependencies
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry/index/
-          ~/.cargo/registry/cache/
-          ~/.cargo/git/db/
-          target/
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Set up QEMU for cross-architecture image smoke checks
+        if: matrix.platform == 'linux/arm64'
+        uses: docker/setup-qemu-action@v3
 
-    - name: Install Fission CLI
-      run: |
-        if ! command -v fission >/dev/null 2>&1; then
-          cargo install cargo-fission --version 0.4.1 --locked
-        fi
+      - name: Install Zig for cross-architecture Rust builds
+        if: matrix.platform == 'linux/arm64'
+        uses: mlugg/setup-zig@v2
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.arch }}-
+            ${{ runner.os }}-cargo-
 
-    - name: Build Docker image for workspace tests
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        file: anvil/Dockerfile
-        load: true
-        push: false
-        tags: anvil:test
-        platforms: linux/amd64
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
+      - name: Install cargo-zigbuild for cross-architecture Rust builds
+        if: matrix.platform == 'linux/arm64'
+        run: |
+          if ! command -v cargo-zigbuild >/dev/null 2>&1; then
+            cargo install cargo-zigbuild --locked
+          fi
 
-    - name: Shared release gates
-      env:
-        ANVIL_IMAGE: anvil:test
-      run: ./scripts/release-gates.sh
+      - name: Build Docker image from host-built binaries
+        env:
+          ANVIL_IMAGE: ${{ matrix.image }}
+          ANVIL_DOCKER_PLATFORM: ${{ matrix.platform }}
+        run: ./scripts/build-image.sh
+
+      - name: Smoke check image binaries
+        run: |
+          docker run --platform ${{ matrix.platform }} --rm ${{ matrix.image }} anvil-server --version
+          docker run --platform ${{ matrix.platform }} --rm ${{ matrix.image }} anvil --version
+          docker run --platform ${{ matrix.platform }} --rm ${{ matrix.image }} anvil-admin --version
+
+      - name: Export Docker image artifact
+        run: docker save ${{ matrix.image }} -o /tmp/${{ matrix.artifact }}.tar
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: /tmp/${{ matrix.artifact }}.tar
+          compression-level: 0
+          retention-days: 1
+
+  static:
+    name: Static, docs, and packaging gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v2
+        with:
+          version: "25.x"
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install Fission CLI
+        run: |
+          if ! command -v fission >/dev/null 2>&1; then
+            cargo install cargo-fission --version 0.4.1 --locked
+          fi
+
+      - name: Run static release gates
+        run: ./scripts/release-gates.sh static
+
+  rust-unit:
+    name: Rust unit and client tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v2
+        with:
+          version: "25.x"
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run Rust unit release gates
+        run: ./scripts/release-gates.sh rust
+
+  server-core:
+    name: Server core integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v2
+        with:
+          version: "25.x"
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run server core integration gates
+        run: ./scripts/release-gates.sh server-core
+
+  docker-integration:
+    name: Docker integration tests (${{ matrix.group }})
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [docker-auth, docker-storage, docker-index, docker-mesh]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v2
+        with:
+          version: "25.x"
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Download amd64 Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: anvil-test-image-amd64
+          path: /tmp/anvil-image-amd64
+
+      - name: Load amd64 Docker image
+        run: docker load -i /tmp/anvil-image-amd64/anvil-test-image-amd64.tar
+
+      - name: Run Docker integration release gates
+        env:
+          ANVIL_IMAGE: anvil:test-amd64
+          ANVIL_DOCKER_TEST_PROJECT: anvil-ci-${{ matrix.group }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: ./scripts/release-gates.sh ${{ matrix.group }}

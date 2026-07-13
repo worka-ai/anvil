@@ -22,16 +22,98 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
+  build-image:
+    name: Build release image (${{ matrix.platform }})
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.docs-deployment.outputs.page_url }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            image: anvil:test-amd64
+            artifact: anvil-test-image-amd64
+          - platform: linux/arm64
+            arch: arm64
+            image: anvil:test-arm64
+            artifact: anvil-test-image-arm64
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v2
+        with:
+          version: "25.x"
+
+      - name: Set up QEMU for cross-architecture image smoke checks
+        if: matrix.platform == 'linux/arm64'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Install Zig for cross-architecture Rust builds
+        if: matrix.platform == 'linux/arm64'
+        uses: mlugg/setup-zig@v2
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-release-cargo-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-cargo-${{ matrix.arch }}-
+            ${{ runner.os }}-release-cargo-
+            ${{ runner.os }}-cargo-
+
+      - name: Install cargo-zigbuild for cross-architecture Rust builds
+        if: matrix.platform == 'linux/arm64'
+        run: |
+          if ! command -v cargo-zigbuild >/dev/null 2>&1; then
+            cargo install cargo-zigbuild --locked
+          fi
+
+      - name: Build Docker image from host-built binaries
+        env:
+          ANVIL_IMAGE: ${{ matrix.image }}
+          ANVIL_DOCKER_PLATFORM: ${{ matrix.platform }}
+        run: ./scripts/build-image.sh
+
+      - name: Smoke check image binaries
+        run: |
+          docker run --platform ${{ matrix.platform }} --rm ${{ matrix.image }} anvil-server --version
+          docker run --platform ${{ matrix.platform }} --rm ${{ matrix.image }} anvil --version
+          docker run --platform ${{ matrix.platform }} --rm ${{ matrix.image }} anvil-admin --version
+
+      - name: Export Docker image artifact
+        run: docker save ${{ matrix.image }} -o /tmp/${{ matrix.artifact }}.tar
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: /tmp/${{ matrix.artifact }}.tar
+          compression-level: 0
+          retention-days: 1
+
+  static-and-docs:
+    name: Static gates and docs artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -51,6 +133,9 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ runner.os }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-cargo-
+            ${{ runner.os }}-cargo-
 
       - name: Install Fission CLI
         run: |
@@ -58,47 +143,203 @@ jobs:
             cargo install cargo-fission --version 0.4.1 --locked
           fi
 
-      - name: Determine release tag
-        id: release-tag
-        shell: bash
-        run: |
-          if [[ -n "${{ inputs.tag || '' }}" ]]; then
-            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build Docker image for release gates
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: anvil/Dockerfile
-          load: true
-          push: false
-          tags: anvil:test
-          platforms: linux/amd64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Shared release gates
-        env:
-          ANVIL_IMAGE: anvil:test
-        run: ./scripts/release-gates.sh
-
-      - name: Configure GitHub Pages
-        uses: actions/configure-pages@v5
+      - name: Run static release gates
+        run: ./scripts/release-gates.sh static
 
       - name: Upload documentation artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: documentation/target/fission/site
 
+  rust-unit:
+    name: Rust unit and client tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v2
+        with:
+          version: "25.x"
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-cargo-
+            ${{ runner.os }}-cargo-
+
+      - name: Run Rust unit release gates
+        run: ./scripts/release-gates.sh rust
+
+  server-core:
+    name: Server core integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v2
+        with:
+          version: "25.x"
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-cargo-
+            ${{ runner.os }}-cargo-
+
+      - name: Run server core integration gates
+        run: ./scripts/release-gates.sh server-core
+
+  docker-integration:
+    name: Docker integration tests (${{ matrix.group }})
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [docker-auth, docker-storage, docker-index, docker-mesh]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v2
+        with:
+          version: "25.x"
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-cargo-
+            ${{ runner.os }}-cargo-
+
+      - name: Download amd64 Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: anvil-test-image-amd64
+          path: /tmp/anvil-image-amd64
+
+      - name: Load amd64 Docker image
+        run: docker load -i /tmp/anvil-image-amd64/anvil-test-image-amd64.tar
+
+      - name: Run Docker integration release gates
+        env:
+          ANVIL_IMAGE: anvil:test-amd64
+          ANVIL_DOCKER_TEST_PROJECT: anvil-release-${{ matrix.group }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: ./scripts/release-gates.sh ${{ matrix.group }}
+
+  publish:
+    name: Publish release artifacts
+    needs: [build-image, static-and-docs, rust-unit, server-core, docker-integration]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: github-pages
+      url: ${{ steps.docs-deployment.outputs.page_url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-cargo-
+            ${{ runner.os }}-cargo-
+
+      - name: Determine release tag
+        id: release-tag
+        shell: bash
+        run: |
+          if [[ -n "${{ github.event.inputs.tag || '' }}" ]]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download amd64 Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: anvil-test-image-amd64
+          path: /tmp/anvil-image-amd64
+
+      - name: Download arm64 Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: anvil-test-image-arm64
+          path: /tmp/anvil-image-arm64
+
+      - name: Load tested Docker image artifacts
+        run: |
+          docker load -i /tmp/anvil-image-amd64/anvil-test-image-amd64.tar
+          docker load -i /tmp/anvil-image-arm64/anvil-test-image-arm64.tar
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
       - name: Deploy documentation before release publication
         id: docs-deployment
         uses: actions/deploy-pages@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -107,16 +348,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push tested Docker image
+      - name: Push tested multi-arch Docker image
         id: docker-push
         shell: bash
         run: |
           tag="${{ steps.release-tag.outputs.tag }}"
-          image="ghcr.io/${{ github.repository }}:${tag}"
-          docker tag anvil:test "$image"
-          docker tag anvil:test "ghcr.io/${{ github.repository }}:latest"
-          docker push "$image"
-          docker push "ghcr.io/${{ github.repository }}:latest"
+          repo="ghcr.io/${{ github.repository }}"
+          image="${repo}:${tag}"
+          amd64_image="${repo}:${tag}-amd64"
+          arm64_image="${repo}:${tag}-arm64"
+          docker tag anvil:test-amd64 "$amd64_image"
+          docker tag anvil:test-arm64 "$arm64_image"
+          docker push "$amd64_image"
+          docker push "$arm64_image"
+          docker buildx imagetools create \
+            -t "$image" \
+            -t "${repo}:latest" \
+            "$amd64_image" \
+            "$arm64_image"
           digest="$(docker buildx imagetools inspect "$image" --format '{{.Manifest.Digest}}')"
           if [[ -z "$digest" || "$digest" != sha256:* ]]; then
             echo "failed to resolve published image digest for $image" >&2
@@ -148,7 +397,7 @@ jobs:
             --docker-image "${{ steps.docker-push.outputs.image }}" \
             --image-digest "${{ steps.docker-push.outputs.digest }}" \
             --crate-version "anvil-storage $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="anvil-storage") | .version')" \
-            --commit-sha "$GITHUB_SHA" \
+            --commit-sha "$(git rev-parse HEAD)" \
             --docs-url "https://${{ github.repository_owner }}.github.io/anvil/" \
             --output release-notes.md
 

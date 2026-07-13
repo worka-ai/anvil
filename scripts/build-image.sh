@@ -35,16 +35,10 @@ case "${ANVIL_DOCKER_PLATFORM:-}" in
 esac
 
 target="${ANVIL_ZIG_TARGET:-$target}"
-
-if ! command -v cargo-zigbuild >/dev/null 2>&1; then
-  echo "cargo-zigbuild is required for fast host-built test images" >&2
-  echo "install with: cargo install cargo-zigbuild" >&2
-  exit 2
-fi
-
-if ! command -v zig >/dev/null 2>&1; then
-  echo "zig is required for fast host-built test images" >&2
-  exit 2
+host_triple="$(rustc -vV | awk '/^host: / { print $2 }')"
+use_zig=1
+if [[ "$(uname -s)" == "Linux" && "$target" == "$host_triple" && "${ANVIL_FORCE_ZIG:-0}" != "1" ]]; then
+  use_zig=0
 fi
 
 if command -v rustup >/dev/null 2>&1; then
@@ -54,13 +48,32 @@ if command -v rustup >/dev/null 2>&1; then
   fi
 fi
 
-echo "[anvil] building Linux binaries with cargo-zigbuild target=${target}"
-cargo zigbuild --release --locked --target "${target}" \
+build_args=(
   -p anvil-server --bin anvil-server
+  -p anvil-storage-cli --bin anvil --bin anvil-admin
+)
+
+if [[ "$use_zig" == "1" ]]; then
+  if ! command -v cargo-zigbuild >/dev/null 2>&1; then
+    echo "cargo-zigbuild is required when building a Linux image from this host/target combination" >&2
+    echo "install with: cargo install cargo-zigbuild" >&2
+    exit 2
+  fi
+
+  if ! command -v zig >/dev/null 2>&1; then
+    echo "zig is required when building a Linux image from this host/target combination" >&2
+    exit 2
+  fi
+
+  echo "[anvil] building Linux binaries with cargo-zigbuild target=${target}"
+  cargo zigbuild --release --locked --target "${target}" "${build_args[@]}"
+else
+  echo "[anvil] building Linux binaries with cargo target=${target}"
+  cargo build --release --locked --target "${target}" "${build_args[@]}"
+fi
 
 target_dir="$(
-  cargo metadata --format-version 1 --no-deps \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])'
+  cargo metadata --format-version 1 --no-deps     | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])'
 )"
 bin_dir="${target_dir}/${target}/release"
 stage_dir="tmp/docker-bin"
@@ -68,16 +81,13 @@ stage_dir="tmp/docker-bin"
 rm -rf "${stage_dir}"
 mkdir -p "${stage_dir}"
 cp "${bin_dir}/anvil-server" "${stage_dir}/anvil-server"
+cp "${bin_dir}/anvil" "${stage_dir}/anvil"
+cp "${bin_dir}/anvil-admin" "${stage_dir}/anvil-admin"
 
 echo "[anvil] packaging runtime image ${image} platform=${platform}"
-iid_file="$(mktemp -t anvil-test-image.XXXXXX)"
+iid_file="$(mktemp -t anvil-image.XXXXXX)"
 trap 'rm -f "${iid_file}"' EXIT
-docker build \
-  --platform "${platform}" \
-  --iidfile "${iid_file}" \
-  -f anvil/Dockerfile.prebuilt \
-  -t "${image}" \
-  .
+docker build   --platform "${platform}"   --iidfile "${iid_file}"   -f anvil/Dockerfile.prebuilt   -t "${image}"   .
 
 # Read the ID emitted by this exact build rather than resolving the mutable tag.
 # Docker Desktop can briefly list a tag while rejecting an inspect by that tag.

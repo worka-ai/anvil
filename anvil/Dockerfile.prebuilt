@@ -8,6 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd --uid 10001 --create-home --home-dir /var/lib/anvil --shell /usr/sbin/nologin anvil
 
 COPY tmp/docker-bin/anvil-server /usr/local/bin/anvil-server
+COPY tmp/docker-bin/anvil /usr/local/bin/anvil
+COPY tmp/docker-bin/anvil-admin /usr/local/bin/anvil-admin
 
 RUN mkdir -p /var/lib/anvil-bootstrap \
     && chown -R anvil:anvil /var/lib/anvil /var/lib/anvil-bootstrap
