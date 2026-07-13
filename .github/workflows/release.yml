@@ -53,11 +53,9 @@ jobs:
           version: "25.x"
 
       - name: Set up QEMU for cross-architecture image smoke checks
-        if: matrix.platform == 'linux/arm64'
         uses: docker/setup-qemu-action@v3
 
-      - name: Install Zig for cross-architecture Rust builds
-        if: matrix.platform == 'linux/arm64'
+      - name: Install Zig for release-shaped Rust builds
         uses: mlugg/setup-zig@v2
 
       - name: Cache Cargo dependencies
@@ -75,8 +73,7 @@ jobs:
             ${{ runner.os }}-release-cargo-
             ${{ runner.os }}-cargo-
 
-      - name: Install cargo-zigbuild for cross-architecture Rust builds
-        if: matrix.platform == 'linux/arm64'
+      - name: Install cargo-zigbuild for release-shaped Rust builds
         run: |
           if ! command -v cargo-zigbuild >/dev/null 2>&1; then
             cargo install cargo-zigbuild --locked

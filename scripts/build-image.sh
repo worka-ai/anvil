@@ -35,9 +35,13 @@ case "${ANVIL_DOCKER_PLATFORM:-}" in
 esac
 
 target="${ANVIL_ZIG_TARGET:-$target}"
-host_triple="$(rustc -vV | awk '/^host: / { print $2 }')"
 use_zig=1
-if [[ "$(uname -s)" == "Linux" && "$target" == "$host_triple" && "${ANVIL_FORCE_ZIG:-0}" != "1" ]]; then
+if [[ "${ANVIL_USE_NATIVE_CARGO:-0}" == "1" ]]; then
+  host_triple="$(rustc -vV | awk '/^host: / { print $2 }')"
+  if [[ "$(uname -s)" != "Linux" || "$target" != "$host_triple" ]]; then
+    echo "ANVIL_USE_NATIVE_CARGO=1 is only valid on Linux when the requested target matches the host" >&2
+    exit 2
+  fi
   use_zig=0
 fi
 
@@ -73,7 +77,8 @@ else
 fi
 
 target_dir="$(
-  cargo metadata --format-version 1 --no-deps     | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])'
+  cargo metadata --format-version 1 --no-deps \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])'
 )"
 bin_dir="${target_dir}/${target}/release"
 stage_dir="tmp/docker-bin"
@@ -87,7 +92,12 @@ cp "${bin_dir}/anvil-admin" "${stage_dir}/anvil-admin"
 echo "[anvil] packaging runtime image ${image} platform=${platform}"
 iid_file="$(mktemp -t anvil-image.XXXXXX)"
 trap 'rm -f "${iid_file}"' EXIT
-docker build   --platform "${platform}"   --iidfile "${iid_file}"   -f anvil/Dockerfile.prebuilt   -t "${image}"   .
+docker build \
+  --platform "${platform}" \
+  --iidfile "${iid_file}" \
+  -f anvil/Dockerfile.prebuilt \
+  -t "${image}" \
+  .
 
 # Read the ID emitted by this exact build rather than resolving the mutable tag.
 # Docker Desktop can briefly list a tag while rejecting an inspect by that tag.

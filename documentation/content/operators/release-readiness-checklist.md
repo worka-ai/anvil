@@ -93,7 +93,7 @@ Good release notes tell operators what changed and how to verify it. They should
 
 ## Docker image gate
 
-The release workflow builds Docker images with `scripts/build-image.sh` for `linux/amd64` and `linux/arm64`. The `linux/amd64` image is loaded as `anvil:test-amd64` and driven through the Docker end-to-end groups on GitHub's standard runner. The `linux/arm64` image is built and smoke-checked so architecture-specific build failures are caught before publication. Publication pushes architecture-specific tags, then creates the public release tag and `latest` as a multi-architecture manifest list. The script builds `anvil-server`, `anvil`, and `anvil-admin` on the host for the requested Linux target, then `anvil/Dockerfile.prebuilt` ships them in a runtime image without the Rust toolchain.
+The release workflow builds Docker images with `scripts/build-image.sh` for `linux/amd64` and `linux/arm64`. The script uses Zig/cargo-zigbuild by default so the Linux binaries are compatible with the runtime image instead of accidentally depending on a newer runner glibc than the container provides. The `linux/amd64` image is loaded as `anvil:test-amd64` and driven through the Docker end-to-end groups on GitHub's standard runner. The `linux/arm64` image is built and smoke-checked so architecture-specific build failures are caught before publication. Publication pushes architecture-specific tags, then creates the public release tag and `latest` as a multi-architecture manifest list. The script builds `anvil-server`, `anvil`, and `anvil-admin` on the host for the requested Linux target, then `anvil/Dockerfile.prebuilt` ships them in a runtime image without the Rust toolchain.
 
 A local image check should use the same shape as CI where possible:
 
@@ -105,7 +105,7 @@ docker run --rm anvil:test anvil --version
 docker run --rm anvil:test anvil-admin --version
 ```
 
-The build command proves the production image packaging path can produce a local image from the current checkout for the current host-selected target. To build the second architecture locally, set `ANVIL_DOCKER_PLATFORM=linux/amd64` or `ANVIL_DOCKER_PLATFORM=linux/arm64` and use a distinct `ANVIL_IMAGE` tag. Cross-architecture builds require Zig, `cargo-zigbuild`, and Docker/QEMU support for the non-native image smoke checks. The three version commands prove the server, public CLI, and admin CLI binaries exist in the image and can start far enough for Clap to report their versions. They do not prove the server can boot with real secrets, read an existing `STORAGE_PATH`, authenticate a tenant, or serve traffic behind your proxy.
+The build command proves the production image packaging path can produce a local image from the current checkout for the current host-selected target. To build the second architecture locally, set `ANVIL_DOCKER_PLATFORM=linux/amd64` or `ANVIL_DOCKER_PLATFORM=linux/arm64` and use a distinct `ANVIL_IMAGE` tag. Image builds require Zig and `cargo-zigbuild`; non-native image smoke checks also require Docker/QEMU support. `ANVIL_USE_NATIVE_CARGO=1` exists only as a local developer escape hatch for same-host Linux builds and should not be used for release evidence. The three version commands prove the server, public CLI, and admin CLI binaries exist in the image and can start far enough for Clap to report their versions. They do not prove the server can boot with real secrets, read an existing `STORAGE_PATH`, authenticate a tenant, or serve traffic behind your proxy.
 
 The release workflow's Docker end-to-end gate is:
 
