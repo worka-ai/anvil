@@ -1,8 +1,8 @@
 use crate::authz_coremeta_payload::{decode_authz_payload_row, encode_authz_payload_row};
 use crate::authz_segment;
 use crate::authz_userset_index::{
-    AuthzDerivedUsersetEntry, DEFAULT_DERIVED_USERSET_INDEX_ID,
-    list_derived_userset_objects_at_revision, lookup_derived_userset_index_at_revision,
+    DEFAULT_DERIVED_USERSET_INDEX_ID, list_derived_userset_objects_at_revision,
+    lookup_derived_userset_index_at_revision,
 };
 use crate::core_store::{
     CF_AUTHZ, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaStore, CoreMetaTuplePart,
@@ -442,36 +442,42 @@ pub(crate) async fn materialize_authz_tuple_segment_at_revision(
     target_revision: u64,
     source_fence_token: u64,
 ) -> Result<String> {
-    let step_started_at = std::time::Instant::now();
-    let derived_entries = crate::authz_userset_index::build_expected_derived_userset_index_at_revision(
+    if let Some(segment_ref) =
+        authz_segment::existing_authz_tuple_segment_ref(storage, tenant_id, target_revision)?
+    {
+        return Ok(segment_ref);
+    }
+    let write_checkpoint = authz_segment::authz_tuple_segment_requires_checkpoint(
         storage,
         tenant_id,
-        DEFAULT_DERIVED_USERSET_INDEX_ID,
         target_revision,
-    )
-    .await?
-    .entries;
+    )?;
+    let step_started_at = std::time::Instant::now();
+    let derived_entries =
+        crate::authz_userset_index::build_expected_derived_userset_index_at_revision(
+            storage,
+            tenant_id,
+            DEFAULT_DERIVED_USERSET_INDEX_ID,
+            target_revision,
+        )
+        .await?
+        .entries;
+    let previous_derived_entries = if !write_checkpoint && target_revision > 1 {
+        crate::authz_userset_index::build_expected_derived_userset_index_at_revision(
+            storage,
+            tenant_id,
+            DEFAULT_DERIVED_USERSET_INDEX_ID,
+            target_revision - 1,
+        )
+        .await?
+        .entries
+    } else {
+        Vec::new()
+    };
     crate::emit_test_timing(
         "authz_journal.materialize_segment build_derived_usersets",
         step_started_at.elapsed(),
     );
-    materialize_authz_tuple_segment_with_derived_entries(
-        storage,
-        tenant_id,
-        target_revision,
-        source_fence_token,
-        &derived_entries,
-    )
-    .await
-}
-
-async fn materialize_authz_tuple_segment_with_derived_entries(
-    storage: &Storage,
-    tenant_id: i64,
-    target_revision: u64,
-    source_fence_token: u64,
-    derived_entries: &[AuthzDerivedUsersetEntry],
-) -> Result<String> {
     let step_started_at = std::time::Instant::now();
     let target_revision = i64::try_from(target_revision)
         .context("authorization segment revision exceeds supported range")?;
@@ -485,33 +491,58 @@ async fn materialize_authz_tuple_segment_with_derived_entries(
         step_started_at.elapsed(),
     );
     let step_started_at = std::time::Instant::now();
-    let segment_ref = authz_segment::write_authz_tuple_segment_with_derived(
-        storage,
-        tenant_id,
-        &records,
-        &derived_entries,
-        source_fence_token,
-    )
-    .await?;
+    let target_revision = u64::try_from(target_revision)?;
+    let segment_ref = if write_checkpoint {
+        authz_segment::write_authz_tuple_checkpoint_segment(
+            storage,
+            tenant_id,
+            &records,
+            &derived_entries,
+            source_fence_token,
+        )
+        .await?
+    } else {
+        authz_segment::write_authz_tuple_delta_segment(
+            storage,
+            tenant_id,
+            &records,
+            &derived_entries,
+            &previous_derived_entries,
+            target_revision,
+            source_fence_token,
+        )
+        .await?
+    };
     crate::emit_test_timing(
-        "authz_journal.materialize_segment write_full_segment",
+        if write_checkpoint {
+            "authz_journal.materialize_segment write_checkpoint_segment"
+        } else {
+            "authz_journal.materialize_segment write_delta_segment"
+        },
         step_started_at.elapsed(),
     );
     Ok(segment_ref)
 }
 
 async fn advance_authz_materialization(
-    _storage: &Storage,
-    _tenant_id: i64,
+    storage: &Storage,
+    tenant_id: i64,
     batch_records: &[AuthzTupleRecord],
-    _source_fence_token: u64,
+    source_fence_token: u64,
 ) -> Result<()> {
     debug_assert!(!batch_records.is_empty());
-    // Tuple writes update the durable journal and current rows. Immutable authz
-    // and userset outputs are coalesced at the revision requested by a query
-    // instead of rewriting a complete snapshot for every tuple. The latest
-    // tuple revision is the durable catch-up cursor, while stale derived state
-    // is ignored by readers until it reaches that exact revision.
+    let revision = batch_records
+        .iter()
+        .map(|record| record.revision)
+        .max()
+        .unwrap_or_default();
+    materialize_authz_tuple_segment_at_revision(
+        storage,
+        tenant_id,
+        u64::try_from(revision).context("authorization revision must be nonnegative")?,
+        source_fence_token,
+    )
+    .await?;
     Ok(())
 }
 

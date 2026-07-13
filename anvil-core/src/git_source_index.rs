@@ -1,8 +1,5 @@
 use crate::{
-    core_store::{
-        CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
-        core_object_ref_from_logical_file_write,
-    },
+    core_store::{CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob},
     formats::{
         FileFamily, Hash32, decode_writer_segment, encode_writer_segment_header,
         git::{GitHashAlgorithm, GitSourceRecord},
@@ -119,11 +116,11 @@ pub async fn write_git_source_index(
             core_meta_mutations: Vec::new(),
         })
         .await?;
-    let written = receipt
-        .written_logical_files
+    let object_ref = receipt
+        .written_object_refs
         .first()
-        .ok_or_else(|| anyhow!("CoreFormatWriter returned no git source logical file"))?;
-    let object_ref = core_object_ref_from_logical_file_write(written);
+        .cloned()
+        .ok_or_else(|| anyhow!("CoreFormatWriter returned no git source object"))?;
     write_writer_segment_catalog_record(
         storage,
         &WriterSegmentCatalogRecord {
@@ -132,7 +129,7 @@ pub async fn write_git_source_index(
             segment_ref: ref_name.clone(),
             core_object_ref_target: encode_core_object_ref_target(&object_ref)?,
             segment_hash: hex::encode(segment_hash),
-            segment_length: written.manifest.logical_size,
+            segment_length: object_ref.logical_size,
             generation: input.generation,
             source_cursor: input.generation,
             created_at_unix_nanos: unix_nanos_from_rfc3339(&header.created_at),

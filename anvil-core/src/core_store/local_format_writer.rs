@@ -1,6 +1,8 @@
 use super::local::write_file_atomic;
 use super::*;
-use crate::formats::writer::{ByteSource, CoreMetaMutation, LogicalFileWrite, WriterBuildOutput};
+use crate::formats::writer::{
+    ByteSource, CoreMetaMutation, DurabilityClass, LogicalFileWrite, WriterBuildOutput,
+};
 use anyhow::{Context, bail};
 use std::time::Instant;
 use tokio::fs;
@@ -9,7 +11,7 @@ use tokio::fs;
 pub struct CoreFormatWriteReceipt {
     pub logical_file_ids: Vec<String>,
     pub manifest_hashes: Vec<String>,
-    pub written_logical_files: Vec<CoreLogicalFileWrite>,
+    pub written_object_refs: Vec<CoreObjectRef>,
     pub coremeta_certificate_hashes: Vec<String>,
 }
 
@@ -21,7 +23,7 @@ impl CoreStore {
         let _guard = self.acquire_corestore_write_lock().await;
         let mut logical_file_ids = Vec::new();
         let mut manifest_hashes = Vec::new();
-        let mut written_logical_files = Vec::new();
+        let mut written_object_refs = Vec::new();
         for logical_file in output.logical_files {
             let logical_file_id = logical_file.logical_file_id.clone();
             let writer_family = logical_file.writer_family.as_str().to_string();
@@ -37,10 +39,41 @@ impl CoreStore {
             );
             record_corestore_trace_event("materialiser.plan", "ok");
             let writer_started_at = Instant::now();
-            let written = self
-                .write_format_logical_file(logical_file)
-                .await
-                .with_context(|| format!("write CoreFormat logical file {logical_file_id}"))?;
+            let inline_metadata = logical_file.durability_class == DurabilityClass::InlineMetadata;
+            let (object_ref, manifest_hash) = if inline_metadata {
+                let ByteSource::InlineBytes(bytes) = logical_file.bytes else {
+                    bail!("CoreFormat inline metadata requires an inline byte source");
+                };
+                let object_ref = self
+                    .put_inline_blob(
+                        PutBlob {
+                            logical_name: logical_file.logical_file_id,
+                            bytes,
+                            boundary_values: logical_file.boundary_values,
+                            region_id: logical_file.region_id,
+                            mutation_id: logical_file.mutation_id,
+                        },
+                        logical_file.writer_family.as_str(),
+                        self.storage_class_catalog()
+                            .select(None)?
+                            .inline_payload_policy
+                            .clone(),
+                    )
+                    .await
+                    .with_context(|| format!("write inline CoreFormat file {logical_file_id}"))?;
+                let manifest_hash = object_ref.hash.clone();
+                (object_ref, manifest_hash)
+            } else {
+                let written = self
+                    .write_format_logical_file(logical_file)
+                    .await
+                    .with_context(|| format!("write CoreFormat logical file {logical_file_id}"))?;
+                let manifest_hash = written.locator.manifest_hash.clone();
+                (
+                    core_object_ref_from_logical_file_write(&written),
+                    manifest_hash,
+                )
+            };
             crate::perf::record_duration(
                 "anvil_writer_build_duration_ms",
                 &[
@@ -51,9 +84,9 @@ impl CoreStore {
                 writer_started_at.elapsed(),
             );
             record_corestore_trace_event("writer.build", "ok");
-            manifest_hashes.push(written.locator.manifest_hash.clone());
+            manifest_hashes.push(manifest_hash);
             logical_file_ids.push(logical_file_id);
-            written_logical_files.push(written);
+            written_object_refs.push(object_ref);
         }
 
         let coremeta_certificate_hashes = self
@@ -62,7 +95,7 @@ impl CoreStore {
         Ok(CoreFormatWriteReceipt {
             logical_file_ids,
             manifest_hashes,
-            written_logical_files,
+            written_object_refs,
             coremeta_certificate_hashes,
         })
     }

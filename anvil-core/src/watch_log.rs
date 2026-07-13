@@ -222,10 +222,11 @@ async fn read_object_watch_records(
         if record.record_kind != "object_watch" {
             continue;
         }
-        let (watch_record, used) = WatchRecord::decode(&record.payload)?;
+        let (mut watch_record, used) = WatchRecord::decode(&record.payload)?;
         if used != record.payload.len() {
             return Err(anyhow!("object watch CoreStore record has trailing bytes"));
         }
+        watch_record.cursor = u128::from(record.sequence);
         decoded.push(watch_record);
     }
     Ok(decoded)
@@ -371,7 +372,7 @@ mod tests {
             latest_object_watch_cursor(&storage, bucket.tenant_id, bucket.id, first.version_id)
                 .await
                 .unwrap(),
-            Some(10)
+            Some(1)
         );
         assert_eq!(
             latest_object_watch_cursor(&storage, bucket.tenant_id, bucket.id, uuid::Uuid::new_v4())
@@ -387,11 +388,11 @@ mod tests {
         assert_eq!(docs[0].key, "docs/a.txt");
 
         let after_first =
-            list_object_watch_events(&storage, bucket.tenant_id, bucket.id, "", 10, 10)
+            list_object_watch_events(&storage, bucket.tenant_id, bucket.id, "", 1, 10)
                 .await
                 .unwrap();
         assert_eq!(after_first.len(), 1);
-        assert_eq!(after_first[0].id, 11);
+        assert_eq!(after_first[0].id, 2);
         assert_eq!(after_first[0].event_type, "delete");
     }
 }

@@ -3,10 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Result, bail};
 
 use crate::core_store::{
-    CoreBoundaryValue, CoreLogicalRangeHint, CoreMetaBatchOp, CoreMetaBatchOpKind,
-    CoreMetaRowCommonProto, CoreMetaVisibilityState, CoreObjectRef, CorePipelinePolicy,
-    CoreSharedRangeMarker, CoreTraceContext, WriteLogicalFilePathRequest, WriteLogicalFileRequest,
-    sha256_hex,
+    CORE_META_MAX_INLINE_PAYLOAD_BYTES, CoreBoundaryValue, CoreLogicalRangeHint, CoreMetaBatchOp,
+    CoreMetaBatchOpKind, CoreMetaRowCommonProto, CoreMetaVisibilityState, CoreObjectRef,
+    CorePipelinePolicy, CoreSharedRangeMarker, CoreTraceContext, WriteLogicalFilePathRequest,
+    WriteLogicalFileRequest, sha256_hex,
 };
 
 use super::{EncodedWriterSegment, FileFamily, Hash32, RangeIndexEntry, encode_writer_segment};
@@ -652,7 +652,11 @@ pub fn build_writer_segment_logical_file(
                 shared_range: None,
             })
             .collect(),
-        durability_class: DurabilityClass::ErasureCodedBytes,
+        durability_class: if encoded.bytes.len() <= CORE_META_MAX_INLINE_PAYLOAD_BYTES {
+            DurabilityClass::InlineMetadata
+        } else {
+            DurabilityClass::ErasureCodedBytes
+        },
         compaction_policy: CompactionPolicy::default(),
         read_profile: ReadProfile::default(),
         pipeline_policy: input.pipeline_policy,

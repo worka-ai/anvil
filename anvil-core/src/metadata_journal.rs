@@ -5,7 +5,7 @@ use crate::core_store::{
     CorePipelinePolicy, CoreStore, CoreTraceContext, CoreTransaction, CoreTransactionUpdate,
     ReadStream, TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW, WriteLogicalFileRequest,
     core_meta_committed_row_common, core_meta_root_key_hash, core_meta_tuple_key,
-    core_object_ref_from_logical_file_write, decode_deterministic_proto, is_stream_head_mismatch,
+    decode_deterministic_proto, is_stream_head_mismatch,
 };
 use crate::formats::{
     FileFamily, Hash32, decode_writer_segment, encode_writer_segment_header, hash32,

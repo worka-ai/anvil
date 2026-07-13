@@ -8,6 +8,8 @@ service AdminService {
   rpc RotateApplicationSecret(RotateApplicationSecretRequest) returns (ApplicationSecretResponse);
   rpc GrantApplicationPolicy(GrantApplicationPolicyRequest) returns (ApplicationPolicyResponse);
   rpc RevokeApplicationPolicy(RevokeApplicationPolicyRequest) returns (ApplicationPolicyResponse);
+  rpc GrantApplicationPolicies(ApplicationPoliciesRequest) returns (ApplicationPoliciesResponse);
+  rpc RevokeApplicationPolicies(ApplicationPoliciesRequest) returns (ApplicationPoliciesResponse);
   rpc RotateSecretEncryptionKey(RotateSecretEncryptionKeyRequest) returns (SecretEncryptionKeyRotationResponse);
   rpc CreateBucketAdmin(CreateBucketAdminRequest) returns (BucketAdminResponse);
   rpc SetBucketPublicAccessAdmin(SetBucketPublicAccessAdminRequest) returns (BucketAdminResponse);
@@ -34,6 +36,7 @@ service AdminService {
   rpc ListCells(ListCellsRequest) returns (ListCellsResponse);
 
   rpc RegisterNode(RegisterNodeRequest) returns (NodeResponse);
+  rpc GetLocalNodeDescriptor(GetLocalNodeDescriptorRequest) returns (NodeResponse);
   rpc ActivateNode(ActivateNodeRequest) returns (NodeResponse);
   rpc DrainNode(DrainNodeRequest) returns (DrainOperationResponse);
   rpc ForceOfflineNode(ForceOfflineNodeRequest) returns (NodeResponse);
@@ -358,6 +361,26 @@ message ApplicationPolicyResponse {
   string audit_event_id = 6;
 }
 
+message ApplicationPolicyMutation {
+  string action = 1;
+  string resource = 2;
+}
+
+message ApplicationPoliciesRequest {
+  AdminRequestContext context = 1;
+  string tenant_id = 2;
+  string app_name = 3;
+  repeated ApplicationPolicyMutation policies = 4;
+}
+
+message ApplicationPoliciesResponse {
+  string request_id = 1;
+  string tenant_id = 2;
+  string app_name = 3;
+  repeated ApplicationPolicyMutation policies = 4;
+  string audit_event_id = 5;
+}
+
 message RotateSecretEncryptionKeyRequest {
   AdminRequestContext context = 1;
   bool dry_run = 2;
@@ -611,6 +634,8 @@ message RegisterNodeRequest {
   bytes receipt_signing_public_key_proto = 9;
   string capacity_json = 10;
 }
+
+message GetLocalNodeDescriptorRequest {}
 
 message ActivateNodeRequest {
   AdminRequestContext context = 1;
@@ -1361,6 +1386,7 @@ service StreamService {
 
 
 service MeshControlService {
+  rpc BootstrapMeshTopology(BootstrapMeshTopologyRequest) returns (BootstrapMeshTopologyResponse);
   rpc PutRegion(PutRegionRequest) returns (WriteResponse);
   rpc PutCell(PutCellRequest) returns (WriteResponse);
   rpc PutNode(PutNodeRequest) returns (WriteResponse);
@@ -2042,6 +2068,19 @@ message PutNodeRequest {
     bytes receipt_signing_public_key_proto = 9;
     repeated string cluster_addrs = 10;
     repeated string capabilities = 11;
+}
+
+message BootstrapMeshTopologyRequest {
+  repeated PutRegionRequest regions = 1;
+  repeated PutCellRequest cells = 2;
+  repeated PutNodeRequest nodes = 3;
+  repeated CoreMetaRowMutation canonical_coremeta_rows = 4;
+}
+
+message BootstrapMeshTopologyResponse {
+  WriteResponse write = 1;
+  repeated CoreMetaRowMutation canonical_coremeta_rows = 2;
+  bool already_initialised = 3;
 }
 
 message MoveBucketRequest {
@@ -3327,8 +3366,9 @@ service RootRegisterInternal {
 }
 
 service CoreMetaReplicationInternal {
-  rpc ReplicatePendingBatch(CoreMetaBatchRequest) returns (CoreMetaPrepareReceipt);
-  rpc PersistCommitCertificate(CoreMetaPersistCommitRequest) returns (CoreMetaCertificatePersistReceipt);
+  rpc ReplicatePendingBatches(CoreMetaBatchGroupRequest) returns (CoreMetaPrepareReceiptGroup);
+  rpc PersistCommitCertificates(CoreMetaPersistCommitGroupRequest) returns (CoreMetaCertificatePersistReceiptGroup);
+  rpc CoreMetaStream(stream CoreMetaStreamRequest) returns (stream CoreMetaStreamResponse);
   rpc AbortPendingBatch(CoreMetaAbortRequest) returns (CoreMetaPrepareReceipt);
   rpc ReadRows(CoreMetaReadRowsRequest) returns (CoreMetaReadRowsResponse);
   rpc CatchUpPartition(CoreMetaCatchUpRequest) returns (stream CoreMetaBatchFrame);
@@ -3375,6 +3415,15 @@ message CoreMetaBatchRequest {
   string pending_batch_hash = 8;
 }
 
+message CoreMetaBatchGroupRequest {
+  InternalRequestHeader header = 1;
+  repeated CoreMetaBatchRequest batches = 2;
+}
+
+message CoreMetaPrepareReceiptGroup {
+  repeated CoreMetaPrepareReceipt receipts = 1;
+}
+
 message CoreMetaPrepareReceipt {
   string replica_node_id = 1;
   uint64 write_sequence = 2;
@@ -3401,6 +3450,31 @@ message CoreMetaPersistCommitRequest {
   CoreMetaCommitCertificate commit_certificate = 2;
   repeated CoreMetaRowMutation committed_rows = 3;
   string committed_batch_hash = 4;
+}
+
+message CoreMetaPersistCommitGroupRequest {
+  InternalRequestHeader header = 1;
+  repeated CoreMetaPersistCommitRequest commits = 2;
+}
+
+message CoreMetaCertificatePersistReceiptGroup {
+  repeated CoreMetaCertificatePersistReceipt receipts = 1;
+}
+
+message CoreMetaStreamRequest {
+  string request_id = 1;
+  oneof command {
+    CoreMetaBatchGroupRequest replicate_pending_batches = 2;
+    CoreMetaPersistCommitGroupRequest persist_commit_certificates = 3;
+  }
+}
+
+message CoreMetaStreamResponse {
+  string request_id = 1;
+  oneof result {
+    CoreMetaPrepareReceiptGroup prepare_receipts = 2;
+    CoreMetaCertificatePersistReceiptGroup certificate_persist_receipts = 3;
+  }
 }
 
 message CoreMetaCertificatePersistReceipt {

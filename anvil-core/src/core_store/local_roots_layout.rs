@@ -1,4 +1,5 @@
 use super::local_stream_control::control_record_proto::*;
+use super::local_tx_rows::{OwnedCoreMetaBatchOp, borrow_owned_coremeta_batch_ops};
 use super::*;
 use crate::formats::writer::{WriterFamily, canonical_logical_file_id};
 
@@ -215,6 +216,22 @@ impl CoreStore {
         stream_id: &str,
         records: &[StreamRecord],
     ) -> Result<Vec<CoreMetaQuorumCommitOutcome>> {
+        let prepared = self
+            .prepare_stream_metadata_rows(stream_id, records)
+            .await?;
+        if prepared.owned_ops.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ops = borrow_owned_coremeta_batch_ops(&prepared.owned_ops);
+        self.commit_coremeta_batch_by_embedded_roots(&prepared.transaction_id, &ops)
+            .await
+    }
+
+    pub(super) async fn prepare_stream_metadata_rows(
+        &self,
+        stream_id: &str,
+        records: &[StreamRecord],
+    ) -> Result<PreparedStreamMetadataWrite> {
         for record in records {
             if record.stream_id != stream_id {
                 bail!("CoreStore stream record metadata row has invalid scope");
@@ -238,7 +255,10 @@ impl CoreStore {
             .collect::<Vec<_>>();
         new_records.sort_by_key(|record| record.sequence);
         if new_records.is_empty() {
-            return Ok(Vec::new());
+            return Ok(PreparedStreamMetadataWrite {
+                transaction_id: String::new(),
+                owned_ops: Vec::new(),
+            });
         }
 
         let mut previous_sequence = existing_sequence;
@@ -288,26 +308,25 @@ impl CoreStore {
         let head_key = stream_head_key(stream_id);
         payloads.push(encode_stream_head_record(&head)?);
 
-        let mut ops = Vec::with_capacity(payloads.len());
+        let mut owned_ops = Vec::with_capacity(payloads.len());
         for (idx, key) in record_keys.iter().enumerate() {
-            ops.push(CoreMetaBatchOp {
+            owned_ops.push(OwnedCoreMetaBatchOp::Put {
                 cf: CF_STREAM_RECORDS,
                 table_id: TABLE_STREAM_RECORD_INDEX_ROW,
-                tuple_key: key,
+                tuple_key: key.clone(),
+                payload: payloads[idx].clone(),
                 common: None,
-                kind: CoreMetaBatchOpKind::Put(&payloads[idx]),
             });
         }
-        ops.push(CoreMetaBatchOp {
+        owned_ops.push(OwnedCoreMetaBatchOp::Put {
             cf: CF_STREAM_HEADS,
             table_id: TABLE_STREAM_HEAD_ROW,
-            tuple_key: &head_key,
+            tuple_key: head_key,
+            payload: payloads
+                .last()
+                .expect("stream head payload is pushed after record payloads")
+                .clone(),
             common: None,
-            kind: CoreMetaBatchOpKind::Put(
-                payloads
-                    .last()
-                    .expect("stream head payload is pushed after record payloads"),
-            ),
         });
         let transaction_id = records
             .last()
@@ -318,8 +337,10 @@ impl CoreStore {
                     existing_sequence, head.last_sequence
                 )
             });
-        self.commit_coremeta_batch_by_embedded_roots(&transaction_id, &ops)
-            .await
+        Ok(PreparedStreamMetadataWrite {
+            transaction_id,
+            owned_ops,
+        })
     }
 
     pub(super) async fn write_stream_record_payload(
@@ -643,19 +664,17 @@ impl CoreStore {
         };
         let checkpoint_bytes = encode_transaction_stream_checkpoint_record(&checkpoint)?;
         let checkpoint_hash = sha256_hex(&checkpoint_bytes);
-        let checkpoint_locator = self
-            .publish_inline_manifest_body(
-                WriterFamily::CoreControl.as_str(),
-                canonical_logical_file_id(
-                    WriterFamily::CoreControl,
-                    post_root_generation,
-                    &format!("core_transaction_checkpoint:{post_root_generation:020}"),
-                    checkpoint_hash.as_bytes(),
-                ),
+        let (checkpoint_locator, checkpoint_op) = self.prepare_inline_manifest_body(
+            WriterFamily::CoreControl.as_str(),
+            canonical_logical_file_id(
+                WriterFamily::CoreControl,
                 post_root_generation,
-                checkpoint_bytes,
-            )
-            .await?;
+                &format!("core_transaction_checkpoint:{post_root_generation:020}"),
+                checkpoint_hash.as_bytes(),
+            ),
+            post_root_generation,
+            checkpoint_bytes,
+        )?;
         let transaction_root_key_hash = root_key_hash(core_transaction_root_anchor_key());
         let root_metadata_commit = metadata_commits
             .iter()
@@ -689,19 +708,24 @@ impl CoreStore {
         };
         let transaction_manifest_bytes = encode_transaction_manifest_record(&transaction)?;
         let transaction_manifest_hash = sha256_hex(&transaction_manifest_bytes);
-        let transaction_manifest = self
-            .publish_inline_manifest_body(
-                WriterFamily::CoreControl.as_str(),
-                canonical_logical_file_id(
-                    WriterFamily::CoreControl,
-                    post_root_generation,
-                    &format!("core_transaction_manifest:{post_root_generation:020}"),
-                    transaction_manifest_hash.as_bytes(),
-                ),
+        let (transaction_manifest, transaction_manifest_op) = self.prepare_inline_manifest_body(
+            WriterFamily::CoreControl.as_str(),
+            canonical_logical_file_id(
+                WriterFamily::CoreControl,
                 post_root_generation,
-                transaction_manifest_bytes,
-            )
-            .await?;
+                &format!("core_transaction_manifest:{post_root_generation:020}"),
+                transaction_manifest_hash.as_bytes(),
+            ),
+            post_root_generation,
+            transaction_manifest_bytes,
+        )?;
+        let manifest_ops = [checkpoint_op, transaction_manifest_op];
+        let manifest_ops = borrow_owned_coremeta_batch_ops(&manifest_ops);
+        self.commit_coremeta_batch_by_embedded_roots(
+            &format!("core-transaction-manifests:{post_root_generation}"),
+            &manifest_ops,
+        )
+        .await?;
         self.publish_core_transaction_root_anchor(
             records,
             transaction_manifest,

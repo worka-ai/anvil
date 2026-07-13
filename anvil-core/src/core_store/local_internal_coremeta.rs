@@ -226,7 +226,7 @@ impl CoreStore {
         self.write_coremeta_encoded_rows(&borrowed)
     }
 
-    pub(super) fn coremeta_commit_evidence_encoded_row(
+    pub(crate) fn coremeta_commit_evidence_encoded_row(
         &self,
         root_key_hash: &str,
         root_generation: u64,
@@ -314,6 +314,32 @@ impl CoreStore {
         pending_batch_hash: &str,
         core_meta_row_count: usize,
     ) -> Result<()> {
+        let row = self.coremeta_pending_batch_marker_encoded_row(
+            root_key_hash,
+            expected_root_generation,
+            post_root_generation,
+            transaction_id,
+            pending_batch_hash,
+            core_meta_row_count,
+        )?;
+        let borrowed = [CoreMetaEncodedRow {
+            cf: row.cf.as_str(),
+            core_meta_key: &row.core_meta_key,
+            value_envelope: &row.value_envelope,
+            delete_marker: row.delete_marker,
+        }];
+        self.write_coremeta_encoded_rows(&borrowed)
+    }
+
+    pub(crate) fn coremeta_pending_batch_marker_encoded_row(
+        &self,
+        root_key_hash: &str,
+        expected_root_generation: u64,
+        post_root_generation: u64,
+        transaction_id: &str,
+        pending_batch_hash: &str,
+        core_meta_row_count: usize,
+    ) -> Result<CoreMetaEncodedOwnedRow> {
         validate_hash(root_key_hash, "CoreMeta pending batch root key hash")?;
         validate_coremeta_digest(pending_batch_hash, "CoreMeta pending batch hash")?;
         validate_logical_id(transaction_id, "CoreMeta pending batch transaction id")?;
@@ -346,17 +372,11 @@ impl CoreStore {
             common: None,
             kind: CoreMetaBatchOpKind::Put(&payload),
         }];
-        let encoded = self.meta.encode_batch_ops(&ops)?;
-        let borrowed = encoded
-            .iter()
-            .map(|row| CoreMetaEncodedRow {
-                cf: row.cf.as_str(),
-                core_meta_key: &row.core_meta_key,
-                value_envelope: &row.value_envelope,
-                delete_marker: row.delete_marker,
-            })
-            .collect::<Vec<_>>();
-        self.write_coremeta_encoded_rows(&borrowed)
+        self.meta
+            .encode_batch_ops(&ops)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("CoreMeta pending batch marker encoding produced no row"))
     }
 
     pub(super) fn read_coremeta_commit_evidence(

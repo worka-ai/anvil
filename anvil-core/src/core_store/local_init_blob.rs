@@ -1,4 +1,5 @@
 use super::local_stream_control::control_record_proto::encode_object_manifest_record;
+use super::local_tx_rows::{OwnedCoreMetaBatchOp, borrow_owned_coremeta_batch_ops};
 use super::*;
 use crate::formats::{
     hash32,
@@ -74,6 +75,7 @@ impl CoreStore {
             meta,
             write_lock,
             internal_channels: Arc::new(Mutex::new(BTreeMap::new())),
+            coremeta_streams: Arc::new(Mutex::new(BTreeMap::new())),
             pipeline_keyring,
             storage_classes,
             node_signing_keypair,
@@ -520,7 +522,7 @@ impl CoreStore {
         Ok(object_ref)
     }
 
-    pub(super) async fn put_inline_blob(
+    pub(crate) async fn put_inline_blob(
         &self,
         input: PutBlob,
         writer_family: &str,
@@ -1015,6 +1017,32 @@ impl CoreStore {
         writer_generation: u64,
         body: Vec<u8>,
     ) -> Result<CoreManifestLocator> {
+        let (locator, op) = self.prepare_inline_manifest_body(
+            writer_family,
+            logical_file_id,
+            writer_generation,
+            body,
+        )?;
+        let owned_ops = [op];
+        let ops = borrow_owned_coremeta_batch_ops(&owned_ops);
+        self.commit_coremeta_batch_by_embedded_roots(
+            &format!(
+                "inline-manifest:{}:{}",
+                locator.manifest_ref.logical_file_id, locator.manifest_ref.writer_generation
+            ),
+            &ops,
+        )
+        .await?;
+        Ok(locator)
+    }
+
+    pub(super) fn prepare_inline_manifest_body(
+        &self,
+        writer_family: &str,
+        logical_file_id: String,
+        writer_generation: u64,
+        body: Vec<u8>,
+    ) -> Result<(CoreManifestLocator, OwnedCoreMetaBatchOp)> {
         let locator = inline_manifest_locator_from_body(
             logical_file_id,
             writer_family.to_string(),
@@ -1033,21 +1061,16 @@ impl CoreStore {
         };
         let key = inline_manifest_body_key(&locator.manifest_hash)?;
         let payload = encode_inline_manifest_body_row(&row)?;
-        self.commit_coremeta_batch_by_embedded_roots(
-            &format!(
-                "inline-manifest:{}:{}",
-                row.logical_file_id, row.writer_generation
-            ),
-            &[CoreMetaBatchOp {
+        Ok((
+            locator,
+            OwnedCoreMetaBatchOp::Put {
                 cf: CF_TRANSACTIONS,
                 table_id: TABLE_INLINE_MANIFEST_BODY_ROW,
-                tuple_key: &key,
+                tuple_key: key,
+                payload,
                 common: None,
-                kind: CoreMetaBatchOpKind::Put(&payload),
-            }],
-        )
-        .await?;
-        Ok(locator)
+            },
+        ))
     }
 
     pub(super) fn encrypt_pipeline_block(

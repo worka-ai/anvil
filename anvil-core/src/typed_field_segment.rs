@@ -2,7 +2,6 @@ use crate::{
     core_store::{
         CoreBoundaryValue, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext,
         EncodedTypedValue, GetBlob, SourceId, TypedFieldValue,
-        core_object_ref_from_logical_file_write,
     },
     formats::{
         FileFamily, Hash32, decode_writer_segment, encode_writer_segment_header, hash32,
@@ -233,11 +232,11 @@ pub async fn write_typed_field_segment(
             core_meta_mutations: Vec::new(),
         })
         .await?;
-    let written = receipt
-        .written_logical_files
+    let object_ref = receipt
+        .written_object_refs
         .first()
-        .ok_or_else(|| anyhow!("CoreFormatWriter returned no typed logical file"))?;
-    let object_ref = core_object_ref_from_logical_file_write(written);
+        .cloned()
+        .ok_or_else(|| anyhow!("CoreFormatWriter returned no typed object"))?;
     let core_object_ref_target = encode_core_object_ref_target(&object_ref)?;
     index_coremeta::write_index_segment_coremeta_record(
         storage,

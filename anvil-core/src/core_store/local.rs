@@ -264,6 +264,7 @@ pub struct CoreStore {
     meta: CoreMetaStore,
     write_lock: Arc<Mutex<()>>,
     internal_channels: Arc<Mutex<BTreeMap<String, Channel>>>,
+    coremeta_streams: Arc<Mutex<BTreeMap<String, local_coremeta_stream::CoreMetaPeerStream>>>,
     pipeline_keyring: Option<Arc<CorePipelineKeyring>>,
     storage_classes: CoreStorageClassCatalog,
     node_signing_keypair: Arc<identity::Keypair>,
@@ -308,9 +309,11 @@ impl CoreStore {
         F: FnMut(Channel) -> Fut,
         Fut: Future<Output = std::result::Result<T, tonic::Status>>,
     {
+        let total_started_at = Instant::now();
         let endpoint = normalise_grpc_endpoint(public_api_addr)?;
         let mut failures = Vec::new();
         for attempt in 0..CORE_INTERNAL_REQUEST_ATTEMPTS {
+            let channel_started_at = Instant::now();
             let channel = match self
                 .internal_grpc_channel(public_api_addr, operation_label)
                 .await
@@ -326,9 +329,24 @@ impl CoreStore {
                     break;
                 }
             };
+            crate::emit_test_timing(
+                format!("coremeta.internal.client {operation_label} channel"),
+                channel_started_at.elapsed(),
+            );
 
+            let call_started_at = Instant::now();
             match call(channel).await {
-                Ok(value) => return Ok(value),
+                Ok(value) => {
+                    crate::emit_test_timing(
+                        format!("coremeta.internal.client {operation_label} call"),
+                        call_started_at.elapsed(),
+                    );
+                    crate::emit_test_timing(
+                        format!("coremeta.internal.client {operation_label} total"),
+                        total_started_at.elapsed(),
+                    );
+                    return Ok(value);
+                }
                 Err(status) if retryable_internal_status(&status) => {
                     failures.push(format!(
                         "request attempt {}: code={:?} message={}",
@@ -598,6 +616,17 @@ struct StreamAppendOutcome {
     state_locator: Option<CoreManifestLocator>,
 }
 
+struct PreparedStreamMetadataWrite {
+    transaction_id: String,
+    owned_ops: Vec<local_tx_rows::OwnedCoreMetaBatchOp>,
+}
+
+struct PreparedStreamAppend {
+    outcome: StreamAppendOutcome,
+    record: Option<StreamRecord>,
+    metadata: PreparedStreamMetadataWrite,
+}
+
 struct CoreStoreLock {
     path: PathBuf,
 }
@@ -700,6 +729,8 @@ mod local_boundaries;
 mod local_codec;
 #[path = "local_coremeta_quorum.rs"]
 mod local_coremeta_quorum;
+#[path = "local_coremeta_stream.rs"]
+mod local_coremeta_stream;
 #[path = "local_erasure.rs"]
 mod local_erasure;
 #[path = "local_init_blob.rs"]

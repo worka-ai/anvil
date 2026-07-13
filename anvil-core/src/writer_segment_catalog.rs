@@ -115,8 +115,18 @@ pub fn latest_writer_segment_catalog_record(
     family: &str,
     scope: &str,
 ) -> Result<Option<WriterSegmentCatalogRecord>> {
+    Ok(list_writer_segment_catalog_records(storage, family, scope)?
+        .into_iter()
+        .max_by_key(|record| (record.generation, record.created_at_unix_nanos)))
+}
+
+pub fn list_writer_segment_catalog_records(
+    storage: &Storage,
+    family: &str,
+    scope: &str,
+) -> Result<Vec<WriterSegmentCatalogRecord>> {
     let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
-    let mut latest = None;
+    let mut records = Vec::new();
     for row in meta.scan_prefix(
         CF_MATERIALISATION,
         TABLE_WRITER_SEGMENT_ROW,
@@ -126,17 +136,10 @@ pub fn latest_writer_segment_catalog_record(
         if record.family != family || record.scope != scope {
             bail!("writer segment catalog row scope mismatch");
         }
-        if latest
-            .as_ref()
-            .is_none_or(|current: &WriterSegmentCatalogRecord| {
-                (record.generation, record.created_at_unix_nanos)
-                    > (current.generation, current.created_at_unix_nanos)
-            })
-        {
-            latest = Some(record);
-        }
+        records.push(record);
     }
-    Ok(latest)
+    records.sort_by_key(|record| (record.generation, record.created_at_unix_nanos));
+    Ok(records)
 }
 
 fn encode_record(record: &WriterSegmentCatalogRecord) -> Result<Vec<u8>> {

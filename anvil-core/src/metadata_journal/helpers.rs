@@ -74,11 +74,11 @@ pub(super) async fn write_segment_file(
             core_meta_mutations: Vec::new(),
         })
         .await?;
-    let written = receipt
-        .written_logical_files
+    let object_ref = receipt
+        .written_object_refs
         .first()
-        .ok_or_else(|| anyhow!("CoreFormatWriter returned no object metadata logical file"))?;
-    let object_ref = core_object_ref_from_logical_file_write(written);
+        .cloned()
+        .ok_or_else(|| anyhow!("CoreFormatWriter returned no object metadata object"))?;
     write_writer_segment_catalog_record(
         storage,
         &WriterSegmentCatalogRecord {
@@ -87,7 +87,7 @@ pub(super) async fn write_segment_file(
             segment_ref: ref_name.clone(),
             core_object_ref_target: encode_core_object_ref_target(&object_ref)?,
             segment_hash: file_hash.clone(),
-            segment_length: written.manifest.logical_size,
+            segment_length: object_ref.logical_size,
             generation,
             source_cursor: generation,
             created_at_unix_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()

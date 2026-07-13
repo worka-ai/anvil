@@ -162,34 +162,43 @@ pub(crate) async fn append_bucket_mutation_with_permits(
     let tenant_precondition = tenant_precondition?;
     let global_precondition = global_precondition?;
 
-    let step_start = std::time::Instant::now();
-    append_bucket_mutation_to_stream(
-        storage,
-        bucket,
-        mutation,
-        tenant_scope,
-        tenant_permit.fence_token,
-        Some(tenant_precondition),
-    )
-    .await?;
-    crate::emit_test_timing(
-        "bucket_journal.append_bucket_mutation tenant_append",
-        step_start.elapsed(),
-    );
-    let step_start = std::time::Instant::now();
-    append_bucket_mutation_to_stream(
-        storage,
-        bucket,
-        mutation,
-        global_scope,
-        global_permit.fence_token,
-        Some(global_precondition),
-    )
-    .await?;
-    crate::emit_test_timing(
-        "bucket_journal.append_bucket_mutation global_append",
-        step_start.elapsed(),
-    );
+    let tenant_append = async {
+        let step_start = std::time::Instant::now();
+        let result = append_bucket_mutation_to_stream(
+            storage,
+            bucket,
+            mutation,
+            tenant_scope,
+            tenant_permit.fence_token,
+            Some(tenant_precondition),
+        )
+        .await;
+        crate::emit_test_timing(
+            "bucket_journal.append_bucket_mutation tenant_append",
+            step_start.elapsed(),
+        );
+        result
+    };
+    let global_append = async {
+        let step_start = std::time::Instant::now();
+        let result = append_bucket_mutation_to_stream(
+            storage,
+            bucket,
+            mutation,
+            global_scope,
+            global_permit.fence_token,
+            Some(global_precondition),
+        )
+        .await;
+        crate::emit_test_timing(
+            "bucket_journal.append_bucket_mutation global_append",
+            step_start.elapsed(),
+        );
+        result
+    };
+    let (tenant_result, global_result) = tokio::join!(tenant_append, global_append);
+    tenant_result?;
+    global_result?;
     crate::emit_test_timing(
         "bucket_journal.append_bucket_mutation total",
         total_start.elapsed(),

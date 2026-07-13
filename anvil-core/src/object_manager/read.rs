@@ -1496,7 +1496,7 @@ impl ObjectManager {
         event_type: &str,
         is_delete_marker: bool,
     ) -> Result<(), Status> {
-        let event = self
+        let mut event = self
             .persistence
             .create_object_watch_event(
                 tenant_id,
@@ -1508,9 +1508,11 @@ impl ObjectManager {
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        watch_log::append_object_watch_record(&self.storage, bucket, object, &event)
+        let receipt = watch_log::append_object_watch_record(&self.storage, bucket, object, &event)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        event.id = i64::try_from(receipt.sequence)
+            .map_err(|_| Status::internal("object watch cursor exceeds i64"))?;
         let _ = self.watch_tx.send(event);
         Ok(())
     }

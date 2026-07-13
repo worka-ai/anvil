@@ -6,10 +6,7 @@ use crate::{
     authz_realm_schema,
     authz_scope::{DEFAULT_AUTHZ_REALM_ID, encode_realm_namespace, split_realm_namespace},
     authz_userset_index::AuthzDerivedUsersetEntry,
-    core_store::{
-        CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
-        core_object_ref_from_logical_file_write,
-    },
+    core_store::{CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob},
     formats::{
         FileFamily, Hash32,
         authz::{TupleKey, TupleOperation, TupleValue},
@@ -32,7 +29,8 @@ use crate::{
     storage::Storage,
     writer_segment_catalog::{
         WriterSegmentCatalogRecord, latest_writer_segment_catalog_record,
-        read_writer_segment_catalog_record, write_writer_segment_catalog_record,
+        list_writer_segment_catalog_records, read_writer_segment_catalog_record,
+        write_writer_segment_catalog_record,
     },
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -42,6 +40,11 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, LazyLock},
 };
+
+mod delta;
+
+use delta::read_authz_tuple_segment_at_revision;
+pub(crate) use delta::write_authz_tuple_delta_segment;
 
 const AUTHZ_TUPLE_SEGMENT_REF_PREFIX: &str = "authz_tuple_segment:";
 const AUTHZ_TUPLE_SEGMENT_CATALOG_FAMILY: &str = "authz_tuple";
@@ -53,6 +56,7 @@ const TABLE_AUTHZ_CAVEAT_DESCRIPTOR: u16 = 0x0505;
 const TABLE_AUTHZ_REVISION_LOG: u16 = 0x0506;
 const TABLE_AUTHZ_LIST_OBJECTS: u16 = 0x0507;
 const TABLE_AUTHZ_LIST_SUBJECTS: u16 = 0x0508;
+const AUTHZ_DELTA_CHECKPOINT_INTERVAL: u64 = 256;
 
 static AUTHZ_SEGMENT_CATCHUP_LOCKS: LazyLock<
     std::sync::Mutex<BTreeMap<i64, Arc<tokio::sync::Mutex<()>>>>,
@@ -74,6 +78,10 @@ pub struct AuthzSegmentHeader {
     pub partition_family: String,
     pub partition_id: String,
     pub generation: u64,
+    pub base_revision: u64,
+    pub segment_kind: String,
+    pub schema_replacement: bool,
+    pub relation_rule_replacement: bool,
     #[serde(default)]
     pub source_fence_token: u64,
     pub key_order: String,
@@ -127,6 +135,7 @@ pub struct AuthzUsersetEdgeRow {
     pub caveat_hash: String,
     pub source: String,
     pub revision: u64,
+    pub operation: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -152,6 +161,7 @@ pub struct AuthzListObjectsRow {
     pub object_id: String,
     pub doc_ordinal: u64,
     pub revision: u64,
+    pub operation: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -164,6 +174,7 @@ pub struct AuthzListSubjectsRow {
     pub caveat_hash: String,
     pub doc_ordinal: u64,
     pub revision: u64,
+    pub operation: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -224,6 +235,8 @@ struct AuthzUsersetEdgeRowProto {
     source: String,
     #[prost(uint64, tag = "8")]
     revision: u64,
+    #[prost(string, tag = "9")]
+    operation: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -266,6 +279,8 @@ struct AuthzListObjectsRowProto {
     doc_ordinal: u64,
     #[prost(uint64, tag = "8")]
     revision: u64,
+    #[prost(string, tag = "9")]
+    operation: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -286,6 +301,8 @@ struct AuthzListSubjectsRowProto {
     doc_ordinal: u64,
     #[prost(uint64, tag = "8")]
     revision: u64,
+    #[prost(string, tag = "9")]
+    operation: String,
 }
 
 #[cfg(test)]
@@ -294,27 +311,10 @@ async fn write_authz_tuple_segment(
     tenant_id: i64,
     records: &[AuthzTupleRecord],
 ) -> Result<String> {
-    write_authz_tuple_segment_inner(storage, tenant_id, records, &[], 0).await
+    write_authz_tuple_checkpoint_segment(storage, tenant_id, records, &[], 0).await
 }
 
-pub(crate) async fn write_authz_tuple_segment_with_derived(
-    storage: &Storage,
-    tenant_id: i64,
-    records: &[AuthzTupleRecord],
-    derived_usersets: &[AuthzDerivedUsersetEntry],
-    source_fence_token: u64,
-) -> Result<String> {
-    write_authz_tuple_segment_inner(
-        storage,
-        tenant_id,
-        records,
-        derived_usersets,
-        source_fence_token,
-    )
-    .await
-}
-
-async fn write_authz_tuple_segment_inner(
+pub(crate) async fn write_authz_tuple_checkpoint_segment(
     storage: &Storage,
     tenant_id: i64,
     records: &[AuthzTupleRecord],
@@ -345,7 +345,11 @@ async fn write_authz_tuple_segment_inner(
     write_authz_tuple_segment_tables(
         storage,
         tenant_id,
+        0,
         generation,
+        "checkpoint",
+        true,
+        true,
         source_fence_token,
         &segment_records,
         segment_tables,
@@ -356,7 +360,11 @@ async fn write_authz_tuple_segment_inner(
 async fn write_authz_tuple_segment_tables(
     storage: &Storage,
     tenant_id: i64,
+    base_revision: u64,
     generation: u64,
+    segment_kind: &str,
+    schema_replacement: bool,
+    relation_rule_replacement: bool,
     source_fence_token: u64,
     segment_records: &[SegmentRecord],
     segment_tables: Vec<WriterBodyTable>,
@@ -367,6 +375,10 @@ async fn write_authz_tuple_segment_tables(
         partition_family: "authz_tuple".to_string(),
         partition_id: hex::encode(partition_id(tenant_id)),
         generation,
+        base_revision,
+        segment_kind: segment_kind.to_string(),
+        schema_replacement,
+        relation_rule_replacement,
         source_fence_token,
         key_order: "tuple_key_revision".to_string(),
         created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
@@ -408,11 +420,11 @@ async fn write_authz_tuple_segment_tables(
             core_meta_mutations: Vec::new(),
         })
         .await?;
-    let written = receipt
-        .written_logical_files
+    let object_ref = receipt
+        .written_object_refs
         .first()
-        .ok_or_else(|| anyhow!("CoreFormatWriter returned no authz logical file"))?;
-    let object_ref = core_object_ref_from_logical_file_write(written);
+        .cloned()
+        .ok_or_else(|| anyhow!("CoreFormatWriter returned no authz object"))?;
     write_writer_segment_catalog_record(
         storage,
         &WriterSegmentCatalogRecord {
@@ -421,7 +433,7 @@ async fn write_authz_tuple_segment_tables(
             segment_ref: ref_name.clone(),
             core_object_ref_target: encode_core_object_ref_target(&object_ref)?,
             segment_hash: hex::encode(segment_hash),
-            segment_length: written.manifest.logical_size,
+            segment_length: object_ref.logical_size,
             generation,
             source_cursor: generation,
             created_at_unix_nanos: unix_nanos_from_rfc3339(&header.created_at),
@@ -466,19 +478,15 @@ pub async fn read_latest_authz_tuple_segment(
     storage: &Storage,
     tenant_id: i64,
 ) -> Result<Option<DecodedAuthzSegment>> {
-    let Some(segment_ref) = latest_authz_tuple_segment_ref(storage, tenant_id).await? else {
+    let Some(record) = latest_writer_segment_catalog_record(
+        storage,
+        AUTHZ_TUPLE_SEGMENT_CATALOG_FAMILY,
+        &authz_tuple_segment_scope(tenant_id)?,
+    )?
+    else {
         return Ok(None);
     };
-    read_authz_tuple_segment_ref(storage, tenant_id, &segment_ref).await
-}
-
-async fn read_authz_tuple_segment_at_revision(
-    storage: &Storage,
-    tenant_id: i64,
-    revision: u64,
-) -> Result<Option<DecodedAuthzSegment>> {
-    let segment_ref = authz_tuple_segment_ref_name(tenant_id, revision)?;
-    read_authz_tuple_segment_ref(storage, tenant_id, &segment_ref).await
+    read_authz_tuple_segment_at_revision(storage, tenant_id, record.generation).await
 }
 
 async fn read_authz_tuple_segment_ref(
@@ -535,13 +543,18 @@ pub async fn ensure_authz_tuple_segment_at_revision(
 
     let source_fence_token =
         authz_journal::latest_authz_journal_fence_token(storage, tenant_id).await?;
-    authz_journal::materialize_authz_tuple_segment_at_revision(
-        storage,
-        tenant_id,
-        target_revision,
-        source_fence_token,
-    )
-    .await?;
+    for revision in 1..=target_revision {
+        let segment_ref = authz_tuple_segment_ref_name(tenant_id, revision)?;
+        if read_authz_tuple_segment_catalog_record(storage, tenant_id, &segment_ref)?.is_none() {
+            authz_journal::materialize_authz_tuple_segment_at_revision(
+                storage,
+                tenant_id,
+                revision,
+                source_fence_token,
+            )
+            .await?;
+        }
+    }
 
     let Some(segment) =
         read_authz_tuple_segment_at_revision(storage, tenant_id, target_revision).await?
@@ -641,6 +654,13 @@ fn encode_authz_header_proto(logical_file_id: &str, header: &AuthzSegmentHeader)
             header_field_string("tenant_id", header.tenant_id.clone()),
             header_field_string("partition_family", header.partition_family.clone()),
             header_field_string("partition_id", header.partition_id.clone()),
+            header_field_u64("base_revision", header.base_revision),
+            header_field_string("segment_kind", header.segment_kind.clone()),
+            header_field_u64("schema_replacement", u64::from(header.schema_replacement)),
+            header_field_u64(
+                "relation_rule_replacement",
+                u64::from(header.relation_rule_replacement),
+            ),
             header_field_u64("source_fence_token", header.source_fence_token),
             header_field_string("key_order", header.key_order.clone()),
             header_field_string("created_at", header.created_at.clone()),
@@ -657,6 +677,10 @@ fn decode_authz_header_proto(
         partition_family: required_header_string(header, "partition_family")?,
         partition_id: required_header_string(header, "partition_id")?,
         generation: header.writer_generation,
+        base_revision: required_header_u64(header, "base_revision")?,
+        segment_kind: required_header_string(header, "segment_kind")?,
+        schema_replacement: required_header_u64(header, "schema_replacement")? != 0,
+        relation_rule_replacement: required_header_u64(header, "relation_rule_replacement")? != 0,
         source_fence_token: required_header_u64(header, "source_fence_token")?,
         key_order: required_header_string(header, "key_order")?,
         created_at: required_header_string(header, "created_at")?,
@@ -664,16 +688,23 @@ fn decode_authz_header_proto(
     })
 }
 
-async fn latest_authz_tuple_segment_ref(
+pub(crate) fn authz_tuple_segment_requires_checkpoint(
     storage: &Storage,
     tenant_id: i64,
-) -> Result<Option<String>> {
-    Ok(latest_writer_segment_catalog_record(
+    target_revision: u64,
+) -> Result<bool> {
+    let previous = list_writer_segment_catalog_records(
         storage,
         AUTHZ_TUPLE_SEGMENT_CATALOG_FAMILY,
         &authz_tuple_segment_scope(tenant_id)?,
     )?
-    .map(|record| record.segment_ref))
+    .into_iter()
+    .filter(|record| record.generation < target_revision)
+    .max_by_key(|record| (record.generation, record.created_at_unix_nanos));
+    Ok(previous.is_none_or(|record| {
+        record.generation.saturating_add(1) != target_revision
+            || target_revision % AUTHZ_DELTA_CHECKPOINT_INTERVAL == 0
+    }))
 }
 
 fn authz_tuple_segment_ref_prefix(tenant_id: i64) -> Result<String> {
@@ -712,6 +743,18 @@ fn read_authz_tuple_segment_catalog_record(
     )
 }
 
+pub(crate) fn existing_authz_tuple_segment_ref(
+    storage: &Storage,
+    tenant_id: i64,
+    revision: u64,
+) -> Result<Option<String>> {
+    let segment_ref = authz_tuple_segment_ref_name(tenant_id, revision)?;
+    Ok(
+        read_authz_tuple_segment_catalog_record(storage, tenant_id, &segment_ref)?
+            .map(|record| record.segment_ref),
+    )
+}
+
 fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
     crate::core_store::encode_core_object_ref_target(object_ref)
 }
@@ -730,36 +773,6 @@ fn segment_records_from_authz_records(records: &[AuthzTupleRecord]) -> Result<Ve
     }
     output.sort_by(|left, right| left.key.cmp(&right.key));
     Ok(output)
-}
-
-async fn authz_writer_tables(
-    storage: &Storage,
-    tenant_id: i64,
-    records: &[AuthzTupleRecord],
-    derived_usersets: &[AuthzDerivedUsersetEntry],
-    segment_records: &[SegmentRecord],
-    generation: u64,
-    source_fence_token: u64,
-) -> Result<Vec<WriterBodyTable>> {
-    let active_records = active_tuple_records(records);
-    let schema_rows = schema_descriptor_rows(storage, tenant_id, &active_records).await?;
-    let bound_relation_rule_rows =
-        bound_relation_rule_rows(storage, tenant_id, &active_records).await?;
-    let relation_rule_rows =
-        all_relation_rule_rows(storage, tenant_id, &bound_relation_rule_rows).await?;
-    authz_writer_tables_with_rows(
-        storage,
-        tenant_id,
-        records,
-        derived_usersets,
-        segment_records,
-        generation,
-        source_fence_token,
-        &schema_rows,
-        &relation_rule_rows,
-        &bound_relation_rule_rows,
-    )
-    .await
 }
 
 async fn authz_writer_tables_with_rows(
@@ -1174,6 +1187,7 @@ fn userset_edge_rows(
                 source: "tuple".to_string(),
                 revision: u64::try_from(record.revision)
                     .context("authz tuple revision must be nonnegative")?,
+                operation: "add".to_string(),
             });
         }
     }
@@ -1187,6 +1201,7 @@ fn userset_edge_rows(
             caveat_hash: entry.caveat_hash.clone(),
             source: "derived_userset".to_string(),
             revision: generation,
+            operation: "add".to_string(),
         });
     }
     Ok(rows.into_iter().collect())
@@ -1213,6 +1228,7 @@ async fn list_object_rows(
             doc_ordinal: authz_doc_ordinal(&record.namespace, &record.object_id),
             revision: u64::try_from(record.revision)
                 .context("authz tuple revision must be nonnegative")?,
+            operation: "add".to_string(),
         });
     }
     for entry in derived_usersets {
@@ -1225,6 +1241,7 @@ async fn list_object_rows(
             object_id: entry.object_id.clone(),
             doc_ordinal: authz_doc_ordinal(&entry.namespace, &entry.object_id),
             revision: generation,
+            operation: "add".to_string(),
         });
     }
     let schema_index = SchemaRuleIndex::load(
@@ -1247,6 +1264,7 @@ async fn list_object_rows(
                 object_id: userset.object_id.clone(),
                 doc_ordinal: authz_doc_ordinal(&userset.namespace, &userset.object_id),
                 revision: generation,
+                operation: "add".to_string(),
             });
         }
     }
@@ -1274,6 +1292,7 @@ async fn list_subject_rows(
             doc_ordinal: authz_doc_ordinal(&record.namespace, &record.object_id),
             revision: u64::try_from(record.revision)
                 .context("authz tuple revision must be nonnegative")?,
+            operation: "add".to_string(),
         });
     }
     for entry in derived_usersets {
@@ -1286,6 +1305,7 @@ async fn list_subject_rows(
             caveat_hash: entry.caveat_hash.clone(),
             doc_ordinal: authz_doc_ordinal(&entry.namespace, &entry.object_id),
             revision: generation,
+            operation: "add".to_string(),
         });
     }
     let schema_index = SchemaRuleIndex::load(
@@ -1308,6 +1328,7 @@ async fn list_subject_rows(
                 caveat_hash: subject.caveat_hash,
                 doc_ordinal: authz_doc_ordinal(&userset.namespace, &userset.object_id),
                 revision: generation,
+                operation: "add".to_string(),
             });
         }
     }
@@ -1515,6 +1536,7 @@ fn encode_userset_edge_row(row: &AuthzUsersetEdgeRow) -> Result<Vec<u8>> {
         caveat_hash: row.caveat_hash.clone(),
         source: row.source.clone(),
         revision: row.revision,
+        operation: row.operation.clone(),
     })
 }
 
@@ -1529,6 +1551,7 @@ fn decode_userset_edge_row(bytes: &[u8]) -> Result<AuthzUsersetEdgeRow> {
         caveat_hash: proto.caveat_hash,
         source: proto.source,
         revision: proto.revision,
+        operation: validate_delta_operation(proto.operation)?,
     })
 }
 
@@ -1572,6 +1595,7 @@ fn encode_list_objects_row(row: &AuthzListObjectsRow) -> Result<Vec<u8>> {
         object_id: row.object_id.clone(),
         doc_ordinal: row.doc_ordinal,
         revision: row.revision,
+        operation: row.operation.clone(),
     })
 }
 
@@ -1586,6 +1610,7 @@ fn decode_list_objects_row(bytes: &[u8]) -> Result<AuthzListObjectsRow> {
         object_id: proto.object_id,
         doc_ordinal: proto.doc_ordinal,
         revision: proto.revision,
+        operation: validate_delta_operation(proto.operation)?,
     })
 }
 
@@ -1599,6 +1624,7 @@ fn encode_list_subjects_row(row: &AuthzListSubjectsRow) -> Result<Vec<u8>> {
         caveat_hash: row.caveat_hash.clone(),
         doc_ordinal: row.doc_ordinal,
         revision: row.revision,
+        operation: row.operation.clone(),
     })
 }
 
@@ -1613,7 +1639,16 @@ fn decode_list_subjects_row(bytes: &[u8]) -> Result<AuthzListSubjectsRow> {
         caveat_hash: proto.caveat_hash,
         doc_ordinal: proto.doc_ordinal,
         revision: proto.revision,
+        operation: validate_delta_operation(proto.operation)?,
     })
+}
+
+fn validate_delta_operation(operation: String) -> Result<String> {
+    if matches!(operation.as_str(), "add" | "remove") {
+        Ok(operation)
+    } else {
+        bail!("authz delta row operation must be add or remove")
+    }
 }
 
 fn encode_proto(message: &impl Message) -> Result<Vec<u8>> {

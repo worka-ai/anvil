@@ -320,13 +320,8 @@ impl Persistence {
         event_type: &str,
         is_delete_marker: bool,
     ) -> Result<ObjectWatchEvent> {
-        let id = self
-            .latest_object_watch_cursor(tenant_id, bucket_id)
-            .await?
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("object watch cursor overflow"))?;
         Ok(ObjectWatchEvent {
-            id,
+            id: 0,
             tenant_id,
             bucket_id,
             bucket_name: bucket_name.to_string(),

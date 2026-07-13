@@ -1,6 +1,7 @@
 #[path = "control_record_proto.rs"]
 pub(in crate::core_store::local) mod control_record_proto;
 
+use super::local_tx_rows::borrow_owned_coremeta_batch_ops;
 use super::*;
 use crate::formats::{
     hash32,
@@ -355,6 +356,35 @@ impl CoreStore {
         input: AppendStreamRecord,
         idempotency_key_hash: Option<String>,
     ) -> Result<StreamAppendOutcome> {
+        let prepared = self
+            .prepare_stream_append_unlocked_with_idempotency_hash(input, idempotency_key_hash)
+            .await?;
+        if prepared.metadata.owned_ops.is_empty() {
+            return Ok(prepared.outcome);
+        }
+        let ops = borrow_owned_coremeta_batch_ops(&prepared.metadata.owned_ops);
+        let metadata_commits = self
+            .commit_coremeta_batch_by_embedded_roots(&prepared.metadata.transaction_id, &ops)
+            .await?;
+        if let Some(record) = prepared
+            .record
+            .as_ref()
+            .filter(|record| record.stream_id == CORE_TRANSACTION_STREAM_ID)
+        {
+            self.write_core_transaction_stream_records(
+                std::slice::from_ref(record),
+                &metadata_commits,
+            )
+            .await?;
+        }
+        Ok(prepared.outcome)
+    }
+
+    pub(super) async fn prepare_stream_append_unlocked_with_idempotency_hash(
+        &self,
+        input: AppendStreamRecord,
+        idempotency_key_hash: Option<String>,
+    ) -> Result<PreparedStreamAppend> {
         if let Some(fence) = input.fence.as_ref() {
             self.validate_fence_precondition_unlocked(fence).await?;
         }
@@ -367,9 +397,16 @@ impl CoreStore {
             )
             .await?
         {
-            return Ok(StreamAppendOutcome {
-                receipt,
-                state_locator: None,
+            return Ok(PreparedStreamAppend {
+                outcome: StreamAppendOutcome {
+                    receipt,
+                    state_locator: None,
+                },
+                record: None,
+                metadata: PreparedStreamMetadataWrite {
+                    transaction_id: String::new(),
+                    owned_ops: Vec::new(),
+                },
             });
         }
         let payload_hash = format!("sha256:{}", sha256_hex(&input.payload));
@@ -400,17 +437,23 @@ impl CoreStore {
             created_at: now_rfc3339(),
         };
         record.event_hash = format!("sha256:{}", sha256_hex(&event_hash_input(&record)?));
-        self.write_stream_records(&input.stream_id, std::slice::from_ref(&record))
+        let metadata = self
+            .prepare_stream_metadata_rows(&input.stream_id, std::slice::from_ref(&record))
             .await?;
-        Ok(StreamAppendOutcome {
-            receipt: StreamAppendReceipt {
-                stream_id: record.stream_id,
-                sequence: record.sequence,
-                cursor: record.cursor,
-                event_hash: record.event_hash,
-                idempotent_replay: false,
+        let receipt = StreamAppendReceipt {
+            stream_id: record.stream_id.clone(),
+            sequence: record.sequence,
+            cursor: record.cursor.clone(),
+            event_hash: record.event_hash.clone(),
+            idempotent_replay: false,
+        };
+        Ok(PreparedStreamAppend {
+            outcome: StreamAppendOutcome {
+                receipt,
+                state_locator: None,
             },
-            state_locator: None,
+            record: Some(record),
+            metadata,
         })
     }
 

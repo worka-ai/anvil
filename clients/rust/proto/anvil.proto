@@ -3366,8 +3366,9 @@ service RootRegisterInternal {
 }
 
 service CoreMetaReplicationInternal {
-  rpc ReplicatePendingBatch(CoreMetaBatchRequest) returns (CoreMetaPrepareReceipt);
-  rpc PersistCommitCertificate(CoreMetaPersistCommitRequest) returns (CoreMetaCertificatePersistReceipt);
+  rpc ReplicatePendingBatches(CoreMetaBatchGroupRequest) returns (CoreMetaPrepareReceiptGroup);
+  rpc PersistCommitCertificates(CoreMetaPersistCommitGroupRequest) returns (CoreMetaCertificatePersistReceiptGroup);
+  rpc CoreMetaStream(stream CoreMetaStreamRequest) returns (stream CoreMetaStreamResponse);
   rpc AbortPendingBatch(CoreMetaAbortRequest) returns (CoreMetaPrepareReceipt);
   rpc ReadRows(CoreMetaReadRowsRequest) returns (CoreMetaReadRowsResponse);
   rpc CatchUpPartition(CoreMetaCatchUpRequest) returns (stream CoreMetaBatchFrame);
@@ -3414,6 +3415,15 @@ message CoreMetaBatchRequest {
   string pending_batch_hash = 8;
 }
 
+message CoreMetaBatchGroupRequest {
+  InternalRequestHeader header = 1;
+  repeated CoreMetaBatchRequest batches = 2;
+}
+
+message CoreMetaPrepareReceiptGroup {
+  repeated CoreMetaPrepareReceipt receipts = 1;
+}
+
 message CoreMetaPrepareReceipt {
   string replica_node_id = 1;
   uint64 write_sequence = 2;
@@ -3440,6 +3450,31 @@ message CoreMetaPersistCommitRequest {
   CoreMetaCommitCertificate commit_certificate = 2;
   repeated CoreMetaRowMutation committed_rows = 3;
   string committed_batch_hash = 4;
+}
+
+message CoreMetaPersistCommitGroupRequest {
+  InternalRequestHeader header = 1;
+  repeated CoreMetaPersistCommitRequest commits = 2;
+}
+
+message CoreMetaCertificatePersistReceiptGroup {
+  repeated CoreMetaCertificatePersistReceipt receipts = 1;
+}
+
+message CoreMetaStreamRequest {
+  string request_id = 1;
+  oneof command {
+    CoreMetaBatchGroupRequest replicate_pending_batches = 2;
+    CoreMetaPersistCommitGroupRequest persist_commit_certificates = 3;
+  }
+}
+
+message CoreMetaStreamResponse {
+  string request_id = 1;
+  oneof result {
+    CoreMetaPrepareReceiptGroup prepare_receipts = 2;
+    CoreMetaCertificatePersistReceiptGroup certificate_persist_receipts = 3;
+  }
 }
 
 message CoreMetaCertificatePersistReceipt {

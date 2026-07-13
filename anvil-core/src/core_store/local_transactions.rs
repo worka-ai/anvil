@@ -192,6 +192,7 @@ impl CoreStore {
             } else {
                 CorePendingMutationPayload::Landed(&batch_payload)
             };
+        let step_start = std::time::Instant::now();
         let admission = self
             .admit_core_mutation(
                 "mutation.batch",
@@ -207,10 +208,24 @@ impl CoreStore {
                 Vec::new(),
             )
             .await?;
+        crate::emit_test_timing(
+            format!("core_store.commit_mutation_batch admission tx={timing_name}"),
+            step_start.elapsed(),
+        );
 
         let step_start = std::time::Instant::now();
-        let (visible_updates, finalisation_error) =
-            self.apply_mutation_batch_operations_unlocked(&batch).await;
+        let mut prepared_coremeta_ops = Vec::new();
+        let (visible_updates, finalisation_error) = match self
+            .prepare_mutation_batch_operations_unlocked(&batch)
+            .await
+        {
+            Some(Ok((ops, updates))) => {
+                prepared_coremeta_ops = ops;
+                (updates, None)
+            }
+            Some(Err(error)) => (Vec::new(), Some(format!("{error:#}"))),
+            None => self.apply_mutation_batch_operations_unlocked(&batch).await,
+        };
         crate::emit_test_timing(
             format!("core_store.commit_mutation_batch operations tx={timing_name}"),
             step_start.elapsed(),
@@ -251,11 +266,15 @@ impl CoreStore {
             outcome: core_transaction_state_name(transaction_state).to_string(),
         };
         let step_start = std::time::Instant::now();
-        self.write_transaction_with_staged_rows_unlocked(&transaction, &batch.preconditions)
+        let transaction_ops = self
+            .transaction_rows_as_coremeta_ops_unlocked(&transaction, &batch.preconditions)
             .await?;
-        self.mark_pending_mutation_finalised_unlocked(
+        prepared_coremeta_ops.extend(transaction_ops);
+        self.mark_pending_mutation_finalised_with_result_and_ops_unlocked(
             &admission,
             core_transaction_state_name(transaction_state),
+            None,
+            prepared_coremeta_ops,
         )
         .await?;
         crate::emit_test_timing(
@@ -465,6 +484,95 @@ impl CoreStore {
         }
 
         (visible_updates, None)
+    }
+
+    async fn prepare_mutation_batch_operations_unlocked(
+        &self,
+        batch: &CoreMutationBatch,
+    ) -> Option<Result<(Vec<OwnedCoreMetaBatchOp>, Vec<CoreTransactionUpdate>)>> {
+        let mut stream_ids = BTreeSet::new();
+        for operation in &batch.operations {
+            if let CoreMutationOperation::StreamAppend { stream_id, .. } = operation
+                && (stream_id == CORE_TRANSACTION_STREAM_ID
+                    || !stream_ids.insert(stream_id.as_str()))
+            {
+                return None;
+            }
+        }
+
+        let mut owned_ops = Vec::new();
+        let mut updates = Vec::with_capacity(batch.operations.len());
+        for operation in &batch.operations {
+            let prepared = match operation {
+                CoreMutationOperation::CoreMetaPut {
+                    cf,
+                    table_id,
+                    tuple_key,
+                    payload,
+                    ..
+                } => self
+                    .prepare_coremeta_put_update_unlocked(cf, *table_id, tuple_key, payload)
+                    .map(|(op, update)| (vec![op], update)),
+                CoreMutationOperation::CoreMetaDelete {
+                    cf,
+                    table_id,
+                    tuple_key,
+                    ..
+                } => self
+                    .prepare_coremeta_delete_update_unlocked(
+                        cf,
+                        *table_id,
+                        tuple_key,
+                        format!("coremeta-delete:{}", sha256_hex(tuple_key)),
+                    )
+                    .map(|(op, update)| (vec![op], update)),
+                CoreMutationOperation::StreamAppend {
+                    stream_id,
+                    partition_id,
+                    record_kind,
+                    payload,
+                    idempotency_key,
+                } => {
+                    let idempotency_key_hash = idempotency_key
+                        .as_deref()
+                        .map(|key| format!("sha256:{}", sha256_hex(key.as_bytes())));
+                    self.prepare_stream_append_unlocked_with_idempotency_hash(
+                        AppendStreamRecord {
+                            stream_id: stream_id.clone(),
+                            partition_id: partition_id.clone(),
+                            record_kind: record_kind.clone(),
+                            payload: payload.clone(),
+                            content_type: None,
+                            user_metadata_json: "{}".to_string(),
+                            fence: None,
+                            transaction_id: Some(batch.transaction_id.clone()),
+                            idempotency_key: idempotency_key.clone(),
+                        },
+                        idempotency_key_hash,
+                    )
+                    .await
+                    .map(|prepared| {
+                        let receipt = prepared.outcome.receipt;
+                        (
+                            prepared.metadata.owned_ops,
+                            CoreTransactionUpdate::StreamAppend {
+                                stream_id: stream_id.clone(),
+                                visible_sequence: receipt.sequence,
+                                prepared_record_hash: receipt.event_hash,
+                            },
+                        )
+                    })
+                }
+            };
+            match prepared {
+                Ok((mut ops, update)) => {
+                    owned_ops.append(&mut ops);
+                    updates.push(update);
+                }
+                Err(error) => return Some(Err(error)),
+            }
+        }
+        Some(Ok((owned_ops, updates)))
     }
 
     async fn flush_coremeta_mutation_run_unlocked(

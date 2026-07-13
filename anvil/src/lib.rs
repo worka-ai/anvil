@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use axum::ServiceExt;
+use axum::serve::ListenerExt;
 use once_cell::sync::OnceCell;
 use std::time::Instant;
 use tonic::service;
@@ -174,6 +175,11 @@ pub async fn start_node_with_admin_listener(
         outbound_events_rx,
     ));
     let server_task = tokio::spawn(async move {
+        let listener = listener.tap_io(|stream| {
+            if let Err(error) = stream.set_nodelay(true) {
+                tracing::warn!(%error, "failed to enable TCP_NODELAY on public connection");
+            }
+        });
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -183,9 +189,14 @@ pub async fn start_node_with_admin_listener(
     let admin_server_task = admin_listener
         .zip(admin_axum)
         .map(|(admin_listener, admin_app)| {
-            tokio::spawn(
-                async move { axum::serve(admin_listener, admin_app.into_make_service()).await },
-            )
+            tokio::spawn(async move {
+                let admin_listener = admin_listener.tap_io(|stream| {
+                    if let Err(error) = stream.set_nodelay(true) {
+                        tracing::warn!(%error, "failed to enable TCP_NODELAY on admin connection");
+                    }
+                });
+                axum::serve(admin_listener, admin_app.into_make_service()).await
+            })
         });
 
     // Run both tasks concurrently.

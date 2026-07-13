@@ -9,6 +9,7 @@ use crate::{AppState, auth, diagnostic_store, system_realm, task_lease};
 use futures_util::StreamExt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -169,120 +170,318 @@ impl BlockStoreInternal for AppState {
 
 #[tonic::async_trait]
 impl CoreMetaReplicationInternal for AppState {
-    async fn replicate_pending_batch(
+    type CoreMetaStreamStream =
+        Pin<Box<dyn futures_core::Stream<Item = Result<CoreMetaStreamResponse, Status>> + Send>>;
+
+    async fn replicate_pending_batches(
         &self,
-        request: Request<CoreMetaBatchRequest>,
-    ) -> Result<Response<crate::anvil_api::CoreMetaPrepareReceipt>, Status> {
+        request: Request<CoreMetaBatchGroupRequest>,
+    ) -> Result<Response<CoreMetaPrepareReceiptGroup>, Status> {
+        let total_started_at = Instant::now();
+        let auth_started_at = Instant::now();
         ensure_internal_node_request(self, &request).await?;
+        crate::emit_test_timing(
+            "coremeta.internal.replicate_pending_batches authorise",
+            auth_started_at.elapsed(),
+        );
+        let validation_started_at = Instant::now();
         let req = request.into_inner();
-        let rows = request_rows_checked(&req.mutations)?;
-        let row_hashes = req
-            .mutations
-            .iter()
-            .map(|row| row.row_hash.clone())
-            .collect();
-        let expected_pending_hash =
-            core_store::pending_batch_hash(&core_store::CoreMetaPendingBatchInput {
-                root_key_hash: req.root_key_hash.clone(),
-                expected_root_generation: req.expected_root_generation,
-                post_root_generation: req.post_root_generation,
-                transaction_id: req.transaction_id.clone(),
-                row_hashes,
-            })
-            .map_err(internal_status)?;
-        if req.pending_batch_hash != expected_pending_hash {
-            return Err(Status::failed_precondition(
-                "CoreMeta pending batch hash mismatch",
+        if req.batches.is_empty() {
+            return Err(Status::invalid_argument(
+                "CoreMeta batch group must not be empty",
             ));
         }
+        let mut marker_rows = Vec::with_capacity(req.batches.len());
+        let mut roots = BTreeSet::new();
+        for batch in &req.batches {
+            if !roots.insert(batch.root_key_hash.as_str()) {
+                return Err(Status::invalid_argument(
+                    "CoreMeta batch group contains a duplicate root",
+                ));
+            }
+            if batch.visibility_state != "pending" {
+                return Err(Status::invalid_argument(
+                    "CoreMeta batch group entries must have pending visibility",
+                ));
+            }
+            let rows = request_rows_checked(&batch.mutations)?;
+            let row_hashes = batch
+                .mutations
+                .iter()
+                .map(|row| row.row_hash.clone())
+                .collect();
+            let expected_pending_hash =
+                core_store::pending_batch_hash(&core_store::CoreMetaPendingBatchInput {
+                    root_key_hash: batch.root_key_hash.clone(),
+                    expected_root_generation: batch.expected_root_generation,
+                    post_root_generation: batch.post_root_generation,
+                    transaction_id: batch.transaction_id.clone(),
+                    row_hashes,
+                })
+                .map_err(internal_status)?;
+            if batch.pending_batch_hash != expected_pending_hash {
+                return Err(Status::failed_precondition(
+                    "CoreMeta pending batch hash mismatch",
+                ));
+            }
+            marker_rows.push(
+                self.core_store
+                    .coremeta_pending_batch_marker_encoded_row(
+                        &batch.root_key_hash,
+                        batch.expected_root_generation,
+                        batch.post_root_generation,
+                        &batch.transaction_id,
+                        &batch.pending_batch_hash,
+                        rows.len(),
+                    )
+                    .map_err(internal_status)?,
+            );
+        }
+        crate::emit_test_timing(
+            "coremeta.internal.replicate_pending_batches validate",
+            validation_started_at.elapsed(),
+        );
+        let borrowed = marker_rows
+            .iter()
+            .map(|row| CoreMetaEncodedRow {
+                cf: row.cf.as_str(),
+                core_meta_key: &row.core_meta_key,
+                value_envelope: &row.value_envelope,
+                delete_marker: row.delete_marker,
+            })
+            .collect::<Vec<_>>();
+        let write_started_at = Instant::now();
         self.core_store
-            .persist_coremeta_pending_batch_marker(
-                &req.root_key_hash,
-                req.expected_root_generation,
-                req.post_root_generation,
-                &req.transaction_id,
-                &req.pending_batch_hash,
-                rows.len(),
-            )
+            .write_coremeta_encoded_rows(&borrowed)
             .map_err(internal_status)?;
-        let receipt = local_prepare_receipt(&self.core_store, &self.config.node_id, &req, 1)?;
-        Ok(Response::new(receipt))
+        crate::emit_test_timing(
+            "coremeta.internal.replicate_pending_batches rocksdb_write",
+            write_started_at.elapsed(),
+        );
+        let receipt_started_at = Instant::now();
+        let receipts = req
+            .batches
+            .iter()
+            .map(|batch| local_prepare_receipt(&self.core_store, &self.config.node_id, batch, 1))
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::emit_test_timing(
+            "coremeta.internal.replicate_pending_batches sign_receipts",
+            receipt_started_at.elapsed(),
+        );
+        crate::emit_test_timing(
+            "coremeta.internal.replicate_pending_batches total",
+            total_started_at.elapsed(),
+        );
+        Ok(Response::new(CoreMetaPrepareReceiptGroup { receipts }))
     }
 
-    async fn persist_commit_certificate(
+    async fn persist_commit_certificates(
         &self,
-        request: Request<CoreMetaPersistCommitRequest>,
-    ) -> Result<Response<crate::anvil_api::CoreMetaCertificatePersistReceipt>, Status> {
+        request: Request<CoreMetaPersistCommitGroupRequest>,
+    ) -> Result<Response<CoreMetaCertificatePersistReceiptGroup>, Status> {
+        let total_started_at = Instant::now();
+        let auth_started_at = Instant::now();
         ensure_internal_node_request(self, &request).await?;
+        crate::emit_test_timing(
+            "coremeta.internal.persist_commit_certificates authorise",
+            auth_started_at.elapsed(),
+        );
+        let validation_started_at = Instant::now();
         let req = request.into_inner();
-        let rows = request_rows_checked(&req.committed_rows)?;
-        let cert = req
-            .commit_certificate
-            .ok_or_else(|| Status::invalid_argument("commit_certificate is required"))?;
-        let row_hashes = req
-            .committed_rows
-            .iter()
-            .map(|row| row.row_hash.clone())
-            .collect();
-        let expected_committed_hash =
-            core_store::committed_batch_hash(&core_store::CoreMetaCommittedBatchInput {
-                root_key_hash: cert.root_key_hash.clone(),
-                expected_root_generation: cert.expected_root_generation,
-                post_root_generation: cert.post_root_generation,
-                transaction_id: cert.transaction_id.clone(),
-                pending_batch_hash: cert.pending_batch_hash.clone(),
-                committed_row_hashes: row_hashes,
-            })
-            .map_err(internal_status)?;
-        if req.committed_batch_hash != expected_committed_hash {
-            return Err(Status::failed_precondition(
-                "CoreMeta committed batch hash mismatch",
+        if req.commits.is_empty() {
+            return Err(Status::invalid_argument(
+                "CoreMeta commit group must not be empty",
             ));
         }
-        let core_cert = api_commit_certificate_to_core(&cert)?;
-        core_store::validate_commit_certificate_with_verifier(
-            &self
-                .core_store
-                .default_coremeta_quorum_profile()
-                .map_err(internal_status)?,
-            &core_cert,
-            |node_id, signed_payload_hash, signature| {
-                self.core_store.verify_internal_core_receipt_signature(
-                    node_id,
-                    signed_payload_hash,
-                    signature,
-                )
-            },
-        )
-        .map_err(internal_status)?;
-        let receipt = local_persist_receipt(
-            &self.core_store,
-            &self.config.node_id,
-            &cert,
-            &req.committed_batch_hash,
-            1,
-        )?;
-        let certificate_bytes = core_store::encode_deterministic_proto(&cert);
-        let persist_receipt_hashes = vec![
-            core_store::certificate_persist_receipt_payload_hash(&api_persist_receipt_to_core(
-                &receipt,
-            )?)
-            .map_err(internal_status)?,
-        ];
-        self.core_store
-            .persist_coremeta_committed_rows_with_evidence(
-                &rows,
-                &cert.root_key_hash,
-                cert.post_root_generation,
-                &cert.transaction_id,
-                &cert.certificate_hash,
-                &req.committed_batch_hash,
-                certificate_bytes,
-                persist_receipt_hashes,
-                vec![core_store::encode_deterministic_proto(&receipt)],
+        let mut receipts = Vec::with_capacity(req.commits.len());
+        let mut evidence_rows = Vec::with_capacity(req.commits.len());
+        let mut roots = BTreeSet::new();
+        for commit in &req.commits {
+            let _rows = request_rows_checked(&commit.committed_rows)?;
+            let cert = commit
+                .commit_certificate
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("commit_certificate is required"))?;
+            if !roots.insert(cert.root_key_hash.as_str()) {
+                return Err(Status::invalid_argument(
+                    "CoreMeta commit group contains a duplicate root",
+                ));
+            }
+            let row_hashes = commit
+                .committed_rows
+                .iter()
+                .map(|row| row.row_hash.clone())
+                .collect();
+            let expected_committed_hash =
+                core_store::committed_batch_hash(&core_store::CoreMetaCommittedBatchInput {
+                    root_key_hash: cert.root_key_hash.clone(),
+                    expected_root_generation: cert.expected_root_generation,
+                    post_root_generation: cert.post_root_generation,
+                    transaction_id: cert.transaction_id.clone(),
+                    pending_batch_hash: cert.pending_batch_hash.clone(),
+                    committed_row_hashes: row_hashes,
+                })
+                .map_err(internal_status)?;
+            if commit.committed_batch_hash != expected_committed_hash {
+                return Err(Status::failed_precondition(
+                    "CoreMeta committed batch hash mismatch",
+                ));
+            }
+            let core_cert = api_commit_certificate_to_core(cert)?;
+            core_store::validate_commit_certificate_with_verifier(
+                &self
+                    .core_store
+                    .default_coremeta_quorum_profile()
+                    .map_err(internal_status)?,
+                &core_cert,
+                |node_id, signed_payload_hash, signature| {
+                    self.core_store.verify_internal_core_receipt_signature(
+                        node_id,
+                        signed_payload_hash,
+                        signature,
+                    )
+                },
             )
             .map_err(internal_status)?;
-        Ok(Response::new(receipt))
+            let receipt = local_persist_receipt(
+                &self.core_store,
+                &self.config.node_id,
+                cert,
+                &commit.committed_batch_hash,
+                1,
+            )?;
+            evidence_rows.push(
+                self.core_store
+                    .coremeta_commit_evidence_encoded_row(
+                        &cert.root_key_hash,
+                        cert.post_root_generation,
+                        &cert.transaction_id,
+                        &cert.certificate_hash,
+                        &commit.committed_batch_hash,
+                        core_store::encode_deterministic_proto(cert),
+                        vec![
+                            core_store::certificate_persist_receipt_payload_hash(
+                                &api_persist_receipt_to_core(&receipt)?,
+                            )
+                            .map_err(internal_status)?,
+                        ],
+                        vec![core_store::encode_deterministic_proto(&receipt)],
+                    )
+                    .map_err(internal_status)?,
+            );
+            receipts.push(receipt);
+        }
+        crate::emit_test_timing(
+            "coremeta.internal.persist_commit_certificates validate_and_sign",
+            validation_started_at.elapsed(),
+        );
+
+        let mut rows = Vec::new();
+        for commit in &req.commits {
+            rows.extend(request_rows_checked(&commit.committed_rows)?);
+        }
+        rows.extend(evidence_rows.iter().map(|row| CoreMetaEncodedRow {
+            cf: row.cf.as_str(),
+            core_meta_key: &row.core_meta_key,
+            value_envelope: &row.value_envelope,
+            delete_marker: row.delete_marker,
+        }));
+        let write_started_at = Instant::now();
+        self.core_store
+            .write_coremeta_encoded_rows(&rows)
+            .map_err(internal_status)?;
+        crate::emit_test_timing(
+            "coremeta.internal.persist_commit_certificates rocksdb_write",
+            write_started_at.elapsed(),
+        );
+        crate::emit_test_timing(
+            "coremeta.internal.persist_commit_certificates total",
+            total_started_at.elapsed(),
+        );
+        Ok(Response::new(CoreMetaCertificatePersistReceiptGroup {
+            receipts,
+        }))
+    }
+
+    async fn core_meta_stream(
+        &self,
+        request: Request<tonic::Streaming<CoreMetaStreamRequest>>,
+    ) -> Result<Response<Self::CoreMetaStreamStream>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let state = self.clone();
+        let mut inbound = request.into_inner();
+        let (tx, rx) = mpsc::channel(16);
+
+        tokio::spawn(async move {
+            while let Some(item) = inbound.next().await {
+                let frame = match item {
+                    Ok(frame) => frame,
+                    Err(status) => {
+                        let _ = tx.send(Err(status)).await;
+                        return;
+                    }
+                };
+                let request_id = frame.request_id.clone();
+                if request_id.trim().is_empty() {
+                    let _ = tx
+                        .send(Err(Status::invalid_argument(
+                            "CoreMeta stream request_id is required",
+                        )))
+                        .await;
+                    return;
+                }
+
+                let result = match frame.command {
+                    Some(core_meta_stream_request::Command::ReplicatePendingBatches(command)) => {
+                        let mut request = Request::new(command);
+                        request.extensions_mut().insert(claims.clone());
+                        CoreMetaReplicationInternal::replicate_pending_batches(&state, request)
+                            .await
+                            .map(|response| CoreMetaStreamResponse {
+                                request_id,
+                                result: Some(core_meta_stream_response::Result::PrepareReceipts(
+                                    response.into_inner(),
+                                )),
+                            })
+                    }
+                    Some(core_meta_stream_request::Command::PersistCommitCertificates(command)) => {
+                        let mut request = Request::new(command);
+                        request.extensions_mut().insert(claims.clone());
+                        CoreMetaReplicationInternal::persist_commit_certificates(&state, request)
+                            .await
+                            .map(|response| CoreMetaStreamResponse {
+                                request_id,
+                                result: Some(
+                                    core_meta_stream_response::Result::CertificatePersistReceipts(
+                                        response.into_inner(),
+                                    ),
+                                ),
+                            })
+                    }
+                    None => Err(Status::invalid_argument(
+                        "CoreMeta stream command is required",
+                    )),
+                };
+
+                match result {
+                    Ok(response) => {
+                        if tx.send(Ok(response)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(status) => {
+                        let _ = tx.send(Err(status)).await;
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
     async fn abort_pending_batch(
@@ -422,8 +621,8 @@ impl_internal_header_carrier!(
     GetShardRequest => "block.get_shard",
     GetShardReceiptRequest => "block.get_shard_receipt",
     RepairShardRequest => "block.repair_shard",
-    CoreMetaBatchRequest => "coremeta.replicate_pending_batch",
-    CoreMetaPersistCommitRequest => "coremeta.persist_commit_certificate",
+    CoreMetaBatchGroupRequest => "coremeta.replicate_pending_batches",
+    CoreMetaPersistCommitGroupRequest => "coremeta.persist_commit_certificates",
     CoreMetaAbortRequest => "coremeta.abort_pending_batch",
     CoreMetaReadRowsRequest => "coremeta.read_rows",
     CoreMetaCatchUpRequest => "coremeta.catch_up_partition",
@@ -445,10 +644,12 @@ async fn ensure_internal_node_request<T: InternalHeaderCarrier>(
     state: &AppState,
     request: &Request<T>,
 ) -> Result<(), Status> {
+    let total_started_at = Instant::now();
     let claims = request
         .extensions()
         .get::<auth::Claims>()
         .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+    let relation_started_at = Instant::now();
     let allowed = system_realm::check_admin_relation(
         &state.storage,
         &state.config.mesh_id,
@@ -457,6 +658,10 @@ async fn ensure_internal_node_request<T: InternalHeaderCarrier>(
     )
     .await
     .map_err(internal_status)?;
+    crate::emit_test_timing(
+        "coremeta.internal.authorise zanzibar_check",
+        relation_started_at.elapsed(),
+    );
     if !allowed {
         return Err(Status::permission_denied(
             "system realm manage_nodes relation required",
@@ -495,6 +700,10 @@ async fn ensure_internal_node_request<T: InternalHeaderCarrier>(
             &header.signature,
         )
         .map_err(internal_status)?;
+    crate::emit_test_timing(
+        "coremeta.internal.authorise total",
+        total_started_at.elapsed(),
+    );
     Ok(())
 }
 

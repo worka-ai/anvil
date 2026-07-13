@@ -1,8 +1,5 @@
 use crate::{
-    core_store::{
-        CoreBoundaryValue, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
-        core_object_ref_from_logical_file_write,
-    },
+    core_store::{CoreBoundaryValue, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob},
     formats::{
         FileFamily, Hash32, decode_writer_segment, encode_writer_segment_header, hash32,
         header_field_string, header_field_u64, required_header_string, required_header_u64,
@@ -139,11 +136,11 @@ pub async fn write_registry_segment(
             core_meta_mutations: Vec::new(),
         })
         .await?;
-    let written = receipt
-        .written_logical_files
+    let object_ref = receipt
+        .written_object_refs
         .first()
-        .ok_or_else(|| anyhow!("CoreFormatWriter returned no registry logical file"))?;
-    let object_ref = core_object_ref_from_logical_file_write(written);
+        .cloned()
+        .ok_or_else(|| anyhow!("CoreFormatWriter returned no registry object"))?;
     write_writer_segment_catalog_record(
         storage,
         &WriterSegmentCatalogRecord {
@@ -157,7 +154,7 @@ pub async fn write_registry_segment(
             segment_ref: ref_name.clone(),
             core_object_ref_target: crate::core_store::encode_core_object_ref_target(&object_ref)?,
             segment_hash: hex::encode(segment_hash),
-            segment_length: written.manifest.logical_size,
+            segment_length: object_ref.logical_size,
             generation: write.generation,
             source_cursor: write.source_cursor,
             created_at_unix_nanos: unix_nanos_from_rfc3339(&header.created_at),

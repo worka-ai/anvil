@@ -1,3 +1,4 @@
+use super::local_tx_rows::{OwnedCoreMetaBatchOp, borrow_owned_coremeta_batch_ops};
 use super::*;
 use crate::formats::{
     hash32,
@@ -724,6 +725,22 @@ impl CoreStore {
         state: &str,
         result: Option<CorePendingMutationFinalisationResult>,
     ) -> Result<()> {
+        self.mark_pending_mutation_finalised_with_result_and_ops_unlocked(
+            admission,
+            state,
+            result,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub(super) async fn mark_pending_mutation_finalised_with_result_and_ops_unlocked(
+        &self,
+        admission: &CorePendingMutationRecord,
+        state: &str,
+        result: Option<CorePendingMutationFinalisationResult>,
+        mut preceding_ops: Vec<OwnedCoreMetaBatchOp>,
+    ) -> Result<()> {
         let admission_key = CorePendingMutationKey::from(admission);
         let finalisation_lock_id = format!(
             "{}:{}:{}",
@@ -747,6 +764,11 @@ impl CoreStore {
                 && existing.state == state
                 && existing.result_hash == result_hash
             {
+                if !preceding_ops.is_empty() {
+                    let ops = borrow_owned_coremeta_batch_ops(&preceding_ops);
+                    self.commit_coremeta_batch_by_embedded_roots(&admission.mutation_id, &ops)
+                        .await?;
+                }
                 if let Some(record) =
                     self.read_pending_mutation_finalisation_record(&admission_key)?
                 {
@@ -803,32 +825,147 @@ impl CoreStore {
         let finalisation_payload = encode_pending_mutation_finalisation_record(&finalisation)?;
         let finalisation_index_payload =
             encode_pending_mutation_finalisation_index_row(&finalisation_index)?;
-        self.commit_coremeta_batch_by_embedded_roots(
-            &admission.mutation_id,
-            &[
-                CoreMetaBatchOp {
-                    cf: CF_MATERIALISATION,
-                    table_id: TABLE_MATERIALISATION_CURSOR_ROW,
-                    tuple_key: &record_key,
-                    common: None,
-                    kind: CoreMetaBatchOpKind::Put(&finalisation_payload),
-                },
-                CoreMetaBatchOp {
-                    cf: CF_MATERIALISATION,
-                    table_id: TABLE_MATERIALISATION_CURSOR_ROW,
-                    tuple_key: &index_key,
-                    common: None,
-                    kind: CoreMetaBatchOpKind::Put(&finalisation_index_payload),
-                },
-            ],
-        )
+        preceding_ops.extend([
+            OwnedCoreMetaBatchOp::Put {
+                cf: CF_MATERIALISATION,
+                table_id: TABLE_MATERIALISATION_CURSOR_ROW,
+                tuple_key: record_key,
+                payload: finalisation_payload.clone(),
+                common: None,
+            },
+            OwnedCoreMetaBatchOp::Put {
+                cf: CF_MATERIALISATION,
+                table_id: TABLE_MATERIALISATION_CURSOR_ROW,
+                tuple_key: index_key,
+                payload: finalisation_index_payload,
+                common: None,
+            },
+        ]);
+        let cleanup_common = core_meta_committed_row_common(
+            "system",
+            root_key_hash(CORE_TRANSACTION_ROOT_ANCHOR_KEY),
+            admission.sequence,
+            admission.mutation_id.clone(),
+            unix_timestamp_nanos(),
+        );
+        preceding_ops.extend([
+            OwnedCoreMetaBatchOp::Delete {
+                cf: CF_TRANSACTIONS,
+                table_id: TABLE_PENDING_MUTATION_ROW,
+                tuple_key: admission_record_key(admission.sequence),
+                common: Some(cleanup_common.clone()),
+            },
+            OwnedCoreMetaBatchOp::Delete {
+                cf: CF_TRANSACTIONS,
+                table_id: TABLE_ADMISSION_COMMIT_CERTIFICATE_ROW,
+                tuple_key: admission_certificate_key(admission.sequence),
+                common: Some(cleanup_common.clone()),
+            },
+        ]);
+        for landed in &admission.landed_bytes {
+            preceding_ops.push(OwnedCoreMetaBatchOp::Delete {
+                cf: CF_MATERIALISATION,
+                table_id: TABLE_LANDED_BYTE_REF_ROW,
+                tuple_key: meta_tuple_key(&[b"landed-byte", landed.landing_id.as_bytes()]),
+                common: Some(cleanup_common.clone()),
+            });
+        }
+        let finalisation_idempotency_key = format!(
+            "pending-finalisation:{}:{}:{}",
+            finalisation.node_id, finalisation.mutation_epoch, finalisation.mutation_sequence
+        );
+        let finalisation_idempotency_hash = format!(
+            "sha256:{}",
+            sha256_hex(finalisation_idempotency_key.as_bytes())
+        );
+        let _stream_guard = self
+            .acquire_named_lock("stream", CORE_TRANSACTION_STREAM_ID)
+            .await?;
+        let prepared_stream = Box::pin(self.prepare_stream_append_unlocked_with_idempotency_hash(
+            AppendStreamRecord {
+                stream_id: CORE_TRANSACTION_STREAM_ID.to_string(),
+                partition_id: "system/core-control".to_string(),
+                record_kind: CORE_PENDING_MUTATION_FINALISATION_RECORD_KIND.to_string(),
+                payload: finalisation_payload.clone(),
+                content_type: Some("application/protobuf".to_string()),
+                user_metadata_json: "{}".to_string(),
+                fence: None,
+                transaction_id: Some(finalisation.mutation_id.clone()),
+                idempotency_key: Some(finalisation_idempotency_key),
+            },
+            Some(finalisation_idempotency_hash),
+        ))
         .await?;
-        self.append_pending_mutation_finalisation_transaction_record(
-            &finalisation,
-            &finalisation_payload,
-        )
-        .await?;
-        self.checkpoint_pending_mutations_unlocked().await?;
+        let combine_stream_metadata = prepared_stream
+            .record
+            .as_ref()
+            .is_some_and(|record| record.sequence == admission.sequence);
+        let stream_transaction_id = prepared_stream.metadata.transaction_id.clone();
+        let mut stream_metadata_ops = prepared_stream.metadata.owned_ops;
+        if combine_stream_metadata {
+            preceding_ops.append(&mut stream_metadata_ops);
+        }
+        let finalisation_ops = borrow_owned_coremeta_batch_ops(&preceding_ops);
+        let step_started_at = Instant::now();
+        let metadata_commits = self
+            .commit_coremeta_batch_by_embedded_roots(&admission.mutation_id, &finalisation_ops)
+            .await?;
+        crate::emit_test_timing(
+            "core_store.pending_finalisation write_rows",
+            step_started_at.elapsed(),
+        );
+        let step_started_at = Instant::now();
+        if let Some(record) = prepared_stream.record.as_ref() {
+            let stream_metadata_commits = if combine_stream_metadata {
+                metadata_commits
+            } else {
+                let ops = borrow_owned_coremeta_batch_ops(&stream_metadata_ops);
+                self.commit_coremeta_batch_by_embedded_roots(&stream_transaction_id, &ops)
+                    .await?
+            };
+            self.write_core_transaction_stream_records(
+                std::slice::from_ref(record),
+                &stream_metadata_commits,
+            )
+            .await?;
+        }
+        self.remove_finalised_landed_byte_files_after_metadata_cleanup(admission)
+            .await?;
+        crate::emit_test_timing(
+            "core_store.pending_finalisation append_transaction_record",
+            step_started_at.elapsed(),
+        );
+        Ok(())
+    }
+
+    async fn remove_finalised_landed_byte_files_after_metadata_cleanup(
+        &self,
+        admission: &CorePendingMutationRecord,
+    ) -> Result<()> {
+        for landed in &admission.landed_bytes {
+            let landed_hash = strip_sha256_prefix(&landed.sha256)?.to_string();
+            let _landed_guard = self
+                .acquire_named_lock("landed-bytes", &landed_hash)
+                .await?;
+            if self.landed_bytes_has_live_references(&landed.relative_path)? {
+                continue;
+            }
+            let landed_path = self
+                .storage
+                .resolve_relative_storage_path(&landed.relative_path)?;
+            match fs::remove_file(&landed_path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "remove finalised CoreStore landed bytes {}",
+                            landed_path.display()
+                        )
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
