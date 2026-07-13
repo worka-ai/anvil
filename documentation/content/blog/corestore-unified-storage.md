@@ -1,16 +1,16 @@
 ---
-title: Anvil 0.2.4: CoreStore, hardened administration, and book-quality operations docs
+title: Anvil 0.3.0: CoreStore, hardened administration, and book-quality operations docs
 slug: /blog/corestore-unified-storage/
-description: Anvil 0.2.4 turns CoreStore into the durable centre of objects, metadata, search, authorisation, watches, PersonalDB, mesh lifecycle, and gateway records.
-release: v0.2.4
-release_date: 2026-07-06
+description: Anvil 0.3.0 turns CoreStore into the durable centre of objects, metadata, search, authorisation, watches, PersonalDB, mesh lifecycle, and gateway records.
+release: v0.3.0
+release_date: 2026-07-13
 artifacts:
-  rust_crate: anvil-storage 0.2.4
+  rust_crate: anvil-storage 0.3.0
 ---
 
-# Anvil 0.2.4: CoreStore, hardened administration, and book-quality operations docs
+# Anvil 0.3.0: CoreStore, hardened administration, and book-quality operations docs
 
-Anvil 0.2.4 is the release where the system becomes easier to explain because the architecture has become stricter. Objects, metadata, search indexes, relationship authorisation, PersonalDB witness records, mesh control records, gateway records, leases, watches, audit evidence, and repair findings now share the same durable centre: CoreStore.
+Anvil 0.3.0 is the release where the system becomes easier to explain because the architecture has become stricter. Objects, metadata, search indexes, relationship authorisation, PersonalDB witness records, mesh control records, gateway records, leases, watches, audit evidence, and repair findings now share the same durable centre: CoreStore.
 
 That matters because object storage becomes product infrastructure as soon as the stored object is used by more than one subsystem. A document is not only bytes; it may need a current pointer, version history, metadata filters, full text search, vector retrieval, relationship checks, public links, append-only audit records, repair diagnostics, and a live watch stream. If every feature stores its own truth, operators eventually have to debug several small databases and guess which one is authoritative.
 
@@ -139,11 +139,51 @@ The Docker image is built from the Anvil server Dockerfile, release-tested, then
 
 Documentation publishes through a separate Fission static-site workflow. That keeps docs publishing independent from server releases while still letting release notes link to the exact public documentation.
 
+
+## Architecture status for this release
+
+This release is structured around a clear storage contract. CoreMeta stores metadata in RocksDB column families. Bounded tiny payloads may be stored in the inline payload column family, with a 32 KiB raw default inline cap and a 64 KiB encoded CoreMeta value ceiling. Larger durable bytes, including object bodies and large writer segments, go through the CoreStore byte pipeline and are stored as erasure-coded shard data.
+
+That storage boundary is the important release point. It means the system can continue improving query grammar, gateway coverage, watch ergonomics, and transport performance without asking operators to move data from a feature-specific side store into CoreStore later. Indexes, streams, authz segments, PersonalDB records, registry records, and mesh records now fit the same mental model: metadata and locators in CoreMeta, payload-like bytes through the byte pipeline.
+
+The Architecture book now expands this in detail: [Architecture Overview](/architecture/overview/), [CoreMeta and Blob Storage Layout](/architecture/storage-layout/), [Indexing and Query Architecture](/architecture/indexing-and-query/), [Streams, Watches, and Mesh Transport](/architecture/streams-watches-and-mesh/), and [Release Architecture Status](/architecture/release-status/).
+
+## Performance progression
+
+The optimisation work for this release moved common metadata-heavy paths from tens of seconds into low-single-digit seconds, while preserving the CoreMeta quorum and commit-certificate model. The following numbers are the observed progression from the release investigation. They are useful as release context rather than as universal benchmarks for every deployment.
+
+### Write path
+
+| Run | Main change | Tenant | App | 7 grants | Token | Bucket | PUT 27B | Authz write |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline | before optimisation | 66.42s | 16.02s | 19.48s | - | 48.70s | 32.01s | 19.04s |
+| v1 | first three optimisations | 7.871s | 1.781s | 5.043s | 54.1ms | 9.291s | 6.976s | 5.679s |
+| v2 | inline path | 7.904s | 1.826s | 5.107s | 1.86ms | 9.067s | 6.941s | 2.426s |
+| v3 | authz delta | 7.944s | 1.841s | 2.119s | 1.95ms | 5.989s | 3.691s | 2.440s |
+| v4 | CoreMeta batching | 5.366s | 1.333s | 1.544s | 5.16ms | 4.350s | 2.814s | 1.998s |
+| v5 | stream batching | 3.914s | 816ms | 1.296s | 2.21ms | 3.226s | 2.439s | 1.656s |
+| v6 | RPC instrumentation | 3.878s | 833ms | 1.248s | 2.10ms | 3.289s | 2.691s | 1.758s |
+| v7 | CoreMeta streaming | 1.261s | 272ms | 373ms | 3.88ms | 1.462s | 1.500s | 531ms |
+
+### Read and query path
+
+| Run | GET 27B | Permission check | List authz objects | List objects cold | List objects warm |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Baseline | 440ms | 280-480ms | - | 26.26s | 1.33s |
+| v1 | 8.86ms | 5.11ms | 4.71ms | 403ms | 401ms |
+| v2 | 7.07ms | 3.70ms | 4.28ms | 365ms | 363ms |
+| v3 | 6.06ms | 6.39ms | 7.59ms | 24.5ms | 24.0ms |
+| v4 | 4.45ms | 5.60ms | 5.08ms | 25.2ms | 21.0ms |
+| v5 | 4.99ms | 4.70ms | 4.94ms | 21.2ms | 18.5ms |
+| v6 | 10.6ms | 5.86ms | 5.24ms | 27.3ms | 20.9ms |
+| v7 | 9.86ms | 5.51ms | 7.49ms | 21.4ms | 19.6ms |
+
 ## How to read the new documentation
 
-The documentation has been rebuilt as four books:
+The documentation has been rebuilt as five books:
 
 - **Learn** teaches the model from first principles: objects, keys, CoreStore, regions, reads, writes, watches, indexes, authorisation, gateways, PersonalDB, and primitive selection.
+- **Architecture** documents CoreMeta, RocksDB column families, inline payload policy, the byte pipeline, index segment formats, watches, mesh transport, and release status for contributors and reviewers.
 - **Tutorials** turns those concepts into concrete operations: local Docker setup, bootstrap, tenants, buckets, metadata, versions, links, authorisation, public access, watches, search, streams, leases, PersonalDB, S3, static hosting, package gateway foundations, mesh lifecycle, repair, and an end-to-end document system.
 - **Operators** covers production decisions: deployment, networking, topology, secrets, admin-plane control, provisioning, CoreStore operations, observability, indexes, watches, gateways, PersonalDB, backup, repair, capacity, upgrades, security, incidents, and release readiness.
 - **Reference** documents the public CLI, the admin CLI, CLI workflows, authorisation actions/resources, and the JSON shapes for index definitions and queries.
@@ -158,7 +198,7 @@ This release is intended to be consumed as a coordinated server/client/docs rele
 
 Start with the Docker-first setup tutorial if you want to run Anvil locally. Read the Learn section if the vocabulary is new. Use the Tutorials book when you want to perform a specific operation. Use the Operators book before a real deployment. Use the Reference book when you need exact command families, action/resource strings, or JSON field shapes.
 
-Anvil 0.2.4 is a storage release, an operations release, and a documentation release. It makes the system stricter internally and clearer externally, which is the right foundation for teams that want object storage to carry real product data rather than only static blobs.
+Anvil 0.3.0 is a storage release, an operations release, and a documentation release. It makes the system stricter internally and clearer externally, which is the right foundation for teams that want object storage to carry real product data rather than only static blobs.
 
 ## What to validate after upgrading
 

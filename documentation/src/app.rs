@@ -144,6 +144,7 @@ impl From<HomeHeader> for Widget {
                     justify_content: JustifyContent::End,
                     children: vec![
                         HeaderLink::new("Learn", "/learn/overview/").into(),
+                        HeaderLink::new("Architecture", "/architecture/overview/").into(),
                         HeaderLink::new("Tutorials", "/tutorials/overview/").into(),
                         HeaderLink::new("Operators", "/operators/overview/").into(),
                         HeaderLink::new("CLIs", "/reference/public-cli/").into(),
@@ -356,7 +357,7 @@ impl From<CapabilitySection> for Widget {
                     children: vec![
                         CapabilityLine::new("Store", "Buckets, keys, versions, checksums, range reads, multipart uploads, append streams, JSON patching, manifest compare-and-swap.", "/tutorials/buckets-and-objects/").into(),
                         CapabilityLine::new("Find", "Directory indexes, metadata filters, full text search, vector search, hybrid ranking, source indexes, model tensor lookup.", "/tutorials/hybrid-search/").into(),
-                        CapabilityLine::new("Protect", "Token scopes, public access policy, relationship tuples, caveats, permission checks, authz watches, fail-closed internal namespaces.", "/tutorials/authorisation/").into(),
+                        CapabilityLine::new("Protect", "Principal credentials, public access policy, relationship tuples, caveats, permission checks, authz watches, fail-closed internal namespaces.", "/tutorials/authorisation/").into(),
                         CapabilityLine::new("React", "Bucket metadata watches, prefix watches, index definition watches, partition watches, authz watches, source watches, PersonalDB watches.", "/tutorials/watches/").into(),
                         CapabilityLine::new("Sync", "PersonalDB groups, changesets, catch-up, snapshots, projections, row metadata, projection writeback, witness certificates.", "/tutorials/personaldb/").into(),
                         CapabilityLine::new("Operate", "Index repair, directory repair, authz derived repair, PersonalDB log-chain repair, diagnostics, release smoke tests, package publishing.", "/tutorials/repair-and-diagnostics/").into(),
@@ -386,15 +387,16 @@ impl From<FlowSection> for Widget {
                 SectionIntro::new(
                     "How to evaluate it",
                     "Read the docs as a course, then use the tutorials as operating muscle memory.",
-                    "The Learn section teaches concepts from first principles. The tutorial section turns those concepts into operations through the Rust client shipped in this release. The operator section covers deployment, identity, indexing operations, backup, recovery, and releases.",
+                    "The Learn section teaches concepts from first principles. The Architecture section explains CoreMeta, RocksDB, the byte pipeline, index formats, streams, mesh transport, and release status. The tutorial section turns those concepts into operations through the Rust client shipped in this release. The operator section covers deployment, identity, indexing operations, backup, recovery, and releases.",
                 )
                 .into(),
                 Container::new(Column {
                     gap: Some(14.0),
                     children: vec![
                         StepText::new("1", "Learn", "Understand object storage, keys, indexes, vectors, authorisation, watches, and PersonalDB.").into(),
-                        StepText::new("2", "Build", "Run tutorials that create buckets, write objects, query indexes, stream watches, and submit PersonalDB changes.").into(),
-                        StepText::new("3", "Operate", "Deploy nodes, issue credentials, monitor lag, repair derived data, and publish release artefacts.").into(),
+                        StepText::new("2", "Review", "Inspect the CoreStore storage architecture, index formats, mesh transport, and release status.").into(),
+                        StepText::new("3", "Build", "Run tutorials that create buckets, write objects, query indexes, stream watches, and submit PersonalDB changes.").into(),
+                        StepText::new("4", "Operate", "Deploy nodes, issue credentials, monitor lag, repair derived data, and publish release artefacts.").into(),
                     ],
                     ..Default::default()
                 })
@@ -954,6 +956,7 @@ impl From<SiteFooter> for Widget {
                     wrap: FlexWrap::Wrap,
                     children: vec![
                         InlineLink::new("Learn", "/learn/overview/").into(),
+                        InlineLink::new("Architecture", "/architecture/overview/").into(),
                         InlineLink::new("Tutorials", "/tutorials/overview/").into(),
                         InlineLink::new("Operators", "/operators/overview/").into(),
                         InlineLink::new("CLIs", "/reference/public-cli/").into(),

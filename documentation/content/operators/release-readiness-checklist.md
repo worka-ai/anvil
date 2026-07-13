@@ -73,7 +73,7 @@ Anvil release notes are rendered from a blog post in `documentation/content/blog
 A minimal local render looks like this:
 
 ```bash
-TAG=v0.2.4
+TAG=v0.3.0
 IMAGE_DIGEST=sha256:replace-with-published-digest
 DOCS_URL=https://example.invalid/anvil/
 
@@ -121,7 +121,7 @@ This proves the test suite can drive the image through the Docker cluster and Hu
 After CI pushes the image, verify the immutable digest rather than relying only on a mutable tag:
 
 ```bash
-TAG=v0.2.4
+TAG=v0.3.0
 IMAGE="ghcr.io/OWNER/REPOSITORY:${TAG}"
 
 docker pull "$IMAGE"
@@ -145,7 +145,7 @@ This proves Cargo can package the client crate, include generated bindings as co
 After the release workflow runs, verify publication explicitly:
 
 ```bash
-VERSION=0.2.4
+VERSION=0.3.0
 python3 scripts/crate-version-exists.py anvil-storage "$VERSION"
 ```
 
@@ -158,7 +158,7 @@ The public and admin CLIs are release-coupled to the server image. They are not 
 Use the binaries from the image you will publish:
 
 ```bash
-ANVIL_IMAGE="ghcr.io/OWNER/REPOSITORY:v0.2.4"
+ANVIL_IMAGE="ghcr.io/OWNER/REPOSITORY:v0.3.0"
 
 docker run --rm "$ANVIL_IMAGE" anvil --version
 docker run --rm "$ANVIL_IMAGE" anvil-admin --version
@@ -239,7 +239,7 @@ The release workflow publishes three main outputs: the tested Docker image, the 
 After the tag workflow completes, verify the public record:
 
 ```bash
-TAG=v0.2.4
+TAG=v0.3.0
 
 gh release view "$TAG" --json tagName,targetCommitish,url
 python3 scripts/crate-version-exists.py anvil-storage "${TAG#v}"

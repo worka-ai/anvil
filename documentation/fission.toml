@@ -44,6 +44,10 @@ title = "Learn"
 href = "/learn/overview/"
 
 [[site.nav]]
+title = "Architecture"
+href = "/architecture/overview/"
+
+[[site.nav]]
 title = "Tutorials"
 href = "/tutorials/overview/"
 
@@ -65,6 +69,13 @@ path = "/learn"
 source = "content/learn"
 template = "fission::site::documentation"
 sidebar = "site/learn-sidebar.toml"
+
+[[site.routes]]
+kind = "content"
+path = "/architecture"
+source = "content/architecture"
+template = "fission::site::documentation"
+sidebar = "site/architecture-sidebar.toml"
 
 [[site.routes]]
 kind = "content"

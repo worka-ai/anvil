@@ -49,7 +49,7 @@ default = ["full"]
 tonic-prost = ["dep:tonic-prost"]
 
 [dependencies]
-anvil-core = { package = "anvil-storage-core", path = "../anvil-core", version = "0.2.0" }
+anvil-core = { package = "anvil-storage-core", path = "../anvil-core", version = "0.3.0" }
 # Enterprise crate is private and not part of the OSS workspace.
 # Do not declare it here to keep OSS repo self-contained.
 anyhow = { version = "1" }
@@ -130,8 +130,8 @@ bcrypt = "0.15"
 tonic-prost-build = { version = "0.14.2" }
 
 [dev-dependencies]
-anvil-storage = { path = "../clients/rust", version = "0.2.0" }
-anvil-test-utils = { package = "anvil-storage-test-utils", path = "../anvil-test-utils", version = "0.2.0" }
+anvil-storage = { path = "../clients/rust", version = "0.3.0" }
+anvil-test-utils = { package = "anvil-storage-test-utils", path = "../anvil-test-utils", version = "0.3.0" }
 aws-config = "1.1.7"
 aws-sdk-s3 = "1.18.0"
 http-body-util = "0.1.1"

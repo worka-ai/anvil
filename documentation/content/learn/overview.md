@@ -9,7 +9,7 @@ This Learn section is the conceptual book for Anvil. The tutorials show you how 
 
 You do not need to arrive as an object-store expert. This book assumes you may be learning object keys, control planes, data planes, indexes, watches, Zanzibar-style relationships, regions, cells, nodes, and CoreStore for the first time. The aim is to give junior-to-mid developers and operators a shared language before they copy a command, design a schema, grant a permission, expose a gateway, or repair a derived index.
 
-If you want hands-on steps, start with [Tutorials Overview](/tutorials/overview/). If you need exact command syntax, use [Public CLI](/reference/public-cli/) and [Admin CLI](/reference/admin-cli/). If you need permission strings, use [Authorisation Actions and Resources](/reference/authorisation-actions-and-resources/). This page is the map for the concepts those references assume.
+If you want hands-on steps, start with [Tutorials Overview](/tutorials/overview/). If you need implementation-level storage details for review or contribution, use [Architecture Overview](/architecture/overview/) and [Release Architecture Status](/architecture/release-status/). If you need exact command syntax, use [Public CLI](/reference/public-cli/) and [Admin CLI](/reference/admin-cli/). If you need permission strings, use [Authorisation Actions and Resources](/reference/authorisation-actions-and-resources/). This page is the map for the concepts those references assume.
 
 ## What Anvil is
 

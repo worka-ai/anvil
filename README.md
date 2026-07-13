@@ -27,10 +27,12 @@ CoreStore is Anvil's durable boundary. It has three primitives:
 
 Feature-specific formats still exist where useful, but durable truth goes through those primitives. S3 is a gateway, not the storage model. The native API, S3 gateway, search, watches, PersonalDB, and admin workflows all resolve back to Anvil tenants, buckets, resources, authorisation, and CoreStore records.
 
+CoreStore is split into a metadata plane and a byte plane. CoreMeta uses RocksDB column families for metadata, heads, versions, transactions, index definitions, segment locators, authz rows, mesh records, leases, and other small control records. Tiny payloads may be inlined according to the inline payload policy. Larger durable bytes are written through the CoreStore byte pipeline and stored as erasure-coded shard data. Index segments, stream payloads, PersonalDB pages, gateway blobs, and object bodies all follow that same rule.
+
 ## Release Surfaces
 
 - **Server:** Docker image and release binaries. The server crate is not published to crates.io.
-- **Rust client:** `anvil-storage = "0.2.4"` on crates.io.
+- **Rust client:** `anvil-storage = "0.3.0"` on crates.io.
 - **CLIs:** `anvil` for tenant/public operations and `anvil-admin` for private admin-plane operations.
 - **Documentation:** Fission static site in `documentation/`, published by a separate docs workflow.
 - **Protocol bindings:** generated gRPC bindings are packaged with the Rust client.
@@ -40,7 +42,7 @@ Feature-specific formats still exist where useful, but durable truth goes throug
 Anvil is Docker-first. Set `ANVIL_IMAGE` to the image published for the release you want to run, preferably pinned by tag or digest:
 
 ```sh
-export ANVIL_IMAGE="ghcr.io/worka-ai/anvil:v0.2.4"
+export ANVIL_IMAGE="ghcr.io/worka-ai/anvil:v0.3.0"
 docker pull "$ANVIL_IMAGE"
 ```
 
@@ -55,7 +57,7 @@ Add the Rust client to an application:
 
 ```toml
 [dependencies]
-anvil-storage = "0.2.4"
+anvil-storage = "0.3.0"
 ```
 
 Use the client with a bearer token minted by Anvil:
@@ -78,9 +80,10 @@ Existing S3-compatible tools can use the S3 gateway with Anvil-issued app creden
 
 ## Documentation
 
-The documentation is organised as four books:
+The documentation is organised as five books:
 
 - `documentation/content/learn/` teaches the concepts from first principles.
+- `documentation/content/architecture/` explains storage internals, CoreMeta, index formats, mesh transport, release status, and contributor rules.
 - `documentation/content/tutorials/` walks through concrete operations.
 - `documentation/content/operators/` covers deployment and production operation.
 - `documentation/content/reference/` documents the CLIs, authorisation action/resource strings, and index/query JSON shapes.
@@ -113,7 +116,7 @@ The release flow is designed so PR and release testing use the same gates:
 4. Let the release workflow test the Docker image, publish the tested image, publish `anvil-storage` if the version is new, render release notes from the release blog post, and create the GitHub release.
 5. Let the independent documentation workflow publish the Fission static site from `documentation/`.
 
-See `documentation/content/operators/release-readiness-checklist.md` for the operator checklist.
+See `documentation/content/operators/release-readiness-checklist.md` for the operator checklist and `documentation/content/architecture/release-status.md` for the release architecture status report.
 
 ## License
 
@@ -124,7 +127,7 @@ Anvil is licensed under the Apache 2.0 License. See `LICENSE`.
 A single-node local run is useful for learning the planes before building a larger topology. Keep the storage path on a volume, generate real secret material for anything you intend to keep, and remember that the admin listener is private even in local demos.
 
 ```sh
-export ANVIL_IMAGE="ghcr.io/worka-ai/anvil:v0.2.4"
+export ANVIL_IMAGE="ghcr.io/worka-ai/anvil:v0.3.0"
 export ANVIL_SECRET_ENCRYPTION_KEY="$(anvil-admin key generate-secret-encryption-key)"
 
 docker run --rm \
