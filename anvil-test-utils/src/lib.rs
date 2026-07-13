@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use anvil::anvil_api::GetAccessTokenRequest;
 use anvil::anvil_api::admin_service_client::AdminServiceClient;
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
+use anvil::anvil_api::mesh_control_service_client::MeshControlServiceClient;
 use anvil_core::{AppState, access_control};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client as S3Client;
@@ -17,8 +18,30 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tracing_subscriber::{self, EnvFilter};
 
+mod coremeta_bootstrap;
+mod docker_image;
+mod docker_topology;
+
+use coremeta_bootstrap::*;
+use docker_image::{configured_docker_image, require_docker_image};
+use docker_topology::ensure_docker_topology;
+
 static INIT_LOGGER: Once = Once::new();
 static TEST_CLUSTER_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static SHARED_TEST_THROTTLE: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
+static SHARED_DEFAULT_CLUSTER: OnceLock<Arc<TestCluster>> = OnceLock::new();
+static SHARED_PUBLIC_REGION_CLUSTER: OnceLock<Arc<TestCluster>> = OnceLock::new();
+static SHARED_DOCKER_CLUSTER: OnceLock<Arc<DockerTestCluster>> = OnceLock::new();
+
+const DEFAULT_TEST_REGION: &str = "test-region-1";
+const SHARED_CLUSTER_REGIONS: [&str; 6] = [
+    DEFAULT_TEST_REGION,
+    DEFAULT_TEST_REGION,
+    DEFAULT_TEST_REGION,
+    DEFAULT_TEST_REGION,
+    DEFAULT_TEST_REGION,
+    DEFAULT_TEST_REGION,
+];
 
 fn test_cluster_limit() -> usize {
     std::env::var("ANVIL_TEST_CLUSTER_CONCURRENCY")
@@ -37,8 +60,1104 @@ async fn acquire_test_cluster_permit() -> OwnedSemaphorePermit {
         .expect("test cluster semaphore is not closed")
 }
 
+fn shared_test_limit() -> Option<usize> {
+    std::env::var("ANVIL_SHARED_TEST_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+}
+
+async fn acquire_shared_test_throttle() -> Option<OwnedSemaphorePermit> {
+    let semaphore = SHARED_TEST_THROTTLE
+        .get_or_init(|| shared_test_limit().map(|limit| Arc::new(Semaphore::new(limit))))
+        .clone()?;
+    Some(
+        semaphore
+            .acquire_owned()
+            .await
+            .expect("shared test throttle semaphore is not closed"),
+    )
+}
+
+pub struct SharedTestCluster {
+    cluster: Arc<TestCluster>,
+    _debug_throttle: Option<OwnedSemaphorePermit>,
+}
+
+impl std::ops::Deref for SharedTestCluster {
+    type Target = TestCluster;
+
+    fn deref(&self) -> &Self::Target {
+        &self.cluster
+    }
+}
+
+pub struct SharedDockerTestCluster {
+    cluster: Arc<DockerTestCluster>,
+    _debug_throttle: Option<OwnedSemaphorePermit>,
+}
+
+impl std::ops::Deref for SharedDockerTestCluster {
+    type Target = DockerTestCluster;
+
+    fn deref(&self) -> &Self::Target {
+        &self.cluster
+    }
+}
+
+/// Shared Docker-backed integration cluster for public API, gateway and CLI
+/// tests. Test binaries are clients only; the Anvil nodes run as real services
+/// inside Docker Compose and are reused through a filesystem startup lock.
+pub async fn shared_docker_test_cluster() -> SharedDockerTestCluster {
+    let debug_throttle = acquire_shared_test_throttle().await;
+    let cluster = tokio::task::spawn_blocking(|| {
+        SHARED_DOCKER_CLUSTER
+            .get_or_init(|| DockerTestCluster::start_shared())
+            .clone()
+    })
+    .await
+    .expect("shared Docker Anvil test cluster initialization panicked");
+    SharedDockerTestCluster {
+        cluster,
+        _debug_throttle: debug_throttle,
+    }
+}
+
+/// Create a Docker-backed cluster with a unique compose project and host ports.
+/// Use this only for tests that intentionally stop/restart nodes, need a unique
+/// region, or otherwise cannot share the long-lived Docker cluster safely.
+pub async fn isolated_docker_test_cluster(label: &str, region: &str) -> DockerTestCluster {
+    let label = compact_resource_label(label, 24);
+    let region = if region.trim().is_empty() {
+        docker_test_region()
+    } else {
+        region.to_string()
+    };
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build isolated Docker Anvil test-cluster runtime");
+        runtime.block_on(async move { DockerTestCluster::start_isolated(&label, &region).await })
+    })
+    .await
+    .expect("isolated Docker Anvil test cluster initialization panicked")
+}
+
+/// Shared default integration cluster for tests that only need normal Anvil
+/// behaviour. This is intentionally long-lived for the whole test binary so
+/// individual tests do not pay cluster bootstrap cost.
+/// It uses six nodes because the current erasure profile requires six active
+/// object nodes for distributed logical-file writes.
+///
+/// Tests using this helper must create unique tenants/apps/buckets/object keys
+/// and must not assert global counts or global ordering. Shared-cluster tests run
+/// concurrently by default. ANVIL_SHARED_TEST_CONCURRENCY is a local debugging
+/// throttle for resource pressure; it must not be required for correctness.
+pub async fn shared_default_test_cluster() -> SharedTestCluster {
+    let debug_throttle = acquire_shared_test_throttle().await;
+    let cluster = tokio::task::spawn_blocking(|| {
+        SHARED_DEFAULT_CLUSTER
+            .get_or_init(|| start_shared_cluster_thread(SharedClusterProfile::Default))
+            .clone()
+    })
+    .await
+    .expect("shared default Anvil test cluster initialization panicked");
+    SharedTestCluster {
+        cluster,
+        _debug_throttle: debug_throttle,
+    }
+}
+
+/// Shared cluster for S3/public-host tests. Use this instead of a custom
+/// per-test config when the only required config difference is regional/public
+/// host routing support. It follows the same concurrent-by-default rule as the
+/// default shared cluster.
+pub async fn shared_public_region_test_cluster() -> SharedTestCluster {
+    let debug_throttle = acquire_shared_test_throttle().await;
+    let cluster = tokio::task::spawn_blocking(|| {
+        SHARED_PUBLIC_REGION_CLUSTER
+            .get_or_init(|| start_shared_cluster_thread(SharedClusterProfile::PublicRegion))
+            .clone()
+    })
+    .await
+    .expect("shared public-region Anvil test cluster initialization panicked");
+    SharedTestCluster {
+        cluster,
+        _debug_throttle: debug_throttle,
+    }
+}
+
+/// Create a fresh cluster only when a test has a real isolation requirement:
+/// restart, destructive topology mutation, custom storage/worker config, or
+/// assertions over exact global state.
+pub async fn isolated_test_cluster(reason: &str, regions: &[&str]) -> TestCluster {
+    assert!(
+        !reason.trim().is_empty(),
+        "isolated_test_cluster requires a justification"
+    );
+    eprintln!("[anvil-test] isolated cluster: {reason}");
+    TestCluster::new(regions).await
+}
+
+/// Create a fresh custom cluster. Prefer a shared profile unless the test needs
+/// the config difference being supplied here.
+pub async fn isolated_test_cluster_with_config(
+    reason: &str,
+    regions: &[&str],
+    configure: impl FnOnce(&mut anvil_core::config::Config),
+) -> TestCluster {
+    assert!(
+        !reason.trim().is_empty(),
+        "isolated_test_cluster_with_config requires a justification"
+    );
+    eprintln!("[anvil-test] isolated cluster: {reason}");
+    TestCluster::new_with_config(regions, configure).await
+}
+
+/// Generate per-test resource names for tests sharing a cluster.
+pub fn unique_test_name(prefix: &str) -> String {
+    format!("{}-{}", prefix, uuid::Uuid::new_v4().simple())
+}
+
+/// Identity and routing context for one concurrent test actor.
+///
+/// Use this for shared-cluster tests instead of the cluster's default app when
+/// the test creates buckets or objects. Each actor owns a unique storage tenant
+/// and app, so concurrent tests cannot observe each other's bucket/object state.
+#[derive(Debug, Clone)]
+pub struct TestStorageActor {
+    pub tenant_id: i64,
+    pub app_id: String,
+    pub token: String,
+    pub grpc_addr: String,
+    pub region: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DockerTestStorageActor {
+    pub tenant_id: i64,
+    pub tenant_name: Option<String>,
+    pub app_id: String,
+    pub app_name: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub token: String,
+    pub grpc_addr: String,
+    pub region: String,
+}
+
+#[derive(Debug)]
+pub struct DockerTestCluster {
+    pub project_name: String,
+    pub compose_file: PathBuf,
+    pub grpc_addrs: Vec<String>,
+    pub admin_addrs: Vec<String>,
+    pub region: String,
+    pub public_region_host: String,
+    admin_token: String,
+    compose_env: Vec<(String, String)>,
+    cleanup_on_drop: bool,
+}
+
+impl DockerTestCluster {
+    fn start_shared() -> Arc<Self> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build Docker shared-cluster startup runtime");
+        runtime.block_on(async {
+            let _guard = TestClusterStartupLock::acquire("docker-shared-cluster").await;
+            let cluster = Self::start_or_reuse().await;
+            Arc::new(cluster)
+        })
+    }
+
+    async fn start_or_reuse() -> Self {
+        let docker_image = require_docker_image();
+        let compose_file = docker_compose_file();
+        let project_name = docker_compose_project_name();
+        let compose_env = vec![("ANVIL_IMAGE".to_string(), docker_image)];
+        docker_compose_with_env(
+            &compose_file,
+            &project_name,
+            &["up", "-d", "--remove-orphans"],
+            &compose_env,
+        );
+
+        let grpc_addrs = (1_u8..=docker_node_count())
+            .map(docker_host_api_url)
+            .collect::<Vec<_>>();
+
+        let wait_start = Instant::now();
+        for addr in &grpc_addrs {
+            assert!(
+                wait_for_http_ready(addr, Duration::from_secs(90)).await,
+                "Docker Anvil test endpoint did not become ready: {addr}"
+            );
+        }
+        emit_test_timing("docker_shared_cluster ports_ready", wait_start.elapsed());
+
+        let admin_addrs = (1_u8..=docker_node_count())
+            .map(docker_host_admin_url)
+            .collect::<Vec<_>>();
+
+        let admin_token = mint_docker_system_admin_token("docker-system-admin");
+        ensure_docker_topology(&admin_addrs, &admin_token, &docker_test_region()).await;
+
+        Self {
+            project_name,
+            compose_file,
+            grpc_addrs,
+            admin_addrs,
+            region: docker_test_region(),
+            public_region_host: format!("{}.anvil-storage.test", docker_test_region()),
+            admin_token,
+            compose_env,
+            cleanup_on_drop: false,
+        }
+    }
+
+    async fn start_isolated(label: &str, region: &str) -> Self {
+        let docker_image = require_docker_image();
+        let compose_file = docker_compose_file();
+        let project_name = format!("anvil-test-{}-{}", label, uuid::Uuid::new_v4().simple());
+        let ports = reserve_docker_host_ports(12);
+        let (api_ports, admin_ports) = ports.split_at(6);
+        let mut compose_env = vec![
+            ("ANVIL_IMAGE".to_string(), docker_image),
+            ("ANVIL_DOCKER_TEST_REGION".to_string(), region.to_string()),
+            ("ANVIL_DOCKER_TEST_NODE_COUNT".to_string(), "6".to_string()),
+        ];
+        for (index, port) in api_ports.iter().enumerate() {
+            compose_env.push((
+                format!("ANVIL_TEST_API{}_PORT", index + 1),
+                port.to_string(),
+            ));
+        }
+        for (index, port) in admin_ports.iter().enumerate() {
+            compose_env.push((
+                format!("ANVIL_TEST_ADMIN{}_PORT", index + 1),
+                port.to_string(),
+            ));
+        }
+        docker_compose_with_env(
+            &compose_file,
+            &project_name,
+            &["up", "-d", "--remove-orphans"],
+            &compose_env,
+        );
+
+        let grpc_addrs = api_ports
+            .iter()
+            .map(|port| format!("http://127.0.0.1:{port}"))
+            .collect::<Vec<_>>();
+        let admin_addrs = admin_ports
+            .iter()
+            .map(|port| format!("http://127.0.0.1:{port}"))
+            .collect::<Vec<_>>();
+        let wait_start = Instant::now();
+        for addr in &grpc_addrs {
+            assert!(
+                wait_for_http_ready(addr, Duration::from_secs(90)).await,
+                "isolated Docker Anvil test endpoint did not become ready: {addr}"
+            );
+        }
+        emit_test_timing("docker_isolated_cluster ports_ready", wait_start.elapsed());
+
+        let admin_token = mint_docker_system_admin_token("docker-system-admin");
+        ensure_docker_topology(&admin_addrs, &admin_token, region).await;
+
+        Self {
+            project_name,
+            compose_file,
+            grpc_addrs,
+            admin_addrs,
+            region: region.to_string(),
+            public_region_host: format!("{region}.anvil-storage.test"),
+            admin_token,
+            compose_env,
+            cleanup_on_drop: true,
+        }
+    }
+
+    pub fn admin_token(&self) -> &str {
+        &self.admin_token
+    }
+
+    pub fn grpc_addr_for_test(&self, _label: &str) -> String {
+        // Admin-created credentials are currently anchored through anvil1 in
+        // the Docker harness. Use the same public endpoint for data-plane
+        // requests so ordinary API tests do not depend on cross-node control
+        // projection timing. Dedicated distributed tests still stop/restart
+        // and inspect individual nodes explicitly.
+        self.grpc_addrs[0].clone()
+    }
+
+    pub async fn create_tenant(&self, tenant_name: &str) -> i64 {
+        let started_at = Instant::now();
+        let mut client = AdminServiceClient::connect(self.admin_addrs[0].clone())
+            .await
+            .expect("connect Docker admin endpoint");
+        let mut request = tonic::Request::new(anvil::anvil_api::CreateTenantRequest {
+            context: Some(test_admin_context(
+                &format!("create-tenant-{tenant_name}"),
+                0,
+            )),
+            name: tenant_name.to_string(),
+            home_region: self.region.clone(),
+        });
+        add_docker_admin_bearer(&mut request, &self.admin_token);
+        let tenant_id = client
+            .create_tenant(request)
+            .await
+            .expect("Docker admin CreateTenant")
+            .into_inner()
+            .tenant
+            .expect("tenant create response includes tenant")
+            .tenant_id
+            .parse::<i64>()
+            .expect("tenant id should be numeric");
+        emit_test_timing("docker_actor create_tenant", started_at.elapsed());
+        tenant_id
+    }
+
+    pub async fn create_application_with_id(
+        &self,
+        tenant_id: i64,
+        app_name: &str,
+    ) -> (String, String, String) {
+        let started_at = Instant::now();
+        let mut client = AdminServiceClient::connect(self.admin_addrs[0].clone())
+            .await
+            .expect("connect Docker admin endpoint");
+        let mut request = tonic::Request::new(anvil::anvil_api::CreateApplicationRequest {
+            context: Some(test_admin_context(&format!("create-app-{app_name}"), 0)),
+            tenant_id: tenant_id.to_string(),
+            app_name: app_name.to_string(),
+        });
+        add_docker_admin_bearer(&mut request, &self.admin_token);
+        let response = client
+            .create_application(request)
+            .await
+            .expect("Docker admin CreateApplication")
+            .into_inner();
+        emit_test_timing("docker_actor create_application", started_at.elapsed());
+        (response.app_id, response.client_id, response.client_secret)
+    }
+
+    pub async fn grant_application_policy(
+        &self,
+        tenant_id: i64,
+        app_name: &str,
+        action: &str,
+        resource: &str,
+    ) {
+        let started_at = Instant::now();
+        let mut client = AdminServiceClient::connect(self.admin_addrs[0].clone())
+            .await
+            .expect("connect Docker admin endpoint");
+        let mut request = tonic::Request::new(anvil::anvil_api::GrantApplicationPolicyRequest {
+            context: Some(test_admin_context(&format!("grant-{app_name}-{action}"), 0)),
+            tenant_id: tenant_id.to_string(),
+            app_name: app_name.to_string(),
+            action: action.to_string(),
+            resource: resource.to_string(),
+        });
+        add_docker_admin_bearer(&mut request, &self.admin_token);
+        client
+            .grant_application_policy(request)
+            .await
+            .expect("Docker admin GrantApplicationPolicy");
+        emit_test_timing(
+            format!("docker_actor grant_application_policy action={action}"),
+            started_at.elapsed(),
+        );
+    }
+
+    pub async fn grant_application_policies(
+        &self,
+        tenant_id: i64,
+        app_name: &str,
+        policies: &[(String, String)],
+    ) {
+        let started_at = Instant::now();
+        let mut client = AdminServiceClient::connect(self.admin_addrs[0].clone())
+            .await
+            .expect("connect Docker admin endpoint");
+        let mut request = tonic::Request::new(anvil::anvil_api::ApplicationPoliciesRequest {
+            context: Some(test_admin_context(&format!("grant-batch-{app_name}"), 0)),
+            tenant_id: tenant_id.to_string(),
+            app_name: app_name.to_string(),
+            policies: policies
+                .iter()
+                .map(
+                    |(action, resource)| anvil::anvil_api::ApplicationPolicyMutation {
+                        action: action.clone(),
+                        resource: resource.clone(),
+                    },
+                )
+                .collect(),
+        });
+        add_docker_admin_bearer(&mut request, &self.admin_token);
+        client
+            .grant_application_policies(request)
+            .await
+            .expect("Docker admin GrantApplicationPolicies");
+        emit_test_timing(
+            format!(
+                "docker_actor grant_application_policies count={}",
+                policies.len()
+            ),
+            started_at.elapsed(),
+        );
+    }
+
+    pub async fn create_storage_actor(&self, label: &str) -> DockerTestStorageActor {
+        let total_started_at = Instant::now();
+        let label = compact_resource_label(label, 18);
+        let tenant_name = unique_test_name(&format!("{label}-tenant"));
+        let tenant_id = self.create_tenant(&tenant_name).await;
+        let app_name = unique_test_name(&format!("{label}-app"));
+        let (app_id, client_id, client_secret) =
+            self.create_application_with_id(tenant_id, &app_name).await;
+        let tenant_resource = format!("tenant:{tenant_id}");
+        let mut policies = vec![("tenant:manage".to_string(), tenant_resource)];
+        policies.extend(
+            DOCKER_AUTHZ_BOOTSTRAP_ACTIONS
+                .iter()
+                .map(|action| ((*action).to_string(), "default".to_string())),
+        );
+        self.grant_application_policies(tenant_id, &app_name, &policies)
+            .await;
+        let grpc_addr = self.grpc_addrs[0].clone();
+        let token_started_at = Instant::now();
+        let token = get_access_token_for_test(&grpc_addr, &client_id, &client_secret).await;
+        emit_test_timing("docker_actor get_access_token", token_started_at.elapsed());
+        emit_test_timing("docker_actor total", total_started_at.elapsed());
+        DockerTestStorageActor {
+            tenant_id,
+            tenant_name: Some(tenant_name),
+            app_id,
+            app_name,
+            client_id,
+            client_secret,
+            token,
+            grpc_addr,
+            region: self.region.clone(),
+        }
+    }
+
+    pub async fn create_actor_in_tenant(
+        &self,
+        tenant_id: i64,
+        label: &str,
+        grants: &[(&str, &str)],
+    ) -> DockerTestStorageActor {
+        let label = compact_resource_label(label, 18);
+        let app_name = unique_test_name(&format!("{label}-app"));
+        let (app_id, client_id, client_secret) =
+            self.create_application_with_id(tenant_id, &app_name).await;
+        if !grants.is_empty() {
+            let policies = grants
+                .iter()
+                .map(|(action, resource)| ((*action).to_string(), (*resource).to_string()))
+                .collect::<Vec<_>>();
+            self.grant_application_policies(tenant_id, &app_name, &policies)
+                .await;
+        }
+        let grpc_addr = self.grpc_addrs[0].clone();
+        let token = get_access_token_for_test(&grpc_addr, &client_id, &client_secret).await;
+        DockerTestStorageActor {
+            tenant_id,
+            tenant_name: None,
+            app_id,
+            app_name,
+            client_id,
+            client_secret,
+            token,
+            grpc_addr,
+            region: self.region.clone(),
+        }
+    }
+
+    pub async fn stop_node(&self, node: u8) {
+        let service = docker_node_service(node);
+        let compose_file = self.compose_file.clone();
+        let project_name = self.project_name.clone();
+        let compose_env = self.compose_env.clone();
+        tokio::task::spawn_blocking(move || {
+            docker_compose_with_env(
+                &compose_file,
+                &project_name,
+                &["stop", service.as_str()],
+                &compose_env,
+            )
+        })
+        .await
+        .expect("Docker stop node command panicked");
+    }
+
+    pub async fn start_node(&self, node: u8) {
+        let service = docker_node_service(node);
+        let compose_file = self.compose_file.clone();
+        let project_name = self.project_name.clone();
+        let compose_env = self.compose_env.clone();
+        let addr = self.grpc_addrs[(node - 1) as usize].clone();
+        tokio::task::spawn_blocking(move || {
+            docker_compose_with_env(
+                &compose_file,
+                &project_name,
+                &["start", service.as_str()],
+                &compose_env,
+            )
+        })
+        .await
+        .expect("Docker start node command panicked");
+        assert!(
+            wait_for_http_ready(&addr, Duration::from_secs(90)).await,
+            "Docker Anvil test endpoint did not become ready after restart: {addr}"
+        );
+    }
+
+    pub async fn exec_node_output(&self, node: u8, args: &[&str]) -> std::process::Output {
+        let service = docker_node_service(node);
+        let compose_file = self.compose_file.clone();
+        let project_name = self.project_name.clone();
+        let compose_env = self.compose_env.clone();
+        let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        tokio::task::spawn_blocking(move || {
+            let mut command_args = vec!["exec".to_string(), "-T".to_string(), service];
+            command_args.extend(args);
+            let borrowed = command_args.iter().map(String::as_str).collect::<Vec<_>>();
+            docker_compose_output_with_env(&compose_file, &project_name, &borrowed, &compose_env)
+        })
+        .await
+        .expect("Docker exec node command panicked")
+    }
+
+    pub fn s3_client(&self, actor: &DockerTestStorageActor) -> S3Client {
+        let credentials =
+            Credentials::new(&actor.client_id, &actor.client_secret, None, None, "static");
+        let config = aws_sdk_s3::Config::builder()
+            .credentials_provider(credentials)
+            .region(aws_sdk_s3::config::Region::new(self.region.clone()))
+            .endpoint_url(&actor.grpc_addr)
+            .force_path_style(true)
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+        S3Client::from_conf(config)
+    }
+}
+
+impl Drop for DockerTestCluster {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            docker_compose_with_env(
+                &self.compose_file,
+                &self.project_name,
+                &["down", "-v", "--remove-orphans"],
+                &self.compose_env,
+            );
+        }
+    }
+}
+
+pub async fn create_docker_storage_test_actor(
+    cluster: &DockerTestCluster,
+    label: &str,
+) -> DockerTestStorageActor {
+    cluster.create_storage_actor(label).await
+}
+
+impl From<DockerTestStorageActor> for TestStorageActor {
+    fn from(actor: DockerTestStorageActor) -> Self {
+        Self {
+            tenant_id: actor.tenant_id,
+            app_id: actor.app_id,
+            token: actor.token,
+            grpc_addr: actor.grpc_addr,
+            region: actor.region,
+        }
+    }
+}
+
+const DOCKER_AUTHZ_BOOTSTRAP_ACTIONS: &[&str] = &[
+    "authz:tuple_write",
+    "authz:tuple_read",
+    "authz:check",
+    "authz:watch",
+    "authz:schema_read",
+    "authz:schema_write",
+];
+
+/// Select a public gRPC endpoint deterministically from a label. This spreads
+/// concurrent shared-cluster tests across nodes without making the selected node
+/// part of the assertion.
+pub fn grpc_addr_for_test(cluster: &TestCluster, label: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    assert!(
+        !cluster.grpc_addrs.is_empty(),
+        "test cluster must be started before selecting a gRPC address"
+    );
+    let mut hasher = DefaultHasher::new();
+    label.hash(&mut hasher);
+    let idx = (hasher.finish() as usize) % cluster.grpc_addrs.len();
+    cluster.grpc_addrs[idx].clone()
+}
+
+/// Create a unique tenant/app/token for a shared-cluster test.
+pub async fn create_storage_test_actor(cluster: &TestCluster, label: &str) -> TestStorageActor {
+    let label = compact_resource_label(label, 18);
+    let tenant_name = unique_test_name(&format!("{label}-tenant"));
+    let tenant_id = create_test_tenant(cluster, &tenant_name).await;
+    let app_name = unique_test_name(&format!("{label}-app"));
+    let (app_id, client_id, client_secret) = cluster
+        .create_application_with_storage_tenant_owner_id(&tenant_id.to_string(), &app_name)
+        .await;
+    let grpc_addr = grpc_addr_for_test(cluster, &label);
+    let token = get_access_token_for_test(&grpc_addr, &client_id, &client_secret).await;
+
+    TestStorageActor {
+        tenant_id,
+        app_id,
+        token,
+        grpc_addr,
+        region: DEFAULT_TEST_REGION.to_string(),
+    }
+}
+
+fn compact_resource_label(label: &str, max_len: usize) -> String {
+    let mut compact = label
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .filter(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || *ch == '-')
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    compact.truncate(max_len);
+    while compact.ends_with('-') {
+        compact.pop();
+    }
+    if compact.is_empty() {
+        "test".to_string()
+    } else {
+        compact
+    }
+}
+
+pub async fn create_test_tenant(cluster: &TestCluster, tenant_name: &str) -> i64 {
+    let mut admin = AdminServiceClient::connect(cluster.admin_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut request = tonic::Request::new(anvil::anvil_api::CreateTenantRequest {
+        context: Some(anvil::anvil_api::AdminRequestContext {
+            request_id: format!("create-tenant-{tenant_name}-{}", uuid::Uuid::new_v4()),
+            idempotency_key: uuid::Uuid::new_v4().to_string(),
+            audit_reason: format!("test create tenant {tenant_name}"),
+            expected_generation: 0,
+        }),
+        name: tenant_name.to_string(),
+        home_region: DEFAULT_TEST_REGION.to_string(),
+    });
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", cluster.admin_token()).parse().unwrap(),
+    );
+
+    admin
+        .create_tenant(request)
+        .await
+        .unwrap()
+        .into_inner()
+        .tenant
+        .expect("created tenant")
+        .tenant_id
+        .parse::<i64>()
+        .expect("tenant id should be numeric")
+}
+
+pub async fn get_access_token_for_test(
+    grpc_addr: &str,
+    client_id: &str,
+    client_secret: &str,
+) -> String {
+    AuthServiceClient::connect(grpc_addr.to_string())
+        .await
+        .unwrap()
+        .get_access_token(GetAccessTokenRequest {
+            client_id: client_id.to_string(),
+            client_secret: client_secret.to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .access_token
+}
+
+pub fn authenticated_request<T>(mut request: tonic::Request<T>, token: &str) -> tonic::Request<T> {
+    request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    request
+}
+
+pub fn configure_test_public_region(config: &mut anvil_core::config::Config) {
+    config.public_region_base_domain = "anvil-storage.test".to_string();
+}
+
+async fn start_shared_profile<F, Fut>(profile: &'static str, start: F) -> Arc<TestCluster>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Arc<TestCluster>>,
+{
+    let _guard = TestClusterStartupLock::acquire(profile).await;
+    start().await
+}
+
+#[derive(Clone, Copy)]
+enum SharedClusterProfile {
+    Default,
+    PublicRegion,
+}
+
+fn start_shared_cluster_thread(profile: SharedClusterProfile) -> Arc<TestCluster> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let name = match profile {
+        SharedClusterProfile::Default => "anvil-shared-default-cluster",
+        SharedClusterProfile::PublicRegion => "anvil-shared-public-cluster",
+    };
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(shared_cluster_runtime_threads())
+                .thread_name(name)
+                .enable_all()
+                .build()
+                .expect("build shared Anvil test cluster runtime");
+            let cluster = runtime.block_on(async move {
+                match profile {
+                    SharedClusterProfile::Default => {
+                        start_shared_profile("default-6-node", || async {
+                            let mut cluster =
+                                TestCluster::new_shared(&SHARED_CLUSTER_REGIONS).await;
+                            cluster.start_and_converge(Duration::from_secs(20)).await;
+                            Arc::new(cluster)
+                        })
+                        .await
+                    }
+                    SharedClusterProfile::PublicRegion => {
+                        start_shared_profile("public-region-6-node", || async {
+                            let mut cluster = TestCluster::new_shared_with_config(
+                                &SHARED_CLUSTER_REGIONS,
+                                configure_test_public_region,
+                            )
+                            .await;
+                            cluster.start_and_converge(Duration::from_secs(20)).await;
+                            Arc::new(cluster)
+                        })
+                        .await
+                    }
+                }
+            });
+            tx.send(cluster).expect("send shared test cluster handle");
+            // Keep the runtime alive after the initializing test runtime exits.
+            loop {
+                std::thread::park();
+            }
+            #[allow(unreachable_code)]
+            drop(runtime);
+        })
+        .expect("spawn shared Anvil test cluster thread");
+    rx.recv().expect("receive shared Anvil test cluster handle")
+}
+
+fn shared_cluster_runtime_threads() -> usize {
+    std::env::var("ANVIL_SHARED_CLUSTER_RUNTIME_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|parallelism| parallelism.get().saturating_mul(2).clamp(8, 32))
+                .unwrap_or(12)
+        })
+}
+
+fn docker_command_with_env(extra_env: &[(String, String)]) -> std::process::Command {
+    let mut command = command_with_docker_env("docker");
+    for node in 1..=docker_node_count() {
+        command.env(
+            format!("ANVIL_TEST_NODE{node}_TOKEN"),
+            mint_docker_system_admin_token(&format!("anvil-test-node-{node}")),
+        );
+    }
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    command
+}
+
+fn docker_node_service(node: u8) -> String {
+    assert!(
+        (1..=6).contains(&node),
+        "unsupported Docker test node {node}"
+    );
+    format!("anvil{node}")
+}
+
+fn reserve_docker_host_ports(count: usize) -> Vec<u16> {
+    (0..count)
+        .map(|_| {
+            let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .expect("reserve Docker test host port");
+            let port = listener.local_addr().expect("reserved port address").port();
+            drop(listener);
+            port
+        })
+        .collect()
+}
+
+fn docker_jwt_secret() -> String {
+    std::env::var("ANVIL_DOCKER_TEST_JWT_SECRET")
+        .unwrap_or_else(|_| "docker-test-secret".to_string())
+}
+
+fn mint_docker_system_admin_token(app_id: &str) -> String {
+    use jsonwebtoken::{EncodingKey, Header, encode};
+
+    encode(
+        &Header::default(),
+        &anvil_core::auth::Claims {
+            sub: app_id.to_string(),
+            exp: 4_102_444_800,
+            tenant_id: anvil_core::system_realm::SYSTEM_STORAGE_TENANT_ID,
+            jti: Some(format!("docker-test-{app_id}")),
+        },
+        &EncodingKey::from_secret(docker_jwt_secret().as_bytes()),
+    )
+    .expect("mint deterministic Docker system token")
+}
+
+fn add_docker_admin_bearer<T>(request: &mut tonic::Request<T>, token: &str) {
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {token}")
+            .parse()
+            .expect("admin bearer metadata is valid"),
+    );
+}
+
+fn docker_test_region() -> String {
+    std::env::var("ANVIL_DOCKER_TEST_REGION").unwrap_or_else(|_| "test-region-1".to_string())
+}
+
+fn docker_node_count() -> u8 {
+    std::env::var("ANVIL_DOCKER_TEST_NODE_COUNT")
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok())
+        .filter(|value| (3..=6).contains(value))
+        .unwrap_or(6)
+}
+
+fn docker_compose_project_name() -> String {
+    std::env::var("ANVIL_DOCKER_TEST_PROJECT").unwrap_or_else(|_| "anvil-shared-test".to_string())
+}
+
+fn docker_compose_file() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../anvil/tests/docker-compose.test.yml")
+        .canonicalize()
+        .expect("canonicalize Docker test compose file")
+}
+
+fn command_with_docker_env(cmd: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(cmd);
+    if cmd == "docker" {
+        command.env("ANVIL_IMAGE", configured_docker_image());
+        command.env("ANVIL_DOCKER_TEST_REGION", docker_test_region());
+        command.env(
+            "ANVIL_DOCKER_TEST_NODE_COUNT",
+            docker_node_count().to_string(),
+        );
+    }
+    command
+}
+
+fn docker_compose_with_env(
+    compose_file: &std::path::Path,
+    project_name: &str,
+    args: &[&str],
+    extra_env: &[(String, String)],
+) {
+    let mut command_args = vec![
+        "compose",
+        "-p",
+        project_name,
+        "-f",
+        compose_file.to_str().expect("compose path is utf-8"),
+    ];
+    command_args.extend_from_slice(args);
+    let output = docker_command_with_env(extra_env)
+        .args(command_args)
+        .output()
+        .expect("failed to run docker compose command");
+    assert!(
+        output.status.success(),
+        "docker compose command failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn docker_compose_output_with_env(
+    compose_file: &std::path::Path,
+    project_name: &str,
+    args: &[&str],
+    extra_env: &[(String, String)],
+) -> std::process::Output {
+    let mut command_args = vec![
+        "compose",
+        "-p",
+        project_name,
+        "-f",
+        compose_file.to_str().expect("compose path is utf-8"),
+    ];
+    command_args.extend_from_slice(args);
+    docker_command_with_env(extra_env)
+        .args(command_args)
+        .output()
+        .expect("failed to run docker compose command")
+}
+
+fn docker_host_port(node: u8) -> String {
+    let (var, default) = match node {
+        1 => ("ANVIL_TEST_API1_PORT", "55051"),
+        2 => ("ANVIL_TEST_API2_PORT", "55052"),
+        3 => ("ANVIL_TEST_API3_PORT", "55053"),
+        4 => ("ANVIL_TEST_API4_PORT", "55054"),
+        5 => ("ANVIL_TEST_API5_PORT", "55055"),
+        6 => ("ANVIL_TEST_API6_PORT", "55056"),
+        7 => ("ANVIL_TEST_API7_PORT", "55057"),
+        8 => ("ANVIL_TEST_API8_PORT", "55058"),
+        9 => ("ANVIL_TEST_API9_PORT", "55059"),
+        _ => panic!("unsupported Docker test node {node}"),
+    };
+    std::env::var(var).unwrap_or_else(|_| default.to_string())
+}
+
+fn docker_host_api_url(node: u8) -> String {
+    format!("http://127.0.0.1:{}", docker_host_port(node))
+}
+
+fn docker_host_admin_port(node: u8) -> String {
+    let (var, default) = match node {
+        1 => ("ANVIL_TEST_ADMIN1_PORT", "56051"),
+        2 => ("ANVIL_TEST_ADMIN2_PORT", "56052"),
+        3 => ("ANVIL_TEST_ADMIN3_PORT", "56053"),
+        4 => ("ANVIL_TEST_ADMIN4_PORT", "56054"),
+        5 => ("ANVIL_TEST_ADMIN5_PORT", "56055"),
+        6 => ("ANVIL_TEST_ADMIN6_PORT", "56056"),
+        7 => ("ANVIL_TEST_ADMIN7_PORT", "56057"),
+        8 => ("ANVIL_TEST_ADMIN8_PORT", "56058"),
+        9 => ("ANVIL_TEST_ADMIN9_PORT", "56059"),
+        _ => panic!("unsupported Docker test node {node}"),
+    };
+    std::env::var(var).unwrap_or_else(|_| default.to_string())
+}
+
+fn docker_host_admin_url(node: u8) -> String {
+    format!("http://127.0.0.1:{}", docker_host_admin_port(node))
+}
+
+struct TestClusterStartupLock {
+    path: PathBuf,
+}
+
+impl TestClusterStartupLock {
+    async fn acquire(profile: &str) -> Self {
+        let dir = std::env::temp_dir().join("anvil-test-cluster-locks");
+        std::fs::create_dir_all(&dir).expect("create anvil test cluster lock dir");
+        let path = dir.join(format!("{profile}.lock"));
+        let start = Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    let _ = writeln!(file, "pid={}", std::process::id());
+                    return Self { path };
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if startup_lock_owner_is_dead(&path)
+                        || start.elapsed() > Duration::from_secs(30)
+                    {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => panic!("acquire anvil test cluster startup lock {path:?}: {error}"),
+            }
+        }
+    }
+}
+
+fn startup_lock_owner_is_dead(path: &std::path::Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return true;
+    };
+    let Some(pid) = raw
+        .lines()
+        .find_map(|line| line.strip_prefix("pid="))
+        .and_then(|value| value.trim().parse::<u32>().ok())
+    else {
+        return true;
+    };
+    !process_is_alive(pid)
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+impl Drop for TestClusterStartupLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 pub fn test_timing_enabled() -> bool {
-    std::env::var_os("ANVIL_TEST_TIMINGS").is_some()
+    std::env::var("ANVIL_TEST_TIMINGS").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 pub fn emit_test_timing(label: impl AsRef<str>, elapsed: Duration) {
@@ -82,7 +1201,7 @@ pub struct TestCluster {
     pub config: Arc<anvil_core::config::Config>,
     pub storage_path: PathBuf,
     cleanup_path: PathBuf,
-    _cluster_permit: OwnedSemaphorePermit,
+    _cluster_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl TestCluster {
@@ -111,13 +1230,42 @@ impl TestCluster {
         Self::new_with_config(regions, |_| {}).await
     }
 
+    async fn new_inner(
+        regions: &[&str],
+        configure: impl FnOnce(&mut anvil_core::config::Config),
+        cluster_permit: Option<OwnedSemaphorePermit>,
+    ) -> Self {
+        let cluster_permit = match cluster_permit {
+            Some(permit) => Some(permit),
+            None => Some(acquire_test_cluster_permit().await),
+        };
+        Self::new_with_optional_permit(regions, configure, cluster_permit).await
+    }
+
+    async fn new_shared(regions: &[&str]) -> Self {
+        Self::new_shared_with_config(regions, |_| {}).await
+    }
+
+    async fn new_shared_with_config(
+        regions: &[&str],
+        configure: impl FnOnce(&mut anvil_core::config::Config),
+    ) -> Self {
+        Self::new_with_optional_permit(regions, configure, None).await
+    }
+
     #[allow(dead_code)]
     pub async fn new_with_config(
         regions: &[&str],
         configure: impl FnOnce(&mut anvil_core::config::Config),
     ) -> Self {
-        let cluster_permit = acquire_test_cluster_permit().await;
+        Self::new_inner(regions, configure, None).await
+    }
 
+    async fn new_with_optional_permit(
+        regions: &[&str],
+        configure: impl FnOnce(&mut anvil_core::config::Config),
+        cluster_permit: Option<OwnedSemaphorePermit>,
+    ) -> Self {
         INIT_LOGGER.call_once(|| {
             let filter = std::env::var("ANVIL_TEST_LOG")
                 .or_else(|_| std::env::var("RUST_LOG"))
@@ -657,6 +1805,17 @@ impl TestCluster {
         tenant_ref: &str,
         app_name: &str,
     ) -> (String, String) {
+        let (_app_id, client_id, client_secret) = self
+            .create_application_with_storage_tenant_owner_id(tenant_ref, app_name)
+            .await;
+        (client_id, client_secret)
+    }
+
+    pub async fn create_application_with_storage_tenant_owner_id(
+        &self,
+        tenant_ref: &str,
+        app_name: &str,
+    ) -> (String, String, String) {
         let (app_id, client_id, client_secret) =
             self.create_application_with_id(tenant_ref, app_name).await;
         let tenant_id = if let Ok(tenant_id) = tenant_ref.parse::<i64>() {
@@ -679,99 +1838,8 @@ impl TestCluster {
         )
         .await
         .unwrap();
-        (client_id, client_secret)
+        (app_id, client_id, client_secret)
     }
-}
-
-fn test_admin_context(
-    label: &str,
-    expected_generation: u64,
-) -> anvil::anvil_api::AdminRequestContext {
-    anvil::anvil_api::AdminRequestContext {
-        request_id: format!("test-{label}-{}", uuid::Uuid::new_v4().simple()),
-        idempotency_key: uuid::Uuid::new_v4().to_string(),
-        audit_reason: format!("test {label}"),
-        expected_generation,
-    }
-}
-
-fn install_canonical_coremeta_bootstrap_snapshot(states: &[AppState]) {
-    let Some(canonical) = states.first() else {
-        return;
-    };
-    let snapshot = canonical
-        .core_store
-        .export_coremeta_snapshot_rows()
-        .expect("export canonical CoreMeta bootstrap snapshot")
-        .into_iter()
-        .filter(|row| !is_node_local_coremeta_row(row))
-        .filter(|row| !is_local_derived_coremeta_row(row))
-        .filter(|row| !contains_local_corestore_locator(row))
-        .collect::<Vec<_>>();
-
-    for target in states.iter().skip(1) {
-        target
-            .core_store
-            .install_coremeta_snapshot_rows(&snapshot)
-            .expect("install canonical CoreMeta bootstrap snapshot");
-    }
-}
-
-fn is_node_local_coremeta_row(row: &anvil_core::core_store::CoreMetaEncodedOwnedRow) -> bool {
-    if row.cf != anvil_core::core_store::CF_MESH
-        || coremeta_table_id(row) != Some(anvil_core::core_store::TABLE_NODE_SIGNING_KEYPAIR_ROW)
-    {
-        return false;
-    }
-    let Ok(tuple_key) = anvil_core::core_store::core_meta_record_tuple_key(&row.core_meta_key)
-    else {
-        return false;
-    };
-    let local_tuples = [
-        anvil_core::core_store::core_meta_tuple_key(&[
-            anvil_core::core_store::CoreMetaTuplePart::Raw(b"node-signing-keypair"),
-        ]),
-        anvil_core::core_store::core_meta_tuple_key(&[
-            anvil_core::core_store::CoreMetaTuplePart::Utf8("cluster-identity"),
-            anvil_core::core_store::CoreMetaTuplePart::Utf8("local"),
-        ]),
-    ];
-    local_tuples
-        .iter()
-        .filter_map(|result| result.as_ref().ok())
-        .any(|local_tuple| tuple_key == local_tuple.as_slice())
-}
-
-fn is_local_derived_coremeta_row(row: &anvil_core::core_store::CoreMetaEncodedOwnedRow) -> bool {
-    matches!(
-        (row.cf.as_str(), coremeta_table_id(row)),
-        (
-            anvil_core::core_store::CF_MATERIALISATION,
-            Some(anvil_core::core_store::TABLE_MATERIALISATION_CURSOR_ROW)
-        ) | (
-            anvil_core::core_store::CF_MATERIALISATION,
-            Some(anvil_core::core_store::TABLE_WRITER_SEGMENT_ROW)
-        )
-    )
-}
-
-fn contains_local_corestore_locator(row: &anvil_core::core_store::CoreMetaEncodedOwnedRow) -> bool {
-    if row.cf == anvil_core::core_store::CF_ROOT_CACHE {
-        return false;
-    }
-    row.value_envelope
-        .windows(b"local-node".len())
-        .any(|window| window == b"local-node")
-}
-
-fn coremeta_table_id(row: &anvil_core::core_store::CoreMetaEncodedOwnedRow) -> Option<u16> {
-    if row.core_meta_key.len() < 3 {
-        return None;
-    }
-    Some(u16::from_le_bytes([
-        row.core_meta_key[1],
-        row.core_meta_key[2],
-    ]))
 }
 
 impl Drop for TestCluster {
@@ -810,6 +1878,20 @@ pub async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> bool {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+async fn wait_for_http_ready(base_url: &str, timeout: Duration) -> bool {
+    let start = Instant::now();
+    let ready_url = format!("{}/ready", base_url.trim_end_matches('/'));
+    while start.elapsed() < timeout {
+        if let Ok(response) = reqwest::get(&ready_url).await
+            && response.status().is_success()
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
     false
 }

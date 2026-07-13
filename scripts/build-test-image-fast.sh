@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+image="${ANVIL_IMAGE:-anvil:test}"
+
+case "${ANVIL_DOCKER_PLATFORM:-}" in
+  "")
+    case "$(uname -m)" in
+      arm64|aarch64)
+        platform="linux/arm64"
+        target="aarch64-unknown-linux-gnu"
+        ;;
+      x86_64|amd64)
+        platform="linux/amd64"
+        target="x86_64-unknown-linux-gnu"
+        ;;
+      *)
+        echo "unsupported host architecture: $(uname -m)" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  linux/arm64)
+    platform="linux/arm64"
+    target="aarch64-unknown-linux-gnu"
+    ;;
+  linux/amd64)
+    platform="linux/amd64"
+    target="x86_64-unknown-linux-gnu"
+    ;;
+  *)
+    echo "unsupported ANVIL_DOCKER_PLATFORM=${ANVIL_DOCKER_PLATFORM}" >&2
+    exit 2
+    ;;
+esac
+
+target="${ANVIL_ZIG_TARGET:-$target}"
+
+if ! command -v cargo-zigbuild >/dev/null 2>&1; then
+  echo "cargo-zigbuild is required for fast host-built test images" >&2
+  echo "install with: cargo install cargo-zigbuild" >&2
+  exit 2
+fi
+
+if ! command -v zig >/dev/null 2>&1; then
+  echo "zig is required for fast host-built test images" >&2
+  exit 2
+fi
+
+if command -v rustup >/dev/null 2>&1; then
+  if ! rustup target list --installed | grep -Fxq "${target}"; then
+    echo "[anvil] installing Rust std target ${target}"
+    rustup target add "${target}"
+  fi
+fi
+
+echo "[anvil] building Linux binaries with cargo-zigbuild target=${target}"
+cargo zigbuild --release --locked --target "${target}" \
+  -p anvil-server --bin anvil-server
+
+target_dir="$(
+  cargo metadata --format-version 1 --no-deps \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])'
+)"
+bin_dir="${target_dir}/${target}/release"
+stage_dir="tmp/docker-bin"
+
+rm -rf "${stage_dir}"
+mkdir -p "${stage_dir}"
+cp "${bin_dir}/anvil-server" "${stage_dir}/anvil-server"
+
+echo "[anvil] packaging runtime image ${image} platform=${platform}"
+iid_file="$(mktemp -t anvil-test-image.XXXXXX)"
+trap 'rm -f "${iid_file}"' EXIT
+docker build \
+  --platform "${platform}" \
+  --iidfile "${iid_file}" \
+  -f anvil/Dockerfile.prebuilt \
+  -t "${image}" \
+  .
+
+# Read the ID emitted by this exact build rather than resolving the mutable tag.
+# Docker Desktop can briefly list a tag while rejecting an inspect by that tag.
+image_id="$(tr -d '[:space:]' < "${iid_file}")"
+if [[ "${image_id}" != sha256:* ]]; then
+  echo "Docker did not write a valid image ID to ${iid_file}" >&2
+  exit 1
+fi
+docker image inspect "${image_id}" >/dev/null
+docker tag "$image_id" "$image"
+
+echo "[anvil] built ${image} (${image_id})"

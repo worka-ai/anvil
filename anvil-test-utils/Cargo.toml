@@ -32,6 +32,8 @@ aws-config = "1.1.7"
 aws-sdk-s3 = "1.18.0"
 
 futures-util = "0.3.31"
+serde_json = "1.0"
+reqwest = { version = "0.12.23", default-features = false, features = ["rustls-tls"] }
 uuid = { version = "1.18.1", features = ["v4"] }
 dotenvy = "0.15.7"
 libp2p = { version = "0.56.0", features = ["gossipsub", "mdns", "tcp", "tokio", "macros", "noise", "yamux", "quic"] }
@@ -40,3 +42,4 @@ tracing = { version = "0.1.16" }
 tracing-subscriber = { version = "0.3", features = ["tracing-log", "fmt", "env-filter"] }
 
 hex = "0.4.3"
+jsonwebtoken = "9.3.1"
