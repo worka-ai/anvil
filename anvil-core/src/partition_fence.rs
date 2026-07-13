@@ -1273,6 +1273,66 @@ pub async fn publish_partition_ready(
     ))
 }
 
+#[cfg(test)]
+pub async fn ready_partition_owner_for_test(
+    storage: &Storage,
+    partition_family: String,
+    partition_id: String,
+    owner_node_id: &str,
+    recovered_through_sequence: u64,
+    recovered_manifest_hash: String,
+    ready_manifest_hash: String,
+    signing_key: &[u8],
+) -> PartitionOwnerState {
+    if let Some(existing) =
+        read_partition_owner(storage, &partition_family, &partition_id, signing_key)
+            .await
+            .unwrap()
+    {
+        if existing.owner_node_id != owner_node_id && !partition_owner_is_force_expired(&existing) {
+            force_expire_partition_owner_for_node(
+                storage,
+                &partition_family,
+                &partition_id,
+                &existing.owner_node_id,
+                existing.updated_at_nanos.saturating_add(1),
+                signing_key,
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    let recovering = acquire_partition_recovery(
+        storage,
+        PartitionRecoveryAcquire {
+            partition_family: partition_family.clone(),
+            partition_id: partition_id.clone(),
+            owner_node_id: owner_node_id.to_string(),
+            recovered_through_sequence,
+            recovered_manifest_hash,
+            now_nanos: 100,
+        },
+        signing_key,
+    )
+    .await
+    .unwrap();
+
+    publish_partition_ready(
+        storage,
+        &partition_family,
+        &partition_id,
+        owner_node_id,
+        recovering.fence_token,
+        recovered_through_sequence,
+        &ready_manifest_hash,
+        200,
+        signing_key,
+    )
+    .await
+    .unwrap()
+}
+
 fn partition_id_hash(partition_id: &str) -> u64 {
     let hash = hash32(partition_id.as_bytes());
     u64::from_le_bytes(

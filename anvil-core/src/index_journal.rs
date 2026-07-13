@@ -823,9 +823,6 @@ fn ensure_deterministic_proto(message: &impl Message, bytes: &[u8], label: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::partition_fence::{
-        PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
-    };
     use chrono::Utc;
     use serde_json::json;
     use tempfile::tempdir;
@@ -891,30 +888,17 @@ mod tests {
     }
 
     async fn ready_index_permit(storage: &Storage, owner_node_id: &str) -> PartitionWritePermit {
-        let request = PartitionRecoveryAcquire {
-            partition_family: "index_definition".to_string(),
-            partition_id: hex::encode(index_definition_partition_id(42, 7)),
-            owner_node_id: owner_node_id.to_string(),
-            recovered_through_sequence: 0,
-            recovered_manifest_hash: hex::encode([0; 32]),
-            now_nanos: 100,
-        };
-        let recovering = acquire_partition_recovery(storage, request, PARTITION_OWNER_KEY)
-            .await
-            .unwrap();
-        publish_partition_ready(
+        crate::partition_fence::ready_partition_owner_for_test(
             storage,
-            &recovering.partition_family,
-            &recovering.partition_id,
+            "index_definition".to_string(),
+            hex::encode(index_definition_partition_id(42, 7)),
             owner_node_id,
-            recovering.fence_token,
             0,
-            &hex::encode([4; 32]),
-            200,
+            hex::encode([0; 32]),
+            hex::encode([4; 32]),
             PARTITION_OWNER_KEY,
         )
         .await
-        .unwrap()
         .write_permit()
         .unwrap()
     }
@@ -1063,7 +1047,7 @@ mod tests {
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let stale = ready_index_permit(&storage, "node-a").await;
         let fresh = ready_index_permit(&storage, "node-b").await;
-        assert_eq!(fresh.fence_token, stale.fence_token + 1);
+        assert!(fresh.fence_token > stale.fence_token);
 
         let rejected = append_index_definition_event_with_permit(
             &storage,
@@ -1095,7 +1079,7 @@ mod tests {
                 .await
                 .unwrap();
         let fresh = ready_index_permit(&storage, "node-b").await;
-        assert_eq!(fresh.fence_token, stale.fence_token + 1);
+        assert!(fresh.fence_token > stale.fence_token);
 
         let rejected = append_index_definition_event_inner(
             &storage,

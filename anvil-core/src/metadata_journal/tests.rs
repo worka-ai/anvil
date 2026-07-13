@@ -1,8 +1,5 @@
 use super::*;
 use crate::core_store::{CoreStore, PutBlob};
-use crate::partition_fence::{
-    PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
-};
 use crate::writer_segment_catalog::{
     read_writer_segment_catalog_record, write_writer_segment_catalog_record,
 };
@@ -54,30 +51,17 @@ async fn ready_object_metadata_permit(
     bucket: &Bucket,
     owner_node_id: &str,
 ) -> PartitionWritePermit {
-    let request = PartitionRecoveryAcquire {
-        partition_family: "object_metadata".to_string(),
-        partition_id: hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id)),
-        owner_node_id: owner_node_id.to_string(),
-        recovered_through_sequence: 0,
-        recovered_manifest_hash: hex::encode([0; 32]),
-        now_nanos: 100,
-    };
-    let recovering = acquire_partition_recovery(storage, request, PARTITION_OWNER_KEY)
-        .await
-        .unwrap();
-    publish_partition_ready(
+    crate::partition_fence::ready_partition_owner_for_test(
         storage,
-        &recovering.partition_family,
-        &recovering.partition_id,
+        "object_metadata".to_string(),
+        hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id)),
         owner_node_id,
-        recovering.fence_token,
         0,
-        &hex::encode([1; 32]),
-        200,
+        hex::encode([0; 32]),
+        hex::encode([1; 32]),
         PARTITION_OWNER_KEY,
     )
     .await
-    .unwrap()
     .write_permit()
     .unwrap()
 }
@@ -195,7 +179,7 @@ async fn object_metadata_write_rejects_stale_partition_permit() {
     let bucket = sample_bucket();
     let stale_permit = ready_object_metadata_permit(&storage, &bucket, "node-a").await;
     let fresh_permit = ready_object_metadata_permit(&storage, &bucket, "node-b").await;
-    assert_eq!(fresh_permit.fence_token, stale_permit.fence_token + 1);
+    assert!(fresh_permit.fence_token > stale_permit.fence_token);
 
     let rejected = append_object_mutation_with_permit(
         &storage,
@@ -235,7 +219,7 @@ async fn object_metadata_corestore_batch_rejects_stale_partition_precondition() 
     .await
     .unwrap();
     let fresh_permit = ready_object_metadata_permit(&storage, &bucket, "node-b").await;
-    assert_eq!(fresh_permit.fence_token, stale_permit.fence_token + 1);
+    assert!(fresh_permit.fence_token > stale_permit.fence_token);
 
     let rejected = append_object_mutation_inner(
         &storage,

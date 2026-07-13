@@ -1048,9 +1048,6 @@ fn ensure_deterministic_proto(message: &impl Message, bytes: &[u8], label: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::partition_fence::{
-        PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
-    };
     use chrono::Utc;
     use tempfile::tempdir;
 
@@ -1072,30 +1069,17 @@ mod tests {
         scope: BucketJournalScope,
         owner_node_id: &str,
     ) -> PartitionWritePermit {
-        let request = PartitionRecoveryAcquire {
-            partition_family: "bucket_metadata".to_string(),
-            partition_id: hex::encode(scope.partition_id()),
-            owner_node_id: owner_node_id.to_string(),
-            recovered_through_sequence: 0,
-            recovered_manifest_hash: hex::encode([0; 32]),
-            now_nanos: 100,
-        };
-        let recovering = acquire_partition_recovery(storage, request, PARTITION_OWNER_KEY)
-            .await
-            .unwrap();
-        publish_partition_ready(
+        crate::partition_fence::ready_partition_owner_for_test(
             storage,
-            &recovering.partition_family,
-            &recovering.partition_id,
+            "bucket_metadata".to_string(),
+            hex::encode(scope.partition_id()),
             owner_node_id,
-            recovering.fence_token,
             0,
-            &hex::encode([2; 32]),
-            200,
+            hex::encode([0; 32]),
+            hex::encode([2; 32]),
             PARTITION_OWNER_KEY,
         )
         .await
-        .unwrap()
         .write_permit()
         .unwrap()
     }
@@ -1374,7 +1358,7 @@ mod tests {
         let fresh_tenant = ready_bucket_permit(&storage, tenant_scope, "node-b").await;
         let global_permit =
             ready_bucket_permit(&storage, BucketJournalScope::Global, "node-b").await;
-        assert_eq!(fresh_tenant.fence_token, stale_tenant.fence_token + 1);
+        assert!(fresh_tenant.fence_token > stale_tenant.fence_token);
 
         let rejected = append_bucket_mutation_with_permits(
             &storage,
@@ -1412,7 +1396,7 @@ mod tests {
                 .await
                 .unwrap();
         let fresh_tenant = ready_bucket_permit(&storage, tenant_scope, "node-b").await;
-        assert_eq!(fresh_tenant.fence_token, stale_tenant.fence_token + 1);
+        assert!(fresh_tenant.fence_token > stale_tenant.fence_token);
 
         let rejected = append_bucket_mutation_to_stream(
             &storage,

@@ -446,9 +446,6 @@ fn require_nonempty(value: &str, field: &'static str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::partition_fence::{
-        PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
-    };
     use tempfile::tempdir;
 
     const KEY: &[u8] = b"model metadata partition owner key";
@@ -641,32 +638,16 @@ mod tests {
     ) -> crate::partition_fence::PartitionOwnerState {
         let family = "model_metadata".to_string();
         let id = hex::encode(model_partition_id());
-        let recovering = acquire_partition_recovery(
+        crate::partition_fence::ready_partition_owner_for_test(
             storage,
-            PartitionRecoveryAcquire {
-                partition_family: family.clone(),
-                partition_id: id.clone(),
-                owner_node_id: owner_node_id.to_string(),
-                recovered_through_sequence: 0,
-                recovered_manifest_hash: hex::encode([0; 32]),
-                now_nanos: 100,
-            },
-            KEY,
-        )
-        .await
-        .unwrap();
-        publish_partition_ready(
-            storage,
-            &family,
-            &id,
+            family,
+            id,
             owner_node_id,
-            recovering.fence_token,
             0,
-            &hex::encode([1; 32]),
-            200,
+            hex::encode([0; 32]),
+            hex::encode([1; 32]),
             KEY,
         )
         .await
-        .unwrap()
     }
 }
