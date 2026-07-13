@@ -246,7 +246,7 @@ pub(super) async fn list_object_links(
     let req = request.into_inner();
     validate_public_tenant_locator(&claims, &req.tenant_id)?;
     let bucket = public_link_bucket(state, &claims, &req.bucket_name).await?;
-    let consistency = object_read_consistency(req.consistency.as_ref())?;
+    let _consistency = object_read_consistency(req.consistency.as_ref())?;
     crate::access_control::require_action(
         &state.storage,
         &state.persistence,
@@ -255,25 +255,11 @@ pub(super) async fn list_object_links(
         &format!("{}/{}", bucket.name, req.prefix),
     )
     .await?;
-    let (objects, _) = state
-        .object_manager
-        .list_objects_for_tenant(
-            Some(claims.clone()),
-            Some(claims.tenant_id),
-            &req.bucket_name,
-            &req.prefix,
-            "",
-            page_limit(req.page.as_ref()) as i32 + 1,
-            "",
-            consistency,
-        )
+    let links = state
+        .persistence
+        .list_object_links(bucket.id, Some(&req.prefix))
         .await
-        .map_err(|status| status)?;
-    let mut links = objects
-        .into_iter()
-        .filter(|object| object.kind == object_links::ObjectEntryKind::Link)
-        .filter_map(|object| object_links::link_descriptor(&bucket.name, &object))
-        .collect::<Vec<_>>();
+        .map_err(object_link_status)?;
     let mut authorized_links = Vec::new();
     for link in links {
         if crate::access_control::action_allows(

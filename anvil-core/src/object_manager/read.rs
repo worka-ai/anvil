@@ -858,13 +858,12 @@ impl ObjectManager {
         if let Some(revision) = consistency.authz_revision() {
             return Ok(u64::try_from(revision.max(0))?);
         }
-        Ok(crate::authz_segment::read_latest_authz_tuple_segment(
+        let revision = crate::authz_journal::latest_authz_revision(
             &self.storage,
             crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
         )
-        .await?
-        .map(|segment| segment.header.generation)
-        .unwrap_or(0))
+        .await?;
+        Ok(u64::try_from(revision.max(0))?)
     }
 
     #[allow(clippy::too_many_arguments)]

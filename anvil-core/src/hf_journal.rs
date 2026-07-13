@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use prost::{Message, Oneof};
 use std::collections::{BTreeMap, HashSet};
 
-const HF_METADATA_BODY_SCHEMA: &str = "anvil.core.hf_metadata.v1";
+const HF_METADATA_BODY_SCHEMA: &str = "anvil.core.hf_metadata.v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HfMutationKind {
@@ -38,6 +38,7 @@ enum HfBody {
         emitted_at: DateTime<Utc>,
     },
     KeyDelete {
+        tenant_id: i64,
         key_name: String,
         emitted_at: DateTime<Utc>,
     },
@@ -72,8 +73,8 @@ mod hf_journal_body_proto {
     pub(super) enum Event {
         #[prost(message, tag = "10")]
         KeyUpsert(super::HfKeyProto),
-        #[prost(string, tag = "11")]
-        KeyDelete(String),
+        #[prost(message, tag = "11")]
+        KeyDelete(super::HfKeyDeleteProto),
         #[prost(message, tag = "12")]
         IngestionUpsert(super::HfIngestionProto),
         #[prost(message, tag = "13")]
@@ -95,6 +96,16 @@ struct HfKeyProto {
     created_at: String,
     #[prost(string, tag = "6")]
     updated_at: String,
+    #[prost(int64, tag = "7")]
+    tenant_id: i64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct HfKeyDeleteProto {
+    #[prost(int64, tag = "1")]
+    tenant_id: i64,
+    #[prost(string, tag = "2")]
+    key_name: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -193,12 +204,14 @@ struct HfWriteGuard {
 #[cfg(test)]
 async fn create_key(
     storage: &Storage,
+    tenant_id: i64,
     name: &str,
     token_encrypted: &[u8],
     note: Option<&str>,
 ) -> Result<()> {
     create_key_inner(
         storage,
+        tenant_id,
         name,
         token_encrypted,
         note,
@@ -209,6 +222,7 @@ async fn create_key(
 
 pub(crate) async fn create_key_with_permit(
     storage: &Storage,
+    tenant_id: i64,
     name: &str,
     token_encrypted: &[u8],
     note: Option<&str>,
@@ -216,18 +230,23 @@ pub(crate) async fn create_key_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
     let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
-    create_key_inner(storage, name, token_encrypted, note, guard).await
+    create_key_inner(storage, tenant_id, name, token_encrypted, note, guard).await
 }
 
 async fn create_key_inner(
     storage: &Storage,
+    tenant_id: i64,
     name: &str,
     token_encrypted: &[u8],
     note: Option<&str>,
     guard: HfWriteGuard,
 ) -> Result<()> {
     let state = read_state(storage).await?;
-    if state.keys.values().any(|key| key.name == name) {
+    if state
+        .keys
+        .values()
+        .any(|key| key.tenant_id == tenant_id && key.name == name)
+    {
         return Err(anyhow!("hugging face key already exists"));
     }
     let now = Utc::now();
@@ -236,6 +255,7 @@ async fn create_key_inner(
         HfMutationKind::KeyUpsert,
         Some(HfKey {
             id: next_key_id(&state)?,
+            tenant_id,
             name: name.to_string(),
             token_encrypted: token_encrypted.to_vec(),
             note: note.map(ToOwned::to_owned),
@@ -251,29 +271,38 @@ async fn create_key_inner(
 }
 
 #[cfg(test)]
-async fn delete_key(storage: &Storage, name: &str) -> Result<u64> {
-    delete_key_inner(storage, name, HfWriteGuard::default()).await
+async fn delete_key(storage: &Storage, tenant_id: i64, name: &str) -> Result<u64> {
+    delete_key_inner(storage, tenant_id, name, HfWriteGuard::default()).await
 }
 
 pub(crate) async fn delete_key_with_permit(
     storage: &Storage,
+    tenant_id: i64,
     name: &str,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<u64> {
     let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
-    delete_key_inner(storage, name, guard).await
+    delete_key_inner(storage, tenant_id, name, guard).await
 }
 
-async fn delete_key_inner(storage: &Storage, name: &str, guard: HfWriteGuard) -> Result<u64> {
+async fn delete_key_inner(
+    storage: &Storage,
+    tenant_id: i64,
+    name: &str,
+    guard: HfWriteGuard,
+) -> Result<u64> {
     let state = read_state(storage).await?;
-    let deleted = state.keys.values().any(|key| key.name == name);
+    let deleted = state
+        .keys
+        .values()
+        .any(|key| key.tenant_id == tenant_id && key.name == name);
     if deleted {
         append_body(
             storage,
             HfMutationKind::KeyDelete,
             None,
-            Some(name.to_string()),
+            Some((tenant_id, name.to_string())),
             None,
             None,
             guard,
@@ -283,20 +312,29 @@ async fn delete_key_inner(storage: &Storage, name: &str, guard: HfWriteGuard) ->
     Ok(u64::from(deleted))
 }
 
-pub async fn get_key_encrypted(storage: &Storage, name: &str) -> Result<Option<(i64, Vec<u8>)>> {
+pub async fn get_key_encrypted(
+    storage: &Storage,
+    tenant_id: i64,
+    name: &str,
+) -> Result<Option<(i64, Vec<u8>)>> {
     Ok(read_state(storage)
         .await?
         .keys
         .into_values()
-        .find(|key| key.name == name)
+        .find(|key| key.tenant_id == tenant_id && key.name == name)
         .map(|key| (key.id, key.token_encrypted)))
 }
 
-pub async fn get_key_encrypted_by_id(storage: &Storage, id: i64) -> Result<Option<Vec<u8>>> {
+pub async fn get_key_encrypted_by_id(
+    storage: &Storage,
+    tenant_id: i64,
+    id: i64,
+) -> Result<Option<Vec<u8>>> {
     Ok(read_state(storage)
         .await?
         .keys
         .remove(&id)
+        .filter(|key| key.tenant_id == tenant_id)
         .map(|key| key.token_encrypted))
 }
 
@@ -340,11 +378,13 @@ pub(crate) async fn update_key_encrypted_with_permit(
 
 pub async fn list_keys(
     storage: &Storage,
+    tenant_id: i64,
 ) -> Result<Vec<(String, Option<String>, DateTime<Utc>, DateTime<Utc>)>> {
     let mut keys = read_state(storage)
         .await?
         .keys
         .into_values()
+        .filter(|key| key.tenant_id == tenant_id)
         .map(|key| (key.name, key.note, key.created_at, key.updated_at))
         .collect::<Vec<_>>();
     keys.sort_by(|left, right| left.0.cmp(&right.0));
@@ -836,8 +876,14 @@ async fn read_state(storage: &Storage) -> Result<HfState> {
             HfBody::KeyUpsert { key, .. } => {
                 state.keys.insert(key.id, key);
             }
-            HfBody::KeyDelete { key_name, .. } => {
-                state.keys.retain(|_, key| key.name != key_name);
+            HfBody::KeyDelete {
+                tenant_id,
+                key_name,
+                ..
+            } => {
+                state
+                    .keys
+                    .retain(|_, key| key.tenant_id != tenant_id || key.name != key_name);
             }
             HfBody::IngestionUpsert { ingestion, .. } => {
                 state.ingestions.insert(ingestion.id, ingestion);
@@ -854,7 +900,7 @@ async fn append_body(
     storage: &Storage,
     event: HfMutationKind,
     key: Option<HfKey>,
-    key_name: Option<String>,
+    key_delete: Option<(i64, String)>,
     ingestion: Option<HfIngestion>,
     item: Option<HfIngestionItem>,
     guard: HfWriteGuard,
@@ -863,8 +909,12 @@ async fn append_body(
     let mutation_id = uuid::Uuid::new_v4();
     let key_text = key
         .as_ref()
-        .map(|key| format!("key/{}", key.id))
-        .or_else(|| key_name.as_ref().map(|name| format!("key-name/{name}")))
+        .map(|key| format!("tenant/{}/key/{}", key.tenant_id, key.id))
+        .or_else(|| {
+            key_delete
+                .as_ref()
+                .map(|(tenant_id, name)| format!("tenant/{tenant_id}/key-name/{name}"))
+        })
         .or_else(|| {
             ingestion
                 .as_ref()
@@ -872,7 +922,7 @@ async fn append_body(
         })
         .or_else(|| item.as_ref().map(|item| format!("item/{}", item.id)))
         .unwrap_or_else(|| event.as_str().to_string());
-    let body = hf_body_from_parts(event, key, key_name, ingestion, item, Utc::now())?;
+    let body = hf_body_from_parts(event, key, key_delete, ingestion, item, Utc::now())?;
     let payload = encode_hf_body(&body, guard.fence_token, mutation_id)?;
     let partition_id = hex::encode(hf_partition_id());
     core_store
@@ -912,7 +962,7 @@ async fn read_hf_bodies(storage: &Storage) -> Result<Vec<HfBody>> {
 fn hf_body_from_parts(
     event: HfMutationKind,
     key: Option<HfKey>,
-    key_name: Option<String>,
+    key_delete: Option<(i64, String)>,
     ingestion: Option<HfIngestion>,
     item: Option<HfIngestionItem>,
     emitted_at: DateTime<Utc>,
@@ -922,10 +972,15 @@ fn hf_body_from_parts(
             key: key.ok_or_else(|| anyhow!("hf key upsert body is missing key"))?,
             emitted_at,
         }),
-        HfMutationKind::KeyDelete => Ok(HfBody::KeyDelete {
-            key_name: key_name.ok_or_else(|| anyhow!("hf key delete body is missing key name"))?,
-            emitted_at,
-        }),
+        HfMutationKind::KeyDelete => {
+            let (tenant_id, key_name) = key_delete
+                .ok_or_else(|| anyhow!("hf key delete body is missing tenant and key name"))?;
+            Ok(HfBody::KeyDelete {
+                tenant_id,
+                key_name,
+                emitted_at,
+            })
+        }
         HfMutationKind::IngestionUpsert => Ok(HfBody::IngestionUpsert {
             ingestion: ingestion
                 .ok_or_else(|| anyhow!("hf ingestion upsert body is missing ingestion"))?,
@@ -964,6 +1019,7 @@ fn hf_body_to_proto(
             ))),
         },
         HfBody::KeyDelete {
+            tenant_id,
             key_name,
             emitted_at,
         } => HfJournalBodyProto {
@@ -971,7 +1027,10 @@ fn hf_body_to_proto(
             emitted_at: emitted_at.to_rfc3339(),
             fence_token,
             mutation_id: mutation_id.to_string(),
-            event: Some(hf_journal_body_proto::Event::KeyDelete(key_name.clone())),
+            event: Some(hf_journal_body_proto::Event::KeyDelete(HfKeyDeleteProto {
+                tenant_id: *tenant_id,
+                key_name: key_name.clone(),
+            })),
         },
         HfBody::IngestionUpsert {
             ingestion,
@@ -1012,8 +1071,9 @@ fn hf_body_from_proto(proto: HfJournalBodyProto) -> Result<HfBody> {
             key: hf_key_from_proto(key)?,
             emitted_at,
         }),
-        hf_journal_body_proto::Event::KeyDelete(key_name) => Ok(HfBody::KeyDelete {
-            key_name,
+        hf_journal_body_proto::Event::KeyDelete(key) => Ok(HfBody::KeyDelete {
+            tenant_id: key.tenant_id,
+            key_name: key.key_name,
             emitted_at,
         }),
         hf_journal_body_proto::Event::IngestionUpsert(ingestion) => Ok(HfBody::IngestionUpsert {
@@ -1040,6 +1100,7 @@ fn decode_hf_body_fence(bytes: &[u8]) -> Result<u64> {
 fn hf_key_to_proto(key: &HfKey) -> HfKeyProto {
     HfKeyProto {
         id: key.id,
+        tenant_id: key.tenant_id,
         name: key.name.clone(),
         token_encrypted: key.token_encrypted.clone(),
         note: key.note.clone(),
@@ -1051,6 +1112,7 @@ fn hf_key_to_proto(key: &HfKey) -> HfKeyProto {
 fn hf_key_from_proto(proto: HfKeyProto) -> Result<HfKey> {
     Ok(HfKey {
         id: proto.id,
+        tenant_id: proto.tenant_id,
         name: proto.name,
         token_encrypted: proto.token_encrypted,
         note: proto.note,
@@ -1303,7 +1365,8 @@ fn require_hf_permit(permit: &PartitionWritePermit) -> Result<()> {
 mod tests {
     use super::*;
     use crate::partition_fence::{
-        PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
+        PartitionRecoveryAcquire, acquire_partition_recovery,
+        force_expire_partition_owner_for_node, publish_partition_ready,
     };
     use tempfile::tempdir;
 
@@ -1313,10 +1376,10 @@ mod tests {
     async fn hf_journal_replays_keys_ingestions_and_items() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        create_key(&storage, "primary", b"secret", Some("note"))
+        create_key(&storage, 1, "primary", b"secret", Some("note"))
             .await
             .unwrap();
-        let (key_id, secret) = get_key_encrypted(&storage, "primary")
+        let (key_id, secret) = get_key_encrypted(&storage, 1, "primary")
             .await
             .unwrap()
             .unwrap();
@@ -1359,12 +1422,55 @@ mod tests {
         );
         let summary = status_summary(&storage, ingestion_id).await.unwrap();
         assert_eq!(summary.3, 1);
-        assert_eq!(delete_key(&storage, "primary").await.unwrap(), 1);
+        assert_eq!(delete_key(&storage, 1, "primary").await.unwrap(), 1);
         assert!(
-            get_key_encrypted_by_id(&storage, key_id)
+            get_key_encrypted_by_id(&storage, 1, key_id)
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn hf_keys_are_isolated_by_tenant() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+
+        create_key(&storage, 11, "shared-name", b"tenant-11", None)
+            .await
+            .unwrap();
+        create_key(&storage, 12, "shared-name", b"tenant-12", None)
+            .await
+            .unwrap();
+
+        let (tenant_11_key_id, tenant_11_secret) = get_key_encrypted(&storage, 11, "shared-name")
+            .await
+            .unwrap()
+            .unwrap();
+        let (tenant_12_key_id, tenant_12_secret) = get_key_encrypted(&storage, 12, "shared-name")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(tenant_11_key_id, tenant_12_key_id);
+        assert_eq!(tenant_11_secret, b"tenant-11");
+        assert_eq!(tenant_12_secret, b"tenant-12");
+        assert_eq!(list_keys(&storage, 11).await.unwrap().len(), 1);
+        assert_eq!(list_keys(&storage, 12).await.unwrap().len(), 1);
+
+        assert_eq!(delete_key(&storage, 11, "shared-name").await.unwrap(), 1);
+        assert!(
+            get_key_encrypted(&storage, 11, "shared-name")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            get_key_encrypted(&storage, 12, "shared-name")
+                .await
+                .unwrap()
+                .unwrap()
+                .1,
+            b"tenant-12"
         );
     }
 
@@ -1373,10 +1479,10 @@ mod tests {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
 
-        create_key(&storage, "primary", b"secret", Some("note"))
+        create_key(&storage, 1, "primary", b"secret", Some("note"))
             .await
             .unwrap();
-        let (key_id, _) = get_key_encrypted(&storage, "primary")
+        let (key_id, _) = get_key_encrypted(&storage, 1, "primary")
             .await
             .unwrap()
             .unwrap();
@@ -1401,7 +1507,7 @@ mod tests {
         update_item_success(&storage, item_id, 10, "etag")
             .await
             .unwrap();
-        delete_key(&storage, "primary").await.unwrap();
+        delete_key(&storage, 1, "primary").await.unwrap();
 
         let core_store = CoreStore::new(storage.clone()).await.unwrap();
         let records = core_store
@@ -1433,11 +1539,17 @@ mod tests {
                 HfBody::KeyUpsert { key, .. } => {
                     saw_key_upsert = true;
                     assert_eq!(key.id, key_id);
+                    assert_eq!(key.tenant_id, 1);
                     assert_eq!(key.name, "primary");
                     assert_eq!(key.token_encrypted, b"secret");
                 }
-                HfBody::KeyDelete { key_name, .. } => {
+                HfBody::KeyDelete {
+                    tenant_id,
+                    key_name,
+                    ..
+                } => {
                     saw_key_delete = true;
+                    assert_eq!(tenant_id, 1);
                     assert_eq!(key_name, "primary");
                 }
                 HfBody::IngestionUpsert { ingestion, .. } => {
@@ -1462,6 +1574,7 @@ mod tests {
     #[test]
     fn hf_metadata_body_rejects_invalid_schema_and_unknown_fields() {
         let body = HfBody::KeyDelete {
+            tenant_id: 1,
             key_name: "primary".to_string(),
             emitted_at: fixed_hf_time(),
         };
@@ -1492,10 +1605,18 @@ mod tests {
         let owner = ready_owner(&storage, "node-a").await;
         let permit = owner.write_permit().unwrap();
 
-        create_key_with_permit(&storage, "primary", b"secret", Some("note"), &permit, KEY)
-            .await
-            .unwrap();
-        let (key_id, _) = get_key_encrypted(&storage, "primary")
+        create_key_with_permit(
+            &storage,
+            1,
+            "primary",
+            b"secret",
+            Some("note"),
+            &permit,
+            KEY,
+        )
+        .await
+        .unwrap();
+        let (key_id, _) = get_key_encrypted(&storage, 1, "primary")
             .await
             .unwrap()
             .unwrap();
@@ -1543,7 +1664,7 @@ mod tests {
         update_item_success_with_permit(&storage, item_id, 10, "etag", &permit, KEY)
             .await
             .unwrap();
-        delete_key_with_permit(&storage, "primary", &permit, KEY)
+        delete_key_with_permit(&storage, 1, "primary", &permit, KEY)
             .await
             .unwrap();
 
@@ -1558,11 +1679,23 @@ mod tests {
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = ready_owner(&storage, "node-a").await;
         let stale_permit = owner.write_permit().unwrap();
+        force_expire_partition_owner_for_node(
+            &storage,
+            &owner.partition_family,
+            &owner.partition_id,
+            "node-a",
+            250,
+            KEY,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let newer = ready_owner(&storage, "node-b").await;
         assert!(newer.fence_token > stale_permit.fence_token);
 
         let err = create_key_with_permit(
             &storage,
+            1,
             "primary",
             b"secret",
             Some("note"),
@@ -1586,11 +1719,23 @@ mod tests {
         let stale_precondition = partition_write_precondition(&storage, &stale_permit, KEY)
             .await
             .unwrap();
+        force_expire_partition_owner_for_node(
+            &storage,
+            &owner.partition_family,
+            &owner.partition_id,
+            "node-a",
+            250,
+            KEY,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let newer = ready_owner(&storage, "node-b").await;
         assert!(newer.fence_token > stale_permit.fence_token);
 
         let err = create_key_inner(
             &storage,
+            1,
             "primary",
             b"secret",
             Some("note"),
@@ -1609,6 +1754,7 @@ mod tests {
 
         create_key_with_permit(
             &storage,
+            1,
             "primary",
             b"secret",
             Some("note"),

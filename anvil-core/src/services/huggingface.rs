@@ -38,7 +38,7 @@ impl api::hugging_face_key_service_server::HuggingFaceKeyService for AppState {
         };
 
         self.persistence
-            .hf_create_key(&req.name, &enc, note_opt)
+            .hf_create_key(claims.tenant_id, &req.name, &enc, note_opt)
             .await
             .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?;
 
@@ -69,7 +69,7 @@ impl api::hugging_face_key_service_server::HuggingFaceKeyService for AppState {
 
         let n = self
             .persistence
-            .hf_delete_key(&req.name)
+            .hf_delete_key(claims.tenant_id, &req.name)
             .await
             .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?;
 
@@ -98,7 +98,7 @@ impl api::hugging_face_key_service_server::HuggingFaceKeyService for AppState {
 
         let rows = self
             .persistence
-            .hf_list_keys()
+            .hf_list_keys(claims.tenant_id)
             .await
             .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?;
 
@@ -148,7 +148,7 @@ impl api::hf_ingestion_service_server::HfIngestionService for AppState {
         // Lookup key id
         let Some((key_id, _enc)) = self
             .persistence
-            .hf_get_key_encrypted(&req.key_name)
+            .hf_get_key_encrypted(claims.tenant_id, &req.key_name)
             .await
             .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?
         else {
@@ -221,8 +221,13 @@ impl api::hf_ingestion_service_server::HfIngestionService for AppState {
             .ingestion_id
             .parse()
             .map_err(|_| Status::invalid_argument("invalid id"))?;
-        // The action matrix already checked the caller through Zanzibar before
-        // this point; this endpoint only materialises the ingestion status.
+        let _job = self
+            .persistence
+            .hf_get_ingestion_job(id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .filter(|job| job.tenant_id == claims.tenant_id)
+            .ok_or_else(|| Status::not_found("ingestion not found"))?;
         let (
             state_s,
             queued,
@@ -275,7 +280,12 @@ impl api::hf_ingestion_service_server::HfIngestionService for AppState {
             .ingestion_id
             .parse()
             .map_err(|_| Status::invalid_argument("invalid id"))?;
-        // Authorization aligned
+        self.persistence
+            .hf_get_ingestion_job(id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .filter(|job| job.tenant_id == claims.tenant_id)
+            .ok_or_else(|| Status::not_found("ingestion not found"))?;
         let _ = self
             .persistence
             .hf_cancel_ingestion(id)

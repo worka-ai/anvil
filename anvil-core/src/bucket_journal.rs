@@ -137,20 +137,31 @@ pub(crate) async fn append_bucket_mutation_with_permits(
     let global_scope = BucketJournalScope::Global;
     require_bucket_scope_permit(tenant_scope, tenant_permit)?;
     require_bucket_scope_permit(global_scope, global_permit)?;
-    let step_start = std::time::Instant::now();
-    let tenant_precondition =
-        partition_write_precondition(storage, tenant_permit, partition_owner_signing_key).await?;
-    crate::emit_test_timing(
-        "bucket_journal.append_bucket_mutation tenant_precondition",
-        step_start.elapsed(),
-    );
-    let step_start = std::time::Instant::now();
-    let global_precondition =
-        partition_write_precondition(storage, global_permit, partition_owner_signing_key).await?;
-    crate::emit_test_timing(
-        "bucket_journal.append_bucket_mutation global_precondition",
-        step_start.elapsed(),
-    );
+    let tenant_precondition = async {
+        let step_start = std::time::Instant::now();
+        let precondition =
+            partition_write_precondition(storage, tenant_permit, partition_owner_signing_key).await;
+        crate::emit_test_timing(
+            "bucket_journal.append_bucket_mutation tenant_precondition",
+            step_start.elapsed(),
+        );
+        precondition
+    };
+    let global_precondition = async {
+        let step_start = std::time::Instant::now();
+        let precondition =
+            partition_write_precondition(storage, global_permit, partition_owner_signing_key).await;
+        crate::emit_test_timing(
+            "bucket_journal.append_bucket_mutation global_precondition",
+            step_start.elapsed(),
+        );
+        precondition
+    };
+    let (tenant_precondition, global_precondition) =
+        tokio::join!(tenant_precondition, global_precondition);
+    let tenant_precondition = tenant_precondition?;
+    let global_precondition = global_precondition?;
+
     let step_start = std::time::Instant::now();
     append_bucket_mutation_to_stream(
         storage,

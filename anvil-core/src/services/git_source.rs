@@ -92,7 +92,7 @@ impl GitSourceService for AppState {
             },
         )
         .await
-        .map_err(|err| Status::internal(err.to_string()))?;
+        .map_err(|err| Status::internal(format!("{err:#}")))?;
         let updated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         git_source_manifest::write_git_source_repository_manifest(
             &self.storage,

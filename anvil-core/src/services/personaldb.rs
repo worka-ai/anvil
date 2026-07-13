@@ -9,8 +9,8 @@ use crate::{
     error_codes::AnvilErrorCode,
     formats::{Hash32, hash32, personaldb::PersonalDbLogRecord as CorePersonalDbLogRecord},
     partition_fence::{
-        PartitionRecoveryAcquire, PartitionWritePermit, acquire_partition_recovery,
-        partition_write_precondition, publish_partition_ready,
+        PartitionOwnerStatus, PartitionRecoveryAcquire, PartitionWritePermit,
+        acquire_partition_recovery, partition_write_precondition, publish_partition_ready,
     },
     permissions::AnvilAction,
     personaldb_catchup::{
@@ -664,6 +664,11 @@ impl AppState {
         )
         .await
         .map_err(internal_status)?;
+        if recovering.status == PartitionOwnerStatus::Ready {
+            return recovering.write_permit().map_err(|err| {
+                Status::failed_precondition(format!("PersonalDB partition is not writable: {err}"))
+            });
+        }
         let ready = publish_partition_ready(
             &self.storage,
             &partition_family,
