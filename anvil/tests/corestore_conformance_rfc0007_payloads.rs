@@ -173,7 +173,8 @@ fn object_and_index_payloads_publish_corestore_locators_not_metadata_values() {
             &[
                 "write_format_build_output(WriterBuildOutput",
                 "encode_writer_segment(",
-                "core_object_ref_from_logical_file_write",
+                "written_object_refs",
+                "encode_core_object_ref_target",
             ],
         );
     }

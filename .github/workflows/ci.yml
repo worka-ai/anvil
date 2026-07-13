@@ -77,9 +77,9 @@ jobs:
 
       - name: Smoke check image binaries
         run: |
-          docker run --platform ${{ matrix.platform }} --rm ${{ matrix.image }} anvil-server --version
-          docker run --platform ${{ matrix.platform }} --rm ${{ matrix.image }} anvil --version
-          docker run --platform ${{ matrix.platform }} --rm ${{ matrix.image }} anvil-admin --version
+          timeout 30s docker run --platform ${{ matrix.platform }} --rm ${{ matrix.image }} anvil-server --version
+          timeout 30s docker run --platform ${{ matrix.platform }} --rm ${{ matrix.image }} anvil --version
+          timeout 30s docker run --platform ${{ matrix.platform }} --rm ${{ matrix.image }} anvil-admin --version
 
       - name: Export Docker image artifact
         run: docker save ${{ matrix.image }} -o /tmp/${{ matrix.artifact }}.tar
