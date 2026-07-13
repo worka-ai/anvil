@@ -172,9 +172,10 @@ impl PlannerAuthzCandidateAdapter {
             }
         }
 
-        if let Some(system_segment) = crate::authz_segment::read_latest_authz_tuple_segment(
+        if let Some(system_segment) = crate::authz_segment::ensure_authz_tuple_segment_at_revision(
             &self.storage,
             crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
+            request.system_revision,
         )
         .await?
         {

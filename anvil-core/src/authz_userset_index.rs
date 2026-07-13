@@ -2,10 +2,10 @@ use crate::{
     authz_journal::{self, AuthzTupleFilter},
     core_store::{
         CF_AUTHZ, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaRowCommonProto, CoreMetaStore,
-        CoreMetaTuplePart, CoreMetaVisibilityState, CoreObjectRef, CorePipelinePolicy, CoreStore,
-        CoreTraceContext, GetBlob, TABLE_AUTHZ_TUPLE_PAGE_ROW, WriteLogicalFileRequest,
-        commit_coremeta_batch_for_storage, core_meta_committed_row_common, core_meta_root_key_hash,
-        core_meta_tuple_key, decode_deterministic_proto, encode_deterministic_proto,
+        CoreMetaTuplePart, CoreMetaVisibilityState, CoreObjectRef, CoreStore, GetBlob, PutBlob,
+        TABLE_AUTHZ_TUPLE_PAGE_ROW, commit_coremeta_batch_for_storage,
+        core_meta_committed_row_common, core_meta_root_key_hash, core_meta_tuple_key,
+        decode_deterministic_proto, encode_deterministic_proto,
     },
     formats::{
         hash32,
@@ -394,6 +394,22 @@ pub async fn build_expected_derived_userset_index(
     build_derived_userset_index_from_records(tenant_id, derived_index_id, records)
 }
 
+pub(crate) async fn build_expected_derived_userset_index_at_revision(
+    storage: &Storage,
+    tenant_id: i64,
+    derived_index_id: &str,
+    revision: u64,
+) -> Result<AuthzDerivedUsersetIndex> {
+    let revision = i64::try_from(revision)
+        .map_err(|_| anyhow!("authorization userset revision exceeds supported range"))?;
+    let records = authz_journal::list_authz_tuple_log(storage, tenant_id, 0, "", 0)
+        .await?
+        .into_iter()
+        .filter(|record| record.revision <= revision)
+        .collect();
+    build_derived_userset_index_from_records(tenant_id, derived_index_id, records)
+}
+
 pub async fn read_derived_userset_index(
     storage: &Storage,
     tenant_id: i64,
@@ -431,21 +447,19 @@ pub async fn write_derived_userset_index(
         &hash32(&bytes),
     );
     let object_ref = store
-        .write_logical_file_ref(WriteLogicalFileRequest {
-            writer_family: WriterFamily::Authz.as_str().to_string(),
-            generation: writer_generation,
-            logical_file_id,
-            source: bytes,
-            range_hints: Vec::new(),
-            pipeline_policy: CorePipelinePolicy::default(),
-            trace_context: CoreTraceContext::default(),
-            boundary_values: Vec::new(),
-            mutation_id: format!(
-                "authz-derived-userset-index:{}:{}:{}",
-                index.tenant_id, index.derived_index_id, index.generation
-            ),
-            region_id: "local".to_string(),
-        })
+        .put_format_blob(
+            PutBlob {
+                logical_name: logical_file_id,
+                bytes,
+                boundary_values: Vec::new(),
+                mutation_id: format!(
+                    "authz-derived-userset-index:{}:{}:{}",
+                    index.tenant_id, index.derived_index_id, index.generation
+                ),
+                region_id: "local".to_string(),
+            },
+            WriterFamily::Authz,
+        )
         .await?;
     write_derived_userset_index_row(storage, index, writer_generation, &object_ref).await?;
     Ok(())

@@ -1,9 +1,8 @@
 use crate::authz_coremeta_payload::{decode_authz_payload_row, encode_authz_payload_row};
 use crate::authz_segment;
 use crate::authz_userset_index::{
-    DEFAULT_DERIVED_USERSET_INDEX_ID, advance_derived_userset_index_from_batch,
+    AuthzDerivedUsersetEntry, DEFAULT_DERIVED_USERSET_INDEX_ID,
     list_derived_userset_objects_at_revision, lookup_derived_userset_index_at_revision,
-    read_derived_userset_index,
 };
 use crate::core_store::{
     CF_AUTHZ, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaStore, CoreMetaTuplePart,
@@ -17,7 +16,10 @@ use crate::persistence::AuthzTupleRecord;
 use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow};
 use prost::Message;
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, LazyLock},
+};
 
 pub(crate) mod resolver;
 
@@ -27,6 +29,20 @@ const AUTHZ_TUPLE_CURRENT_ROW_SCHEMA: &str = "anvil.authz_tuple.current_row.v1";
 const AUTHZ_TUPLE_PAGE_PAYLOAD_KIND: &str = "authz_tuple_page";
 const AUTHZ_TUPLE_RECORD_KIND: &str = "authz_tuple";
 const AUTHZ_TUPLE_BATCH_RECORD_KIND: &str = "authz_tuple_batch";
+
+static AUTHZ_TUPLE_WRITE_LOCKS: LazyLock<
+    std::sync::Mutex<BTreeMap<i64, Arc<tokio::sync::Mutex<()>>>>,
+> = LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
+
+fn authz_tuple_write_lock(tenant_id: i64) -> Result<Arc<tokio::sync::Mutex<()>>> {
+    let mut locks = AUTHZ_TUPLE_WRITE_LOCKS
+        .lock()
+        .map_err(|_| anyhow!("authz tuple write lock is poisoned"))?;
+    Ok(locks
+        .entry(tenant_id)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
 enum AuthzTupleOperationProto {
@@ -145,6 +161,8 @@ pub(crate) async fn write_authz_tuple_with_permit(
 ) -> Result<AuthzTupleRecord> {
     require_authz_permit(input.tenant_id, permit)?;
     validate_optional_caveat_hash(input.caveat_hash)?;
+    let write_lock = authz_tuple_write_lock(input.tenant_id)?;
+    let _guard = write_lock.lock().await;
     let partition_precondition =
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     write_authz_tuple_inner(
@@ -173,6 +191,8 @@ pub(crate) async fn write_authz_tuple_batch_with_permit(
         }
         validate_optional_caveat_hash(input.caveat_hash)?;
     }
+    let write_lock = authz_tuple_write_lock(tenant_id)?;
+    let _guard = write_lock.lock().await;
     let partition_precondition =
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     write_authz_tuple_batch_inner(
@@ -274,7 +294,10 @@ fn build_authz_tuple_record(
 }
 
 #[cfg(test)]
-async fn append_authz_tuple_record(storage: &Storage, record: &AuthzTupleRecord) -> Result<()> {
+pub(crate) async fn append_authz_tuple_record(
+    storage: &Storage,
+    record: &AuthzTupleRecord,
+) -> Result<()> {
     append_authz_tuple_record_inner(storage, record, 0, None).await
 }
 
@@ -403,18 +426,65 @@ pub(crate) async fn materialize_authz_tuple_segment(
     tenant_id: i64,
     source_fence_token: u64,
 ) -> Result<String> {
+    let target_revision = latest_authz_revision(storage, tenant_id).await?.max(0) as u64;
+    materialize_authz_tuple_segment_at_revision(
+        storage,
+        tenant_id,
+        target_revision,
+        source_fence_token,
+    )
+    .await
+}
+
+pub(crate) async fn materialize_authz_tuple_segment_at_revision(
+    storage: &Storage,
+    tenant_id: i64,
+    target_revision: u64,
+    source_fence_token: u64,
+) -> Result<String> {
     let step_started_at = std::time::Instant::now();
-    let records = read_all_authz_tuple_records_from_journal(storage, tenant_id).await?;
+    let derived_entries = crate::authz_userset_index::build_expected_derived_userset_index_at_revision(
+        storage,
+        tenant_id,
+        DEFAULT_DERIVED_USERSET_INDEX_ID,
+        target_revision,
+    )
+    .await?
+    .entries;
     crate::emit_test_timing(
-        "authz_journal.materialize_segment read_all_current_records",
+        "authz_journal.materialize_segment build_derived_usersets",
+        step_started_at.elapsed(),
+    );
+    materialize_authz_tuple_segment_with_derived_entries(
+        storage,
+        tenant_id,
+        target_revision,
+        source_fence_token,
+        &derived_entries,
+    )
+    .await
+}
+
+async fn materialize_authz_tuple_segment_with_derived_entries(
+    storage: &Storage,
+    tenant_id: i64,
+    target_revision: u64,
+    source_fence_token: u64,
+    derived_entries: &[AuthzDerivedUsersetEntry],
+) -> Result<String> {
+    let step_started_at = std::time::Instant::now();
+    let target_revision = i64::try_from(target_revision)
+        .context("authorization segment revision exceeds supported range")?;
+    let records = read_authz_tuple_records_for_segment_materialization(storage, tenant_id)
+        .await?
+        .into_iter()
+        .filter(|record| record.revision <= target_revision)
+        .collect::<Vec<_>>();
+    crate::emit_test_timing(
+        "authz_journal.materialize_segment read_segment_source_records",
         step_started_at.elapsed(),
     );
     let step_started_at = std::time::Instant::now();
-    let derived_entries =
-        read_derived_userset_index(storage, tenant_id, DEFAULT_DERIVED_USERSET_INDEX_ID)
-            .await?
-            .map(|index| index.entries)
-            .unwrap_or_default();
     let segment_ref = authz_segment::write_authz_tuple_segment_with_derived(
         storage,
         tenant_id,
@@ -431,28 +501,40 @@ pub(crate) async fn materialize_authz_tuple_segment(
 }
 
 async fn advance_authz_materialization(
-    storage: &Storage,
-    tenant_id: i64,
+    _storage: &Storage,
+    _tenant_id: i64,
     batch_records: &[AuthzTupleRecord],
-    source_fence_token: u64,
-) -> Result<String> {
-    advance_derived_userset_index_from_batch(
-        storage,
-        tenant_id,
-        DEFAULT_DERIVED_USERSET_INDEX_ID,
-        batch_records,
-    )
-    .await?;
-    materialize_authz_tuple_segment(storage, tenant_id, source_fence_token).await
+    _source_fence_token: u64,
+) -> Result<()> {
+    debug_assert!(!batch_records.is_empty());
+    // Tuple writes update the durable journal and current rows. Immutable authz
+    // and userset outputs are coalesced at the revision requested by a query
+    // instead of rewriting a complete snapshot for every tuple. The latest
+    // tuple revision is the durable catch-up cursor, while stale derived state
+    // is ignored by readers until it reaches that exact revision.
+    Ok(())
 }
 
 pub async fn latest_authz_revision(storage: &Storage, tenant_id: i64) -> Result<i64> {
-    Ok(read_all_authz_tuple_records(storage, tenant_id)
+    let tuple_revision = read_all_authz_tuple_records(storage, tenant_id)
         .await?
         .into_iter()
         .map(|record| record.revision)
         .max()
-        .unwrap_or(0))
+        .unwrap_or(0);
+    let schema_revision = crate::authz_realm_schema::list_schema_revisions(storage, tenant_id)
+        .await?
+        .into_iter()
+        .map(|record| record.authz_revision)
+        .chain(
+            crate::authz_realm_schema::list_schema_bindings(storage, tenant_id)
+                .await?
+                .into_iter()
+                .map(|record| record.authz_revision),
+        )
+        .max()
+        .unwrap_or(0);
+    Ok(tuple_revision.max(i64::try_from(schema_revision)?))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -905,7 +987,6 @@ fn decode_authz_tuple_batch_journal_body(bytes: &[u8]) -> Result<Vec<AuthzTupleR
         .collect()
 }
 
-#[cfg(test)]
 fn decode_authz_tuple_journal_body_fence(bytes: &[u8]) -> Result<u64> {
     let body = AuthzTupleJournalBodyProto::decode(bytes)?;
     ensure_deterministic_proto(&body, bytes, "authz tuple journal body")?;
@@ -917,7 +998,6 @@ fn decode_authz_tuple_journal_body_fence(bytes: &[u8]) -> Result<u64> {
     Ok(body.fence_token)
 }
 
-#[cfg(test)]
 fn decode_authz_tuple_batch_journal_body_fence(bytes: &[u8]) -> Result<u64> {
     let body = AuthzTupleBatchJournalBodyProto::decode(bytes)?;
     ensure_deterministic_proto(&body, bytes, "authz tuple batch journal body")?;
@@ -1190,6 +1270,22 @@ async fn read_all_authz_tuple_records_from_journal(
     Ok(records)
 }
 
+async fn read_authz_tuple_records_for_segment_materialization(
+    storage: &Storage,
+    tenant_id: i64,
+) -> Result<Vec<AuthzTupleRecord>> {
+    let mut by_mutation = BTreeMap::<String, AuthzTupleRecord>::new();
+    for record in read_all_authz_tuple_records_from_journal(storage, tenant_id).await? {
+        by_mutation.insert(record.mutation_id.to_string(), record);
+    }
+    for record in read_authz_tuple_records_from_current_rows(storage, tenant_id).await? {
+        by_mutation.insert(record.mutation_id.to_string(), record);
+    }
+    let mut records = by_mutation.into_values().collect::<Vec<_>>();
+    records.sort_by_key(|record| (record.revision, record.revision_ordinal));
+    Ok(records)
+}
+
 pub fn authz_partition_id(tenant_id: i64) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/authz_tuple").as_bytes())
 }
@@ -1202,6 +1298,17 @@ fn authz_partition_principal(tenant_id: i64) -> String {
     format!("partition-owner:authz_tuple:{tenant_id}")
 }
 
+pub(crate) async fn latest_authz_journal_fence_token(
+    storage: &Storage,
+    tenant_id: i64,
+) -> Result<u64> {
+    Ok(read_authz_journal_payload_fences(storage, tenant_id)
+        .await?
+        .into_iter()
+        .max()
+        .unwrap_or(0))
+}
+
 #[cfg(test)]
 pub(crate) async fn read_authz_frame_fences_for_test(
     storage: &Storage,
@@ -1210,7 +1317,6 @@ pub(crate) async fn read_authz_frame_fences_for_test(
     read_authz_journal_payload_fences(storage, tenant_id).await
 }
 
-#[cfg(test)]
 async fn read_authz_journal_payload_fences(storage: &Storage, tenant_id: i64) -> Result<Vec<u64>> {
     let core_store = CoreStore::new(storage.clone()).await?;
     Ok(core_store

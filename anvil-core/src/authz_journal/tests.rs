@@ -1,6 +1,7 @@
 use super::*;
 use crate::partition_fence::{
-    PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
+    PartitionRecoveryAcquire, acquire_partition_recovery, force_expire_partition_owner_for_node,
+    publish_partition_ready,
 };
 use chrono::Utc;
 use tempfile::tempdir;
@@ -700,6 +701,11 @@ async fn authz_tuple_writes_materialize_userset_and_reverse_lookup_segments() {
         append_authz_tuple_record(&storage, &record).await.unwrap();
     }
 
+    authz_segment::ensure_authz_tuple_segment_at_revision(&storage, 42, 3)
+        .await
+        .unwrap()
+        .unwrap();
+
     let segment = authz_segment::read_latest_authz_tuple_segment(&storage, 42)
         .await
         .unwrap()
@@ -751,6 +757,11 @@ async fn authz_journal_permit_sets_payload_and_segment_fence() {
         .unwrap();
     assert_eq!(fences, vec![permit.fence_token]);
 
+    authz_segment::ensure_authz_tuple_segment_at_revision(&storage, 42, 1)
+        .await
+        .unwrap()
+        .unwrap();
+
     let segment = authz_segment::read_latest_authz_tuple_segment(&storage, 42)
         .await
         .unwrap()
@@ -768,8 +779,19 @@ async fn authz_journal_rejects_stale_partition_permit() {
     let temp = tempdir().unwrap();
     let storage = Storage::new_at(temp.path()).await.unwrap();
     let stale = ready_authz_permit(&storage, 42, "node-a").await;
+    force_expire_partition_owner_for_node(
+        &storage,
+        &stale.partition_family,
+        &stale.partition_id,
+        "node-a",
+        250,
+        PARTITION_OWNER_KEY,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let fresh = ready_authz_permit(&storage, 42, "node-b").await;
-    assert_eq!(fresh.fence_token, stale.fence_token + 1);
+    assert!(fresh.fence_token > stale.fence_token);
 
     let rejected = append_authz_tuple_record_with_permit(
         &storage,
@@ -794,8 +816,19 @@ async fn authz_journal_batch_rejects_stale_partition_precondition() {
     let stale_precondition = partition_write_precondition(&storage, &stale, PARTITION_OWNER_KEY)
         .await
         .unwrap();
+    force_expire_partition_owner_for_node(
+        &storage,
+        &stale.partition_family,
+        &stale.partition_id,
+        "node-a",
+        250,
+        PARTITION_OWNER_KEY,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let fresh = ready_authz_permit(&storage, 42, "node-b").await;
-    assert_eq!(fresh.fence_token, stale.fence_token + 1);
+    assert!(fresh.fence_token > stale.fence_token);
 
     let rejected = append_authz_tuple_record_inner(
         &storage,

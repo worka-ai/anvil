@@ -38,7 +38,10 @@ use crate::{
 use anyhow::{Context, Result, anyhow, bail};
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, LazyLock},
+};
 
 const AUTHZ_TUPLE_SEGMENT_REF_PREFIX: &str = "authz_tuple_segment:";
 const AUTHZ_TUPLE_SEGMENT_CATALOG_FAMILY: &str = "authz_tuple";
@@ -50,6 +53,20 @@ const TABLE_AUTHZ_CAVEAT_DESCRIPTOR: u16 = 0x0505;
 const TABLE_AUTHZ_REVISION_LOG: u16 = 0x0506;
 const TABLE_AUTHZ_LIST_OBJECTS: u16 = 0x0507;
 const TABLE_AUTHZ_LIST_SUBJECTS: u16 = 0x0508;
+
+static AUTHZ_SEGMENT_CATCHUP_LOCKS: LazyLock<
+    std::sync::Mutex<BTreeMap<i64, Arc<tokio::sync::Mutex<()>>>>,
+> = LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
+
+fn authz_segment_catchup_lock(tenant_id: i64) -> Result<Arc<tokio::sync::Mutex<()>>> {
+    let mut locks = AUTHZ_SEGMENT_CATCHUP_LOCKS
+        .lock()
+        .map_err(|_| anyhow!("authz segment catch-up lock is poisoned"))?;
+    Ok(locks
+        .entry(tenant_id)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuthzSegmentHeader {
@@ -280,16 +297,6 @@ async fn write_authz_tuple_segment(
     write_authz_tuple_segment_inner(storage, tenant_id, records, &[], 0).await
 }
 
-pub(crate) async fn write_authz_tuple_segment_with_fence(
-    storage: &Storage,
-    tenant_id: i64,
-    records: &[AuthzTupleRecord],
-    source_fence_token: u64,
-) -> Result<String> {
-    write_authz_tuple_segment_with_derived(storage, tenant_id, records, &[], source_fence_token)
-        .await
-}
-
 pub(crate) async fn write_authz_tuple_segment_with_derived(
     storage: &Storage,
     tenant_id: i64,
@@ -314,16 +321,47 @@ async fn write_authz_tuple_segment_inner(
     derived_usersets: &[AuthzDerivedUsersetEntry],
     source_fence_token: u64,
 ) -> Result<String> {
-    let record_generation = records
-        .iter()
-        .map(|record| record.revision)
-        .max()
-        .unwrap_or(0);
-    let record_generation =
-        u64::try_from(record_generation).context("authz segment generation is negative")?;
-    let generation = record_generation.max(source_fence_token);
-    let ref_name = authz_tuple_segment_ref_name(tenant_id, generation)?;
+    let segment_records = segment_records_from_authz_records(records)?;
+    let active_records = active_tuple_records(records);
+    let schema_rows = schema_descriptor_rows(storage, tenant_id, &active_records).await?;
+    let bound_relation_rule_rows =
+        bound_relation_rule_rows(storage, tenant_id, &active_records).await?;
+    let relation_rule_rows =
+        all_relation_rule_rows(storage, tenant_id, &bound_relation_rule_rows).await?;
+    let generation = authz_tuple_segment_generation(records, &schema_rows, &relation_rule_rows)?;
+    let segment_tables = authz_writer_tables_with_rows(
+        storage,
+        tenant_id,
+        records,
+        derived_usersets,
+        &segment_records,
+        generation,
+        source_fence_token,
+        &schema_rows,
+        &relation_rule_rows,
+        &bound_relation_rule_rows,
+    )
+    .await?;
+    write_authz_tuple_segment_tables(
+        storage,
+        tenant_id,
+        generation,
+        source_fence_token,
+        &segment_records,
+        segment_tables,
+    )
+    .await
+}
 
+async fn write_authz_tuple_segment_tables(
+    storage: &Storage,
+    tenant_id: i64,
+    generation: u64,
+    source_fence_token: u64,
+    segment_records: &[SegmentRecord],
+    segment_tables: Vec<WriterBodyTable>,
+) -> Result<String> {
+    let ref_name = authz_tuple_segment_ref_name(tenant_id, generation)?;
     let header = AuthzSegmentHeader {
         tenant_id: tenant_id.to_string(),
         partition_family: "authz_tuple".to_string(),
@@ -334,17 +372,6 @@ async fn write_authz_tuple_segment_inner(
         created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
         codec: "writer-body-table-v1".to_string(),
     };
-    let segment_records = segment_records_from_authz_records(records)?;
-    let segment_tables = authz_writer_tables(
-        storage,
-        tenant_id,
-        records,
-        derived_usersets,
-        &segment_records,
-        generation,
-        source_fence_token,
-    )
-    .await?;
     let body = encode_writer_body_tables(&segment_tables)?;
     let segment_hash = hash32(&body);
     let logical_file_id =
@@ -404,6 +431,37 @@ async fn write_authz_tuple_segment_inner(
     Ok(ref_name)
 }
 
+fn authz_tuple_segment_generation(
+    records: &[AuthzTupleRecord],
+    schema_rows: &[AuthzSchemaDescriptorRow],
+    relation_rule_rows: &[AuthzRelationRuleRow],
+) -> Result<u64> {
+    let record_generation = records
+        .iter()
+        .map(|record| record.revision)
+        .max()
+        .unwrap_or(0);
+    let record_generation =
+        u64::try_from(record_generation).context("authz segment generation is negative")?;
+    let schema_generation = schema_rows
+        .iter()
+        .map(|row| {
+            row.authz_revision
+                .max(row.schema_revision)
+                .max(row.binding_generation)
+        })
+        .max()
+        .unwrap_or(0);
+    let relation_generation = relation_rule_rows
+        .iter()
+        .map(|row| row.schema_generation)
+        .max()
+        .unwrap_or(0);
+    Ok(record_generation
+        .max(schema_generation)
+        .max(relation_generation))
+}
+
 pub async fn read_latest_authz_tuple_segment(
     storage: &Storage,
     tenant_id: i64,
@@ -411,8 +469,27 @@ pub async fn read_latest_authz_tuple_segment(
     let Some(segment_ref) = latest_authz_tuple_segment_ref(storage, tenant_id).await? else {
         return Ok(None);
     };
-    let record = read_authz_tuple_segment_catalog_record(storage, tenant_id, &segment_ref)?
-        .ok_or_else(|| anyhow!("authz tuple segment catalog row is missing"))?;
+    read_authz_tuple_segment_ref(storage, tenant_id, &segment_ref).await
+}
+
+async fn read_authz_tuple_segment_at_revision(
+    storage: &Storage,
+    tenant_id: i64,
+    revision: u64,
+) -> Result<Option<DecodedAuthzSegment>> {
+    let segment_ref = authz_tuple_segment_ref_name(tenant_id, revision)?;
+    read_authz_tuple_segment_ref(storage, tenant_id, &segment_ref).await
+}
+
+async fn read_authz_tuple_segment_ref(
+    storage: &Storage,
+    tenant_id: i64,
+    segment_ref: &str,
+) -> Result<Option<DecodedAuthzSegment>> {
+    let Some(record) = read_authz_tuple_segment_catalog_record(storage, tenant_id, segment_ref)?
+    else {
+        return Ok(None);
+    };
     let store = CoreStore::new(storage.clone()).await?;
     let bytes = store
         .get_blob(GetBlob {
@@ -420,6 +497,69 @@ pub async fn read_latest_authz_tuple_segment(
         })
         .await?;
     Ok(Some(decode_authz_tuple_segment(&bytes)?))
+}
+
+pub async fn ensure_authz_tuple_segment_at_revision(
+    storage: &Storage,
+    tenant_id: i64,
+    target_revision: u64,
+) -> Result<Option<DecodedAuthzSegment>> {
+    if target_revision == 0 {
+        return Ok(None);
+    }
+    if let Some(segment) =
+        read_authz_tuple_segment_at_revision(storage, tenant_id, target_revision).await?
+    {
+        if authz_segment_covers_revision(&segment, target_revision) {
+            return Ok(Some(segment));
+        }
+    }
+
+    let catchup_lock = authz_segment_catchup_lock(tenant_id)?;
+    let _guard = catchup_lock.lock().await;
+
+    if let Some(segment) =
+        read_authz_tuple_segment_at_revision(storage, tenant_id, target_revision).await?
+    {
+        if authz_segment_covers_revision(&segment, target_revision) {
+            return Ok(Some(segment));
+        }
+    }
+
+    let latest_revision = authz_journal::latest_authz_revision(storage, tenant_id).await?;
+    let latest_revision = u64::try_from(latest_revision.max(0))
+        .context("latest authz revision exceeds supported range")?;
+    if latest_revision < target_revision {
+        bail!("AuthzCandidateSetStale");
+    }
+
+    let source_fence_token =
+        authz_journal::latest_authz_journal_fence_token(storage, tenant_id).await?;
+    authz_journal::materialize_authz_tuple_segment_at_revision(
+        storage,
+        tenant_id,
+        target_revision,
+        source_fence_token,
+    )
+    .await?;
+
+    let Some(segment) =
+        read_authz_tuple_segment_at_revision(storage, tenant_id, target_revision).await?
+    else {
+        bail!("AuthzCandidateSetStale");
+    };
+    if !authz_segment_covers_revision(&segment, target_revision) {
+        bail!("AuthzCandidateSetStale");
+    }
+    Ok(Some(segment))
+}
+
+fn authz_segment_covers_revision(segment: &DecodedAuthzSegment, target_revision: u64) -> bool {
+    segment.header.generation == target_revision
+        && segment
+            .records
+            .iter()
+            .all(|record| u64::try_from(record.revision.max(0)).unwrap_or(0) <= target_revision)
 }
 
 pub fn decode_authz_tuple_segment(bytes: &[u8]) -> Result<DecodedAuthzSegment> {
@@ -601,6 +741,39 @@ async fn authz_writer_tables(
     generation: u64,
     source_fence_token: u64,
 ) -> Result<Vec<WriterBodyTable>> {
+    let active_records = active_tuple_records(records);
+    let schema_rows = schema_descriptor_rows(storage, tenant_id, &active_records).await?;
+    let bound_relation_rule_rows =
+        bound_relation_rule_rows(storage, tenant_id, &active_records).await?;
+    let relation_rule_rows =
+        all_relation_rule_rows(storage, tenant_id, &bound_relation_rule_rows).await?;
+    authz_writer_tables_with_rows(
+        storage,
+        tenant_id,
+        records,
+        derived_usersets,
+        segment_records,
+        generation,
+        source_fence_token,
+        &schema_rows,
+        &relation_rule_rows,
+        &bound_relation_rule_rows,
+    )
+    .await
+}
+
+async fn authz_writer_tables_with_rows(
+    storage: &Storage,
+    tenant_id: i64,
+    records: &[AuthzTupleRecord],
+    derived_usersets: &[AuthzDerivedUsersetEntry],
+    segment_records: &[SegmentRecord],
+    generation: u64,
+    source_fence_token: u64,
+    schema_rows: &[AuthzSchemaDescriptorRow],
+    relation_rule_rows: &[AuthzRelationRuleRow],
+    bound_relation_rule_rows: &[AuthzRelationRuleRow],
+) -> Result<Vec<WriterBodyTable>> {
     let tuple_rows = segment_records
         .iter()
         .map(|record| TableRow {
@@ -609,11 +782,6 @@ async fn authz_writer_tables(
         })
         .collect::<Vec<_>>();
     let active_records = active_tuple_records(records);
-    let schema_rows = schema_descriptor_rows(storage, tenant_id, &active_records).await?;
-    let bound_relation_rule_rows =
-        bound_relation_rule_rows(storage, tenant_id, &active_records).await?;
-    let relation_rule_rows =
-        all_relation_rule_rows(storage, tenant_id, &bound_relation_rule_rows).await?;
     let current = tuple_view_from_active_records(&active_records);
     let userset_edge_rows = userset_edge_rows(&active_records, derived_usersets, generation)?;
     let list_object_rows = list_object_rows(
@@ -651,7 +819,7 @@ async fn authz_writer_tables(
         (
             TABLE_AUTHZ_SCHEMA_DESCRIPTOR,
             table_rows_from(
-                schema_rows,
+                schema_rows.to_vec(),
                 schema_descriptor_key,
                 encode_schema_descriptor_row,
             )?,
@@ -660,7 +828,7 @@ async fn authz_writer_tables(
         (
             TABLE_AUTHZ_RELATION_RULE,
             table_rows_from(
-                relation_rule_rows,
+                relation_rule_rows.to_vec(),
                 relation_rule_key,
                 encode_relation_rule_row,
             )?,
@@ -1605,21 +1773,18 @@ impl AuthzSegmentCandidateReader {
 impl AuthzCandidateReader for AuthzSegmentCandidateReader {
     async fn candidate_set(&self, request: AuthzCandidateRequest) -> Result<CandidateSet> {
         let scope = request.candidate_scope.clone();
-        let Some(segment) = read_latest_authz_tuple_segment(&self.storage, self.tenant_id).await?
+        let Some(segment) =
+            ensure_authz_tuple_segment_at_revision(&self.storage, self.tenant_id, request.revision)
+                .await?
         else {
-            if request.revision > 0 {
-                bail!("AuthzCandidateSetStale");
-            }
             return Ok(CandidateSet::empty(scope));
         };
-        if segment.header.generation != request.revision {
-            bail!("AuthzCandidateSetStale");
-        }
         let requested_revision = request.revision;
         let subject = parse_authz_candidate_subject(&request.subject);
         let partition_id = request.partition_id;
         let mut ordinals = Vec::new();
-        for row in segment.list_objects {
+        let rows = segment.list_objects;
+        for row in &rows {
             if row.revision > requested_revision
                 || row.namespace != request.object_namespace
                 || row.relation != request.relation
@@ -1643,11 +1808,10 @@ impl AuthzCandidateReader for AuthzSegmentCandidateReader {
         request: AuthzCandidateRequest,
         object_keys: Vec<ObjectAuthzKey>,
     ) -> Result<Vec<AuthzDecision>> {
-        let Some(segment) = read_latest_authz_tuple_segment(&self.storage, self.tenant_id).await?
+        let Some(segment) =
+            ensure_authz_tuple_segment_at_revision(&self.storage, self.tenant_id, request.revision)
+                .await?
         else {
-            if request.revision > 0 {
-                bail!("AuthzCandidateSetStale");
-            }
             return Ok(object_keys
                 .into_iter()
                 .map(|object_key| AuthzDecision {
@@ -1657,9 +1821,6 @@ impl AuthzCandidateReader for AuthzSegmentCandidateReader {
                 })
                 .collect());
         };
-        if segment.header.generation != request.revision {
-            bail!("AuthzCandidateSetStale");
-        }
         let requested_revision = request.revision;
         let subject = parse_authz_candidate_subject(&request.subject);
         let allowed = segment
@@ -1724,145 +1885,4 @@ fn bitmap_candidate_set(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::Utc;
-    use tempfile::tempdir;
-
-    fn record(revision: i64, operation: &str) -> AuthzTupleRecord {
-        AuthzTupleRecord {
-            revision,
-            revision_ordinal: 0,
-            tenant_id: 7,
-            namespace: "document".to_string(),
-            object_id: "alpha".to_string(),
-            relation: "viewer".to_string(),
-            subject_kind: "user".to_string(),
-            subject_id: "alice".to_string(),
-            caveat_hash: String::new(),
-            operation: operation.to_string(),
-            written_by: "node".to_string(),
-            reason: "test".to_string(),
-            mutation_id: uuid::Uuid::new_v4(),
-            record_hash: hex::encode(hash32(format!("record-{revision}").as_bytes())),
-            written_at: Utc::now(),
-        }
-    }
-
-    fn tuple_record(revision: i64, object_id: &str, subject_id: &str) -> AuthzTupleRecord {
-        AuthzTupleRecord {
-            object_id: object_id.to_string(),
-            subject_id: subject_id.to_string(),
-            ..record(revision, "add")
-        }
-    }
-
-    fn test_hash(ch: char) -> String {
-        format!("blake3:{}", ch.to_string().repeat(64))
-    }
-
-    #[tokio::test]
-    async fn authz_tuple_segment_uses_exact_binary_records() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let records = vec![record(2, "remove"), record(1, "add")];
-        let segment_ref = write_authz_tuple_segment(&storage, 7, &records)
-            .await
-            .unwrap();
-        assert_eq!(
-            segment_ref,
-            "authz_tuple_segment:tenant:7:generation:00000000000000000002"
-        );
-
-        let decoded = read_latest_authz_tuple_segment(&storage, 7)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(decoded.header.partition_family, "authz_tuple");
-        assert_eq!(decoded.records.len(), 2);
-        assert_eq!(decoded.records[0].revision, 1);
-        assert_eq!(decoded.records[1].operation, "remove");
-
-        let latest = read_latest_authz_tuple_segment(&storage, 7)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(latest.records.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn authz_tuple_segment_candidate_reader_returns_revision_scoped_doc_ids() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let records = vec![
-            tuple_record(1, "alpha", "alice"),
-            tuple_record(2, "beta", "bob"),
-            tuple_record(3, "gamma", "alice"),
-        ];
-        write_authz_tuple_segment(&storage, 7, &records)
-            .await
-            .unwrap();
-
-        let scope = CandidateSetScope {
-            root_key_hash: test_hash('0'),
-            root_generation: 9,
-            index_id: "index:documents".to_string(),
-            index_generation: 4,
-            authz_realm_id: "tenant:7".to_string(),
-            authz_scope_hash: test_hash('1'),
-            authz_object_namespace: "document".to_string(),
-            authz_relation: "viewer".to_string(),
-            authz_principal_hash: test_hash('2'),
-            authz_revision: 3,
-            boundary_schema_generation_hash: test_hash('3'),
-            predicate_hash: test_hash('4'),
-            order_hash: test_hash('5'),
-        };
-        let reader = AuthzSegmentCandidateReader::new(storage.clone(), 7);
-        let partition_id = 44;
-        let request = AuthzCandidateRequest {
-            authz_scope: "tenant:7".to_string(),
-            candidate_scope: scope,
-            partition_id,
-            subject: "user:alice".to_string(),
-            relation: "viewer".to_string(),
-            object_namespace: "document".to_string(),
-            revision: 3,
-            system_revision: 0,
-            root_generation: 9,
-        };
-
-        let candidates = reader.candidate_set(request.clone()).await.unwrap();
-        assert!(candidates.contains_doc_id(
-            ObjectAuthzKey::realm_object("document", "alpha").doc_id(partition_id)
-        ));
-        assert!(candidates.contains_doc_id(
-            ObjectAuthzKey::realm_object("document", "gamma").doc_id(partition_id)
-        ));
-        assert!(!candidates.contains_doc_id(
-            ObjectAuthzKey::realm_object("document", "beta").doc_id(partition_id)
-        ));
-
-        let decisions = reader
-            .verify_page(
-                request.clone(),
-                vec![
-                    ObjectAuthzKey::realm_object("document", "alpha"),
-                    ObjectAuthzKey::realm_object("document", "beta"),
-                ],
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            decisions
-                .iter()
-                .map(|decision| decision.allowed)
-                .collect::<Vec<_>>(),
-            vec![true, false]
-        );
-
-        let mut stale = request;
-        stale.revision = 4;
-        assert!(reader.candidate_set(stale).await.is_err());
-    }
-}
+mod tests;
