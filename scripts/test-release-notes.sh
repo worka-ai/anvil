@@ -20,11 +20,11 @@ python3 scripts/render-release-notes.py --tag v9.9.9 --blog-dir "$scratch/blog" 
 grep -q 'Release body.' "$scratch/notes.md"
 grep -q 'sha256:test' "$scratch/notes.md"
 grep -q 'anvil-storage 9.9.9' "$scratch/notes.md"
-if python3 scripts/render-release-notes.py --tag v0.0.0 --blog-dir "$scratch/blog" >/tmp/anvil-release-missing.out 2>&1; then
+if python3 scripts/render-release-notes.py --tag v0.0.0 --blog-dir "$scratch/blog" >"$scratch/anvil-release-missing.out" 2>&1; then
   echo 'missing blog should fail' >&2
   exit 1
 fi
-grep -q 'no release blog post found for v0.0.0' /tmp/anvil-release-missing.out
+grep -q 'no release blog post found for v0.0.0' "$scratch/anvil-release-missing.out"
 cat > "$scratch/blog/bad-artifacts.md" <<'MD'
 ---
 title: "Anvil v9.9.8: Bad"
@@ -37,11 +37,11 @@ artifacts:
 
 # Bad release
 MD
-if python3 scripts/render-release-notes.py --tag v9.9.8 --blog-dir "$scratch/blog" >/tmp/anvil-release-bad-artifacts.out 2>&1; then
+if python3 scripts/render-release-notes.py --tag v9.9.8 --blog-dir "$scratch/blog" >"$scratch/anvil-release-bad-artifacts.out" 2>&1; then
   echo 'wrong artifact version should fail' >&2
   exit 1
 fi
-grep -q 'docker image must end with :v9.9.8' /tmp/anvil-release-bad-artifacts.out
+grep -q 'docker image must end with :v9.9.8' "$scratch/anvil-release-bad-artifacts.out"
 cat > "$scratch/blog/bad-crate.md" <<'MD'
 ---
 title: "Anvil v9.9.7: Bad"
@@ -54,8 +54,8 @@ artifacts:
 
 # Bad release
 MD
-if python3 scripts/render-release-notes.py --tag v9.9.7 --blog-dir "$scratch/blog" >/tmp/anvil-release-bad-crate.out 2>&1; then
+if python3 scripts/render-release-notes.py --tag v9.9.7 --blog-dir "$scratch/blog" >"$scratch/anvil-release-bad-crate.out" 2>&1; then
   echo 'wrong crate version should fail' >&2
   exit 1
 fi
-grep -q 'rust_crate artifact must end with version 9.9.7' /tmp/anvil-release-bad-crate.out
+grep -q 'rust_crate artifact must end with version 9.9.7' "$scratch/anvil-release-bad-crate.out"
