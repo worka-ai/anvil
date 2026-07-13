@@ -185,11 +185,18 @@ impl CoreStore {
             })
             .collect::<Vec<_>>();
         self.commit_coremeta_batch_by_embedded_roots(
-            &format!("boundary-values:{bucket}:{object_ref}"),
+            &Self::boundary_values_transaction_id(bucket, object_ref),
             &ops,
         )
         .await?;
         Ok(())
+    }
+
+    fn boundary_values_transaction_id(bucket: &str, object_ref: &str) -> String {
+        format!(
+            "boundary-values:{bucket}:{}",
+            sha256_hex(object_ref.as_bytes())
+        )
     }
 
     fn read_latest_boundary_schema_unlocked(

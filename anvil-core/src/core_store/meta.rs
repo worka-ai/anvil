@@ -1643,7 +1643,7 @@ fn expected_schema_markers(table_id: u16) -> Option<&'static [&'static str]> {
         TABLE_INDEX_ROW => Some(&["anvil.coremeta.index_segment_row.v1"]),
         TABLE_DERIVED_INDEX_PROOF_ROW => Some(&["anvil.coremeta.derived_index_proof.v1"]),
         TABLE_BOUNDARY_SCHEMA_ROW => Some(&["anvil.core.boundary_schema.v1"]),
-        TABLE_BOUNDARY_VALUE_ROW => Some(&["anvil.core.boundary_value.v1"]),
+        TABLE_BOUNDARY_VALUE_ROW => Some(&["anvil.core.boundary_value_row.v1"]),
         TABLE_BOUNDARY_MIGRATION_ROW => Some(&["anvil.boundary_migration.v1"]),
         TABLE_AUTHZ_SCHEMA_ROW | TABLE_AUTHZ_TUPLE_PAGE_ROW => Some(&[
             "anvil.authz.coremeta_payload_row.v1",
