@@ -505,11 +505,21 @@ fn rfc_0007_conformance_audit_s3_gateway_object_link_tests_are_corestore_backed(
         "S3 large object CoreStore backing test",
         &large_object_test,
         &[
-            "test_s3_large_object_uses_corestore_ref_and_ranges_across_large_object",
+            "test_s3_large_object_ranges_across_docker_cluster",
             ".put_object()",
+            "S3 range GET across large CoreStore-backed object should succeed",
+        ],
+    );
+
+    let native_object_test = read_workspace_file("anvil/tests/object_tests/reserved_head_core.rs");
+    assert_source_contains_all(
+        "native object CoreStore target test",
+        &native_object_test,
+        &[
+            "test_object_payloads_are_corestore_backed_and_readable",
             "shard_map",
             "\"anvil.core.object_data_target.v1\"",
-            "S3 range GET across large CoreStore-backed object should succeed",
+            "external object should record a CoreStore object data target",
         ],
     );
 

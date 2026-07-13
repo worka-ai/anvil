@@ -4,6 +4,7 @@ use crate::formats::{
     hash32,
     writer::{WriterFamily, canonical_logical_file_id},
 };
+use futures_util::{StreamExt, stream::FuturesUnordered};
 
 fn core_store_instance_registry_key(storage: &Storage) -> PathBuf {
     storage.core_store_root_path()
@@ -72,6 +73,7 @@ impl CoreStore {
             storage,
             meta,
             write_lock,
+            internal_channels: Arc::new(Mutex::new(BTreeMap::new())),
             pipeline_keyring,
             storage_classes,
             node_signing_keypair,
@@ -252,6 +254,24 @@ impl CoreStore {
             &storage_class.byte_profile.compression,
             "none",
             WriterFamily::ObjectBlob.as_str(),
+            storage_class.inline_payload_policy,
+        )
+        .await
+    }
+
+    pub(crate) async fn put_format_blob(
+        &self,
+        input: PutBlob,
+        writer_family: WriterFamily,
+    ) -> Result<CoreObjectRef> {
+        let storage_class = self.default_storage_class()?.clone();
+        let profile = local_erasure_profile_from_byte_profile(&storage_class.byte_profile)?;
+        self.put_blob_with_profile_and_encoding_policy(
+            input,
+            profile,
+            &storage_class.byte_profile.compression,
+            "none",
+            writer_family.as_str(),
             storage_class.inline_payload_policy,
         )
         .await
@@ -656,29 +676,34 @@ impl CoreStore {
             placement_started_at.elapsed(),
         );
         record_corestore_trace_event("placement.plan", "ok");
-        let mut object_placements = Vec::with_capacity(shards.len());
-        let mut stripe_size = 0u64;
-
+        let stripe_size = shards
+            .iter()
+            .map(|shard| (shard.len() as u64).saturating_mul(profile.data_shards as u64))
+            .max()
+            .unwrap_or(0);
+        let block_id_ref = block_id.as_str();
+        let boundary_summary_hash_ref = boundary_summary_hash.as_str();
+        let boundary_values_b64_ref = boundary_values_b64.as_str();
+        let mut shard_writes = FuturesUnordered::new();
         for (shard_index, shard) in shards.iter().enumerate() {
             let placement = placements.get(shard_index).ok_or_else(|| {
                 anyhow!("CoreStore missing local placement for shard {shard_index}")
             })?;
             let shard_hash = format!("sha256:{}", sha256_hex(shard));
             let logical_offset = shard_index as u64 * shard.len() as u64;
-            stripe_size =
-                stripe_size.max((shard.len() as u64).saturating_mul(profile.data_shards as u64));
-            object_placements.push(
-                self.write_shard_to_placement(WriteShardToPlacement {
+            shard_writes.push(async move {
+                let written = self
+                    .write_shard_to_placement(WriteShardToPlacement {
                     logical_file_id,
-                    block_id: &block_id,
+                    block_id: block_id_ref,
                     shard_index: shard_index as u16,
                     shard,
                     shard_hash: &shard_hash,
                     logical_offset,
                     profile,
                     placement,
-                    boundary_summary_hash: &boundary_summary_hash,
-                    boundary_values_b64: &boundary_values_b64,
+                    boundary_summary_hash: boundary_summary_hash_ref,
+                    boundary_values_b64: boundary_values_b64_ref,
                     mutation_id,
                     encryption_algorithm,
                     writer_family,
@@ -687,11 +712,18 @@ impl CoreStore {
                 .with_context(|| {
                     format!(
                         "write CoreStore shard logical_file_id={} block_id={} shard_index={} node_id={}",
-                        logical_file_id, block_id, shard_index, placement.node_id
+                        logical_file_id, block_id_ref, shard_index, placement.node_id
                     )
-                })?,
-            );
+                })?;
+                Ok::<_, anyhow::Error>(written)
+            });
         }
+        let mut object_placements = Vec::with_capacity(shards.len());
+        while let Some(result) = shard_writes.next().await {
+            object_placements.push(result?);
+        }
+        drop(shard_writes);
+        object_placements.sort_by_key(|placement| placement.shard_index);
 
         let object_ref = CoreObjectRef {
             hash: object_hash.to_string(),

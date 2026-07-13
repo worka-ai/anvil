@@ -1,7 +1,7 @@
 use super::local_transactions::{
     transaction_lists_stream_record, validate_core_meta_row_precondition,
 };
-use super::local_tx_rows::{OwnedCoreMetaBatchOp, borrow_owned_coremeta_batch_ops};
+use super::local_tx_rows::OwnedCoreMetaBatchOp;
 use super::*;
 
 impl CoreStore {
@@ -167,57 +167,50 @@ impl CoreStore {
             .await
     }
 
-    pub(super) async fn apply_coremeta_put_update_unlocked(
+    pub(super) fn prepare_coremeta_put_update_unlocked(
         &self,
         cf: &str,
         table_id: u16,
         tuple_key: &[u8],
         payload: &[u8],
-    ) -> Result<CoreTransactionUpdate> {
+    ) -> Result<(OwnedCoreMetaBatchOp, CoreTransactionUpdate)> {
         validate_coremeta_operation_payload(cf, table_id, tuple_key, payload)?;
         let cf = canonical_coremeta_cf_name(cf)?;
         let previous_payload_hash = self
             .committed_coremeta_payload_unlocked(cf, table_id, tuple_key)?
             .map(|payload| core_meta_payload_digest(table_id, &payload));
         let payload_hash = core_meta_payload_digest(table_id, payload);
-        let op = CoreMetaBatchOp {
+        let op = OwnedCoreMetaBatchOp::Put {
             cf,
             table_id,
-            tuple_key,
+            tuple_key: tuple_key.to_vec(),
             common: None,
-            kind: CoreMetaBatchOpKind::Put(payload),
+            payload: payload.to_vec(),
         };
-        self.commit_coremeta_batch_by_embedded_roots(
-            &format!(
-                "coremeta-put:{}",
-                payload_hash.trim_start_matches("sha256:")
-            ),
-            &[op],
-        )
-        .await?;
-        Ok(CoreTransactionUpdate::CoreMetaPut {
+        let update = CoreTransactionUpdate::CoreMetaPut {
             cf: cf.to_string(),
             table_id,
             tuple_key: tuple_key.to_vec(),
             previous_payload_hash,
             payload: payload.to_vec(),
             payload_hash,
-        })
+        };
+        Ok((op, update))
     }
 
-    pub(super) async fn apply_coremeta_delete_update_unlocked(
+    pub(super) fn prepare_coremeta_delete_update_unlocked(
         &self,
         cf: &str,
         table_id: u16,
         tuple_key: &[u8],
-    ) -> Result<CoreTransactionUpdate> {
+        transaction_id: String,
+    ) -> Result<(OwnedCoreMetaBatchOp, CoreTransactionUpdate)> {
         validate_coremeta_operation_key(cf, table_id, tuple_key)?;
         let cf = canonical_coremeta_cf_name(cf)?;
         let current_payload = self.committed_coremeta_payload_unlocked(cf, table_id, tuple_key)?;
         let previous_payload_hash = current_payload
             .as_ref()
             .map(|payload| core_meta_payload_digest(table_id, payload));
-        let transaction_id = format!("coremeta-delete:{}", sha256_hex(tuple_key));
         let deleted_at_unix_nanos = current_unix_nanos_u64()?;
         let delete_common = current_payload
             .as_ref()
@@ -233,21 +226,19 @@ impl CoreStore {
                 })
             })
             .transpose()?;
-        let op = CoreMetaBatchOp {
+        let op = OwnedCoreMetaBatchOp::Delete {
             cf,
             table_id,
-            tuple_key,
+            tuple_key: tuple_key.to_vec(),
             common: delete_common,
-            kind: CoreMetaBatchOpKind::Delete,
         };
-        self.commit_coremeta_batch_by_embedded_roots(&transaction_id, &[op])
-            .await?;
-        Ok(CoreTransactionUpdate::CoreMetaDelete {
+        let update = CoreTransactionUpdate::CoreMetaDelete {
             cf: cf.to_string(),
             table_id,
             tuple_key: tuple_key.to_vec(),
             previous_payload_hash,
-        })
+        };
+        Ok((op, update))
     }
 
     async fn validate_explicit_transaction_stream_commits_unlocked(

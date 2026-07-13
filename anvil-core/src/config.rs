@@ -73,6 +73,11 @@ pub struct Config {
     #[arg(long, env, default_value = "")]
     pub bootstrap_system_admin_subject_id: String,
 
+    /// Node principals admitted during mesh genesis. These principals receive
+    /// only the system-realm relation required for authenticated node RPCs.
+    #[arg(long, env, use_value_delimiter = true, value_delimiter = ',')]
+    pub bootstrap_node_ids: Vec<String>,
+
     /// The current region this node is operating in.
     #[arg(long, env)]
     pub region: String,
@@ -93,8 +98,9 @@ pub struct Config {
     #[arg(long, env, default_value_t = CrossRegionRoutingPolicy::RedirectPreferred)]
     pub cross_region_routing_policy: CrossRegionRoutingPolicy,
 
-    /// Resolved stable node id loaded from CoreMeta during startup.
-    #[arg(skip)]
+    /// Stable node id. When supplied for a new volume, it becomes the persisted
+    /// identity; subsequent starts must supply the same value or omit it.
+    #[arg(long, env, default_value = "")]
     pub node_id: String,
 
     /// A list of bootstrap addresses for joining a cluster.
@@ -199,8 +205,12 @@ impl Config {
     }
 
     pub async fn with_persisted_identity(mut self) -> Result<Self> {
-        let identity =
-            crate::cluster_identity::load_or_create_cluster_identity(&self.storage_path).await?;
+        let requested_node_id = (!self.node_id.trim().is_empty()).then_some(self.node_id.as_str());
+        let identity = crate::cluster_identity::load_or_create_cluster_identity_with_node_id(
+            &self.storage_path,
+            requested_node_id,
+        )
+        .await?;
         self.node_id = identity.node_id;
 
         Ok(self)

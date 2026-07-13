@@ -36,14 +36,30 @@ pub fn cluster_peer_id(keypair: &identity::Keypair) -> PeerId {
 pub async fn load_or_create_cluster_identity(
     storage_path: impl AsRef<std::path::Path>,
 ) -> Result<ClusterIdentity> {
+    load_or_create_cluster_identity_with_node_id(storage_path, None).await
+}
+
+pub async fn load_or_create_cluster_identity_with_node_id(
+    storage_path: impl AsRef<std::path::Path>,
+    requested_node_id: Option<&str>,
+) -> Result<ClusterIdentity> {
     let storage = Storage::new_at(storage_path).await?;
     let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
     let key = cluster_identity_key()?;
     if let Some(bytes) = meta.get(CF_MESH, TABLE_NODE_SIGNING_KEYPAIR_ROW, &key)? {
-        return decode_cluster_identity(&bytes);
+        let identity = decode_cluster_identity(&bytes)?;
+        if let Some(requested_node_id) = requested_node_id
+            && identity.node_id != requested_node_id
+        {
+            bail!(
+                "configured node id {requested_node_id} does not match persisted node id {}",
+                identity.node_id
+            );
+        }
+        return Ok(identity);
     }
 
-    let node_id = generate_node_id();
+    let node_id = requested_node_id.map_or_else(generate_node_id, str::to_owned);
     let record = ClusterIdentityProto {
         common: Some(core_meta_committed_row_common(
             "system",

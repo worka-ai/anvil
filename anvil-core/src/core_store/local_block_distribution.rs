@@ -6,7 +6,6 @@ use crate::anvil_api::{
 use crate::mesh_lifecycle::{self, LifecycleState, NodeCapability};
 use futures_util::StreamExt;
 use tonic::metadata::MetadataValue;
-use tonic::transport::Endpoint;
 
 impl CoreStore {
     pub(super) async fn plan_publish_shard_placements(
@@ -66,7 +65,6 @@ impl CoreStore {
         profile: LocalErasureProfile,
     ) -> Result<Vec<LocalShardPlacement>> {
         let mut active = Vec::new();
-        let mut bootstrap = Vec::new();
         for node in mesh_lifecycle::list_node_projections_with_core_store(self, None, None)? {
             if node.mesh_id != self.node_identity.mesh_id {
                 continue;
@@ -74,7 +72,7 @@ impl CoreStore {
             if node.region != self.node_identity.region_id {
                 continue;
             }
-            if !matches!(node.state, LifecycleState::Active | LifecycleState::Joining) {
+            if node.state != LifecycleState::Active {
                 continue;
             }
             if !node.capabilities.contains(&NodeCapability::Object) {
@@ -97,24 +95,19 @@ impl CoreStore {
                 cell_weight: 100,
                 public_api_addr: node.public_api_addr,
             };
-            if node.state == LifecycleState::Active {
-                active.push(placement.clone());
-            }
-            bootstrap.push(placement);
+            active.push(placement);
         }
 
         let mut out = if active.len() >= profile.total_shards() {
             active
-        } else if bootstrap.len() >= profile.total_shards() {
-            bootstrap
-        } else if bootstrap.len() <= 1 {
+        } else if active.len() <= 1 {
             plan_local_shard_placements(profile)?
         } else {
             bail!(
                 "CoreStore placement for {} requires {} active object nodes, got {}",
                 profile.id,
                 profile.total_shards(),
-                bootstrap.len()
+                active.len()
             );
         };
         out.sort_by(|a, b| {
@@ -291,13 +284,7 @@ impl CoreStore {
                 input.placement.node_id
             )
         })?;
-        let endpoint = normalise_grpc_endpoint(&input.placement.public_api_addr)?;
-        let channel = Endpoint::from_shared(endpoint.clone())?
-            .connect()
-            .await
-            .with_context(|| format!("connect CoreStore block service at {endpoint}"))?;
-        let mut client = BlockStoreInternalClient::new(channel);
-        let mut request = tonic::Request::new(PutShardRequest {
+        let request_body = PutShardRequest {
             header: Some(self.internal_request_header("block.put_shard")?),
             logical_file_id: input.logical_file_id.to_string(),
             block_id: input.block_id.to_string(),
@@ -310,22 +297,34 @@ impl CoreStore {
             boundary_values_b64: input.boundary_values_b64.to_string(),
             writer_family: input.writer_family.to_string(),
             mutation_id: input.mutation_id.to_string(),
-        });
-        request.metadata_mut().insert(
-            "authorization",
-            MetadataValue::try_from(format!("Bearer {bearer}"))
-                .context("encode CoreStore internal bearer token")?,
-        );
-        let receipt = client
-            .put_shard(request)
+        };
+        let authorization = MetadataValue::try_from(format!("Bearer {bearer}"))
+            .context("encode CoreStore internal bearer token")?;
+        let receipt = self
+            .internal_grpc_request(
+                &input.placement.public_api_addr,
+                "put CoreStore shard",
+                move |channel| {
+                    let mut client = BlockStoreInternalClient::new(channel);
+                    let mut request = tonic::Request::new(request_body.clone());
+                    request
+                        .metadata_mut()
+                        .insert("authorization", authorization.clone());
+                    async move {
+                        client
+                            .put_shard(request)
+                            .await
+                            .map(tonic::Response::into_inner)
+                    }
+                },
+            )
             .await
             .with_context(|| {
                 format!(
                     "put CoreStore shard {}:{} to {}",
                     input.block_id, input.shard_index, input.placement.node_id
                 )
-            })?
-            .into_inner();
+            })?;
         self.placement_from_remote_receipt(input, receipt)
     }
 
@@ -363,11 +362,9 @@ impl CoreStore {
                 input.placement.node_id
             )
         })?;
-        let endpoint = normalise_grpc_endpoint(endpoint)?;
-        let channel = Endpoint::from_shared(endpoint.clone())?
-            .connect()
-            .await
-            .with_context(|| format!("connect CoreStore block service at {endpoint}"))?;
+        let channel = self
+            .internal_grpc_channel(endpoint, "CoreStore block service")
+            .await?;
         let mut client = BlockStoreInternalClient::new(channel);
         let (range_start, range_end_exclusive) = input
             .range
@@ -667,18 +664,6 @@ fn local_node_ordinal(node_id: &str) -> Option<u64> {
         .strip_prefix('-')?
         .parse()
         .ok()
-}
-
-fn normalise_grpc_endpoint(value: &str) -> Result<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        bail!("CoreStore remote endpoint is empty");
-    }
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        Ok(trimmed.to_string())
-    } else {
-        Ok(format!("http://{trimmed}"))
-    }
 }
 
 fn internal_request_payload_hash(

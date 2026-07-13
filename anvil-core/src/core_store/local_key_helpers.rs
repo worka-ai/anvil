@@ -95,6 +95,10 @@ pub(super) fn root_cache_key(root_anchor_key: &str) -> Vec<u8> {
     meta_tuple_key(&[b"root-anchor", root_anchor_key.as_bytes()])
 }
 
+pub(super) fn root_cache_hash_key(root_key_hash: &str) -> Vec<u8> {
+    meta_tuple_key(&[b"root-anchor-hash", root_key_hash.as_bytes()])
+}
+
 pub(super) fn root_anchor_generation_key(root_key_hash: &str, generation: u64) -> Vec<u8> {
     meta_tuple_key(&[
         b"root-anchor-generation",
@@ -184,6 +188,15 @@ pub(super) fn store_node_receipt_signing_public_key(
         bail!("node receipt signing public key protobuf is not canonical");
     }
     let public_key_hash = node_receipt_signing_public_key_hash(public_key_protobuf);
+    let key = node_receipt_signing_public_key_key(node_id);
+    if let Some(existing_bytes) = meta.get(CF_MESH, TABLE_NODE_SIGNING_KEYPAIR_ROW, &key)? {
+        let existing = decode_node_receipt_signing_public_key_row(node_id, &existing_bytes)?;
+        if existing.public_key_hash == public_key_hash
+            && existing.public_key_protobuf == public_key_protobuf
+        {
+            return Ok(public_key_hash);
+        }
+    }
     let updated_at_unix_nanos =
         u64::try_from(Utc::now().timestamp_nanos_opt().unwrap_or_default()).unwrap_or_default();
     let row = NodeReceiptSigningPublicKeyRowProto {
@@ -199,7 +212,6 @@ pub(super) fn store_node_receipt_signing_public_key(
         public_key_hash: public_key_hash.clone(),
         updated_at_unix_nanos,
     };
-    let key = node_receipt_signing_public_key_key(node_id);
     let bytes = encode_deterministic_proto(&row);
     meta.write_local_committed_batch(&[CoreMetaBatchOp {
         cf: CF_MESH,

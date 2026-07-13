@@ -914,6 +914,67 @@ async fn core_store_pending_mutation_finalisation_is_idempotent_for_same_record(
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_pending_mutation_finalisations_publish_one_contiguous_root_stream() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let store = Arc::new(CoreStore::new(storage).await.unwrap());
+    let mut pending = Vec::new();
+    for index in 0..8 {
+        pending.push(
+            store
+                .admit_core_mutation(
+                    "test.concurrent",
+                    "core_control",
+                    test_mutation_target(),
+                    format!("concurrent-finalisation-{index}"),
+                    Some(format!("concurrent-finalisation-key-{index}")),
+                    CorePendingMutationPayload::Inline(b"concurrent-finalisation"),
+                    Vec::new(),
+                )
+                .await
+                .unwrap(),
+        );
+    }
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(pending.len()));
+    let tasks = pending.into_iter().map(|record| {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store
+                .mark_pending_mutation_finalised_unlocked(&record, "committed")
+                .await
+        })
+    });
+    for result in futures_util::future::join_all(tasks).await {
+        result.unwrap().unwrap();
+    }
+
+    let records = store
+        .read_direct_stream_records(CORE_TRANSACTION_STREAM_ID)
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 8);
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>(),
+        (1..=8).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        store
+            .read_latest_root_anchor(core_transaction_root_anchor_key())
+            .await
+            .unwrap()
+            .expect("concurrent finalisation root anchor")
+            .root_generation,
+        8
+    );
+}
+
 #[tokio::test]
 async fn core_store_pending_mutation_checkpoint_preserves_high_watermark_when_prefix_is_unfinalised()
  {

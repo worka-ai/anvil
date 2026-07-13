@@ -5,8 +5,10 @@ use crate::anvil_api::{
     core_meta_replication_internal_client::CoreMetaReplicationInternalClient,
 };
 use crate::mesh_lifecycle::{self, LifecycleState, NodeCapability};
+use futures_util::StreamExt;
 use tonic::metadata::MetadataValue;
-use tonic::transport::Endpoint;
+
+const COREMETA_ROOT_COMMIT_CONCURRENCY: usize = 16;
 
 #[derive(Debug, Clone)]
 pub(crate) struct CoreMetaQuorumCommitOutcome {
@@ -79,20 +81,24 @@ impl CoreStore {
             self.write_coremeta_encoded_rows(&borrowed)?;
         }
 
-        let mut outcomes = Vec::new();
-        for ((root_key_hash, post_root_generation), rows) in replicated_rows {
-            let expected_root_generation = post_root_generation.saturating_sub(1);
-            let outcome = self
-                .commit_coremeta_encoded_rows_for_root(
+        let outcomes = futures_util::stream::iter(replicated_rows.into_iter().map(
+            |((root_key_hash, post_root_generation), rows)| async move {
+                let expected_root_generation = post_root_generation.saturating_sub(1);
+                self.commit_coremeta_encoded_rows_for_root(
                     &root_key_hash,
                     expected_root_generation,
                     post_root_generation,
                     transaction_id,
                     rows,
                 )
-                .await?;
-            outcomes.push(outcome);
-        }
+                .await
+            },
+        ))
+        .buffer_unordered(COREMETA_ROOT_COMMIT_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
         Ok(outcomes)
     }
 
@@ -133,32 +139,38 @@ impl CoreStore {
             "coremeta.commit_for_root select_coremeta_replicas",
             select_started_at.elapsed(),
         );
+        let prepare_started_at = Instant::now();
+        let mut prepare_results = replicas
+            .iter()
+            .map(|replica| async {
+                let result = if replica.is_local || replica.public_api_addr.trim().is_empty() {
+                    self.replicate_coremeta_batch_locally(
+                        replica,
+                        root_key_hash,
+                        expected_root_generation,
+                        post_root_generation,
+                        transaction_id,
+                        &pending_hash,
+                        &rows,
+                    )
+                } else {
+                    self.replicate_coremeta_batch_remotely(
+                        replica,
+                        root_key_hash,
+                        expected_root_generation,
+                        post_root_generation,
+                        transaction_id,
+                        &pending_hash,
+                        &rows,
+                    )
+                    .await
+                };
+                (replica.node_id.clone(), result)
+            })
+            .collect::<futures_util::stream::FuturesUnordered<_>>();
         let mut prepare_receipts = Vec::new();
         let mut prepare_errors = Vec::new();
-        let prepare_started_at = Instant::now();
-        for replica in &replicas {
-            let result = if replica.is_local || replica.public_api_addr.trim().is_empty() {
-                self.replicate_coremeta_batch_locally(
-                    replica,
-                    root_key_hash,
-                    expected_root_generation,
-                    post_root_generation,
-                    transaction_id,
-                    &pending_hash,
-                    &rows,
-                )
-            } else {
-                self.replicate_coremeta_batch_remotely(
-                    replica,
-                    root_key_hash,
-                    expected_root_generation,
-                    post_root_generation,
-                    transaction_id,
-                    &pending_hash,
-                    &rows,
-                )
-                .await
-            };
+        while let Some((node_id, result)) = prepare_results.next().await {
             match result.and_then(|receipt| {
                 self.verify_internal_core_receipt_signature(
                     &receipt.replica_node_id,
@@ -168,9 +180,13 @@ impl CoreStore {
                 Ok(receipt)
             }) {
                 Ok(receipt) => prepare_receipts.push(receipt),
-                Err(error) => prepare_errors.push(format!("{}: {error}", replica.node_id)),
+                Err(error) => prepare_errors.push(format!("{node_id}: {error}")),
+            }
+            if prepare_receipts.len() >= profile.prepare_quorum {
+                break;
             }
         }
+        drop(prepare_results);
         if prepare_receipts.len() < profile.prepare_quorum {
             record_corestore_trace_event("coremeta.replicate_pending", "quorum_failed");
             record_corestore_trace_event("coremeta.quorum_wait", "quorum_failed");
@@ -238,26 +254,32 @@ impl CoreStore {
             pending_batch_hash: pending_hash,
             committed_row_hashes: row_hashes,
         })?;
+        let persist_started_at = Instant::now();
+        let mut persist_results = replicas
+            .iter()
+            .map(|replica| async {
+                let result = if replica.is_local || replica.public_api_addr.trim().is_empty() {
+                    self.persist_coremeta_certificate_locally(
+                        replica,
+                        &certificate,
+                        &committed_hash,
+                        &rows,
+                    )
+                } else {
+                    self.persist_coremeta_certificate_remotely(
+                        replica,
+                        &certificate,
+                        &committed_hash,
+                        &rows,
+                    )
+                    .await
+                };
+                (replica.node_id.clone(), result)
+            })
+            .collect::<futures_util::stream::FuturesUnordered<_>>();
         let mut persist_receipts = Vec::new();
         let mut persist_errors = Vec::new();
-        let persist_started_at = Instant::now();
-        for replica in &replicas {
-            let result = if replica.is_local || replica.public_api_addr.trim().is_empty() {
-                self.persist_coremeta_certificate_locally(
-                    replica,
-                    &certificate,
-                    &committed_hash,
-                    &rows,
-                )
-            } else {
-                self.persist_coremeta_certificate_remotely(
-                    replica,
-                    &certificate,
-                    &committed_hash,
-                    &rows,
-                )
-                .await
-            };
+        while let Some((node_id, result)) = persist_results.next().await {
             match result.and_then(|receipt| {
                 self.verify_internal_core_receipt_signature(
                     &receipt.replica_node_id,
@@ -267,9 +289,13 @@ impl CoreStore {
                 Ok(receipt)
             }) {
                 Ok(receipt) => persist_receipts.push(receipt),
-                Err(error) => persist_errors.push(format!("{}: {error}", replica.node_id)),
+                Err(error) => persist_errors.push(format!("{node_id}: {error}")),
+            }
+            if persist_receipts.len() >= profile.certificate_persist_quorum {
+                break;
             }
         }
+        drop(persist_results);
         if persist_receipts.len() < profile.certificate_persist_quorum {
             record_corestore_trace_event("coremeta.persist_commit_certificate", "quorum_failed");
             record_corestore_trace_event("coremeta.quorum_wait", "quorum_failed");
@@ -430,7 +456,6 @@ impl CoreStore {
     ) -> Result<Vec<LocalShardPlacement>> {
         let nodes = mesh_lifecycle::list_node_projections_with_core_store(self, None, None)?;
         let mut active_candidates = Vec::new();
-        let mut bootstrap_candidates = Vec::new();
         for node in nodes {
             if node.mesh_id != self.node_identity.mesh_id {
                 continue;
@@ -438,7 +463,7 @@ impl CoreStore {
             if node.region != self.node_identity.region_id {
                 continue;
             }
-            if !matches!(node.state, LifecycleState::Active | LifecycleState::Joining) {
+            if node.state != LifecycleState::Active {
                 continue;
             }
             if !node.capabilities.contains(&NodeCapability::Metadata) {
@@ -462,18 +487,13 @@ impl CoreStore {
                 cell_weight: 100,
                 public_api_addr: node.public_api_addr,
             };
-            if node.state == LifecycleState::Active {
-                active_candidates.push(placement.clone());
-            }
-            bootstrap_candidates.push(placement);
+            active_candidates.push(placement);
         }
-        if active_candidates.len() >= prepare_quorum {
-            Self::sort_coremeta_candidates(&mut active_candidates);
-            Ok(active_candidates)
-        } else {
-            Self::sort_coremeta_candidates(&mut bootstrap_candidates);
-            Ok(bootstrap_candidates)
+        Self::sort_coremeta_candidates(&mut active_candidates);
+        if active_candidates.len() < prepare_quorum {
+            return Ok(Vec::new());
         }
+        Ok(active_candidates)
     }
 
     fn sort_coremeta_candidates(candidates: &mut [LocalShardPlacement]) {
@@ -538,13 +558,7 @@ impl CoreStore {
                 replica.node_id
             )
         })?;
-        let endpoint = normalise_grpc_endpoint(&replica.public_api_addr)?;
-        let channel = Endpoint::from_shared(endpoint.clone())?
-            .connect()
-            .await
-            .with_context(|| format!("connect CoreMeta replica at {endpoint}"))?;
-        let mut client = CoreMetaReplicationInternalClient::new(channel);
-        let mut request = tonic::Request::new(CoreMetaBatchRequest {
+        let request_body = CoreMetaBatchRequest {
             header: Some(self.internal_request_header("coremeta.replicate_pending_batch")?),
             root_key_hash: root_key_hash.to_string(),
             expected_root_generation,
@@ -553,24 +567,29 @@ impl CoreStore {
             visibility_state: "pending".to_string(),
             mutations: rows_to_api_mutations(rows),
             pending_batch_hash: pending_batch_hash_value.to_string(),
-        });
-        request.metadata_mut().insert(
-            "authorization",
-            MetadataValue::try_from(format!("Bearer {bearer}"))
-                .context("encode CoreMeta internal bearer token")?,
-        );
-        let receipt = client
-            .replicate_pending_batch(request)
+        };
+        let authorization = MetadataValue::try_from(format!("Bearer {bearer}"))
+            .context("encode CoreMeta internal bearer token")?;
+        let receipt = self
+            .internal_grpc_request(
+                &replica.public_api_addr,
+                "replicate CoreMeta batch",
+                move |channel| {
+                    let mut client = CoreMetaReplicationInternalClient::new(channel);
+                    let mut request = tonic::Request::new(request_body.clone());
+                    request
+                        .metadata_mut()
+                        .insert("authorization", authorization.clone());
+                    async move {
+                        client
+                            .replicate_pending_batch(request)
+                            .await
+                            .map(tonic::Response::into_inner)
+                    }
+                },
+            )
             .await
-            .map_err(|status| {
-                anyhow!(
-                    "replicate CoreMeta batch to {} failed: code={:?} message={}",
-                    replica.node_id,
-                    status.code(),
-                    status.message()
-                )
-            })?
-            .into_inner();
+            .with_context(|| format!("replicate CoreMeta batch to {}", replica.node_id))?;
         api_prepare_receipt_to_core(receipt)
     }
 
@@ -626,35 +645,34 @@ impl CoreStore {
                 replica.node_id
             )
         })?;
-        let endpoint = normalise_grpc_endpoint(&replica.public_api_addr)?;
-        let channel = Endpoint::from_shared(endpoint.clone())?
-            .connect()
-            .await
-            .with_context(|| format!("connect CoreMeta replica at {endpoint}"))?;
-        let mut client = CoreMetaReplicationInternalClient::new(channel);
-        let mut request = tonic::Request::new(CoreMetaPersistCommitRequest {
+        let request_body = CoreMetaPersistCommitRequest {
             header: Some(self.internal_request_header("coremeta.persist_commit_certificate")?),
             commit_certificate: Some(core_commit_certificate_to_api(certificate)),
             committed_rows: rows_to_api_mutations(rows),
             committed_batch_hash: committed_batch_hash_value.to_string(),
-        });
-        request.metadata_mut().insert(
-            "authorization",
-            MetadataValue::try_from(format!("Bearer {bearer}"))
-                .context("encode CoreMeta internal bearer token")?,
-        );
-        let receipt = client
-            .persist_commit_certificate(request)
+        };
+        let authorization = MetadataValue::try_from(format!("Bearer {bearer}"))
+            .context("encode CoreMeta internal bearer token")?;
+        let receipt = self
+            .internal_grpc_request(
+                &replica.public_api_addr,
+                "persist CoreMeta certificate",
+                move |channel| {
+                    let mut client = CoreMetaReplicationInternalClient::new(channel);
+                    let mut request = tonic::Request::new(request_body.clone());
+                    request
+                        .metadata_mut()
+                        .insert("authorization", authorization.clone());
+                    async move {
+                        client
+                            .persist_commit_certificate(request)
+                            .await
+                            .map(tonic::Response::into_inner)
+                    }
+                },
+            )
             .await
-            .map_err(|status| {
-                anyhow!(
-                    "persist CoreMeta certificate on {} failed: code={:?} message={}",
-                    replica.node_id,
-                    status.code(),
-                    status.message()
-                )
-            })?
-            .into_inner();
+            .with_context(|| format!("persist CoreMeta certificate on {}", replica.node_id))?;
         api_persist_receipt_to_core(receipt)
     }
 }

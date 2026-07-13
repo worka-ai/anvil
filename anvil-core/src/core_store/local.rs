@@ -70,6 +70,7 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, Weak};
@@ -78,10 +79,14 @@ use tokio::fs;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+use tonic::transport::{Channel, Endpoint};
 
 const CORE_PROCESS_LOCK_RETRY_ATTEMPTS: usize = 12_000;
 const CORE_PROCESS_LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
 const CORE_CONTROL_READ_RETRY_ATTEMPTS: usize = 400;
+const CORE_INTERNAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const CORE_INTERNAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const CORE_INTERNAL_REQUEST_ATTEMPTS: usize = 4;
 const LOCAL_ERASURE_PROFILE_ID: &str = "ec-4-2";
 const LOCAL_PLACEMENT_EPOCH: u64 = 1;
 const LOCAL_SHARD_FSYNC_SEQUENCE: u64 = 1;
@@ -258,6 +263,7 @@ pub struct CoreStore {
     storage: Storage,
     meta: CoreMetaStore,
     write_lock: Arc<Mutex<()>>,
+    internal_channels: Arc<Mutex<BTreeMap<String, Channel>>>,
     pipeline_keyring: Option<Arc<CorePipelineKeyring>>,
     storage_classes: CoreStorageClassCatalog,
     node_signing_keypair: Arc<identity::Keypair>,
@@ -268,6 +274,102 @@ impl CoreStore {
     pub(crate) async fn acquire_corestore_write_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.write_lock.lock().await
     }
+
+    pub(super) async fn internal_grpc_channel(
+        &self,
+        public_api_addr: &str,
+        operation_label: &str,
+    ) -> Result<Channel> {
+        let endpoint = normalise_grpc_endpoint(public_api_addr)?;
+        if let Some(channel) = self.internal_channels.lock().await.get(&endpoint).cloned() {
+            return Ok(channel);
+        }
+
+        let channel = Endpoint::from_shared(endpoint.clone())?
+            .connect_timeout(CORE_INTERNAL_CONNECT_TIMEOUT)
+            .timeout(CORE_INTERNAL_REQUEST_TIMEOUT)
+            .connect()
+            .await
+            .with_context(|| format!("connect {operation_label} replica at {endpoint}"))?;
+        let mut channels = self.internal_channels.lock().await;
+        Ok(channels
+            .entry(endpoint)
+            .or_insert_with(|| channel.clone())
+            .clone())
+    }
+
+    pub(super) async fn internal_grpc_request<T, F, Fut>(
+        &self,
+        public_api_addr: &str,
+        operation_label: &str,
+        mut call: F,
+    ) -> Result<T>
+    where
+        F: FnMut(Channel) -> Fut,
+        Fut: Future<Output = std::result::Result<T, tonic::Status>>,
+    {
+        let endpoint = normalise_grpc_endpoint(public_api_addr)?;
+        let mut failures = Vec::new();
+        for attempt in 0..CORE_INTERNAL_REQUEST_ATTEMPTS {
+            let channel = match self
+                .internal_grpc_channel(public_api_addr, operation_label)
+                .await
+            {
+                Ok(channel) => channel,
+                Err(error) => {
+                    failures.push(format!("connect attempt {}: {error}", attempt + 1));
+                    self.internal_channels.lock().await.remove(&endpoint);
+                    if attempt + 1 < CORE_INTERNAL_REQUEST_ATTEMPTS {
+                        tokio::time::sleep(core_internal_retry_delay(attempt)).await;
+                        continue;
+                    }
+                    break;
+                }
+            };
+
+            match call(channel).await {
+                Ok(value) => return Ok(value),
+                Err(status) if retryable_internal_status(&status) => {
+                    failures.push(format!(
+                        "request attempt {}: code={:?} message={}",
+                        attempt + 1,
+                        status.code(),
+                        status.message()
+                    ));
+                    self.internal_channels.lock().await.remove(&endpoint);
+                    if attempt + 1 < CORE_INTERNAL_REQUEST_ATTEMPTS {
+                        tokio::time::sleep(core_internal_retry_delay(attempt)).await;
+                    }
+                }
+                Err(status) => {
+                    return Err(anyhow!(
+                        "{operation_label} request to {endpoint} failed: code={:?} message={}",
+                        status.code(),
+                        status.message()
+                    ));
+                }
+            }
+        }
+
+        bail!(
+            "{operation_label} request to {endpoint} failed after {CORE_INTERNAL_REQUEST_ATTEMPTS} attempts: {}",
+            failures.join("; ")
+        )
+    }
+}
+
+fn core_internal_retry_delay(attempt: usize) -> Duration {
+    Duration::from_millis(50_u64.saturating_mul(1_u64 << attempt.min(4)))
+}
+
+fn retryable_internal_status(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+    ) || (status.code() == tonic::Code::Unknown
+        && ["transport", "service was not ready", "connection"]
+            .iter()
+            .any(|needle| status.message().to_ascii_lowercase().contains(needle)))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

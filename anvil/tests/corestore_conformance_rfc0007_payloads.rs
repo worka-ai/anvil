@@ -910,12 +910,13 @@ fn feature_metadata_current_state_uses_coremeta_rows_not_legacy_refs() {
     );
 
     assert_contains_all(
-        "authz userset CoreMeta row plus logical file",
+        "authz userset CoreMeta row plus bounded format blob",
         &authz_userset,
         &[
             "TABLE_AUTHZ_TUPLE_PAGE_ROW",
             "derived_userset_index_tuple_key",
-            "write_logical_file_ref(WriteLogicalFileRequest",
+            "put_format_blob(",
+            "WriterFamily::Authz",
             "core_object_ref_target",
         ],
     );

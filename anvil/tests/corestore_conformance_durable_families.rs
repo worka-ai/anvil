@@ -162,7 +162,12 @@ fn rfc_0006_no_durable_bypass_feature_families_are_corestore_backed() {
             name: "authz_derived_index",
             source_files: &["anvil-core/src/authz_userset_index.rs"],
             required_terms: &["AuthzDerivedUsersetIndex", "write_derived_userset_index"],
-            corestore_terms: &["CoreStore", ".write_logical_file", "CoreMetaStore"],
+            corestore_terms: &[
+                "CoreStore",
+                ".put_format_blob(",
+                "WriterFamily::Authz",
+                "CoreMetaStore",
+            ],
         },
         DurableFeatureFamily {
             name: "path_index",

@@ -11,7 +11,12 @@ use tokio::sync::{Mutex, RwLock, broadcast};
 
 pub(crate) fn emit_test_timing(label: impl AsRef<str>, elapsed: Duration) {
     let label = label.as_ref();
-    if std::env::var_os("ANVIL_TEST_TIMINGS").is_some() {
+    if std::env::var("ANVIL_TEST_TIMINGS").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    }) {
         eprintln!("[timing] {label}={elapsed:?}");
     }
     if crate::perf::enabled() {

@@ -101,6 +101,19 @@ impl CoreStore {
         self.meta.scan_all_encoded_rows()
     }
 
+    /// Export the canonical cluster bootstrap state without copying this
+    /// node's private identity, runtime coordination state, or local-only
+    /// payload locators into a joining node.
+    pub fn export_portable_coremeta_bootstrap_rows(&self) -> Result<Vec<CoreMetaEncodedOwnedRow>> {
+        Ok(self
+            .export_coremeta_snapshot_rows()?
+            .into_iter()
+            .filter(|row| !is_node_local_bootstrap_row(row))
+            .filter(|row| !is_runtime_local_bootstrap_row(row))
+            .filter(|row| !contains_local_bootstrap_locator(row))
+            .collect())
+    }
+
     pub fn install_coremeta_snapshot_rows(&self, rows: &[CoreMetaEncodedOwnedRow]) -> Result<()> {
         let borrowed = rows
             .iter()
@@ -112,6 +125,23 @@ impl CoreStore {
             })
             .collect::<Vec<_>>();
         self.write_coremeta_encoded_rows(&borrowed)
+    }
+
+    pub fn install_portable_coremeta_bootstrap_rows(
+        &self,
+        rows: &[CoreMetaEncodedOwnedRow],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            bail!("portable CoreMeta bootstrap snapshot must not be empty");
+        }
+        if rows.iter().any(|row| {
+            is_node_local_bootstrap_row(row)
+                || is_runtime_local_bootstrap_row(row)
+                || contains_local_bootstrap_locator(row)
+        }) {
+            bail!("portable CoreMeta bootstrap snapshot contains node-local state");
+        }
+        self.install_coremeta_snapshot_rows(rows)
     }
 
     fn coremeta_payload_is_committed_visible(
@@ -376,4 +406,54 @@ impl CoreStore {
             certificate_persist_receipt_bytes: row.certificate_persist_receipt_bytes,
         }))
     }
+}
+
+fn is_node_local_bootstrap_row(row: &CoreMetaEncodedOwnedRow) -> bool {
+    if row.cf != CF_MESH || encoded_coremeta_table_id(row) != Some(TABLE_NODE_SIGNING_KEYPAIR_ROW) {
+        return false;
+    }
+    let Ok(tuple_key) = crate::core_store::core_meta_record_tuple_key(&row.core_meta_key) else {
+        return false;
+    };
+    let local_tuples = [
+        core_meta_tuple_key(&[CoreMetaTuplePart::Raw(b"node-signing-keypair")]),
+        core_meta_tuple_key(&[
+            CoreMetaTuplePart::Utf8("cluster-identity"),
+            CoreMetaTuplePart::Utf8("local"),
+        ]),
+    ];
+    local_tuples
+        .iter()
+        .filter_map(|result| result.as_ref().ok())
+        .any(|local_tuple| tuple_key == local_tuple.as_slice())
+}
+
+fn is_runtime_local_bootstrap_row(row: &CoreMetaEncodedOwnedRow) -> bool {
+    row.cf == CF_LEASES_FENCES
+        || matches!(
+            (row.cf.as_str(), encoded_coremeta_table_id(row)),
+            (CF_MATERIALISATION, Some(TABLE_MATERIALISATION_CURSOR_ROW))
+                | (
+                    CF_MATERIALISATION,
+                    Some(crate::core_store::TABLE_WRITER_SEGMENT_ROW)
+                )
+        )
+}
+
+fn contains_local_bootstrap_locator(row: &CoreMetaEncodedOwnedRow) -> bool {
+    if row.cf == CF_ROOT_CACHE {
+        return false;
+    }
+    [b"local-node".as_slice(), b"local-control-node".as_slice()]
+        .into_iter()
+        .any(|needle| {
+            row.value_envelope
+                .windows(needle.len())
+                .any(|window| window == needle)
+        })
+}
+
+fn encoded_coremeta_table_id(row: &CoreMetaEncodedOwnedRow) -> Option<u16> {
+    (row.core_meta_key.len() >= 3)
+        .then(|| u16::from_le_bytes([row.core_meta_key[1], row.core_meta_key[2]]))
 }

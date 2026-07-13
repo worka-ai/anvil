@@ -1,4 +1,5 @@
 use super::*;
+use futures_util::{StreamExt, stream::FuturesUnordered};
 
 impl CoreStore {
     pub async fn get_blob(&self, input: GetBlob) -> Result<Vec<u8>> {
@@ -77,6 +78,11 @@ impl CoreStore {
         let manifest_boundary_values_b64 = encode_boundary_values_b64(&manifest.boundary_values)?;
         let total_shards = data_shards + parity_shards;
         let mut shards = vec![None; total_shards];
+        let mut shard_failures = Vec::new();
+        let mut pending_reads = FuturesUnordered::new();
+        let block_id = manifest.encoding.block_id.as_str();
+        let boundary_summary_hash = manifest_boundary_summary_hash.as_str();
+        let boundary_values_b64 = manifest_boundary_values_b64.as_str();
         for placement in &manifest.placements {
             self.verify_object_placement_receipt(
                 &manifest.encoding.block_id,
@@ -92,42 +98,39 @@ impl CoreStore {
                     total_shards
                 );
             }
-            let block_read_started_at = Instant::now();
-            let shard_bytes = match self
-                .read_shard_from_placement(ReadShardFromPlacement {
-                    block_id: &manifest.encoding.block_id,
-                    profile,
-                    placement,
-                    boundary_summary_hash: &manifest_boundary_summary_hash,
-                    boundary_values_b64: &manifest_boundary_values_b64,
-                    range: None,
-                    operation: "read_blob_shard",
-                })
-                .await
-            {
-                Ok(bytes) => {
+            pending_reads.push(async move {
+                let block_read_started_at = Instant::now();
+                let result = self
+                    .read_shard_from_placement(ReadShardFromPlacement {
+                        block_id,
+                        profile,
+                        placement,
+                        boundary_summary_hash,
+                        boundary_values_b64,
+                        range: None,
+                        operation: "read_blob_shard",
+                    })
+                    .await;
+                (placement, result, block_read_started_at.elapsed())
+            });
+        }
+        while let Some((placement, result, elapsed)) = pending_reads.next().await {
+            let index = usize::from(placement.shard_index);
+            match result {
+                Ok(shard_bytes) => {
                     record_block_read_duration(
                         &placement.node_id,
                         &placement.region_id,
                         &placement.cell_id,
                         "read_blob_shard",
-                        "local",
+                        "distributed",
                         "ok",
-                        block_read_started_at.elapsed(),
+                        elapsed,
                     );
-                    bytes
-                }
-                Err(err) if is_not_found_error(&err) => {
-                    record_block_read_duration(
-                        &placement.node_id,
-                        &placement.region_id,
-                        &placement.cell_id,
-                        "read_blob_shard",
-                        "local",
-                        "missing",
-                        block_read_started_at.elapsed(),
-                    );
-                    continue;
+                    shards[index] = Some(shard_bytes);
+                    if shards.iter().filter(|shard| shard.is_some()).count() >= data_shards {
+                        break;
+                    }
                 }
                 Err(err) => {
                     record_block_read_duration(
@@ -135,27 +138,25 @@ impl CoreStore {
                         &placement.region_id,
                         &placement.cell_id,
                         "read_blob_shard",
-                        "local",
-                        "error",
-                        block_read_started_at.elapsed(),
+                        "distributed",
+                        "unavailable",
+                        elapsed,
                     );
-                    return Err(err).with_context(|| {
-                        format!(
-                            "read CoreStore shard {}:{} from {}",
-                            manifest.encoding.block_id, placement.shard_index, placement.node_id
-                        )
-                    });
+                    shard_failures.push(format!(
+                        "{}:{} on {}: {err:#}",
+                        block_id, placement.shard_index, placement.node_id
+                    ));
                 }
-            };
-            shards[index] = Some(shard_bytes);
+            }
         }
         let present = shards.iter().filter(|shard| shard.is_some()).count();
         if present < data_shards {
             bail!(
-                "CoreStore blob {} has only {} shards present; {} data shards required",
+                "CoreStore blob {} has only {} shards present; {} data shards required; unavailable or invalid shards: {}",
                 input.object_ref.hash,
                 present,
-                data_shards
+                data_shards,
+                shard_failures.join("; ")
             );
         }
         let profile = local_erasure_profile_for_counts(
@@ -318,34 +319,17 @@ impl CoreStore {
                     );
                     bytes
                 }
-                Err(err) if is_not_found_error(&err) => {
+                Err(_err) => {
                     record_block_read_duration(
                         &placement.node_id,
                         &placement.region_id,
                         &placement.cell_id,
                         "read_blob_range_shard",
                         "local",
-                        "missing",
+                        "fallback_reconstruction",
                         block_read_started_at.elapsed(),
                     );
                     return self.get_blob_range_via_full_reconstruction(input).await;
-                }
-                Err(err) => {
-                    record_block_read_duration(
-                        &placement.node_id,
-                        &placement.region_id,
-                        &placement.cell_id,
-                        "read_blob_range_shard",
-                        "local",
-                        "error",
-                        block_read_started_at.elapsed(),
-                    );
-                    return Err(err).with_context(|| {
-                        format!(
-                            "read CoreStore range shard {}:{} from {}",
-                            manifest.encoding.block_id, placement.shard_index, placement.node_id
-                        )
-                    });
                 }
             };
             let shard_offset = usize::try_from(overlap_start - shard_logical_start)

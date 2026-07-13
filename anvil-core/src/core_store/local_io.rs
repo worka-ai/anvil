@@ -12,12 +12,6 @@ pub(super) async fn read_file(
     result
 }
 
-pub(super) fn is_not_found_error(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<std::io::Error>()
-        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-}
-
 pub(crate) fn record_corestore_trace_event(operation: &'static str, status: &'static str) {
     let trace_id = format!("corestore-{}", sha256_hex(operation.as_bytes()));
     let span_id = format!("span-{}", sha256_hex(status.as_bytes()));

@@ -3,10 +3,9 @@ use crate::anvil_api::{
     CompareAndSwapRootRequest, PrepareRootRequest, RootPrepareReceipt,
     root_register_internal_client::RootRegisterInternalClient,
 };
-use anyhow::Context;
+use futures_util::StreamExt;
 use std::collections::BTreeSet;
 use tonic::metadata::MetadataValue;
-use tonic::transport::Endpoint;
 
 impl CoreStore {
     pub async fn read_internal_root_anchor(
@@ -35,35 +34,27 @@ impl CoreStore {
         min_generation: u64,
     ) -> Result<CoreInternalRootAnchorRead> {
         validate_hash(root_key_hash_value, "internal root key hash")?;
-        let mut latest = None;
-        for row in self.meta.scan_prefix(
+        let Some(bytes) = self.meta.get(
             CF_ROOT_CACHE,
             TABLE_ROOT_CACHE_ROW,
-            &root_anchor_generation_prefix(root_key_hash_value),
-        )? {
-            let anchor = decode_root_cache_row(&row.payload)?;
-            if anchor.root_key_hash != root_key_hash_value
-                || anchor.root_generation < min_generation
-            {
-                continue;
-            }
-            if latest
-                .as_ref()
-                .is_none_or(|current: &CoreRootAnchorRecord| {
-                    anchor.root_generation > current.root_generation
-                })
-            {
-                latest = Some(anchor);
-            }
-        }
-        let Some(anchor) = latest else {
+            &root_cache_hash_key(root_key_hash_value),
+        )?
+        else {
             bail!("CoreStore root anchor not found")
         };
+        let anchor = decode_root_cache_row(&bytes)?;
+        if anchor.root_key_hash != root_key_hash_value || anchor.root_generation < min_generation {
+            bail!("CoreStore root anchor not found");
+        }
         if !self
-            .verify_root_anchor_chain(root_key_hash_value, &anchor.root_anchor_key, &anchor)
+            .verify_root_anchor_direct_predecessor(
+                root_key_hash_value,
+                &anchor.root_anchor_key,
+                &anchor,
+            )
             .await?
         {
-            bail!("CoreStore root anchor chain verification failed");
+            bail!("CoreStore root anchor predecessor verification failed");
         }
         let bytes = encode_root_anchor_record(&anchor)?;
         Ok(CoreInternalRootAnchorRead {
@@ -88,29 +79,35 @@ impl CoreStore {
         let profile = self.default_coremeta_quorum_profile()?;
         profile.validate()?;
         let replicas = self.select_coremeta_replicas(&profile).await?;
+        let prepare_started_at = Instant::now();
+        let mut prepare_results = replicas
+            .iter()
+            .map(|replica| async {
+                let result = if replica.is_local || replica.public_api_addr.trim().is_empty() {
+                    self.prepare_root_anchor_locally(
+                        replica,
+                        anchor,
+                        &anchor_bytes,
+                        expected_generation,
+                        &expected_root_hash,
+                    )
+                    .await
+                } else {
+                    self.prepare_root_anchor_remotely(
+                        replica,
+                        anchor,
+                        &anchor_bytes,
+                        expected_generation,
+                        &expected_root_hash,
+                    )
+                    .await
+                };
+                (replica.node_id.clone(), result)
+            })
+            .collect::<futures_util::stream::FuturesUnordered<_>>();
         let mut prepare_receipts = Vec::new();
         let mut prepare_errors = Vec::new();
-        let prepare_started_at = Instant::now();
-        for replica in &replicas {
-            let result = if replica.is_local || replica.public_api_addr.trim().is_empty() {
-                self.prepare_root_anchor_locally(
-                    replica,
-                    anchor,
-                    &anchor_bytes,
-                    expected_generation,
-                    &expected_root_hash,
-                )
-                .await
-            } else {
-                self.prepare_root_anchor_remotely(
-                    replica,
-                    anchor,
-                    &anchor_bytes,
-                    expected_generation,
-                    &expected_root_hash,
-                )
-                .await
-            };
+        while let Some((node_id, result)) = prepare_results.next().await {
             match result.and_then(|receipt| {
                 self.verify_root_prepare_receipt(
                     anchor,
@@ -121,7 +118,10 @@ impl CoreStore {
                 Ok(receipt)
             }) {
                 Ok(receipt) => prepare_receipts.push(receipt),
-                Err(error) => prepare_errors.push(format!("{}: {error}", replica.node_id)),
+                Err(error) => prepare_errors.push(format!("{node_id}: {error}")),
+            }
+            if prepare_receipts.len() >= profile.prepare_quorum {
+                break;
             }
         }
         if prepare_receipts.len() < profile.prepare_quorum {
@@ -177,31 +177,40 @@ impl CoreStore {
         let mut write_count = 0usize;
         let mut write_errors = Vec::new();
         let cas_started_at = Instant::now();
-        for replica in &replicas {
-            let result = if replica.is_local || replica.public_api_addr.trim().is_empty() {
-                self.compare_and_swap_root_anchor_locally(
-                    anchor,
-                    expected_generation,
-                    &expected_root_hash,
-                )
-                .await
-            } else {
-                self.compare_and_swap_root_anchor_remotely(
-                    replica,
-                    anchor,
-                    &anchor_bytes,
-                    expected_generation,
-                    &expected_root_hash,
-                    &certificate,
-                    &certificate_persist_receipts,
-                    &prepare_receipts,
-                )
-                .await
-                .map(|_| ())
-            };
+        let mut cas_results = replicas
+            .iter()
+            .map(|replica| async {
+                let result = if replica.is_local || replica.public_api_addr.trim().is_empty() {
+                    self.compare_and_swap_root_anchor_locally(
+                        anchor,
+                        expected_generation,
+                        &expected_root_hash,
+                    )
+                    .await
+                } else {
+                    self.compare_and_swap_root_anchor_remotely(
+                        replica,
+                        anchor,
+                        &anchor_bytes,
+                        expected_generation,
+                        &expected_root_hash,
+                        &certificate,
+                        &certificate_persist_receipts,
+                        &prepare_receipts,
+                    )
+                    .await
+                    .map(|_| ())
+                };
+                (replica.node_id.clone(), result)
+            })
+            .collect::<futures_util::stream::FuturesUnordered<_>>();
+        while let Some((node_id, result)) = cas_results.next().await {
             match result {
                 Ok(()) => write_count += 1,
-                Err(error) => write_errors.push(format!("{}: {error}", replica.node_id)),
+                Err(error) => write_errors.push(format!("{node_id}: {error}")),
+            }
+            if write_count >= profile.certificate_persist_quorum {
+                break;
             }
         }
         if write_count < profile.certificate_persist_quorum {
@@ -268,11 +277,9 @@ impl CoreStore {
                 replica.node_id
             )
         })?;
-        let endpoint = normalise_grpc_endpoint(&replica.public_api_addr)?;
-        let channel = Endpoint::from_shared(endpoint.clone())?
-            .connect()
-            .await
-            .with_context(|| format!("connect root register replica at {endpoint}"))?;
+        let channel = self
+            .internal_grpc_channel(&replica.public_api_addr, "root register")
+            .await?;
         let mut client = RootRegisterInternalClient::new(channel);
         let mut request = tonic::Request::new(PrepareRootRequest {
             header: Some(self.internal_request_header("root.prepare")?),
@@ -323,11 +330,9 @@ impl CoreStore {
                 replica.node_id
             )
         })?;
-        let endpoint = normalise_grpc_endpoint(&replica.public_api_addr)?;
-        let channel = Endpoint::from_shared(endpoint.clone())?
-            .connect()
-            .await
-            .with_context(|| format!("connect root register replica at {endpoint}"))?;
+        let channel = self
+            .internal_grpc_channel(&replica.public_api_addr, "root register")
+            .await?;
         let mut client = RootRegisterInternalClient::new(channel);
         let mut request = tonic::Request::new(CompareAndSwapRootRequest {
             header: Some(self.internal_request_header("root.compare_and_swap")?),

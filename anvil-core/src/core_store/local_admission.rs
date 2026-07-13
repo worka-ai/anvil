@@ -724,10 +724,14 @@ impl CoreStore {
         state: &str,
         result: Option<CorePendingMutationFinalisationResult>,
     ) -> Result<()> {
-        let _finalisation_guard = self
-            .acquire_named_lock("pending_mutation", "finalisation")
-            .await?;
         let admission_key = CorePendingMutationKey::from(admission);
+        let finalisation_lock_id = format!(
+            "{}:{}:{}",
+            admission_key.node_id, admission_key.mutation_epoch, admission_key.mutation_sequence
+        );
+        let _finalisation_guard = self
+            .acquire_named_lock("pending_mutation_finalisation", &finalisation_lock_id)
+            .await?;
         let result_hash = finalisation_result_hash(&result)?;
         let index_key = admission_finalisation_key(&admission_key);
         if let Some(existing_bytes) = self.meta.get(
@@ -833,6 +837,13 @@ impl CoreStore {
         finalisation: &CorePendingMutationFinalisationRecord,
         payload: &[u8],
     ) -> Result<()> {
+        // Finalisations from unrelated mutations can run concurrently. They
+        // still append to one root-anchored stream, so sequence allocation and
+        // root publication must share the same cross-process stream lock as a
+        // public append.
+        let _stream_guard = self
+            .acquire_named_lock("stream", CORE_TRANSACTION_STREAM_ID)
+            .await?;
         Box::pin(self.append_stream_unlocked(AppendStreamRecord {
             stream_id: CORE_TRANSACTION_STREAM_ID.to_string(),
             partition_id: "system/core-control".to_string(),

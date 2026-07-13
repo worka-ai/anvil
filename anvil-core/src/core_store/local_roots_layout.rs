@@ -816,37 +816,54 @@ impl CoreStore {
         root_anchor_key: &str,
     ) -> Result<Option<CoreRootAnchorRecord>> {
         let root_key_hash = root_key_hash(root_anchor_key);
-        let mut latest_coremeta = None;
-        for row in self.meta.scan_prefix(
+        let Some(bytes) = self.meta.get(
             CF_ROOT_CACHE,
             TABLE_ROOT_CACHE_ROW,
-            &root_anchor_generation_prefix(&root_key_hash),
-        )? {
-            let anchor = decode_root_cache_row(&row.payload)?;
-            if anchor.root_anchor_key != root_anchor_key || anchor.root_key_hash != root_key_hash {
-                bail!("CoreStore root anchor scope mismatch");
-            }
-            if latest_coremeta
-                .as_ref()
-                .is_none_or(|current: &CoreRootAnchorRecord| {
-                    anchor.root_generation > current.root_generation
-                })
-            {
-                latest_coremeta = Some(anchor);
-            }
-        }
-        let latest = latest_coremeta;
-        let Some(anchor) = latest else {
+            &root_cache_key(root_anchor_key),
+        )?
+        else {
             return Ok(None);
         };
+        let anchor = decode_root_cache_row(&bytes)?;
+        if anchor.root_anchor_key != root_anchor_key || anchor.root_key_hash != root_key_hash {
+            bail!("CoreStore root anchor scope mismatch");
+        }
         if self
-            .verify_root_anchor_chain(&root_key_hash, root_anchor_key, &anchor)
+            .verify_root_anchor_direct_predecessor(&root_key_hash, root_anchor_key, &anchor)
             .await?
         {
             Ok(Some(anchor))
         } else {
             Ok(None)
         }
+    }
+
+    pub(super) async fn verify_root_anchor_direct_predecessor(
+        &self,
+        root_key_hash: &str,
+        root_anchor_key: &str,
+        anchor: &CoreRootAnchorRecord,
+    ) -> Result<bool> {
+        if anchor.root_key_hash != root_key_hash || anchor.root_anchor_key != root_anchor_key {
+            bail!("CoreStore root anchor scope mismatch");
+        }
+        if anchor.root_generation == 0 {
+            return Ok(anchor.previous_root_hash == ZERO_HASH);
+        }
+
+        let Some(previous) = self
+            .read_committed_root_anchor_generation(
+                root_key_hash,
+                anchor.root_generation.saturating_sub(1),
+            )
+            .await?
+        else {
+            return Ok(false);
+        };
+        if previous.root_anchor_key != root_anchor_key || previous.root_key_hash != root_key_hash {
+            bail!("CoreStore root anchor predecessor scope mismatch");
+        }
+        Ok(anchor.previous_root_hash == hash_root_anchor_record(&previous)?)
     }
 
     pub(super) async fn verify_root_anchor_chain(
@@ -963,6 +980,7 @@ impl CoreStore {
         let generation_key =
             root_anchor_generation_key(&anchor.root_key_hash, anchor.root_generation);
         let latest_key = root_cache_key(&anchor.root_anchor_key);
+        let latest_hash_key = root_cache_hash_key(&anchor.root_key_hash);
         let ops = [
             CoreMetaBatchOp {
                 cf: CF_ROOT_CACHE,
@@ -975,6 +993,13 @@ impl CoreStore {
                 cf: CF_ROOT_CACHE,
                 table_id: TABLE_ROOT_CACHE_ROW,
                 tuple_key: &latest_key,
+                common: None,
+                kind: CoreMetaBatchOpKind::Put(&row),
+            },
+            CoreMetaBatchOp {
+                cf: CF_ROOT_CACHE,
+                table_id: TABLE_ROOT_CACHE_ROW,
+                tuple_key: &latest_hash_key,
                 common: None,
                 kind: CoreMetaBatchOpKind::Put(&row),
             },
