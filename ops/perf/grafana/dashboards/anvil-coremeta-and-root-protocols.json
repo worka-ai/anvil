@@ -193,7 +193,7 @@
       "targets": [
         {
           "datasource": {
-            "type": "postgres",
+            "type": "mysql",
             "uid": "greptime"
           },
           "format": "time_series",

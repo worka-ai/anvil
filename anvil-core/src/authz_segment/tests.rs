@@ -153,7 +153,7 @@ async fn authz_candidate_reader_merges_revisioned_tuple_segments() {
         tuple_record(2, "beta", "bob"),
         tuple_record(3, "gamma", "alice"),
     ] {
-        crate::authz_journal::append_authz_tuple_record(&storage, &record)
+        crate::authz_journal::test_append_authz_tuple_record_unfenced(&storage, &record)
             .await
             .unwrap();
     }
@@ -266,7 +266,7 @@ async fn authz_candidate_reader_applies_remove_delta_without_changing_history() 
         tuple_record(2, "beta", "alice"),
         record(3, "remove"),
     ] {
-        crate::authz_journal::append_authz_tuple_record(&storage, &record)
+        crate::authz_journal::test_append_authz_tuple_record_unfenced(&storage, &record)
             .await
             .unwrap();
     }

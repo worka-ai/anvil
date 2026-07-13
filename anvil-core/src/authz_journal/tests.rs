@@ -98,10 +98,10 @@ async fn ready_authz_permit(
 async fn authz_journal_recovers_latest_exact_and_watch_ranges() {
     let temp = tempdir().unwrap();
     let storage = Storage::new_at(temp.path()).await.unwrap();
-    append_authz_tuple_record(&storage, &record(1, "add"))
+    test_append_authz_tuple_record_unfenced(&storage, &record(1, "add"))
         .await
         .unwrap();
-    append_authz_tuple_record(&storage, &record(2, "remove"))
+    test_append_authz_tuple_record_unfenced(&storage, &record(2, "remove"))
         .await
         .unwrap();
 
@@ -166,7 +166,9 @@ async fn authz_resolves_direct_and_nested_userset_tuples() {
             "add",
         ),
     ] {
-        append_authz_tuple_record(&storage, &record).await.unwrap();
+        test_append_authz_tuple_record_unfenced(&storage, &record)
+            .await
+            .unwrap();
     }
 
     assert!(
@@ -237,7 +239,9 @@ async fn authz_userset_removal_and_cycles_do_not_grant_access() {
             "add",
         ),
     ] {
-        append_authz_tuple_record(&storage, &record).await.unwrap();
+        test_append_authz_tuple_record_unfenced(&storage, &record)
+            .await
+            .unwrap();
     }
 
     assert!(
@@ -434,7 +438,9 @@ async fn authz_bound_schema_inherit_computed_and_tuple_to_userset_rules_are_enfo
             "add",
         ),
     ] {
-        append_authz_tuple_record(&storage, &record).await.unwrap();
+        test_append_authz_tuple_record_unfenced(&storage, &record)
+            .await
+            .unwrap();
     }
 
     for subject in ["direct-editor", "tenant-member", "group-member"] {
@@ -601,7 +607,9 @@ async fn authz_current_tuple_reads_filter_active_adds_only() {
         tuple(3, "document", "beta", "viewer", "user", "alice", "remove"),
         tuple(4, "document", "alpha", "editor", "user", "bob", "add"),
     ] {
-        append_authz_tuple_record(&storage, &record).await.unwrap();
+        test_append_authz_tuple_record_unfenced(&storage, &record)
+            .await
+            .unwrap();
     }
 
     let active_viewers = read_current_authz_tuples_at_revision(
@@ -698,7 +706,9 @@ async fn authz_tuple_writes_materialize_userset_and_reverse_lookup_segments() {
             "add",
         ),
     ] {
-        append_authz_tuple_record(&storage, &record).await.unwrap();
+        test_append_authz_tuple_record_unfenced(&storage, &record)
+            .await
+            .unwrap();
     }
 
     authz_segment::ensure_authz_tuple_segment_at_revision(&storage, 42, 3)

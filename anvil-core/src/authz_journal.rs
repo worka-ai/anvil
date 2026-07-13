@@ -294,7 +294,7 @@ fn build_authz_tuple_record(
 }
 
 #[cfg(test)]
-pub(crate) async fn append_authz_tuple_record(
+pub(crate) async fn test_append_authz_tuple_record_unfenced(
     storage: &Storage,
     record: &AuthzTupleRecord,
 ) -> Result<()> {
