@@ -61,7 +61,7 @@ static_gates() {
 rust_unit_gates() {
   run_cargo_test "core library tests" -p anvil-storage-core --lib --bins
   run_cargo_test "server library and binary tests" -p anvil-server --lib --bins
-  run_cargo_test "public CLI package tests" -p anvil-storage-cli --lib --bins --tests
+  run_cargo_test "public CLI package tests" -p anvil-storage-cli --bins --tests
   run_cargo_test "Rust client package tests" -p anvil-storage --lib --tests
   run_cargo_test "test utils package tests" -p anvil-storage-test-utils --lib
   run_cargo_test "CoreStore model package tests" -p anvil-corestore-model --lib --tests
