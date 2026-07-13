@@ -393,17 +393,10 @@ async fn resolve_bootstrap_subject(
     let output_path = Path::new(output_path);
     reject_bootstrap_credential_output_path(config, output_path)?;
 
-    let tenant = match persistence.get_tenant_by_name("system").await? {
-        Some(tenant) => tenant,
-        None => {
-            persistence
-                .create_tenant("system", "system-realm-bootstrap")
-                .await?
-        }
-    };
+    let tenant_id = SYSTEM_STORAGE_TENANT_ID;
 
     let existing = persistence
-        .list_apps_for_tenant(tenant.id)
+        .list_apps_for_tenant(tenant_id)
         .await?
         .into_iter()
         .find(|app| app.name == app_name);
@@ -414,7 +407,7 @@ async fn resolve_bootstrap_subject(
                 config,
                 persistence,
                 secret_keyring,
-                tenant.id,
+                tenant_id,
                 app_name,
                 output_path,
             )
@@ -1316,6 +1309,68 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("system realm is missing"));
+    }
+
+    #[tokio::test]
+    async fn generated_bootstrap_admin_credential_uses_reserved_system_tenant() {
+        let temp = tempdir().unwrap();
+        let storage_path = temp.path().join("storage");
+        let credential_path = temp.path().join("system-admin.json");
+        let mut config = test_config(&storage_path);
+        config.storage_path = storage_path.to_string_lossy().to_string();
+        config.bootstrap_system_admin_subject_kind.clear();
+        config.bootstrap_system_admin_subject_id.clear();
+        config.bootstrap_system_admin_app_name = "system-admin".to_string();
+        config.bootstrap_system_admin_credential_output_path =
+            credential_path.to_string_lossy().to_string();
+
+        let storage = Storage::new_at(&storage_path).await.unwrap();
+        let persistence = Persistence::new(&config, None).unwrap();
+        let keyring = config.secret_keyring().unwrap();
+
+        ensure_bootstrapped(&config, &persistence, &storage, &keyring)
+            .await
+            .unwrap();
+
+        let credential: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&credential_path).unwrap()).unwrap();
+        assert_eq!(
+            credential["tenant_id"].as_i64().unwrap(),
+            SYSTEM_STORAGE_TENANT_ID
+        );
+        assert!(
+            persistence
+                .get_tenant_by_name("system")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let client_id = credential["client_id"].as_str().unwrap();
+        let app_details = persistence
+            .get_app_by_client_id(client_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(app_details.tenant_id, SYSTEM_STORAGE_TENANT_ID);
+
+        let token = auth::JwtManager::new(config.jwt_secret.clone())
+            .mint_token(app_details.id.to_string(), app_details.tenant_id)
+            .unwrap();
+        let claims = auth::JwtManager::new(config.jwt_secret.clone())
+            .verify_token(&token)
+            .unwrap();
+        assert_eq!(claims.tenant_id, SYSTEM_STORAGE_TENANT_ID);
+
+        let allowed = check_admin_relation(
+            &storage,
+            &config.mesh_id,
+            &claims,
+            SystemAdminRelation::ManageTenants,
+        )
+        .await
+        .unwrap();
+        assert!(allowed);
     }
 
     #[test]
