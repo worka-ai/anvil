@@ -48,9 +48,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@v2
-        with:
-          version: "25.x"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
 
       - name: Set up QEMU for cross-architecture image smoke checks
         uses: docker/setup-qemu-action@v3
@@ -116,9 +116,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@v2
-        with:
-          version: "25.x"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
@@ -162,9 +162,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@v2
-        with:
-          version: "25.x"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
@@ -197,9 +197,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@v2
-        with:
-          version: "25.x"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
@@ -237,9 +237,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@v2
-        with:
-          version: "25.x"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
