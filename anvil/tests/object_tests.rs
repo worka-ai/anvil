@@ -10,11 +10,11 @@ use anvil::anvil_api::{
     CreateBucketRequest, CreateIndexRequest, DeleteObjectRequest, GetObjectRequest,
     HeadObjectRequest, IndexKind, InitiateMultipartRequest, LeaseFencePrecondition,
     ListObjectVersionsRequest, ListObjectsRequest, MutationBatchAppendStreamRecord,
-    MutationBatchOperation, MutationBatchPatchJsonObject, MutationBatchRequest,
-    NativeMutationContext, ObjectMetadata, PatchJsonObjectRequest, PutObjectRequest,
-    ReadAppendStreamRequest, RepairDirectoryIndexRequest, SealAppendStreamSegmentRequest,
-    TailAppendStreamRequest, UploadPartMetadata, UploadPartRequest, WatchPrefixRequest,
-    WritePrecondition,
+    MutationBatchOperation, MutationBatchPatchJsonObject, MutationBatchPutObject,
+    MutationBatchRequest, NativeMutationContext, ObjectMetadata, PatchJsonObjectRequest,
+    PutObjectRequest, ReadAppendStreamRequest, RepairDirectoryIndexRequest,
+    SealAppendStreamSegmentRequest, TailAppendStreamRequest, UploadPartMetadata, UploadPartRequest,
+    WatchPrefixRequest, WritePrecondition,
 };
 use futures_util::StreamExt;
 use std::{future::Future, pin::Pin, time::Duration};

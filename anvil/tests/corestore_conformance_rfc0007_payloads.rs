@@ -1080,6 +1080,28 @@ fn low_level_manifests_and_shard_receipts_carry_boundary_summaries() {
 }
 
 #[test]
+fn object_upload_scratch_files_are_not_the_durability_boundary() {
+    let storage = workspace_file("anvil-core/src/storage.rs");
+
+    assert_contains_all(
+        "scratch upload path remains non-authoritative",
+        &storage,
+        &[
+            "stream_to_temp_file",
+            "non-authoritative scratch",
+            "file.flush().await?",
+            "\"temp_file_flush\"",
+            "\"stream_to_temp_file finished\"",
+        ],
+    );
+    assert_contains_none(
+        "scratch upload must not fsync before CoreStore ingestion",
+        &storage,
+        &["\"temp_file_sync_all\"", "file.sync_all().await?"],
+    );
+}
+
+#[test]
 fn low_level_observability_names_cover_admission_pipeline_and_shards() {
     let io = workspace_file("anvil-core/src/core_store/local_io.rs");
     let admission = workspace_file("anvil-core/src/core_store/local_admission.rs");

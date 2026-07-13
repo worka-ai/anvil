@@ -1,6 +1,92 @@
 use super::*;
 
 #[tokio::test]
+async fn test_mutation_batch_put_object_publishes_small_json_without_upload_stall() {
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_object_test_actor(&cluster, "mutation-batch-put-object-small-json").await;
+
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
+    let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut bucket_client = BucketServiceClient::connect(grpc_addr).await.unwrap();
+
+    let bucket_name = unique_test_name("batch-put");
+    let object_key = "/markets/pl".to_string();
+    let bucket_id = bucket_client
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: actor.region.clone(),
+                options: None,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .bucket_id;
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(10),
+        object_client.mutation_batch(authorized(
+            MutationBatchRequest {
+                bucket_name: bucket_name.clone(),
+                mutation_context: Some(native_mutation_context(
+                    &actor,
+                    bucket_id,
+                    "batch-put-small-json",
+                )),
+                precondition: None,
+                operations: vec![MutationBatchOperation {
+                    op: Some(anvil_api::mutation_batch_operation::Op::PutObject(
+                        MutationBatchPutObject {
+                            object_key: object_key.clone(),
+                            payload: br#"{"market":"pl","ready":true}"#.to_vec(),
+                            content_type: Some("application/json".to_string()),
+                            user_metadata_json: serde_json::json!({
+                                "boundaries": {
+                                    "market": "pl",
+                                    "legal_realm": "eu",
+                                    "provider": "cacydil"
+                                }
+                            })
+                            .to_string(),
+                            storage_class: None,
+                        },
+                    )),
+                }],
+            },
+            &token,
+        )),
+    )
+    .await
+    .expect("mutation batch put_object must not stall on scratch upload")
+    .unwrap()
+    .into_inner();
+
+    assert_eq!(response.operation_receipts.len(), 1);
+    assert_eq!(response.operation_receipts[0].operation, "put_object");
+    assert_eq!(response.operation_receipts[0].object_key, object_key);
+
+    let head = object_client
+        .head_object(authorized(
+            HeadObjectRequest {
+                bucket_name,
+                object_key,
+                version_id: None,
+                ..Default::default()
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(head.content_type, "application/json");
+}
+
+#[tokio::test]
 async fn test_mutation_batch_rejects_stale_lease_fence_for_state_update() {
     let cluster = shared_docker_test_cluster().await;
     let actor =

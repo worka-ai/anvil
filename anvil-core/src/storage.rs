@@ -150,11 +150,14 @@ impl Storage {
             ],
             chunk_count,
         );
+        // This file is non-authoritative scratch. CoreStore is responsible for
+        // durable publication after it ingests these bytes, so forcing an fsync
+        // here only adds latency and can block callers on container filesystems.
         let started_at = Instant::now();
-        file.sync_all().await?;
+        file.flush().await?;
         crate::perf::record_io_duration(
             "storage",
-            "temp_file_sync_all",
+            "temp_file_flush",
             &temp_path,
             total_bytes as u64,
             started_at.elapsed(),
