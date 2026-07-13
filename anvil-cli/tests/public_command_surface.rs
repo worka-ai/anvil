@@ -150,7 +150,7 @@ async fn start_cluster_for_public_cli() -> (TestCluster, TempDir) {
     let config_dir = tempdir().unwrap();
     let app_name = format!("public-cli-{}", uuid::Uuid::new_v4().simple());
     let (client_id, client_secret) = cluster
-        .create_application_with_policy("default", &app_name, "*", "*")
+        .create_application_with_storage_tenant_owner("default", &app_name)
         .await;
     run_anvil(
         &config_dir,

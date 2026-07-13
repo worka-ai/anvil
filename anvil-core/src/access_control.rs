@@ -34,6 +34,7 @@ pub fn system_realm_namespace(namespace: &str) -> String {
 }
 
 fn split_bucket_key(resource: &str) -> (&str, Option<&str>) {
+    let resource = resource.trim_end_matches('/');
     match resource.split_once('/') {
         Some((bucket, key)) if !bucket.is_empty() && !key.is_empty() => (bucket, Some(key)),
         _ => (resource, None),
@@ -1667,4 +1668,20 @@ pub async fn grant_authz_realm_defaults(
         )
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_bucket_key;
+
+    #[test]
+    fn split_bucket_key_treats_empty_prefix_as_bucket_scope() {
+        assert_eq!(split_bucket_key("photos"), ("photos", None));
+        assert_eq!(split_bucket_key("photos/"), ("photos", None));
+        assert_eq!(split_bucket_key("photos///"), ("photos", None));
+        assert_eq!(
+            split_bucket_key("photos/2026/report.txt"),
+            ("photos", Some("2026/report.txt"))
+        );
+    }
 }

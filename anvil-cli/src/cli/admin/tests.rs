@@ -307,8 +307,9 @@ fn node_capabilities_map_to_proto_values() {
     assert_eq!(NodeCapabilityArg::Object.to_proto(), 1);
     assert_eq!(NodeCapabilityArg::Index.to_proto(), 2);
     assert_eq!(NodeCapabilityArg::Personaldb.to_proto(), 3);
-    assert_eq!(NodeCapabilityArg::Gateway.to_proto(), 4);
-    assert_eq!(NodeCapabilityArg::Admin.to_proto(), 5);
+    assert_eq!(NodeCapabilityArg::Metadata.to_proto(), 4);
+    assert_eq!(NodeCapabilityArg::Gateway.to_proto(), 5);
+    assert_eq!(NodeCapabilityArg::Admin.to_proto(), 6);
 }
 
 #[test]
@@ -845,8 +846,11 @@ async fn missing_lifecycle_cli_handlers_call_admin_service_and_persist_state() {
             public_api_addr: "http://127.0.0.1:50051".to_string(),
             public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
             capabilities: vec![NodeCapabilityArg::Object, NodeCapabilityArg::Admin],
-            receipt_signing_public_key_proto_b64: base64::engine::general_purpose::STANDARD
-                .encode(b"test-receipt-key"),
+            receipt_signing_public_key_proto_b64: base64::engine::general_purpose::STANDARD.encode(
+                node.state
+                    .core_store
+                    .local_receipt_signing_public_key_proto(),
+            ),
             capacity_json: "{}".to_string(),
         },
         &mut client,

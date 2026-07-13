@@ -1,6 +1,7 @@
 #![recursion_limit = "512"]
 
 use std::process::Command;
+use std::time::Duration;
 use tempfile::tempdir;
 
 use anvil_test_utils::*;
@@ -70,6 +71,23 @@ async fn setup_test_profile(
     .await;
     assert!(output.status.success());
     actor
+}
+
+async fn wait_for_hf_key(config_dir: &std::path::Path, key_name: &str) {
+    let mut last_stdout = String::new();
+    let mut last_stderr = String::new();
+    for _ in 0..20 {
+        let output = run_cli(&["hf", "key", "ls"], config_dir).await;
+        last_stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        last_stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if output.status.success() && last_stdout.contains(key_name) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!(
+        "HF key {key_name} did not become visible before ingestion start\nstdout:\n{last_stdout}\nstderr:\n{last_stderr}"
+    );
 }
 
 #[tokio::test]
@@ -415,6 +433,7 @@ async fn test_cli_hf_ingest_cancel() {
     )
     .await;
     assert!(output.status.success());
+    wait_for_hf_key(config_dir.path(), &key_name).await;
 
     let bucket_name = format!("my-hf-ingest-cancel-bucket-{}", uuid::Uuid::new_v4());
     let output = run_cli(
@@ -476,6 +495,7 @@ async fn test_cli_hf_ingest_start_with_options() {
     )
     .await;
     assert!(output.status.success());
+    wait_for_hf_key(config_dir.path(), &key_name).await;
 
     let bucket_name = format!("hf-ingest-opts-{}", uuid::Uuid::new_v4());
     let output = run_cli(
