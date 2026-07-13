@@ -67,8 +67,7 @@ fn delete_index_segment_coremeta_row(
 
 #[tokio::test]
 async fn test_full_text_index_builds_from_object_write_task() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -80,7 +79,7 @@ async fn test_full_text_index_builds_from_object_write_task() {
         .unwrap();
     let mut object_client = ObjectServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = format!("index-build-task-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("index-build-task");
     bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -93,7 +92,7 @@ async fn test_full_text_index_builds_from_object_write_task() {
         ))
         .await
         .unwrap();
-    index_client
+    let created = index_client
         .create_index(authorized(
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
@@ -110,6 +109,7 @@ async fn test_full_text_index_builds_from_object_write_task() {
         ))
         .await
         .unwrap();
+    let created = created.into_inner().index.expect("created index");
 
     let bucket_id = cluster.states[0]
         .persistence
@@ -144,46 +144,29 @@ async fn test_full_text_index_builds_from_object_write_task() {
     );
     object_client.put_object(put_req).await.unwrap();
 
-    let mut final_response = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    while tokio::time::Instant::now() < deadline {
-        let response = index_client
-            .query_index(authorized(
-                QueryIndexRequest {
-                    bucket_name: bucket_name.clone(),
-                    index_name: "body".to_string(),
-                    query_text: "automatic index".to_string(),
-                    query_vector: vec![],
-                    limit: 10,
-                    phrase: false,
-                    path_prefix: String::new(),
-                    metadata_filters_json: String::new(),
-                    boundary_predicates_json: String::new(),
-                    typed_predicates_json: String::new(),
-                    typed_order_json: String::new(),
-                    page_token: String::new(),
-                    require_caught_up_to_watch_cursor: String::new(),
-                    lag_timeout_ms: 0,
-                },
-                &token,
-            ))
-            .await;
-        if let Ok(response) = response {
-            let response = response.into_inner();
-            if response
-                .hits
-                .iter()
-                .any(|hit| hit.object_key == "docs/alpha.txt")
-            {
-                final_response = Some(response);
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-
-    let response =
-        final_response.expect("full text index build task should make object searchable");
+    let response = query_index_until_hits(
+        &mut index_client,
+        &token,
+        QueryIndexRequest {
+            bucket_name: bucket_name.clone(),
+            index_name: "body".to_string(),
+            query_text: "automatic index".to_string(),
+            query_vector: vec![],
+            limit: 10,
+            phrase: false,
+            path_prefix: String::new(),
+            metadata_filters_json: String::new(),
+            boundary_predicates_json: String::new(),
+            typed_predicates_json: String::new(),
+            typed_order_json: String::new(),
+            page_token: String::new(),
+            require_caught_up_to_watch_cursor: String::new(),
+            lag_timeout_ms: 0,
+        },
+        1,
+        Duration::from_secs(60),
+    )
+    .await;
     assert_eq!(response.index_kind, IndexKind::FullText as i32);
     assert!(response.index_generation >= 1);
     assert_eq!(response.hits[0].object_key, "docs/alpha.txt");
@@ -229,18 +212,14 @@ async fn test_full_text_index_builds_from_object_write_task() {
     assert_eq!(envelope.record_kind, "index_partition");
     assert!(!envelope.payload_hash.is_empty());
 
-    let mut tasks = Vec::new();
-    let task_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while tokio::time::Instant::now() < task_deadline {
-        tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
-        if tasks.iter().any(|task| {
-            task.task_type == anvil::tasks::TaskType::IndexBuild
-                && task.status == anvil::tasks::TaskStatus::Completed
-        }) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let tasks = wait_for_index_builds_for_indexes(
+        &cluster,
+        Duration::from_secs(10),
+        1,
+        bucket_id,
+        &[created.index_id as i64],
+    )
+    .await;
     assert!(tasks.iter().any(|task| {
         task.task_type == anvil::tasks::TaskType::IndexBuild
             && task.status == anvil::tasks::TaskStatus::Completed
@@ -253,8 +232,7 @@ async fn test_full_text_index_builds_from_object_write_task() {
 
 #[tokio::test]
 async fn test_full_text_index_build_extracts_json_pointer_from_object_write_task() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -266,7 +244,7 @@ async fn test_full_text_index_build_extracts_json_pointer_from_object_write_task
         .unwrap();
     let mut object_client = ObjectServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = format!("json-pointer-index-build-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("json-pointer-index-build");
     bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -334,46 +312,29 @@ async fn test_full_text_index_build_extracts_json_pointer_from_object_write_task
     );
     object_client.put_object(put_req).await.unwrap();
 
-    let mut final_response = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while tokio::time::Instant::now() < deadline {
-        let response = index_client
-            .query_index(authorized(
-                QueryIndexRequest {
-                    bucket_name: bucket_name.clone(),
-                    index_name: "summary".to_string(),
-                    query_text: "tenant retention".to_string(),
-                    query_vector: vec![],
-                    limit: 10,
-                    phrase: false,
-                    path_prefix: String::new(),
-                    metadata_filters_json: String::new(),
-                    boundary_predicates_json: String::new(),
-                    typed_predicates_json: String::new(),
-                    typed_order_json: String::new(),
-                    page_token: String::new(),
-                    require_caught_up_to_watch_cursor: String::new(),
-                    lag_timeout_ms: 0,
-                },
-                &token,
-            ))
-            .await;
-        if let Ok(response) = response {
-            let response = response.into_inner();
-            if response
-                .hits
-                .iter()
-                .any(|hit| hit.object_key == "docs/report.json")
-            {
-                final_response = Some(response);
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-
-    let response =
-        final_response.expect("json_pointer text extraction should make object searchable");
+    let response = query_index_until_hits(
+        &mut index_client,
+        &token,
+        QueryIndexRequest {
+            bucket_name: bucket_name.clone(),
+            index_name: "summary".to_string(),
+            query_text: "tenant retention".to_string(),
+            query_vector: vec![],
+            limit: 10,
+            phrase: false,
+            path_prefix: String::new(),
+            metadata_filters_json: String::new(),
+            boundary_predicates_json: String::new(),
+            typed_predicates_json: String::new(),
+            typed_order_json: String::new(),
+            page_token: String::new(),
+            require_caught_up_to_watch_cursor: String::new(),
+            lag_timeout_ms: 0,
+        },
+        1,
+        Duration::from_secs(20),
+    )
+    .await;
     assert_eq!(response.index_kind, IndexKind::FullText as i32);
     assert_eq!(response.hits[0].object_key, "docs/report.json");
     assert!(response.hits[0].score > 0.0);
@@ -381,10 +342,14 @@ async fn test_full_text_index_build_extracts_json_pointer_from_object_write_task
 
 #[tokio::test]
 async fn test_full_text_index_build_uses_source_cursor_snapshot() {
-    let cluster = TestCluster::new(&["test-region-1"]).await;
+    let cluster = isolated_test_cluster(
+        "source cursor snapshot test inspects pending index tasks with background workers disabled",
+        &["test-region-1"],
+    )
+    .await;
     let persistence = &cluster.states[0].persistence;
     let tenant_id = 1;
-    let bucket_name = format!("cursor-snapshot-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("cursor-snapshot");
     let bucket = persistence
         .create_bucket(tenant_id, &bucket_name, "test-region-1")
         .await
@@ -424,6 +389,8 @@ async fn test_full_text_index_build_uses_source_cursor_snapshot() {
         .into_iter()
         .find(|task| {
             task.task_type == anvil::tasks::TaskType::IndexBuild
+                && task.payload["tenant_id"] == serde_json::json!(tenant_id)
+                && task.payload["bucket_id"] == serde_json::json!(bucket.id)
                 && task.payload["index_id"] == serde_json::json!(index.id)
         })
         .and_then(|task| task.payload["source_cursor"].as_u64())
@@ -446,6 +413,8 @@ async fn test_full_text_index_build_uses_source_cursor_snapshot() {
         .into_iter()
         .filter(|task| {
             task.task_type == anvil::tasks::TaskType::IndexBuild
+                && task.payload["tenant_id"] == serde_json::json!(tenant_id)
+                && task.payload["bucket_id"] == serde_json::json!(bucket.id)
                 && task.payload["index_id"] == serde_json::json!(index.id)
         })
         .collect::<Vec<_>>();
@@ -565,10 +534,14 @@ async fn test_full_text_index_build_uses_source_cursor_snapshot() {
 
 #[tokio::test]
 async fn test_index_build_requires_current_rfc_ownership_fence() {
-    let cluster = TestCluster::new(&["test-region-1"]).await;
+    let cluster = isolated_test_cluster(
+        "ownership fence test manually claims index tasks with background workers disabled",
+        &["test-region-1"],
+    )
+    .await;
     let persistence = &cluster.states[0].persistence;
     let tenant_id = 1;
-    let bucket_name = format!("index-fence-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("index-fence");
     let bucket = persistence
         .create_bucket(tenant_id, &bucket_name, "test-region-1")
         .await
@@ -607,6 +580,8 @@ async fn test_index_build_requires_current_rfc_ownership_fence() {
         .into_iter()
         .find(|task| {
             task.task_type == anvil::tasks::TaskType::IndexBuild
+                && task.payload["tenant_id"] == serde_json::json!(tenant_id)
+                && task.payload["bucket_id"] == serde_json::json!(bucket.id)
                 && task.payload["index_id"] == serde_json::json!(index.id)
         })
         .and_then(|task| task.payload["source_cursor"].as_u64())
@@ -664,10 +639,14 @@ async fn test_index_build_requires_current_rfc_ownership_fence() {
 
 #[tokio::test]
 async fn test_index_enqueue_rebuilds_when_checkpoint_exists_but_proof_is_missing() {
-    let cluster = TestCluster::new(&["test-region-1"]).await;
+    let cluster = isolated_test_cluster(
+        "missing proof rebuild test mutates index task checkpoints with background workers disabled",
+        &["test-region-1"],
+    )
+    .await;
     let persistence = &cluster.states[0].persistence;
     let tenant_id = 1;
-    let bucket_name = format!("index-missing-proof-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("index-missing-proof");
     let bucket = persistence
         .create_bucket(tenant_id, &bucket_name, "test-region-1")
         .await
@@ -707,6 +686,8 @@ async fn test_index_enqueue_rebuilds_when_checkpoint_exists_but_proof_is_missing
         .into_iter()
         .find(|task| {
             task.task_type == anvil::tasks::TaskType::IndexBuild
+                && task.payload["tenant_id"] == serde_json::json!(tenant_id)
+                && task.payload["bucket_id"] == serde_json::json!(bucket.id)
                 && task.payload["index_id"] == serde_json::json!(index.id)
         })
         .expect("initial index build task should exist");
@@ -769,6 +750,8 @@ async fn test_index_enqueue_rebuilds_when_checkpoint_exists_but_proof_is_missing
         .find(|task| {
             task.task_type == anvil::tasks::TaskType::IndexBuild
                 && task.status == anvil::tasks::TaskStatus::Pending
+                && task.payload["tenant_id"] == serde_json::json!(tenant_id)
+                && task.payload["bucket_id"] == serde_json::json!(bucket.id)
                 && task.payload["index_id"] == serde_json::json!(index.id)
                 && task.payload["source_cursor"] == serde_json::json!(source_cursor)
         })
@@ -793,13 +776,12 @@ async fn test_index_enqueue_rebuilds_when_checkpoint_exists_but_proof_is_missing
 
 #[tokio::test]
 async fn test_repair_rebuilds_missing_full_text_segment_from_base_journal() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
     let persistence = &cluster.states[0].persistence;
     let tenant_id = 1;
-    let bucket_name = format!("index-repair-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("index-repair");
     let bucket = persistence
         .create_bucket(tenant_id, &bucket_name, "test-region-1")
         .await
@@ -850,6 +832,8 @@ async fn test_repair_rebuilds_missing_full_text_segment_from_base_journal() {
         .into_iter()
         .find(|task| {
             task.task_type == anvil::tasks::TaskType::IndexBuild
+                && task.payload["tenant_id"] == serde_json::json!(tenant_id)
+                && task.payload["bucket_id"] == serde_json::json!(bucket.id)
                 && task.payload["index_id"] == serde_json::json!(index.id)
         })
         .and_then(|task| task.payload["source_cursor"].as_u64())
@@ -971,13 +955,12 @@ async fn test_repair_rebuilds_missing_full_text_segment_from_base_journal() {
 
 #[tokio::test]
 async fn test_repair_rebuilds_missing_vector_segment_from_base_journal() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
     let persistence = &cluster.states[0].persistence;
     let tenant_id = 1;
-    let bucket_name = format!("vector-index-repair-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("vector-index-repair");
     let bucket = persistence
         .create_bucket(tenant_id, &bucket_name, "test-region-1")
         .await
@@ -1135,10 +1118,14 @@ async fn test_repair_rebuilds_missing_vector_segment_from_base_journal() {
 
 #[tokio::test]
 async fn test_index_build_followup_waits_for_running_build_and_catches_up_after_restart() {
-    let cluster = TestCluster::new(&["test-region-1"]).await;
+    let cluster = isolated_test_cluster(
+        "follow-up handoff test claims pending tasks and reopens persistence to simulate restart",
+        &["test-region-1"],
+    )
+    .await;
     let persistence = &cluster.states[0].persistence;
     let tenant_id = 1;
-    let bucket_name = format!("index-handoff-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("index-handoff");
     let bucket = persistence
         .create_bucket(tenant_id, &bucket_name, "test-region-1")
         .await

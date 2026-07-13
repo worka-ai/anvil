@@ -2,8 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn test_typed_json_index_queries_canonical_object_body_with_range_order_and_page_token() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -15,7 +14,7 @@ async fn test_typed_json_index_queries_canonical_object_body_with_range_order_an
         .unwrap();
     let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = "typed-json-index-bucket".to_string();
+    let bucket_name = unique_test_name("typed-json-index-bucket");
     let bucket_id = bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -386,8 +385,7 @@ async fn test_typed_json_index_queries_canonical_object_body_with_range_order_an
 
 #[tokio::test]
 async fn test_query_index_results_are_filtered_by_zanzibar_object_relationships() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -401,7 +399,7 @@ async fn test_query_index_results_are_filtered_by_zanzibar_object_relationships(
         .await
         .unwrap();
 
-    let bucket_name = format!("query-authz-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("query-authz");
     let bucket_id = bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -500,13 +498,14 @@ async fn test_query_index_results_are_filtered_by_zanzibar_object_relationships(
     )
     .await;
 
+    let reader_app_name = unique_test_name("query-reader-app");
     let (_reader_app_id, reader_client_id, reader_client_secret) = cluster
-        .create_application_with_id("default", "query-reader-app")
+        .create_application_with_id("default", &reader_app_name)
         .await;
     cluster
         .grant_application_policy(
             "default",
-            "query-reader-app",
+            &reader_app_name,
             "index:read",
             &format!("{bucket_name}/due-work"),
         )
@@ -514,7 +513,7 @@ async fn test_query_index_results_are_filtered_by_zanzibar_object_relationships(
     cluster
         .grant_application_policy(
             "default",
-            "query-reader-app",
+            &reader_app_name,
             "object:read",
             &format!("{bucket_name}/queue/visible.json"),
         )
@@ -541,7 +540,7 @@ async fn test_query_index_results_are_filtered_by_zanzibar_object_relationships(
     cluster
         .grant_application_policy(
             "default",
-            "query-reader-app",
+            &reader_app_name,
             "object:read",
             &format!("{bucket_name}/queue/hidden.json"),
         )
@@ -566,8 +565,7 @@ async fn test_query_index_results_are_filtered_by_zanzibar_object_relationships(
 
 #[tokio::test]
 async fn test_query_spec_intersects_full_text_with_typed_filter_without_bucket_scan() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -579,7 +577,7 @@ async fn test_query_spec_intersects_full_text_with_typed_filter_without_bucket_s
         .unwrap();
     let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = format!("query-spec-composite-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("query-spec-composite");
     let bucket_id = bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -852,8 +850,7 @@ async fn test_query_spec_intersects_full_text_with_typed_filter_without_bucket_s
 
 #[tokio::test]
 async fn test_query_spec_intersection_filters_inherit_object_hits_by_read_scope() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -865,7 +862,7 @@ async fn test_query_spec_intersection_filters_inherit_object_hits_by_read_scope(
         .unwrap();
     let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = format!("qsa-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("qsa");
     let bucket_id = bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -960,16 +957,17 @@ async fn test_query_spec_intersection_filters_inherit_object_hits_by_read_scope(
     .await;
 
     let claims = cluster.states[0].jwt_manager.verify_token(&token).unwrap();
+    let scope_reader = unique_test_name("query-spec-scope-reader");
     let limited_token = cluster.states[0]
         .jwt_manager
-        .mint_token("query-spec-scope-reader".to_string(), claims.tenant_id)
+        .mint_token(scope_reader.clone(), claims.tenant_id)
         .unwrap();
-    grant_bucket_index_query_for_principal(&cluster, &bucket_name, "query-spec-scope-reader").await;
+    grant_bucket_index_query_for_principal(&cluster, &bucket_name, &scope_reader).await;
     grant_tenant_object_reader_for_principal(
         &cluster,
         &bucket_name,
         "auth/allowed.json",
-        "query-spec-scope-reader",
+        &scope_reader,
     )
     .await;
 
@@ -1032,8 +1030,7 @@ async fn test_query_spec_intersection_filters_inherit_object_hits_by_read_scope(
 
 #[tokio::test]
 async fn test_query_spec_path_filter_intersects_authz_before_results() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -1045,7 +1042,7 @@ async fn test_query_spec_path_filter_intersects_authz_before_results() {
         .unwrap();
     let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = format!("qsp-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("qsp");
     let bucket_id = bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -1111,39 +1108,37 @@ async fn test_query_spec_path_filter_intersects_authz_before_results() {
     .await;
 
     let claims = cluster.states[0].jwt_manager.verify_token(&token).unwrap();
+    let path_reader = unique_test_name("query-spec-path-reader");
+    let prefix_reader = unique_test_name("query-spec-path-prefix-reader");
     let limited_token = cluster.states[0]
         .jwt_manager
-        .mint_token("query-spec-path-reader".to_string(), claims.tenant_id)
+        .mint_token(path_reader.clone(), claims.tenant_id)
         .unwrap();
     let prefix_token = cluster.states[0]
         .jwt_manager
-        .mint_token(
-            "query-spec-path-prefix-reader".to_string(),
-            claims.tenant_id,
-        )
+        .mint_token(prefix_reader.clone(), claims.tenant_id)
         .unwrap();
-    grant_bucket_index_query_for_principal(&cluster, &bucket_name, "query-spec-path-reader").await;
+    grant_bucket_index_query_for_principal(&cluster, &bucket_name, &path_reader).await;
     grant_tenant_object_reader_for_principal(
         &cluster,
         &bucket_name,
         "docs/allowed.json",
-        "query-spec-path-reader",
+        &path_reader,
     )
     .await;
-    grant_bucket_index_query_for_principal(&cluster, &bucket_name, "query-spec-path-prefix-reader")
-        .await;
+    grant_bucket_index_query_for_principal(&cluster, &bucket_name, &prefix_reader).await;
     grant_tenant_object_reader_for_principal(
         &cluster,
         &bucket_name,
         "docs/allowed.json",
-        "query-spec-path-prefix-reader",
+        &prefix_reader,
     )
     .await;
     grant_tenant_object_reader_for_principal(
         &cluster,
         &bucket_name,
         "docs/denied.json",
-        "query-spec-path-prefix-reader",
+        &prefix_reader,
     )
     .await;
 
@@ -1226,8 +1221,7 @@ async fn test_query_spec_path_filter_intersects_authz_before_results() {
 
 #[tokio::test]
 async fn test_query_spec_inherit_object_filter_uses_derived_userset_grants() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -1242,7 +1236,7 @@ async fn test_query_spec_inherit_object_filter_uses_derived_userset_grants() {
         .unwrap();
     let mut auth_client = AuthServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = format!("qsu-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("qsu");
     let bucket_id = bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -1298,15 +1292,16 @@ async fn test_query_spec_inherit_object_filter_uses_derived_userset_grants() {
     .await;
 
     let claims = cluster.states[0].jwt_manager.verify_token(&token).unwrap();
-    let reader_subject = "query-spec-userset-reader";
+    let reader_subject = unique_test_name("query-spec-userset-reader");
+    let group_name = unique_test_name("query-spec-group");
     write_authz_tuple(
         &mut auth_client,
         &token,
         "group",
-        "engineering",
+        &group_name,
         "member",
         "app",
-        reader_subject,
+        &reader_subject,
     )
     .await;
     write_authz_tuple(
@@ -1316,7 +1311,7 @@ async fn test_query_spec_inherit_object_filter_uses_derived_userset_grants() {
         &format!("{bucket_name}/docs/group-allowed.json"),
         "reader",
         "userset",
-        "group/engineering#member",
+        &format!("group/{group_name}#member"),
     )
     .await;
 
@@ -1326,16 +1321,16 @@ async fn test_query_spec_inherit_object_filter_uses_derived_userset_grants() {
         &format!("{bucket_name}/docs/group-allowed.json"),
         "reader",
         "app",
-        reader_subject,
+        &reader_subject,
         Duration::from_secs(10),
     )
     .await;
 
     let userset_token = cluster.states[0]
         .jwt_manager
-        .mint_token(reader_subject.to_string(), claims.tenant_id)
+        .mint_token(reader_subject.clone(), claims.tenant_id)
         .unwrap();
-    grant_bucket_index_query_for_principal(&cluster, &bucket_name, reader_subject).await;
+    grant_bucket_index_query_for_principal(&cluster, &bucket_name, &reader_subject).await;
     let query_spec = serde_json::json!({
         "schema": "anvil.query.spec.v1",
         "scope": {
@@ -1392,8 +1387,7 @@ async fn test_query_spec_inherit_object_filter_uses_derived_userset_grants() {
 
 #[tokio::test]
 async fn test_query_spec_intersects_vector_with_typed_filter_without_bucket_scan() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -1405,7 +1399,7 @@ async fn test_query_spec_intersects_vector_with_typed_filter_without_bucket_scan
         .unwrap();
     let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = format!("qsv-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("qsv");
     let bucket_id = bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -1581,8 +1575,7 @@ async fn test_query_spec_intersects_vector_with_typed_filter_without_bucket_scan
 
 #[tokio::test]
 async fn test_query_spec_intersects_hybrid_with_typed_filter_without_bucket_scan() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -1594,7 +1587,7 @@ async fn test_query_spec_intersects_hybrid_with_typed_filter_without_bucket_scan
         .unwrap();
     let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = format!("qsh-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("qsh");
     let bucket_id = bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {

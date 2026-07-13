@@ -31,7 +31,10 @@ use anvil::typed_field_segment::source_id_binary;
 use anvil::vector_segment::{VectorSegmentEntry, VectorSegmentWrite, write_vector_segment};
 use anvil_test_utils::*;
 use futures_util::StreamExt;
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 use tonic::Request;
 
 fn authorized<T>(message: T, token: &str) -> Request<T> {
@@ -114,57 +117,83 @@ fn rfc_vector_policy(
     })
 }
 
-async fn wait_for_index_build_task(
-    cluster: &TestCluster,
-    timeout: Duration,
-) -> Vec<anvil::persistence::TaskRecord> {
-    wait_for_index_build_task_count(cluster, timeout, 1).await
+fn index_build_payload_i64(task: &anvil::persistence::TaskRecord, field: &str) -> Option<i64> {
+    task.payload.get(field)?.as_i64()
 }
 
-async fn wait_for_index_build_task_count(
+fn scoped_index_build_task(
+    task: &anvil::persistence::TaskRecord,
+    tenant_id: i64,
+    bucket_id: i64,
+    index_ids: &[i64],
+) -> bool {
+    task.task_type == anvil::tasks::TaskType::IndexBuild
+        && index_build_payload_i64(task, "tenant_id") == Some(tenant_id)
+        && index_build_payload_i64(task, "bucket_id") == Some(bucket_id)
+        && index_build_payload_i64(task, "index_id").is_some_and(|id| index_ids.contains(&id))
+}
+
+async fn wait_for_index_builds_for_indexes(
     cluster: &TestCluster,
     timeout: Duration,
-    expected_completed: usize,
+    tenant_id: i64,
+    bucket_id: i64,
+    index_ids: &[i64],
 ) -> Vec<anvil::persistence::TaskRecord> {
+    assert!(
+        !index_ids.is_empty(),
+        "test must wait for at least one specific index"
+    );
     let wait_start = std::time::Instant::now();
     let deadline = tokio::time::Instant::now() + timeout;
     let mut attempts = 0_u64;
-    let mut tasks = Vec::new();
+    let mut matching_tasks = Vec::new();
     while tokio::time::Instant::now() < deadline {
         attempts += 1;
-        tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
-        let completed = tasks
+        matching_tasks = cluster.states[0]
+            .persistence
+            .list_tasks()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|task| scoped_index_build_task(task, tenant_id, bucket_id, index_ids))
+            .collect();
+        let completed_index_ids = matching_tasks
             .iter()
-            .filter(|task| {
-                task.task_type == anvil::tasks::TaskType::IndexBuild
-                    && task.status == anvil::tasks::TaskStatus::Completed
+            .filter_map(|task| {
+                (task.status == anvil::tasks::TaskStatus::Completed)
+                    .then(|| index_build_payload_i64(task, "index_id"))
+                    .flatten()
             })
-            .count();
-        if completed >= expected_completed {
+            .collect::<BTreeSet<_>>();
+        if index_ids.iter().all(|id| completed_index_ids.contains(id)) {
             emit_test_timing(
                 format!(
-                    "wait_for_index_build_task_count expected={expected_completed} attempts={attempts}"
+                    "wait_for_index_builds_for_indexes bucket={bucket_id} indexes={} attempts={attempts}",
+                    index_ids.len()
                 ),
                 wait_start.elapsed(),
             );
-            return tasks;
+            return matching_tasks;
         }
         assert!(
-            !tasks.iter().any(|task| {
-                task.task_type == anvil::tasks::TaskType::IndexBuild
-                    && task.status == anvil::tasks::TaskStatus::Failed
-            }),
-            "index build task failed; tasks={tasks:?}"
+            !matching_tasks
+                .iter()
+                .any(|task| task.status == anvil::tasks::TaskStatus::Failed),
+            "scoped index build task failed for bucket_id={bucket_id} index_ids={index_ids:?}; tasks={matching_tasks:?}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     emit_test_timing(
         format!(
-            "wait_for_index_build_task_count timeout expected={expected_completed} attempts={attempts}"
+            "wait_for_index_builds_for_indexes timeout bucket={bucket_id} indexes={} attempts={attempts}",
+            index_ids.len()
         ),
         wait_start.elapsed(),
     );
-    tasks
+    panic!(
+        "timed out waiting for scoped index build tasks bucket_id={bucket_id} index_ids={index_ids:?}; tasks={matching_tasks:?}"
+    );
 }
 
 async fn persist_index_object(
@@ -509,9 +538,15 @@ async fn wait_for_vector_hit(
     query_vector: Vec<f32>,
     token: &str,
 ) -> anvil::anvil_api::QueryIndexResponse {
+    let wait_start = std::time::Instant::now();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut attempts = 0_u64;
+    let mut last = None;
+    let mut last_failed_precondition = None;
+
     while tokio::time::Instant::now() < deadline {
-        let response = index_client
+        attempts += 1;
+        let response = match index_client
             .query_index(authorized(
                 QueryIndexRequest {
                     bucket_name: bucket_name.to_string(),
@@ -531,16 +566,80 @@ async fn wait_for_vector_hit(
                 },
                 token,
             ))
-            .await;
-        if let Ok(response) = response {
-            let response = response.into_inner();
-            if response.hits.iter().any(|hit| hit.object_key == object_key) {
-                return response;
+            .await
+        {
+            Ok(response) => response.into_inner(),
+            Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+                last_failed_precondition = Some(status.message().to_string());
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                continue;
             }
+            Err(status) => panic!("vector query failed while waiting for index: {status:?}"),
+        };
+        if response.is_caught_up && response.hits.iter().any(|hit| hit.object_key == object_key) {
+            emit_test_timing(
+                format!("wait_for_vector_hit index={index_name} attempts={attempts}"),
+                wait_start.elapsed(),
+            );
+            return response;
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        last = Some(response);
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
-    panic!("vector index `{index_name}` did not return `{object_key}` before timeout");
+
+    panic!(
+        "vector index `{index_name}` did not return `{object_key}` before timeout; last_failed_precondition={last_failed_precondition:?}; last_response={last:?}"
+    );
+}
+
+async fn wait_for_index_diagnostic(
+    index_client: &mut IndexServiceClient<tonic::transport::Channel>,
+    token: &str,
+    bucket_name: &str,
+    index_name: &str,
+    severity: &str,
+    object_key: &str,
+    code: &str,
+    timeout: Duration,
+) -> Vec<anvil::anvil_api::IndexDiagnosticRecord> {
+    let wait_start = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut attempts = 0_u64;
+    let mut last = Vec::new();
+
+    while tokio::time::Instant::now() < deadline {
+        attempts += 1;
+        last = index_client
+            .list_index_diagnostics(authorized(
+                ListIndexDiagnosticsRequest {
+                    bucket_name: bucket_name.to_string(),
+                    index_name: index_name.to_string(),
+                    severity: severity.to_string(),
+                    after_cursor: 0,
+                    limit: 10,
+                },
+                token,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .diagnostics;
+        if last
+            .iter()
+            .any(|diagnostic| diagnostic.object_key == object_key && diagnostic.code == code)
+        {
+            emit_test_timing(
+                format!("wait_for_index_diagnostic index={index_name} attempts={attempts}"),
+                wait_start.elapsed(),
+            );
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    panic!(
+        "index `{index_name}` did not write diagnostic {code} for {object_key} before timeout; diagnostics={last:?}"
+    );
 }
 
 fn test_object_authz_label_hash(

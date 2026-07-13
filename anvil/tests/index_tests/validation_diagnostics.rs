@@ -2,8 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn test_index_definition_rejects_invalid_policy_shape() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -12,7 +11,7 @@ async fn test_index_definition_rejects_invalid_policy_shape() {
         .unwrap();
     let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = "index-validation-bucket".to_string();
+    let bucket_name = unique_test_name("index-validation-bucket");
     bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -194,8 +193,7 @@ async fn test_index_definition_rejects_invalid_policy_shape() {
 
 #[tokio::test]
 async fn test_list_index_diagnostics_filters_by_index_and_severity() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -204,7 +202,7 @@ async fn test_list_index_diagnostics_filters_by_index_and_severity() {
         .unwrap();
     let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = "index-diagnostics-bucket".to_string();
+    let bucket_name = unique_test_name("index-diagnostics-bucket");
     bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {

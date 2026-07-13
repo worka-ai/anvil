@@ -2,8 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn test_vector_index_builds_from_object_write_task() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -15,7 +14,7 @@ async fn test_vector_index_builds_from_object_write_task() {
         .unwrap();
     let mut object_client = ObjectServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = format!("vector-index-build-task-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("vector-index-build-task");
     bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -28,7 +27,7 @@ async fn test_vector_index_builds_from_object_write_task() {
         ))
         .await
         .unwrap();
-    index_client
+    let created = index_client
         .create_index(authorized(
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
@@ -52,7 +51,10 @@ async fn test_vector_index_builds_from_object_write_task() {
             &token,
         ))
         .await
-        .unwrap();
+        .unwrap()
+        .into_inner()
+        .index
+        .expect("created vector index");
 
     let bucket_id = cluster.states[0]
         .persistence
@@ -87,43 +89,29 @@ async fn test_vector_index_builds_from_object_write_task() {
     );
     object_client.put_object(put_req).await.unwrap();
 
-    let mut final_response = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while tokio::time::Instant::now() < deadline {
-        let response = index_client
-            .query_index(authorized(
-                QueryIndexRequest {
-                    bucket_name: bucket_name.clone(),
-                    index_name: "embedding".to_string(),
-                    query_text: String::new(),
-                    query_vector: vec![1.0, 0.0],
-                    limit: 10,
-                    phrase: false,
-                    path_prefix: String::new(),
-                    metadata_filters_json: String::new(),
-                    boundary_predicates_json: String::new(),
-                    typed_predicates_json: String::new(),
-                    typed_order_json: String::new(),
-                    page_token: String::new(),
-                    require_caught_up_to_watch_cursor: String::new(),
-                    lag_timeout_ms: 0,
-                },
-                &token,
-            ))
-            .await;
-        if let Ok(response) = response {
-            let response = response.into_inner();
-            if response
-                .hits
-                .iter()
-                .any(|hit| hit.object_key == "docs/vector.json")
-            {
-                final_response = Some(response);
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let response = query_index_until_hits(
+        &mut index_client,
+        &token,
+        QueryIndexRequest {
+            bucket_name: bucket_name.clone(),
+            index_name: "embedding".to_string(),
+            query_text: String::new(),
+            query_vector: vec![1.0, 0.0],
+            limit: 10,
+            phrase: false,
+            path_prefix: String::new(),
+            metadata_filters_json: String::new(),
+            boundary_predicates_json: String::new(),
+            typed_predicates_json: String::new(),
+            typed_order_json: String::new(),
+            page_token: String::new(),
+            require_caught_up_to_watch_cursor: String::new(),
+            lag_timeout_ms: 0,
+        },
+        1,
+        Duration::from_secs(20),
+    )
+    .await;
 
     let diagnostics = index_client
         .list_index_diagnostics(authorized(
@@ -140,14 +128,22 @@ async fn test_vector_index_builds_from_object_write_task() {
         .unwrap()
         .into_inner()
         .diagnostics;
-    let response = final_response.unwrap_or_else(|| {
-        panic!("vector index build task should make object searchable; diagnostics={diagnostics:?}")
-    });
+    assert!(
+        !response.hits.is_empty(),
+        "vector index build task should make object searchable; diagnostics={diagnostics:?}"
+    );
     assert_eq!(response.index_kind, IndexKind::Vector as i32);
     assert!(response.index_generation >= 1);
     assert_eq!(response.hits[0].object_key, "docs/vector.json");
     assert_eq!(response.hits[0].vector_id, 1);
-    let tasks = wait_for_index_build_task(&cluster, Duration::from_secs(60)).await;
+    let tasks = wait_for_index_builds_for_indexes(
+        &cluster,
+        Duration::from_secs(60),
+        1,
+        bucket_id,
+        &[created.index_id as i64],
+    )
+    .await;
     assert!(
         tasks.iter().any(|task| {
             task.task_type == anvil::tasks::TaskType::IndexBuild
@@ -163,8 +159,7 @@ async fn test_vector_index_builds_from_object_write_task() {
 
 #[tokio::test]
 async fn test_vector_index_builds_required_media_modalities_from_object_write_tasks() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -175,7 +170,7 @@ async fn test_vector_index_builds_required_media_modalities_from_object_write_ta
         .await
         .unwrap();
 
-    let bucket_name = format!("media-vector-index-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("media-vector-index");
     bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -235,9 +230,10 @@ async fn test_vector_index_builds_required_media_modalities_from_object_write_ta
         .await;
     }
 
+    let mut index_ids = Vec::new();
     for (modality, content_type, object_key, _body) in media_cases {
         let index_name = format!("{modality}-embedding");
-        index_client
+        let created = index_client
             .create_index(authorized(
                 CreateIndexRequest {
                     bucket_name: bucket_name.clone(),
@@ -265,7 +261,11 @@ async fn test_vector_index_builds_required_media_modalities_from_object_write_ta
                 &token,
             ))
             .await
-            .unwrap();
+            .unwrap()
+            .into_inner()
+            .index
+            .expect("created modality vector index");
+        index_ids.push(created.index_id as i64);
 
         let response = wait_for_vector_hit(
             &mut index_client,
@@ -283,7 +283,14 @@ async fn test_vector_index_builds_required_media_modalities_from_object_write_ta
         assert_eq!(metadata["modality"], modality);
     }
 
-    let tasks = wait_for_index_build_task_count(&cluster, Duration::from_secs(60), 1).await;
+    let tasks = wait_for_index_builds_for_indexes(
+        &cluster,
+        Duration::from_secs(60),
+        claims.tenant_id,
+        bucket.id,
+        &index_ids,
+    )
+    .await;
     assert!(!tasks.iter().any(|task| {
         task.task_type == anvil::tasks::TaskType::IndexBuild
             && task.status == anvil::tasks::TaskStatus::Failed
@@ -292,8 +299,7 @@ async fn test_vector_index_builds_required_media_modalities_from_object_write_ta
 
 #[tokio::test]
 async fn test_vector_index_build_records_dimension_mismatch_diagnostic() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -305,7 +311,7 @@ async fn test_vector_index_build_records_dimension_mismatch_diagnostic() {
         .unwrap();
     let mut object_client = ObjectServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = format!("vector-diagnostic-task-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("vector-diagnostic-task");
     bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -318,7 +324,7 @@ async fn test_vector_index_build_records_dimension_mismatch_diagnostic() {
         ))
         .await
         .unwrap();
-    index_client
+    let created = index_client
         .create_index(authorized(
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
@@ -342,7 +348,10 @@ async fn test_vector_index_build_records_dimension_mismatch_diagnostic() {
             &token,
         ))
         .await
-        .unwrap();
+        .unwrap()
+        .into_inner()
+        .index
+        .expect("created vector index");
 
     let bucket_id = cluster.states[0]
         .persistence
@@ -377,47 +386,25 @@ async fn test_vector_index_build_records_dimension_mismatch_diagnostic() {
     );
     object_client.put_object(put_req).await.unwrap();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    let mut found = false;
-    while tokio::time::Instant::now() < deadline {
-        let diagnostics = index_client
-            .list_index_diagnostics(authorized(
-                ListIndexDiagnosticsRequest {
-                    bucket_name: bucket_name.clone(),
-                    index_name: "embedding".to_string(),
-                    severity: "error".to_string(),
-                    after_cursor: 0,
-                    limit: 10,
-                },
-                &token,
-            ))
-            .await
-            .unwrap()
-            .into_inner()
-            .diagnostics;
-        if diagnostics.iter().any(|diagnostic| {
-            diagnostic.object_key == "docs/bad-vector.json"
-                && diagnostic.code == "VectorDimensionMismatch"
-        }) {
-            found = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-
-    assert!(found, "dimension mismatch should write an index diagnostic");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    let tasks = loop {
-        let tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
-        if tasks.iter().any(|task| {
-            task.task_type == anvil::tasks::TaskType::IndexBuild
-                && task.status == anvil::tasks::TaskStatus::Completed
-        }) || tokio::time::Instant::now() >= deadline
-        {
-            break tasks;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+    wait_for_index_diagnostic(
+        &mut index_client,
+        &token,
+        &bucket_name,
+        "embedding",
+        "error",
+        "docs/bad-vector.json",
+        "VectorDimensionMismatch",
+        Duration::from_secs(20),
+    )
+    .await;
+    let tasks = wait_for_index_builds_for_indexes(
+        &cluster,
+        Duration::from_secs(60),
+        1,
+        bucket_id,
+        &[created.index_id as i64],
+    )
+    .await;
     assert!(
         tasks.iter().any(|task| {
             task.task_type == anvil::tasks::TaskType::IndexBuild
@@ -433,8 +420,7 @@ async fn test_vector_index_build_records_dimension_mismatch_diagnostic() {
 
 #[tokio::test]
 async fn test_hybrid_index_builds_text_and_vector_segments_from_object_write_task() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -446,7 +432,7 @@ async fn test_hybrid_index_builds_text_and_vector_segments_from_object_write_tas
         .unwrap();
     let mut object_client = ObjectServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = format!("hybrid-index-build-task-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("hybrid-index-build-task");
     bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -468,7 +454,7 @@ async fn test_hybrid_index_builds_text_and_vector_segments_from_object_write_tas
         "cosine",
     );
     vector_policy["extractor"]["json_pointer"] = serde_json::json!("/embedding");
-    index_client
+    let created = index_client
         .create_index(authorized(
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
@@ -494,7 +480,10 @@ async fn test_hybrid_index_builds_text_and_vector_segments_from_object_write_tas
             &token,
         ))
         .await
-        .unwrap();
+        .unwrap()
+        .into_inner()
+        .index
+        .expect("created hybrid index");
 
     let body = br#"{"body":"lease dashboard summary","embedding":[0.0,1.0]}"#.to_vec();
     let bucket_id = cluster.states[0]
@@ -528,43 +517,29 @@ async fn test_hybrid_index_builds_text_and_vector_segments_from_object_write_tas
     );
     object_client.put_object(put_req).await.unwrap();
 
-    let mut final_response = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    while tokio::time::Instant::now() < deadline {
-        let response = index_client
-            .query_index(authorized(
-                QueryIndexRequest {
-                    bucket_name: bucket_name.clone(),
-                    index_name: "body-and-vector".to_string(),
-                    query_text: "lease dashboard".to_string(),
-                    query_vector: vec![0.0, 1.0],
-                    limit: 10,
-                    phrase: false,
-                    path_prefix: String::new(),
-                    metadata_filters_json: String::new(),
-                    boundary_predicates_json: String::new(),
-                    typed_predicates_json: String::new(),
-                    typed_order_json: String::new(),
-                    page_token: String::new(),
-                    require_caught_up_to_watch_cursor: String::new(),
-                    lag_timeout_ms: 0,
-                },
-                &token,
-            ))
-            .await;
-        if let Ok(response) = response {
-            let response = response.into_inner();
-            if response
-                .hits
-                .iter()
-                .any(|hit| hit.object_key == "docs/hybrid.json")
-            {
-                final_response = Some(response);
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let response = query_index_until_hits(
+        &mut index_client,
+        &token,
+        QueryIndexRequest {
+            bucket_name: bucket_name.clone(),
+            index_name: "body-and-vector".to_string(),
+            query_text: "lease dashboard".to_string(),
+            query_vector: vec![0.0, 1.0],
+            limit: 10,
+            phrase: false,
+            path_prefix: String::new(),
+            metadata_filters_json: String::new(),
+            boundary_predicates_json: String::new(),
+            typed_predicates_json: String::new(),
+            typed_order_json: String::new(),
+            page_token: String::new(),
+            require_caught_up_to_watch_cursor: String::new(),
+            lag_timeout_ms: 0,
+        },
+        1,
+        Duration::from_secs(60),
+    )
+    .await;
 
     let diagnostics = index_client
         .list_index_diagnostics(authorized(
@@ -581,14 +556,22 @@ async fn test_hybrid_index_builds_text_and_vector_segments_from_object_write_tas
         .unwrap()
         .into_inner()
         .diagnostics;
-    let response = final_response.unwrap_or_else(|| {
-        panic!("hybrid index build task should make object searchable; diagnostics={diagnostics:?}")
-    });
+    assert!(
+        !response.hits.is_empty(),
+        "hybrid index build task should make object searchable; diagnostics={diagnostics:?}"
+    );
     assert_eq!(response.index_kind, IndexKind::Hybrid as i32);
     assert!(response.index_generation >= 1);
     assert_eq!(response.hits[0].object_key, "docs/hybrid.json");
     assert!(response.hits[0].score > 0.0);
-    let tasks = wait_for_index_build_task_count(&cluster, Duration::from_secs(60), 1).await;
+    let tasks = wait_for_index_builds_for_indexes(
+        &cluster,
+        Duration::from_secs(60),
+        1,
+        bucket_id,
+        &[created.index_id as i64],
+    )
+    .await;
     assert!(tasks.iter().any(|task| {
         task.task_type == anvil::tasks::TaskType::IndexBuild
             && task.status == anvil::tasks::TaskStatus::Completed
@@ -601,8 +584,7 @@ async fn test_hybrid_index_builds_text_and_vector_segments_from_object_write_tas
 
 #[tokio::test]
 async fn test_query_full_text_index_reads_latest_segment() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -611,7 +593,7 @@ async fn test_query_full_text_index_reads_latest_segment() {
         .unwrap();
     let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = "index-query-full-text-bucket".to_string();
+    let bucket_name = unique_test_name("index-query-full-text-bucket");
     bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -745,8 +727,7 @@ async fn test_query_full_text_index_reads_latest_segment() {
 
 #[tokio::test]
 async fn test_query_full_text_phrase_requires_position_enabled_index() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -755,7 +736,7 @@ async fn test_query_full_text_phrase_requires_position_enabled_index() {
         .unwrap();
     let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = "index-query-phrase-no-positions-bucket".to_string();
+    let bucket_name = unique_test_name("index-query-phrase-no-positions-bucket");
     bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -864,8 +845,7 @@ async fn test_query_full_text_phrase_requires_position_enabled_index() {
 
 #[tokio::test]
 async fn test_query_vector_index_reads_latest_segment() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -874,7 +854,7 @@ async fn test_query_vector_index_reads_latest_segment() {
         .unwrap();
     let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = "index-query-vector-bucket".to_string();
+    let bucket_name = unique_test_name("index-query-vector-bucket");
     bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -1056,8 +1036,7 @@ async fn test_query_vector_index_reads_latest_segment() {
 
 #[tokio::test]
 async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -1066,7 +1045,7 @@ async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
         .unwrap();
     let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = "index-query-hybrid-bucket".to_string();
+    let bucket_name = unique_test_name("index-query-hybrid-bucket");
     bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -1301,8 +1280,7 @@ async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
 
 #[tokio::test]
 async fn test_query_inherit_object_vector_filters_results_by_object_read_scope() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -1311,7 +1289,7 @@ async fn test_query_inherit_object_vector_filters_results_by_object_read_scope()
         .unwrap();
     let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = "index-query-inherit-vector-bucket".to_string();
+    let bucket_name = unique_test_name("index-query-inherit-vector-bucket");
     bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -1429,16 +1407,17 @@ async fn test_query_inherit_object_vector_filters_results_by_object_read_scope()
     .await
     .unwrap();
 
+    let limited_reader = unique_test_name("limited-vector-reader");
     let limited_token = cluster.states[0]
         .jwt_manager
-        .mint_token("limited-vector-reader".to_string(), claims.tenant_id)
+        .mint_token(limited_reader.clone(), claims.tenant_id)
         .unwrap();
-    grant_bucket_index_query_for_principal(&cluster, &bucket_name, "limited-vector-reader").await;
+    grant_bucket_index_query_for_principal(&cluster, &bucket_name, &limited_reader).await;
     grant_tenant_object_reader_for_principal(
         &cluster,
         &bucket_name,
         "docs/vector-allowed.txt",
-        "limited-vector-reader",
+        &limited_reader,
     )
     .await;
     let response = index_client
@@ -1477,8 +1456,7 @@ async fn test_query_inherit_object_vector_filters_results_by_object_read_scope()
 
 #[tokio::test]
 async fn test_query_inherit_object_full_text_filters_results_by_object_read_scope() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -1487,7 +1465,7 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
         .unwrap();
     let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = "index-query-inherit-object-bucket".to_string();
+    let bucket_name = unique_test_name("index-query-inherit-object-bucket");
     bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -1603,16 +1581,17 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
     .await
     .unwrap();
 
+    let limited_reader = unique_test_name("limited-index-reader");
     let limited_token = cluster.states[0]
         .jwt_manager
-        .mint_token("limited-index-reader".to_string(), claims.tenant_id)
+        .mint_token(limited_reader.clone(), claims.tenant_id)
         .unwrap();
-    grant_bucket_index_query_for_principal(&cluster, &bucket_name, "limited-index-reader").await;
+    grant_bucket_index_query_for_principal(&cluster, &bucket_name, &limited_reader).await;
     grant_tenant_object_reader_for_principal(
         &cluster,
         &bucket_name,
         "docs/allowed.txt",
-        "limited-index-reader",
+        &limited_reader,
     )
     .await;
     let response = index_client
@@ -1643,6 +1622,7 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
     assert_eq!(response.hits[0].object_key, "docs/allowed.txt");
     assert_eq!(response.hits[0].document_id, 1);
 
+    let tuple_reader = unique_test_name("tuple-index-reader");
     let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
         .await
         .unwrap();
@@ -1653,7 +1633,7 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
                 object_id: format!("{bucket_name}/docs/denied.txt"),
                 relation: "reader".to_string(),
                 subject_kind: "app".to_string(),
-                subject_id: "tuple-index-reader".to_string(),
+                subject_id: tuple_reader.clone(),
                 caveat_hash: "".to_string(),
                 operation: "add".to_string(),
                 reason: "index query inherited object authz test".to_string(),
@@ -1665,9 +1645,9 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
         .unwrap();
     let tuple_token = cluster.states[0]
         .jwt_manager
-        .mint_token("tuple-index-reader".to_string(), claims.tenant_id)
+        .mint_token(tuple_reader.clone(), claims.tenant_id)
         .unwrap();
-    grant_bucket_index_query_for_principal(&cluster, &bucket_name, "tuple-index-reader").await;
+    grant_bucket_index_query_for_principal(&cluster, &bucket_name, &tuple_reader).await;
     let tuple_response = query_index_until_hits(
         &mut index_client,
         &tuple_token,

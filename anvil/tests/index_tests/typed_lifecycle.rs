@@ -6,8 +6,7 @@ use std::collections::BTreeMap;
 
 #[tokio::test]
 async fn test_typed_json_index_queries_append_record_payloads() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -19,7 +18,7 @@ async fn test_typed_json_index_queries_append_record_payloads() {
         .unwrap();
     let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = "typed-json-append-index-bucket".to_string();
+    let bucket_name = unique_test_name("typed-json-append-index-bucket");
     let bucket_id = bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -150,8 +149,7 @@ async fn test_typed_json_index_queries_append_record_payloads() {
 
 #[tokio::test]
 async fn test_typed_json_index_omits_reserved_internal_candidates() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -160,7 +158,7 @@ async fn test_typed_json_index_omits_reserved_internal_candidates() {
         .unwrap();
     let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = format!("typed-reserved-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("typed-reserved");
     let bucket_id = bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -303,8 +301,7 @@ async fn test_typed_json_index_omits_reserved_internal_candidates() {
 
 #[tokio::test]
 async fn test_index_definition_lifecycle() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -313,7 +310,7 @@ async fn test_index_definition_lifecycle() {
         .unwrap();
     let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = "index-definition-bucket".to_string();
+    let bucket_name = unique_test_name("index-definition-bucket");
     bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -468,7 +465,7 @@ async fn test_index_definition_lifecycle() {
     let after_drop = index_client
         .list_indexes(authorized(
             ListIndexesRequest {
-                bucket_name,
+                bucket_name: bucket_name.clone(),
                 include_disabled: true,
             },
             &token,
@@ -482,7 +479,7 @@ async fn test_index_definition_lifecycle() {
     let mut watch = index_client
         .watch_index_definition(authorized(
             WatchIndexDefinitionRequest {
-                bucket_name: "index-definition-bucket".to_string(),
+                bucket_name,
                 after_cursor: 0,
             },
             &token,
@@ -519,8 +516,7 @@ async fn test_index_definition_lifecycle() {
 
 #[tokio::test]
 async fn test_query_path_and_metadata_filter_indexes_from_object_metadata() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -529,7 +525,7 @@ async fn test_query_path_and_metadata_filter_indexes_from_object_metadata() {
         .unwrap();
     let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = format!("metadata-backed-index-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("metadata-backed-index");
     bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -543,7 +539,7 @@ async fn test_query_path_and_metadata_filter_indexes_from_object_metadata() {
         .await
         .unwrap();
 
-    index_client
+    let path_index = index_client
         .create_index(authorized(
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
@@ -559,8 +555,11 @@ async fn test_query_path_and_metadata_filter_indexes_from_object_metadata() {
             &token,
         ))
         .await
-        .unwrap();
-    index_client
+        .unwrap()
+        .into_inner()
+        .index
+        .expect("created path index");
+    let metadata_index = index_client
         .create_index(authorized(
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
@@ -576,9 +575,12 @@ async fn test_query_path_and_metadata_filter_indexes_from_object_metadata() {
             &token,
         ))
         .await
-        .unwrap();
+        .unwrap()
+        .into_inner()
+        .index
+        .expect("created metadata index");
 
-    let _bucket_id = cluster.states[0]
+    let bucket_id = cluster.states[0]
         .persistence
         .get_bucket_by_name(1, &bucket_name)
         .await
@@ -606,18 +608,14 @@ async fn test_query_path_and_metadata_filter_indexes_from_object_metadata() {
         Some(serde_json::json!({"tenant": "alpha", "nested": {"state": "open"}})),
     )
     .await;
-    let tasks = wait_for_index_build_task_count(&cluster, Duration::from_secs(60), 2).await;
-    assert!(
-        tasks
-            .iter()
-            .filter(|task| {
-                task.task_type == anvil::tasks::TaskType::IndexBuild
-                    && task.status == anvil::tasks::TaskStatus::Completed
-            })
-            .count()
-            >= 2,
-        "path and metadata_filter build tasks should complete; tasks={tasks:?}"
-    );
+    wait_for_index_builds_for_indexes(
+        &cluster,
+        Duration::from_secs(60),
+        1,
+        bucket_id,
+        &[path_index.index_id as i64, metadata_index.index_id as i64],
+    )
+    .await;
 
     let path_response = query_index_until_hits(
         &mut index_client,
@@ -780,8 +778,7 @@ async fn test_query_path_and_metadata_filter_indexes_from_object_metadata() {
 
 #[tokio::test]
 async fn test_live_metadata_query_uses_planner_authz_candidates_and_scoped_page_tokens() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -790,7 +787,7 @@ async fn test_live_metadata_query_uses_planner_authz_candidates_and_scoped_page_
         .unwrap();
     let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = format!("planner-authz-metadata-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("planner-authz-metadata");
     bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -804,7 +801,7 @@ async fn test_live_metadata_query_uses_planner_authz_candidates_and_scoped_page_
         .await
         .unwrap();
 
-    index_client
+    let created = index_client
         .create_index(authorized(
             CreateIndexRequest {
                 bucket_name: bucket_name.clone(),
@@ -820,7 +817,17 @@ async fn test_live_metadata_query_uses_planner_authz_candidates_and_scoped_page_
             &token,
         ))
         .await
-        .unwrap();
+        .unwrap()
+        .into_inner()
+        .index
+        .expect("created metadata index");
+    let bucket_id = cluster.states[0]
+        .persistence
+        .get_bucket_by_name(1, &bucket_name)
+        .await
+        .unwrap()
+        .expect("bucket metadata should exist")
+        .id;
 
     persist_index_object(
         &cluster,
@@ -850,40 +857,48 @@ async fn test_live_metadata_query_uses_planner_authz_candidates_and_scoped_page_
         Some(serde_json::json!({"tenant": "b", "kind": "invoice"})),
     )
     .await;
-    wait_for_index_build_task(&cluster, Duration::from_secs(60)).await;
+    wait_for_index_builds_for_indexes(
+        &cluster,
+        Duration::from_secs(60),
+        1,
+        bucket_id,
+        &[created.index_id as i64],
+    )
+    .await;
 
     let claims = cluster.states[0].jwt_manager.verify_token(&token).unwrap();
+    let metadata_reader = unique_test_name("planner-metadata-reader");
+    let no_object_reader = unique_test_name("planner-no-object-reader");
     let limited_token = cluster.states[0]
         .jwt_manager
-        .mint_token("planner-metadata-reader".to_string(), claims.tenant_id)
+        .mint_token(metadata_reader.clone(), claims.tenant_id)
         .unwrap();
     let no_object_token = cluster.states[0]
         .jwt_manager
-        .mint_token("planner-no-object-reader".to_string(), claims.tenant_id)
+        .mint_token(no_object_reader.clone(), claims.tenant_id)
         .unwrap();
 
-    grant_bucket_index_query_for_principal(&cluster, &bucket_name, "planner-metadata-reader").await;
-    grant_bucket_index_query_for_principal(&cluster, &bucket_name, "planner-no-object-reader")
-        .await;
+    grant_bucket_index_query_for_principal(&cluster, &bucket_name, &metadata_reader).await;
+    grant_bucket_index_query_for_principal(&cluster, &bucket_name, &no_object_reader).await;
     grant_tenant_object_reader_for_principal(
         &cluster,
         &bucket_name,
         "tenant-a/allowed-1.json",
-        "planner-metadata-reader",
+        &metadata_reader,
     )
     .await;
     grant_tenant_object_reader_for_principal(
         &cluster,
         &bucket_name,
         "tenant-a/allowed-2.json",
-        "planner-metadata-reader",
+        &metadata_reader,
     )
     .await;
     grant_tenant_object_reader_for_principal(
         &cluster,
         &bucket_name,
         "tenant-b/allowed.json",
-        "planner-metadata-reader",
+        &metadata_reader,
     )
     .await;
 
