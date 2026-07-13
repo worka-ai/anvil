@@ -594,7 +594,12 @@ async fn authz_schema_writes_materialize_segment_schema_tables() {
             && row.rule_kind == "inherit"
             && row.inherited_relation == "editor"
     }));
-    assert_eq!(bound_segment.revision_checkpoints[0].revision, 11);
+    assert!(
+        bound_segment
+            .revision_checkpoints
+            .iter()
+            .any(|row| row.revision == 11)
+    );
 }
 
 #[tokio::test]

@@ -450,7 +450,7 @@ mod tests {
     use crate::core_store::{
         CF_TRANSACTIONS, CoreMetaRowCommonProto, CoreMetaStore, CoreMetaTuplePart,
         CoreMetaVisibilityState, CoreMutationBatch, CoreMutationOperation, CoreStore, ReadStream,
-        TABLE_EXPLICIT_TRANSACTION_ROW, core_meta_committed_row_common, core_meta_tuple_key,
+        TABLE_NATIVE_IDEMPOTENCY_ROW, core_meta_committed_row_common, core_meta_tuple_key,
     };
     use tempfile::TempDir;
     use tokio::time::{Duration, sleep};
@@ -575,7 +575,7 @@ mod tests {
     ) -> Option<ExplicitTransactionStateRowProto> {
         let payload = CoreMetaStore::open(state.storage.core_store_meta_path())
             .unwrap()
-            .get(CF_TRANSACTIONS, TABLE_EXPLICIT_TRANSACTION_ROW, tuple_key)
+            .get(CF_TRANSACTIONS, TABLE_NATIVE_IDEMPOTENCY_ROW, tuple_key)
             .unwrap()?;
         Some(
             crate::core_store::decode_deterministic_proto(
@@ -657,7 +657,7 @@ mod tests {
                 &begin.transaction_id,
                 &transaction_principal(&with_claims(())).unwrap(),
                 CF_TRANSACTIONS,
-                TABLE_EXPLICIT_TRANSACTION_ROW,
+                TABLE_NATIVE_IDEMPOTENCY_ROW,
                 row_key.clone(),
                 row_payload,
                 None,
@@ -793,7 +793,7 @@ mod tests {
                     CoreMutationOperation::CoreMetaPut {
                         partition_id: root.to_string(),
                         cf: CF_TRANSACTIONS.to_string(),
-                        table_id: TABLE_EXPLICIT_TRANSACTION_ROW,
+                        table_id: TABLE_NATIVE_IDEMPOTENCY_ROW,
                         tuple_key: row_key.clone(),
                         payload: row_payload,
                     },

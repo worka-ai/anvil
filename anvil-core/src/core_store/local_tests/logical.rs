@@ -328,11 +328,9 @@ async fn core_store_range_read_does_not_require_unrelated_data_shards() {
         .await
         .unwrap();
     let manifest = store.read_object_manifest(&object_ref).await.unwrap();
-    for placement in manifest
-        .placements
-        .iter()
-        .filter(|placement| placement.shard_index >= LOCAL_DATA_SHARDS as u16)
-    {
+    for placement in manifest.placements.iter().filter(|placement| {
+        placement.shard_index > 0 && placement.shard_index < LOCAL_DATA_SHARDS as u16
+    }) {
         let shard_path = store.shard_path(
             &placement.node_id,
             &manifest.encoding.block_id,
@@ -843,15 +841,20 @@ async fn core_store_logical_range_read_does_not_materialise_unrelated_blocks() {
         .unwrap();
     let unrelated_ref =
         object_ref_from_logical_block_ref(unrelated, &manifest.erasure_profile_id).unwrap();
-    let placement = unrelated_ref
+    for placement in unrelated_ref
         .placements
         .iter()
-        .find(|placement| placement.shard_index == 0)
-        .unwrap();
-    let shard_path = store.shard_path(&placement.node_id, &unrelated_ref.encoding.block_id, 0);
-    fs::write(&shard_path, vec![0xee; placement.stored_size as usize])
-        .await
-        .unwrap();
+        .filter(|placement| placement.shard_index < 3)
+    {
+        let shard_path = store.shard_path(
+            &placement.node_id,
+            &unrelated_ref.encoding.block_id,
+            placement.shard_index,
+        );
+        fs::write(&shard_path, vec![0xee; placement.stored_size as usize])
+            .await
+            .unwrap();
+    }
 
     let slice = store
         .read_logical_range(ReadLogicalRangeRequest {

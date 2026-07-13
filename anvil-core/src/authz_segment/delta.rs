@@ -44,8 +44,19 @@ pub(crate) async fn write_authz_tuple_delta_segment(
         bound_relation_rule_rows(storage, tenant_id, &previous_active).await?;
     let previous_relation_rule_rows =
         all_relation_rule_rows(storage, tenant_id, &previous_bound_relation_rule_rows).await?;
-    let schema_replacement = schema_rows != previous_schema_rows;
-    let relation_rule_replacement = relation_rule_rows != previous_relation_rule_rows;
+    let schema_or_binding_changed_at_target_revision =
+        authz_realm_schema::list_schema_revisions(storage, tenant_id)
+            .await?
+            .into_iter()
+            .any(|record| record.authz_revision == target_revision)
+            || authz_realm_schema::list_schema_bindings(storage, tenant_id)
+                .await?
+                .into_iter()
+                .any(|record| record.authz_revision == target_revision);
+    let schema_replacement =
+        schema_or_binding_changed_at_target_revision || schema_rows != previous_schema_rows;
+    let relation_rule_replacement = schema_or_binding_changed_at_target_revision
+        || relation_rule_rows != previous_relation_rule_rows;
 
     let current_view = tuple_view_from_active_records(&current_active);
     let previous_view = tuple_view_from_active_records(&previous_active);
