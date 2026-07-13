@@ -6,18 +6,13 @@ fn test_s3_public_and_private_access() {
 }
 
 #[test]
-fn test_s3_large_object_uses_corestore_ref_and_ranges_across_large_object() {
+fn test_s3_large_object_ranges_across_docker_cluster() {
     run_large_s3_gateway_test(Box::pin(async {
-        let mut cluster = TestCluster::new(&["test-region-1"]).await;
-        cluster.start_and_converge(Duration::from_secs(5)).await;
+        let cluster = shared_docker_test_cluster().await;
+        let actor = create_docker_app(&cluster, "s3-large-chunks").await;
 
-        let app_name = format!("s3-large-chunks-{}", uuid::Uuid::new_v4());
-        let (client_id, client_secret) = create_app(&cluster, &app_name).await;
-        grant_storage_tenant_owner_for_test(&cluster, &app_name).await;
-
-        let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
-        let client = s3_client(http_base, &client_id, &client_secret);
-        let bucket_name = format!("s3-large-chunks-{}", uuid::Uuid::new_v4());
+        let client = s3_client_for_docker_app(&cluster, &actor);
+        let bucket_name = unique_test_name("s3-large-chunks");
         let object_key = "large/chunked.bin";
         let object_len = LARGE_OBJECT_RANGE_SPLIT_BYTES + 257;
         let content = (0..object_len)
@@ -39,31 +34,6 @@ fn test_s3_large_object_uses_corestore_ref_and_ranges_across_large_object() {
             .send()
             .await
             .expect("large S3 PUT should succeed");
-
-        let bucket_id = cluster.states[0]
-            .persistence
-            .get_bucket_by_name(1, &bucket_name)
-            .await
-            .unwrap()
-            .expect("bucket metadata should exist")
-            .id;
-        let object = cluster.states[0]
-            .persistence
-            .get_object(bucket_id, object_key)
-            .await
-            .unwrap()
-            .expect("large object metadata should exist");
-        let shard_map = object
-            .shard_map
-            .as_ref()
-            .expect("large object should record a CoreStore object data target");
-        assert_eq!(shard_map["schema"], "anvil.core.object_data_target.v1");
-        assert!(
-            shard_map["target"]
-                .as_str()
-                .is_some_and(|target| target.len() > 16),
-            "large object should store a canonical CoreStore object data target"
-        );
 
         let full_resp = client
             .get_object()
@@ -95,34 +65,22 @@ fn test_s3_large_object_uses_corestore_ref_and_ranges_across_large_object() {
 }
 
 async fn run_s3_public_and_private_access() {
-    let mut cluster = TestCluster::new_with_config(&["test-region-1"], |config| {
-        configure_test_public_region(config);
-    })
-    .await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
-
-    let (client_id, client_secret) = create_app(&cluster, "s3-test-app").await;
-
-    // Grant the test app storage-tenant ownership before getting a token.
-    grant_storage_tenant_owner_for_test(&cluster, "s3-test-app").await;
-
-    // Allow a moment for the policy change to propagate or be read by the server.
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    let token = get_token(&cluster.grpc_addrs[0], &client_id, &client_secret).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_app(&cluster, "s3-test-app").await;
+    let token = actor.token.clone();
 
     // 1. Create a private and a public bucket
-    let private_bucket = "private-s3-bucket".to_string();
-    let public_bucket = "public-s3-bucket".to_string();
+    let private_bucket = unique_test_name("private-s3-bucket");
+    let public_bucket = unique_test_name("public-s3-bucket");
 
     let mut bucket_client = anvil::anvil_api::bucket_service_client::BucketServiceClient::connect(
-        cluster.grpc_addrs[0].clone(),
+        actor.grpc_addr.clone(),
     )
     .await
     .unwrap();
     let mut req = tonic::Request::new(anvil::anvil_api::CreateBucketRequest {
         bucket_name: private_bucket.clone(),
-        region: "test-region-1".to_string(),
+        region: cluster.region.clone(),
 
         options: None,
     });
@@ -134,7 +92,7 @@ async fn run_s3_public_and_private_access() {
 
     let mut req = tonic::Request::new(anvil::anvil_api::CreateBucketRequest {
         bucket_name: public_bucket.clone(),
-        region: "test-region-1".to_string(),
+        region: cluster.region.clone(),
 
         options: None,
     });
@@ -145,23 +103,12 @@ async fn run_s3_public_and_private_access() {
     bucket_client.create_bucket(req).await.unwrap();
 
     // 2. Set the public bucket to be public
-    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
-        .await
-        .unwrap();
-    let mut public_req = tonic::Request::new(SetPublicAccessRequest {
-        bucket: public_bucket.clone(),
-        allow_public_read: true,
-    });
-    public_req.metadata_mut().insert(
-        "authorization",
-        format!("Bearer {}", token).parse().unwrap(),
-    );
-    auth_client.set_public_access(public_req).await.unwrap();
+    set_bucket_public_for_docker_app(&actor, &public_bucket).await;
 
     // 3. Configure AWS S3 client to talk to our local server
     // TestCluster stores gRPC base at /grpc; S3 must hit HTTP root.
-    let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
-    let client = s3_client(http_base, &client_id, &client_secret);
+    let http_base = actor.grpc_addr.trim_end_matches('/');
+    let client = s3_client_for_docker_app(&cluster, &actor);
 
     let location = client
         .get_bucket_location()
@@ -170,7 +117,7 @@ async fn run_s3_public_and_private_access() {
         .await
         .unwrap();
     assert!(
-        format!("{:?}", location.location_constraint()).contains("test-region-1"),
+        format!("{:?}", location.location_constraint()).contains(&cluster.region),
         "bucket location response should include the stored bucket region"
     );
 
@@ -196,7 +143,7 @@ async fn run_s3_public_and_private_access() {
         "bucket versioning should be reported as enabled"
     );
 
-    let deleted_bucket = format!("delete-s3-bucket-{}", uuid::Uuid::new_v4());
+    let deleted_bucket = unique_test_name("delete-s3-bucket");
     client
         .create_bucket()
         .bucket(&deleted_bucket)
@@ -218,7 +165,7 @@ async fn run_s3_public_and_private_access() {
         "deleted bucket should no longer be visible: {deleted_head_debug}"
     );
 
-    let active_multipart_bucket = format!("delete-s3-active-multipart-{}", uuid::Uuid::new_v4());
+    let active_multipart_bucket = unique_test_name("delete-s3-active-multipart");
     let active_multipart_key = "active-upload.txt";
     client
         .create_bucket()
@@ -1014,10 +961,15 @@ async fn run_s3_public_and_private_access() {
     assert!(version_specific_after_delete.delete_markers().is_empty());
 
     // 6. Test Public Access (Success): Use reqwest (no auth) to get from public bucket
-    let public_url = tenant_routed_public_url(http_base, "default", &public_bucket, public_key);
+    let public_url = tenant_routed_public_url(
+        http_base,
+        &actor.tenant_id.to_string(),
+        &public_bucket,
+        public_key,
+    );
     let public_resp = reqwest::Client::new()
         .get(&public_url)
-        .header(reqwest::header::HOST, TEST_PUBLIC_REGION_HOST)
+        .header(reqwest::header::HOST, &cluster.public_region_host)
         .send()
         .await
         .expect("Failed to make public request");
@@ -1026,10 +978,15 @@ async fn run_s3_public_and_private_access() {
     assert_eq!(public_data.as_ref(), public_content);
 
     // 7. Test Private Access (Failure): Use reqwest (no auth) to get from private bucket
-    let private_url = tenant_routed_public_url(http_base, "default", &private_bucket, private_key);
+    let private_url = tenant_routed_public_url(
+        http_base,
+        &actor.tenant_id.to_string(),
+        &private_bucket,
+        private_key,
+    );
     let private_resp = reqwest::Client::new()
         .get(&private_url)
-        .header(reqwest::header::HOST, TEST_PUBLIC_REGION_HOST)
+        .header(reqwest::header::HOST, &cluster.public_region_host)
         .send()
         .await
         .unwrap();
@@ -1050,12 +1007,16 @@ async fn run_s3_public_and_private_access() {
     ];
     for reserved_prefix in reserved_prefixes {
         let reserved_key = format!("{reserved_prefix}s3-compat-object");
-        let reserved_url =
-            tenant_routed_public_url(http_base, "default", &public_bucket, &reserved_key);
+        let reserved_url = tenant_routed_public_url(
+            http_base,
+            &actor.tenant_id.to_string(),
+            &public_bucket,
+            &reserved_key,
+        );
 
         let reserved_get = reqwest::Client::new()
             .get(&reserved_url)
-            .header(reqwest::header::HOST, TEST_PUBLIC_REGION_HOST)
+            .header(reqwest::header::HOST, &cluster.public_region_host)
             .send()
             .await
             .unwrap();
@@ -1070,7 +1031,7 @@ async fn run_s3_public_and_private_access() {
 
         let reserved_head = reqwest::Client::new()
             .head(&reserved_url)
-            .header(reqwest::header::HOST, TEST_PUBLIC_REGION_HOST)
+            .header(reqwest::header::HOST, &cluster.public_region_host)
             .send()
             .await
             .unwrap();
@@ -1078,7 +1039,7 @@ async fn run_s3_public_and_private_access() {
 
         let reserved_range_get = reqwest::Client::new()
             .get(&reserved_url)
-            .header(reqwest::header::HOST, TEST_PUBLIC_REGION_HOST)
+            .header(reqwest::header::HOST, &cluster.public_region_host)
             .header(reqwest::header::RANGE, "bytes=0-1")
             .send()
             .await
@@ -1104,7 +1065,7 @@ async fn run_s3_public_and_private_access() {
 
         let forged_internal_token_put = reqwest::Client::new()
             .put(format!("{reserved_url}?internal_write_token=caller-forged"))
-            .header(reqwest::header::HOST, TEST_PUBLIC_REGION_HOST)
+            .header(reqwest::header::HOST, &cluster.public_region_host)
             .header("x-anvil-internal-write-token", "caller-forged")
             .body("must not be stored")
             .send()

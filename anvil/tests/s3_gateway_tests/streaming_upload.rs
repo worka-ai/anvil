@@ -2,32 +2,15 @@ use super::*;
 
 #[tokio::test]
 async fn test_streaming_upload_decoding() {
-    let mut cluster = TestCluster::new_with_config(&["test-region-1"], |config| {
-        configure_test_public_region(config);
-    })
-    .await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
 
-    let (client_id, client_secret) = create_app(&cluster, "streaming-decode-app").await;
-
-    // Grant the test app ownership of the storage tenant through the system realm.
-    grant_storage_tenant_owner_for_test(&cluster, "streaming-decode-app").await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    let actor = create_docker_app(&cluster, "streaming-decode-app").await;
 
     // Configure S3 client
-    let credentials =
-        aws_sdk_s3::config::Credentials::new(&client_id, &client_secret, None, None, "static");
-    let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
-    let config = aws_sdk_s3::Config::builder()
-        .credentials_provider(credentials)
-        .region(aws_sdk_s3::config::Region::new("test-region-1"))
-        .endpoint_url(http_base)
-        .force_path_style(true)
-        .behavior_version_latest()
-        .build();
-    let client = Client::from_conf(config);
+    let http_base = actor.grpc_addr.trim_end_matches('/');
+    let client = s3_client_for_docker_app(&cluster, &actor);
 
-    let bucket_name = format!("streaming-decode-test-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("streaming-decode-test");
     client
         .create_bucket()
         .bucket(&bucket_name)
@@ -75,27 +58,16 @@ async fn test_streaming_upload_decoding() {
         .expect("Failed to put streaming object");
 
     // 2. Make the bucket public so we can test with an unauthenticated client.
-    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
-        .await
-        .unwrap();
-    let token = get_token(&cluster.grpc_addrs[0], &client_id, &client_secret).await;
-    let mut public_req = tonic::Request::new(SetPublicAccessRequest {
-        bucket: bucket_name.clone(),
-        allow_public_read: true,
-    });
-    public_req.metadata_mut().insert(
-        "authorization",
-        format!("Bearer {}", token).parse().unwrap(),
-    );
-    auth_client.set_public_access(public_req).await.unwrap();
+    set_bucket_public_for_docker_app(&actor, &bucket_name).await;
 
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // 3. Download the object using a simple HTTP client (reqwest).
-    let object_url = tenant_routed_public_url(http_base, "default", &bucket_name, object_key);
+    let tenant = actor.tenant_id.to_string();
+    let object_url = tenant_routed_public_url(http_base, &tenant, &bucket_name, object_key);
     let response = reqwest::Client::new()
         .get(&object_url)
-        .header(reqwest::header::HOST, TEST_PUBLIC_REGION_HOST)
+        .header(reqwest::header::HOST, &cluster.public_region_host)
         .send()
         .await
         .unwrap();

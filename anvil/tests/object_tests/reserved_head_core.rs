@@ -2,11 +2,13 @@ use super::*;
 
 #[tokio::test]
 async fn test_native_object_api_rejects_reserved_internal_namespaces() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
+    let actor =
+        create_object_test_actor(&cluster, "native-object-api-rejects-reserved-internal-name")
+            .await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
@@ -14,7 +16,7 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         .await
         .unwrap();
 
-    let bucket_name = "test-native-reserved-namespace".to_string();
+    let bucket_name = unique_test_name("native-reserved");
     let visible_key = "visible/source.json".to_string();
     let reserved_key = "_anvil/authz/native-object-api".to_string();
     let reserved_prefix = "_anvil/authz/".to_string();
@@ -42,7 +44,11 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
                 ObjectMetadata {
                     bucket_name: bucket_name.clone(),
                     object_key: visible_key.clone(),
-                    mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                    mutation_context: Some(native_mutation_context(
+                        &actor,
+                        bucket_id,
+                        "object-metadata",
+                    )),
                     content_type: None,
                     user_metadata_json: String::new(),
                     storage_class: None,
@@ -68,7 +74,11 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
                 ObjectMetadata {
                     bucket_name: bucket_name.clone(),
                     object_key: reserved_key.clone(),
-                    mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                    mutation_context: Some(native_mutation_context(
+                        &actor,
+                        bucket_id,
+                        "object-metadata",
+                    )),
                     content_type: None,
                     user_metadata_json: String::new(),
                     storage_class: None,
@@ -123,7 +133,7 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         bucket_name: bucket_name.clone(),
         object_key: reserved_key.clone(),
         version_id: None,
-        mutation_context: Some(native_mutation_context(bucket_id, "delete-object")),
+        mutation_context: Some(native_mutation_context(&actor, bucket_id, "delete-object")),
     });
     delete_req.metadata_mut().insert(
         "authorization",
@@ -177,6 +187,7 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
                         bucket_name: bucket_name.clone(),
                         object_key: key.clone(),
                         mutation_context: Some(native_mutation_context(
+                            &actor,
                             bucket_id,
                             "reserved-prefix-put",
                         )),
@@ -259,7 +270,7 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         source_version_id: None,
         destination_bucket_name: bucket_name.clone(),
         destination_object_key: "visible/copied-from-reserved.json".to_string(),
-        mutation_context: Some(native_mutation_context(bucket_id, "copy-object")),
+        mutation_context: Some(native_mutation_context(&actor, bucket_id, "copy-object")),
     });
     copy_from_reserved.metadata_mut().insert(
         "authorization",
@@ -273,7 +284,7 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         source_version_id: None,
         destination_bucket_name: bucket_name.clone(),
         destination_object_key: reserved_key.clone(),
-        mutation_context: Some(native_mutation_context(bucket_id, "copy-object")),
+        mutation_context: Some(native_mutation_context(&actor, bucket_id, "copy-object")),
     });
     copy_to_reserved.metadata_mut().insert(
         "authorization",
@@ -289,7 +300,7 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         }],
         destination_bucket_name: bucket_name.clone(),
         destination_object_key: reserved_key.clone(),
-        mutation_context: Some(native_mutation_context(bucket_id, "compose-object")),
+        mutation_context: Some(native_mutation_context(&actor, bucket_id, "compose-object")),
     });
     compose_to_reserved.metadata_mut().insert(
         "authorization",
@@ -302,7 +313,11 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         object_key: reserved_key.clone(),
         base_version_id: None,
         merge_patch_json: r#"{"patched":true}"#.to_string(),
-        mutation_context: Some(native_mutation_context(bucket_id, "patch-json-object")),
+        mutation_context: Some(native_mutation_context(
+            &actor,
+            bucket_id,
+            "patch-json-object",
+        )),
         precondition: None,
     });
     patch_reserved.metadata_mut().insert(
@@ -317,6 +332,7 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         expected_revision: 0,
         manifest_json: "{}".to_string(),
         mutation_context: Some(native_mutation_context(
+            &actor,
             bucket_id,
             "compare-and-swap-manifest",
         )),
@@ -335,7 +351,11 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
     let mut multipart_reserved = Request::new(InitiateMultipartRequest {
         bucket_name: bucket_name.clone(),
         object_key: reserved_key.clone(),
-        mutation_context: Some(native_mutation_context(bucket_id, "initiate-multipart")),
+        mutation_context: Some(native_mutation_context(
+            &actor,
+            bucket_id,
+            "initiate-multipart",
+        )),
     });
     multipart_reserved.metadata_mut().insert(
         "authorization",
@@ -350,7 +370,11 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
     let mut create_append_reserved = Request::new(CreateAppendStreamRequest {
         bucket_name: bucket_name.clone(),
         stream_key: reserved_key.clone(),
-        mutation_context: Some(native_mutation_context(bucket_id, "create-append-stream")),
+        mutation_context: Some(native_mutation_context(
+            &actor,
+            bucket_id,
+            "create-append-stream",
+        )),
     });
     create_append_reserved.metadata_mut().insert(
         "authorization",
@@ -367,7 +391,11 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         stream_key: reserved_key.clone(),
         stream_id: uuid::Uuid::new_v4().to_string(),
         payload: b"reserved append payload".to_vec(),
-        mutation_context: Some(native_mutation_context(bucket_id, "append-stream-record")),
+        mutation_context: Some(native_mutation_context(
+            &actor,
+            bucket_id,
+            "append-stream-record",
+        )),
         content_type: None,
         user_metadata_json: String::new(),
         precondition: None,
@@ -386,7 +414,11 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
         bucket_name: bucket_name.clone(),
         stream_key: reserved_key.clone(),
         stream_id: uuid::Uuid::new_v4().to_string(),
-        mutation_context: Some(native_mutation_context(bucket_id, "seal-append-stream")),
+        mutation_context: Some(native_mutation_context(
+            &actor,
+            bucket_id,
+            "seal-append-stream",
+        )),
         precondition: None,
     });
     seal_append_reserved.metadata_mut().insert(
@@ -439,11 +471,11 @@ async fn test_native_object_api_rejects_reserved_internal_namespaces() {
 
 #[tokio::test]
 async fn test_head_object() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_object_test_actor(&cluster, "head-object").await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
@@ -451,7 +483,7 @@ async fn test_head_object() {
         .await
         .unwrap();
 
-    let bucket_name = "test-head-bucket".to_string();
+    let bucket_name = unique_test_name("head-bucket");
     let object_key = "test-head-object".to_string();
     let content = b"hello head";
 
@@ -476,7 +508,11 @@ async fn test_head_object() {
     let metadata = ObjectMetadata {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
-        mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+        mutation_context: Some(native_mutation_context(
+            &actor,
+            bucket_id,
+            "object-metadata",
+        )),
         content_type: None,
         user_metadata_json: String::new(),
         storage_class: None,
@@ -529,11 +565,13 @@ async fn test_head_object() {
 
 #[tokio::test]
 async fn test_object_payloads_are_corestore_backed_and_readable() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
+    let actor =
+        create_object_test_actor(&cluster, "object-payloads-are-corestore-backed-and-readabl")
+            .await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
@@ -541,7 +579,7 @@ async fn test_object_payloads_are_corestore_backed_and_readable() {
         .await
         .unwrap();
 
-    let bucket_name = "test-inline-payload-bucket".to_string();
+    let bucket_name = unique_test_name("inline-payload");
     let inline_key = "inline-64k.bin".to_string();
     let external_key = "external-over-64k.bin".to_string();
 
@@ -569,7 +607,11 @@ async fn test_object_payloads_are_corestore_backed_and_readable() {
                 ObjectMetadata {
                     bucket_name: bucket_name.clone(),
                     object_key: inline_key.clone(),
-                    mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                    mutation_context: Some(native_mutation_context(
+                        &actor,
+                        bucket_id,
+                        "object-metadata",
+                    )),
                     content_type: None,
                     user_metadata_json: String::new(),
                     storage_class: None,
@@ -599,7 +641,11 @@ async fn test_object_payloads_are_corestore_backed_and_readable() {
             ObjectMetadata {
                 bucket_name: bucket_name.clone(),
                 object_key: external_key.clone(),
-                mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                mutation_context: Some(native_mutation_context(
+                    &actor,
+                    bucket_id,
+                    "object-metadata",
+                )),
                 content_type: None,
                 user_metadata_json: String::new(),
                 storage_class: None,
@@ -628,7 +674,7 @@ async fn test_object_payloads_are_corestore_backed_and_readable() {
 
     let bucket_id = cluster.states[0]
         .persistence
-        .get_bucket_by_name(1, &bucket_name)
+        .get_bucket_by_name(actor.tenant_id, &bucket_name)
         .await
         .unwrap()
         .expect("bucket metadata should exist")
@@ -736,11 +782,13 @@ async fn test_object_payloads_are_corestore_backed_and_readable() {
 
 #[tokio::test]
 async fn test_object_version_records_index_policy_snapshot_and_mutation_metadata() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
+    let actor =
+        create_object_test_actor(&cluster, "object-version-records-index-policy-snapshot-and")
+            .await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
@@ -751,7 +799,7 @@ async fn test_object_version_records_index_policy_snapshot_and_mutation_metadata
         .await
         .unwrap();
 
-    let bucket_name = "object-policy-snapshot-bucket".to_string();
+    let bucket_name = unique_test_name("policy-snap");
     let object_key = "docs/policy-snapshot.txt".to_string();
     let content = b"policy snapshot content";
 
@@ -808,7 +856,11 @@ async fn test_object_version_records_index_policy_snapshot_and_mutation_metadata
                 ObjectMetadata {
                     bucket_name: bucket_name.clone(),
                     object_key: object_key.clone(),
-                    mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                    mutation_context: Some(native_mutation_context(
+                        &actor,
+                        bucket_id,
+                        "object-metadata",
+                    )),
                     content_type: None,
                     user_metadata_json: String::new(),
                     storage_class: None,

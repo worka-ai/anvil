@@ -2,11 +2,13 @@ use super::*;
 
 #[tokio::test]
 async fn test_mutation_batch_rejects_stale_lease_fence_for_state_update() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor =
+        create_object_test_actor(&cluster, "mutation-batch-rejects-stale-lease-fence-for-sta")
+            .await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
@@ -15,13 +17,13 @@ async fn test_mutation_batch_rejects_stale_lease_fence_for_state_update() {
         .unwrap();
     let mut coordination_client = CoordinationServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = "test-fenced-batch-bucket".to_string();
+    let bucket_name = unique_test_name("fenced-batch");
     let object_key = "queue/item-1.json".to_string();
     let bucket_id = bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
                 bucket_name: bucket_name.clone(),
-                region: "test-region-1".to_string(),
+                region: actor.region.clone(),
 
                 options: None,
             },
@@ -37,7 +39,7 @@ async fn test_mutation_batch_rejects_stale_lease_fence_for_state_update() {
             ObjectMetadata {
                 bucket_name: bucket_name.clone(),
                 object_key: object_key.clone(),
-                mutation_context: Some(native_mutation_context(bucket_id, "fenced-seed")),
+                mutation_context: Some(native_mutation_context(&actor, bucket_id, "fenced-seed")),
                 content_type: Some("application/json".to_string()),
                 user_metadata_json: String::new(),
                 storage_class: None,
@@ -57,7 +59,7 @@ async fn test_mutation_batch_rejects_stale_lease_fence_for_state_update() {
         .await
         .unwrap();
 
-    let task_id = "queue-item-1".to_string();
+    let task_id = unique_test_name("queue-item");
     let lease = coordination_client
         .acquire_task_lease(authorized(
             AcquireTaskLeaseRequest {
@@ -82,7 +84,11 @@ async fn test_mutation_batch_rejects_stale_lease_fence_for_state_update() {
         .mutation_batch(authorized(
             MutationBatchRequest {
                 bucket_name: bucket_name.clone(),
-                mutation_context: Some(native_mutation_context(bucket_id, "fenced-batch-claim")),
+                mutation_context: Some(native_mutation_context(
+                    &actor,
+                    bucket_id,
+                    "fenced-batch-claim",
+                )),
                 precondition: Some(WritePrecondition {
                     object_versions: vec![],
                     lease_fence: Some(LeaseFencePrecondition {
@@ -117,6 +123,7 @@ async fn test_mutation_batch_rejects_stale_lease_fence_for_state_update() {
                 bucket_name: bucket_name.clone(),
                 stream_key: stream_key.clone(),
                 mutation_context: Some(native_mutation_context(
+                    &actor,
                     bucket_id,
                     "fenced-batch-create-stream",
                 )),
@@ -145,7 +152,11 @@ async fn test_mutation_batch_rejects_stale_lease_fence_for_state_update() {
         .mutation_batch(authorized(
             MutationBatchRequest {
                 bucket_name: bucket_name.clone(),
-                mutation_context: Some(native_mutation_context(bucket_id, "fenced-batch-stale")),
+                mutation_context: Some(native_mutation_context(
+                    &actor,
+                    bucket_id,
+                    "fenced-batch-stale",
+                )),
                 precondition: Some(WritePrecondition {
                     object_versions: vec![],
                     lease_fence: Some(LeaseFencePrecondition {
@@ -176,6 +187,7 @@ async fn test_mutation_batch_rejects_stale_lease_fence_for_state_update() {
             MutationBatchRequest {
                 bucket_name,
                 mutation_context: Some(native_mutation_context(
+                    &actor,
                     bucket_id,
                     "fenced-batch-stale-append",
                 )),
@@ -208,11 +220,13 @@ async fn test_mutation_batch_rejects_stale_lease_fence_for_state_update() {
 
 #[tokio::test]
 async fn test_compare_and_swap_manifest_enforces_expected_revision() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor =
+        create_object_test_actor(&cluster, "compare-and-swap-manifest-enforces-expected-revi")
+            .await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
@@ -220,11 +234,11 @@ async fn test_compare_and_swap_manifest_enforces_expected_revision() {
         .await
         .unwrap();
 
-    let bucket_name = "test-manifest-bucket".to_string();
+    let bucket_name = unique_test_name("manifest");
     let manifest_key = "manifests/current.json".to_string();
     let mut create_req = Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
-        region: "test-region-1".to_string(),
+        region: actor.region.clone(),
 
         options: None,
     });
@@ -245,6 +259,7 @@ async fn test_compare_and_swap_manifest_enforces_expected_revision() {
         expected_revision: 0,
         manifest_json: serde_json::json!({"generation": 1}).to_string(),
         mutation_context: Some(native_mutation_context(
+            &actor,
             bucket_id,
             "compare-and-swap-manifest",
         )),
@@ -270,6 +285,7 @@ async fn test_compare_and_swap_manifest_enforces_expected_revision() {
         expected_revision: 0,
         manifest_json: serde_json::json!({"generation": 2}).to_string(),
         mutation_context: Some(native_mutation_context(
+            &actor,
             bucket_id,
             "compare-and-swap-manifest",
         )),
@@ -292,6 +308,7 @@ async fn test_compare_and_swap_manifest_enforces_expected_revision() {
         expected_revision: first.revision,
         manifest_json: serde_json::json!({"generation": 2}).to_string(),
         mutation_context: Some(native_mutation_context(
+            &actor,
             bucket_id,
             "compare-and-swap-manifest",
         )),
@@ -315,11 +332,12 @@ async fn test_compare_and_swap_manifest_enforces_expected_revision() {
 
 #[tokio::test]
 async fn test_multipart_upload_completes_ordered_parts() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor =
+        create_object_test_actor(&cluster, "multipart-upload-completes-ordered-parts").await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
@@ -327,11 +345,11 @@ async fn test_multipart_upload_completes_ordered_parts() {
         .await
         .unwrap();
 
-    let bucket_name = "test-multipart-bucket".to_string();
+    let bucket_name = unique_test_name("multipart");
     let object_key = "multipart.txt".to_string();
     let mut create_req = Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
-        region: "test-region-1".to_string(),
+        region: actor.region.clone(),
 
         options: None,
     });
@@ -349,7 +367,11 @@ async fn test_multipart_upload_completes_ordered_parts() {
     let mut initiate_req = Request::new(InitiateMultipartRequest {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
-        mutation_context: Some(native_mutation_context(bucket_id, "initiate-multipart")),
+        mutation_context: Some(native_mutation_context(
+            &actor,
+            bucket_id,
+            "initiate-multipart",
+        )),
     });
     initiate_req.metadata_mut().insert(
         "authorization",
@@ -375,7 +397,11 @@ async fn test_multipart_upload_completes_ordered_parts() {
                         object_key: object_key.clone(),
                         upload_id: upload_id.clone(),
                         part_number,
-                        mutation_context: Some(native_mutation_context(bucket_id, "upload-part")),
+                        mutation_context: Some(native_mutation_context(
+                            &actor,
+                            bucket_id,
+                            "upload-part",
+                        )),
                     },
                 )),
             },
@@ -406,7 +432,11 @@ async fn test_multipart_upload_completes_ordered_parts() {
         object_key: object_key.clone(),
         upload_id,
         parts: completed_parts,
-        mutation_context: Some(native_mutation_context(bucket_id, "complete-multipart")),
+        mutation_context: Some(native_mutation_context(
+            &actor,
+            bucket_id,
+            "complete-multipart",
+        )),
     });
     complete_req.metadata_mut().insert(
         "authorization",
@@ -448,11 +478,12 @@ async fn test_multipart_upload_completes_ordered_parts() {
 
 #[tokio::test]
 async fn test_multipart_abort_returns_mutation_metadata() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor =
+        create_object_test_actor(&cluster, "multipart-abort-returns-mutation-metadata").await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
@@ -460,11 +491,11 @@ async fn test_multipart_abort_returns_mutation_metadata() {
         .await
         .unwrap();
 
-    let bucket_name = "test-multipart-abort-bucket".to_string();
+    let bucket_name = unique_test_name("mpu-abort");
     let object_key = "aborted.txt".to_string();
     let mut create_req = Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
-        region: "test-region-1".to_string(),
+        region: actor.region.clone(),
 
         options: None,
     });
@@ -482,7 +513,11 @@ async fn test_multipart_abort_returns_mutation_metadata() {
     let mut initiate_req = Request::new(InitiateMultipartRequest {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
-        mutation_context: Some(native_mutation_context(bucket_id, "initiate-multipart")),
+        mutation_context: Some(native_mutation_context(
+            &actor,
+            bucket_id,
+            "initiate-multipart",
+        )),
     });
     initiate_req.metadata_mut().insert(
         "authorization",
@@ -499,7 +534,11 @@ async fn test_multipart_abort_returns_mutation_metadata() {
         bucket_name,
         object_key,
         upload_id: initiate_res.upload_id.clone(),
-        mutation_context: Some(native_mutation_context(bucket_id, "abort-multipart")),
+        mutation_context: Some(native_mutation_context(
+            &actor,
+            bucket_id,
+            "abort-multipart",
+        )),
     });
     abort_req.metadata_mut().insert(
         "authorization",
@@ -517,11 +556,12 @@ async fn test_multipart_abort_returns_mutation_metadata() {
 
 #[tokio::test]
 async fn test_compose_object_concatenates_sources_in_order() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor =
+        create_object_test_actor(&cluster, "compose-object-concatenates-sources-in-order").await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
@@ -529,10 +569,10 @@ async fn test_compose_object_concatenates_sources_in_order() {
         .await
         .unwrap();
 
-    let bucket_name = "test-compose-bucket".to_string();
+    let bucket_name = unique_test_name("compose");
     let mut create_req = Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
-        region: "test-region-1".to_string(),
+        region: actor.region.clone(),
 
         options: None,
     });
@@ -556,7 +596,11 @@ async fn test_compose_object_concatenates_sources_in_order() {
         let metadata = ObjectMetadata {
             bucket_name: bucket_name.clone(),
             object_key: key.to_string(),
-            mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+            mutation_context: Some(native_mutation_context(
+                &actor,
+                bucket_id,
+                "object-metadata",
+            )),
             content_type: None,
             user_metadata_json: String::new(),
             storage_class: None,
@@ -597,7 +641,7 @@ async fn test_compose_object_concatenates_sources_in_order() {
             .collect(),
         destination_bucket_name: bucket_name.clone(),
         destination_object_key: "composed.txt".to_string(),
-        mutation_context: Some(native_mutation_context(bucket_id, "compose-object")),
+        mutation_context: Some(native_mutation_context(&actor, bucket_id, "compose-object")),
     });
     compose_req.metadata_mut().insert(
         "authorization",

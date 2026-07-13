@@ -17,7 +17,7 @@ use anvil::anvil_api::{
     WritePrecondition,
 };
 use futures_util::StreamExt;
-use std::time::Duration;
+use std::{future::Future, pin::Pin, time::Duration};
 use tonic::Request;
 
 use anvil::observability::{
@@ -60,6 +60,7 @@ fn assert_reserved_namespace_status<T>(result: Result<T, Status>) {
 }
 
 async fn put_native_object_bytes(
+    actor: &ObjectTestActor,
     client: &mut ObjectServiceClient<tonic::transport::Channel>,
     token: &str,
     bucket_name: &str,
@@ -74,7 +75,11 @@ async fn put_native_object_bytes(
                 ObjectMetadata {
                     bucket_name: bucket_name.to_string(),
                     object_key: object_key.to_string(),
-                    mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                    mutation_context: Some(native_mutation_context(
+                        actor,
+                        bucket_id,
+                        "object-metadata",
+                    )),
                     content_type: content_type.map(ToOwned::to_owned),
                     user_metadata_json: String::new(),
                     storage_class: None,
@@ -99,9 +104,13 @@ async fn put_native_object_bytes(
 
 #[tokio::test]
 async fn native_object_routes_use_mesh_locator_before_local_bucket_metadata() {
-    let cluster = TestCluster::new_with_config(&["us-west-2"], |config| {
-        config.cross_region_routing_policy = CrossRegionRoutingPolicy::ProxyRequired;
-    })
+    let cluster = isolated_test_cluster_with_config(
+        "uses a custom cross-region routing policy and direct mesh locator writes",
+        &["us-west-2"],
+        |config| {
+            config.cross_region_routing_policy = CrossRegionRoutingPolicy::ProxyRequired;
+        },
+    )
     .await;
     let state = &cluster.states[0];
     let signing_key = hex::decode(&state.config.anvil_secret_encryption_key).unwrap();
@@ -227,12 +236,68 @@ async fn native_object_routes_use_mesh_locator_before_local_bucket_metadata() {
     );
 }
 
-fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
+type ObjectTestActor = TestStorageActor;
+
+trait ObjectActorCluster {
+    fn create_object_actor<'a>(
+        &'a self,
+        label: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ObjectTestActor> + Send + 'a>>;
+}
+
+impl ObjectActorCluster for TestCluster {
+    fn create_object_actor<'a>(
+        &'a self,
+        label: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ObjectTestActor> + Send + 'a>> {
+        Box::pin(async move { create_storage_test_actor(self, label).await })
+    }
+}
+
+impl ObjectActorCluster for DockerTestCluster {
+    fn create_object_actor<'a>(
+        &'a self,
+        label: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ObjectTestActor> + Send + 'a>> {
+        Box::pin(async move { create_docker_storage_test_actor(self, label).await.into() })
+    }
+}
+
+impl ObjectActorCluster for SharedTestCluster {
+    fn create_object_actor<'a>(
+        &'a self,
+        label: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ObjectTestActor> + Send + 'a>> {
+        Box::pin(async move { create_storage_test_actor(self, label).await })
+    }
+}
+
+impl ObjectActorCluster for SharedDockerTestCluster {
+    fn create_object_actor<'a>(
+        &'a self,
+        label: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ObjectTestActor> + Send + 'a>> {
+        Box::pin(async move { create_docker_storage_test_actor(self, label).await.into() })
+    }
+}
+
+async fn create_object_test_actor<C>(cluster: &C, label: &str) -> ObjectTestActor
+where
+    C: ObjectActorCluster + ?Sized,
+{
+    cluster.create_object_actor(label).await
+}
+
+fn native_mutation_context(
+    actor: &ObjectTestActor,
+    bucket_id: i64,
+    tag: &str,
+) -> NativeMutationContext {
     let nonce = uuid::Uuid::new_v4();
     NativeMutationContext {
-        tenant_id: 1,
+        tenant_id: actor.tenant_id,
         bucket_id,
-        principal: "2".to_string(),
+        principal: actor.app_id.clone(),
         request_id: format!("{tag}-{nonce}-request"),
         precondition: "none".to_string(),
         authz_zookie_optional: String::new(),
@@ -242,11 +307,12 @@ fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
 }
 
 fn native_mutation_context_with_precondition(
+    actor: &ObjectTestActor,
     bucket_id: i64,
     tag: &str,
     precondition: &str,
 ) -> NativeMutationContext {
-    let mut context = native_mutation_context(bucket_id, tag);
+    let mut context = native_mutation_context(actor, bucket_id, tag);
     context.precondition = precondition.to_string();
     context
 }

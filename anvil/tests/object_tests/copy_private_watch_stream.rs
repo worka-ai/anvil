@@ -2,11 +2,13 @@ use super::*;
 
 #[tokio::test]
 async fn test_copy_object_creates_independent_destination_version() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor =
+        create_object_test_actor(&cluster, "copy-object-creates-independent-destination-vers")
+            .await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
@@ -14,7 +16,7 @@ async fn test_copy_object_creates_independent_destination_version() {
         .await
         .unwrap();
 
-    let bucket_name = "test-copy-bucket".to_string();
+    let bucket_name = unique_test_name("copy-bucket");
     let source_key = "source.txt".to_string();
     let destination_key = "destination.txt".to_string();
     let content = b"copy native object";
@@ -39,7 +41,11 @@ async fn test_copy_object_creates_independent_destination_version() {
     let metadata = ObjectMetadata {
         bucket_name: bucket_name.clone(),
         object_key: source_key.clone(),
-        mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+        mutation_context: Some(native_mutation_context(
+            &actor,
+            bucket_id,
+            "object-metadata",
+        )),
         content_type: None,
         user_metadata_json: String::new(),
         storage_class: None,
@@ -73,7 +79,7 @@ async fn test_copy_object_creates_independent_destination_version() {
         source_version_id: Some(put_res.version_id.clone()),
         destination_bucket_name: bucket_name.clone(),
         destination_object_key: destination_key.clone(),
-        mutation_context: Some(native_mutation_context(bucket_id, "copy-object")),
+        mutation_context: Some(native_mutation_context(&actor, bucket_id, "copy-object")),
     });
     copy_req.metadata_mut().insert(
         "authorization",
@@ -124,17 +130,18 @@ async fn test_copy_object_creates_independent_destination_version() {
 
 #[tokio::test]
 async fn test_private_object_read_denied_before_payload_load() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
+    let actor =
+        create_object_test_actor(&cluster, "private-object-read-denied-before-payload-load").await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
     let mut bucket_client = BucketServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = "test-denied-before-payload-load".to_string();
+    let bucket_name = unique_test_name("denied-payload");
     let object_key = "private/missing-payload.bin".to_string();
 
     let mut create_req = Request::new(CreateBucketRequest {
@@ -179,9 +186,10 @@ async fn test_private_object_read_denied_before_payload_load() {
         .await
         .unwrap();
 
+    let limited_reader = unique_test_name("limited-object-reader");
     let limited_token = cluster.states[0]
         .jwt_manager
-        .mint_token("limited-object-reader".to_string(), claims.tenant_id)
+        .mint_token(limited_reader, claims.tenant_id)
         .unwrap();
 
     let mut denied_req = Request::new(GetObjectRequest {
@@ -275,11 +283,12 @@ async fn test_private_object_read_denied_before_payload_load() {
 
 #[tokio::test]
 async fn test_watch_prefix_streams_snapshot_and_live_events() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor =
+        create_object_test_actor(&cluster, "watch-prefix-streams-snapshot-and-live-events").await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
@@ -290,7 +299,7 @@ async fn test_watch_prefix_streams_snapshot_and_live_events() {
         .await
         .unwrap();
 
-    let bucket_name = "test-watch-bucket".to_string();
+    let bucket_name = unique_test_name("watch-bucket");
     let object_key = "docs/a.txt".to_string();
 
     let mut create_req = Request::new(CreateBucketRequest {
@@ -313,7 +322,11 @@ async fn test_watch_prefix_streams_snapshot_and_live_events() {
     let metadata = ObjectMetadata {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
-        mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+        mutation_context: Some(native_mutation_context(
+            &actor,
+            bucket_id,
+            "object-metadata",
+        )),
         content_type: None,
         user_metadata_json: String::new(),
         storage_class: None,
@@ -375,7 +388,7 @@ async fn test_watch_prefix_streams_snapshot_and_live_events() {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         version_id: None,
-        mutation_context: Some(native_mutation_context(bucket_id, "delete-object")),
+        mutation_context: Some(native_mutation_context(&actor, bucket_id, "delete-object")),
     });
     delete_req.metadata_mut().insert(
         "authorization",
@@ -397,11 +410,12 @@ async fn test_watch_prefix_streams_snapshot_and_live_events() {
 
 #[tokio::test]
 async fn test_append_stream_records_are_ordered_and_sealable() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor =
+        create_object_test_actor(&cluster, "append-stream-records-are-ordered-and-sealable").await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
@@ -409,7 +423,7 @@ async fn test_append_stream_records_are_ordered_and_sealable() {
         .await
         .unwrap();
 
-    let bucket_name = "test-append-bucket".to_string();
+    let bucket_name = unique_test_name("append-bucket");
     let stream_key = "events/topic-a".to_string();
     let mut create_req = Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
@@ -431,7 +445,11 @@ async fn test_append_stream_records_are_ordered_and_sealable() {
     let mut create_stream_req = Request::new(CreateAppendStreamRequest {
         bucket_name: bucket_name.clone(),
         stream_key: stream_key.clone(),
-        mutation_context: Some(native_mutation_context(bucket_id, "create-append-stream")),
+        mutation_context: Some(native_mutation_context(
+            &actor,
+            bucket_id,
+            "create-append-stream",
+        )),
     });
     create_stream_req.metadata_mut().insert(
         "authorization",
@@ -451,7 +469,11 @@ async fn test_append_stream_records_are_ordered_and_sealable() {
         stream_key: stream_key.clone(),
         stream_id: stream_id.clone(),
         payload: b"first".to_vec(),
-        mutation_context: Some(native_mutation_context(bucket_id, "append-stream-record")),
+        mutation_context: Some(native_mutation_context(
+            &actor,
+            bucket_id,
+            "append-stream-record",
+        )),
         content_type: None,
         user_metadata_json: String::new(),
         precondition: None,
@@ -476,7 +498,11 @@ async fn test_append_stream_records_are_ordered_and_sealable() {
         stream_key: stream_key.clone(),
         stream_id: stream_id.clone(),
         payload: b"second".to_vec(),
-        mutation_context: Some(native_mutation_context(bucket_id, "append-stream-record")),
+        mutation_context: Some(native_mutation_context(
+            &actor,
+            bucket_id,
+            "append-stream-record",
+        )),
         content_type: None,
         user_metadata_json: String::new(),
         precondition: None,
@@ -498,7 +524,11 @@ async fn test_append_stream_records_are_ordered_and_sealable() {
         bucket_name: bucket_name.clone(),
         stream_key: stream_key.clone(),
         stream_id: stream_id.clone(),
-        mutation_context: Some(native_mutation_context(bucket_id, "seal-append-stream")),
+        mutation_context: Some(native_mutation_context(
+            &actor,
+            bucket_id,
+            "seal-append-stream",
+        )),
         precondition: None,
     });
     seal_req.metadata_mut().insert(
@@ -521,7 +551,11 @@ async fn test_append_stream_records_are_ordered_and_sealable() {
         stream_key: stream_key.clone(),
         stream_id: stream_id.clone(),
         payload: b"third".to_vec(),
-        mutation_context: Some(native_mutation_context(bucket_id, "append-stream-record")),
+        mutation_context: Some(native_mutation_context(
+            &actor,
+            bucket_id,
+            "append-stream-record",
+        )),
         content_type: None,
         user_metadata_json: String::new(),
         precondition: None,
@@ -593,17 +627,19 @@ async fn test_append_stream_records_are_ordered_and_sealable() {
 
 #[tokio::test]
 async fn test_grpc_object_metadata_round_trips_through_get_head_and_list() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor =
+        create_object_test_actor(&cluster, "grpc-object-metadata-round-trips-through-get-hea")
+            .await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
     let mut bucket_client = BucketServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = "test-object-metadata-bucket".to_string();
+    let bucket_name = unique_test_name("metadata");
     let object_key = "catalog/item.json".to_string();
     let bucket_id = bucket_client
         .create_bucket(authorized(
@@ -626,7 +662,11 @@ async fn test_grpc_object_metadata_round_trips_through_get_head_and_list() {
             ObjectMetadata {
                 bucket_name: bucket_name.clone(),
                 object_key: object_key.clone(),
-                mutation_context: Some(native_mutation_context(bucket_id, "metadata-roundtrip")),
+                mutation_context: Some(native_mutation_context(
+                    &actor,
+                    bucket_id,
+                    "metadata-roundtrip",
+                )),
                 content_type: Some("application/json".to_string()),
                 user_metadata_json: user_metadata.clone(),
                 storage_class: None,

@@ -2,16 +2,11 @@ use super::*;
 
 #[tokio::test]
 async fn test_s3_put_write_etag_preconditions() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_app(&cluster, "s3-write-preconditions").await;
 
-    let app_name = format!("s3-write-preconditions-{}", uuid::Uuid::new_v4());
-    let (client_id, client_secret) = create_app(&cluster, &app_name).await;
-    grant_storage_tenant_owner_for_test(&cluster, &app_name).await;
-
-    let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
-    let client = s3_client(http_base, &client_id, &client_secret);
-    let bucket = format!("s3-write-preconditions-{}", uuid::Uuid::new_v4());
+    let client = s3_client_for_docker_app(&cluster, &actor);
+    let bucket = unique_test_name("s3-write-preconditions");
     let key = "preconditioned.txt";
 
     client
@@ -119,37 +114,50 @@ async fn test_s3_put_write_etag_preconditions() {
 
 #[tokio::test]
 async fn test_s3_list_versions_and_get_filter_by_relationship_authorization() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
 
-    let writer_app = format!("s3-relationship-writer-{}", uuid::Uuid::new_v4());
-    let (_, writer_client_id, writer_client_secret) =
-        create_app_with_id(&cluster, &writer_app).await;
-    grant_storage_tenant_owner_for_test(&cluster, &writer_app).await;
+    let writer_app = unique_test_name("s3-relationship-writer");
+    let writer = create_docker_storage_test_actor(&cluster, &writer_app).await;
 
-    let reader_app = format!("s3-relationship-reader-{}", uuid::Uuid::new_v4());
-    let (_, reader_client_id, reader_client_secret) =
-        create_app_with_id(&cluster, &reader_app).await;
+    let reader_app = unique_test_name("s3-relationship-reader");
+    let (_reader_app_id, reader_client_id, reader_client_secret) = cluster
+        .create_application_with_id(writer.tenant_id, &reader_app)
+        .await;
 
-    let bucket = format!("s3-relationship-filter-{}", uuid::Uuid::new_v4());
+    let bucket = unique_test_name("s3-relationship-filter");
 
-    let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
-    let writer = s3_client(http_base, &writer_client_id, &writer_client_secret);
-    let reader = s3_client(http_base, &reader_client_id, &reader_client_secret);
+    let writer_s3 = s3_client_for_docker_app(&cluster, &writer);
+    let reader_credentials = aws_sdk_s3::config::Credentials::new(
+        &reader_client_id,
+        &reader_client_secret,
+        None,
+        None,
+        "static",
+    );
+    let reader_config = aws_sdk_s3::Config::builder()
+        .credentials_provider(reader_credentials)
+        .region(aws_sdk_s3::config::Region::new(cluster.region.clone()))
+        .endpoint_url(&writer.grpc_addr)
+        .force_path_style(true)
+        .behavior_version(aws_config::BehaviorVersion::latest())
+        .build();
+    let reader = Client::from_conf(reader_config);
 
     let allowed_key = "docs/allowed.txt";
     let denied_key = "docs/denied.txt";
     let visible_nested_key = "visible/nested.txt";
     let hidden_nested_key = "hidden/nested.txt";
 
-    writer
+    writer_s3
         .create_bucket()
         .bucket(&bucket)
         .send()
         .await
         .expect("writer should create private bucket");
-    grant_policy(&cluster, &reader_app, "object:list", &bucket).await;
-    writer
+    cluster
+        .grant_application_policy(writer.tenant_id, &reader_app, "object:list", &bucket)
+        .await;
+    writer_s3
         .put_object()
         .bucket(&bucket)
         .key(allowed_key)
@@ -157,7 +165,7 @@ async fn test_s3_list_versions_and_get_filter_by_relationship_authorization() {
         .send()
         .await
         .expect("writer should put allowed v1");
-    writer
+    writer_s3
         .put_object()
         .bucket(&bucket)
         .key(denied_key)
@@ -165,7 +173,7 @@ async fn test_s3_list_versions_and_get_filter_by_relationship_authorization() {
         .send()
         .await
         .expect("writer should put denied object");
-    writer
+    writer_s3
         .put_object()
         .bucket(&bucket)
         .key(allowed_key)
@@ -173,7 +181,7 @@ async fn test_s3_list_versions_and_get_filter_by_relationship_authorization() {
         .send()
         .await
         .expect("writer should put allowed v2");
-    writer
+    writer_s3
         .put_object()
         .bucket(&bucket)
         .key(visible_nested_key)
@@ -181,7 +189,7 @@ async fn test_s3_list_versions_and_get_filter_by_relationship_authorization() {
         .send()
         .await
         .expect("writer should put visible nested object");
-    writer
+    writer_s3
         .put_object()
         .bucket(&bucket)
         .key(hidden_nested_key)
@@ -218,15 +226,9 @@ async fn test_s3_list_versions_and_get_filter_by_relationship_authorization() {
         );
     }
 
-    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut auth_client = AuthServiceClient::connect(writer.grpc_addr.clone())
         .await
         .unwrap();
-    let writer_token = get_token(
-        &cluster.grpc_addrs[0],
-        &writer_client_id,
-        &writer_client_secret,
-    )
-    .await;
     for key in [allowed_key, visible_nested_key] {
         let mut grant = Request::new(GrantAccessRequest {
             grantee_app_id: reader_app.clone(),
@@ -235,7 +237,7 @@ async fn test_s3_list_versions_and_get_filter_by_relationship_authorization() {
         });
         grant.metadata_mut().insert(
             "authorization",
-            format!("Bearer {writer_token}").parse().unwrap(),
+            format!("Bearer {}", writer.token).parse().unwrap(),
         );
         auth_client.grant_access(grant).await.unwrap();
     }
@@ -310,18 +312,18 @@ async fn test_s3_list_versions_and_get_filter_by_relationship_authorization() {
     );
 }
 
+// Internal-only: directly compacts object metadata through cluster.states persistence.
 #[tokio::test]
 async fn test_s3_reads_and_lists_survive_object_metadata_compaction() {
-    let mut cluster = TestCluster::new(&["compact-region"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
-    let app_name = format!("s3-compact-{}", uuid::Uuid::new_v4());
+    let app_name = unique_test_name("s3-compact");
     let (client_id, client_secret) = create_app(&cluster, &app_name).await;
     grant_storage_tenant_owner_for_test(&cluster, &app_name).await;
 
     let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
     let client = s3_client(http_base, &client_id, &client_secret);
-    let bucket = format!("s3-compact-{}", uuid::Uuid::new_v4());
+    let bucket = unique_test_name("s3-compact");
 
     client
         .create_bucket()
@@ -476,18 +478,18 @@ async fn test_s3_reads_and_lists_survive_object_metadata_compaction() {
     );
 }
 
+// Internal-only: directly compacts object metadata while holding a live in-process reader.
 #[tokio::test]
 async fn test_s3_active_get_survives_object_metadata_compaction() {
-    let mut cluster = TestCluster::new(&["active-read-compact-region"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
-    let app_name = format!("s3-active-compact-{}", uuid::Uuid::new_v4());
+    let app_name = unique_test_name("s3-active-compact");
     let (client_id, client_secret) = create_app(&cluster, &app_name).await;
     grant_storage_tenant_owner_for_test(&cluster, &app_name).await;
 
     let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
     let client = s3_client(http_base, &client_id, &client_secret);
-    let bucket = format!("s3-active-compact-{}", uuid::Uuid::new_v4());
+    let bucket = unique_test_name("s3-active-compact");
     let key = "large/active-read.bin";
     let object_len = LARGE_OBJECT_RANGE_SPLIT_BYTES + 257;
     let payload: Vec<u8> = (0..object_len)
@@ -560,23 +562,28 @@ async fn test_s3_active_get_survives_object_metadata_compaction() {
     assert_eq!(post_compaction_body.as_ref(), observed.as_slice());
 }
 
+// Internal-only: custom compaction thresholds plus exact task, lease, and CoreMeta checks.
 #[tokio::test]
 async fn test_s3_writes_trigger_worker_metadata_compaction() {
-    let mut cluster = TestCluster::new_with_config(&["auto-compact-region"], |config| {
-        config.object_metadata_compaction_frame_threshold = 2;
-        config.object_metadata_compaction_bytes_threshold = 0;
-        config.task_lease_ttl_secs = 60;
-    })
+    let mut cluster = isolated_test_cluster_with_config(
+        "worker metadata compaction test needs custom compaction thresholds",
+        &["auto-compact-region"],
+        |config| {
+            config.object_metadata_compaction_frame_threshold = 2;
+            config.object_metadata_compaction_bytes_threshold = 0;
+            config.task_lease_ttl_secs = 60;
+        },
+    )
     .await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
-    let app_name = format!("s3-auto-compact-{}", uuid::Uuid::new_v4());
+    let app_name = unique_test_name("s3-auto-compact");
     let (client_id, client_secret) = create_app(&cluster, &app_name).await;
     grant_storage_tenant_owner_for_test(&cluster, &app_name).await;
 
     let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
     let client = s3_client(http_base, &client_id, &client_secret);
-    let bucket = format!("s3-auto-compact-{}", uuid::Uuid::new_v4());
+    let bucket = unique_test_name("s3-auto-compact");
 
     client
         .create_bucket()
@@ -672,16 +679,11 @@ async fn test_s3_writes_trigger_worker_metadata_compaction() {
 
 #[tokio::test]
 async fn test_s3_put_triggers_full_text_index_build() {
-    let mut cluster = TestCluster::new(&["s3-index-region"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_app(&cluster, "s3-index").await;
 
-    let app_name = format!("s3-index-{}", uuid::Uuid::new_v4());
-    let (client_id, client_secret) = create_app(&cluster, &app_name).await;
-    grant_storage_tenant_owner_for_test(&cluster, &app_name).await;
-
-    let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
-    let client = s3_client(http_base, &client_id, &client_secret);
-    let bucket = format!("s3-index-{}", uuid::Uuid::new_v4());
+    let client = s3_client_for_docker_app(&cluster, &actor);
+    let bucket = unique_test_name("s3-index");
     client
         .create_bucket()
         .bucket(&bucket)
@@ -689,7 +691,7 @@ async fn test_s3_put_triggers_full_text_index_build() {
         .await
         .expect("S3 CreateBucket should succeed");
 
-    let mut index_client = IndexServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut index_client = IndexServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
     index_client
@@ -705,7 +707,7 @@ async fn test_s3_put_triggers_full_text_index_build() {
 
                 options: None,
             },
-            &cluster.token,
+            &actor.token,
         ))
         .await
         .unwrap();
@@ -742,7 +744,7 @@ async fn test_s3_put_triggers_full_text_index_build() {
                     require_caught_up_to_watch_cursor: String::new(),
                     lag_timeout_ms: 0,
                 },
-                &cluster.token,
+                &actor.token,
             ))
             .await;
         if let Ok(query) = query {
@@ -762,21 +764,15 @@ async fn test_s3_put_triggers_full_text_index_build() {
     let response = indexed.expect("S3 object should be searchable after index task completes");
     assert_eq!(response.index_kind, IndexKind::FullText as i32);
     assert!(response.index_generation >= 1);
-    wait_for_completed_index_build(&cluster, Duration::from_secs(90)).await;
 }
 
 #[tokio::test]
 async fn test_s3_put_metadata_field_triggers_full_text_index_build() {
-    let mut cluster = TestCluster::new(&["s3-metadata-index-region"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_app(&cluster, "s3-metadata-index").await;
 
-    let app_name = format!("s3-metadata-index-{}", uuid::Uuid::new_v4());
-    let (client_id, client_secret) = create_app(&cluster, &app_name).await;
-    grant_storage_tenant_owner_for_test(&cluster, &app_name).await;
-
-    let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
-    let client = s3_client(http_base, &client_id, &client_secret);
-    let bucket = format!("s3-metadata-index-{}", uuid::Uuid::new_v4());
+    let client = s3_client_for_docker_app(&cluster, &actor);
+    let bucket = unique_test_name("s3-metadata-index");
     client
         .create_bucket()
         .bucket(&bucket)
@@ -784,7 +780,7 @@ async fn test_s3_put_metadata_field_triggers_full_text_index_build() {
         .await
         .expect("S3 CreateBucket should succeed");
 
-    let mut index_client = IndexServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut index_client = IndexServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
     index_client
@@ -804,7 +800,7 @@ async fn test_s3_put_metadata_field_triggers_full_text_index_build() {
 
                 options: None,
             },
-            &cluster.token,
+            &actor.token,
         ))
         .await
         .unwrap();
@@ -842,7 +838,7 @@ async fn test_s3_put_metadata_field_triggers_full_text_index_build() {
                     require_caught_up_to_watch_cursor: String::new(),
                     lag_timeout_ms: 0,
                 },
-                &cluster.token,
+                &actor.token,
             ))
             .await;
         if let Ok(query) = query {
@@ -868,16 +864,11 @@ async fn test_s3_put_metadata_field_triggers_full_text_index_build() {
 
 #[tokio::test]
 async fn test_s3_put_personaldb_table_column_triggers_full_text_index_build() {
-    let mut cluster = TestCluster::new(&["s3-personaldb-column-index-region"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_app(&cluster, "s3-personaldb-column-index").await;
 
-    let app_name = format!("s3-personaldb-column-index-{}", uuid::Uuid::new_v4());
-    let (client_id, client_secret) = create_app(&cluster, &app_name).await;
-    grant_storage_tenant_owner_for_test(&cluster, &app_name).await;
-
-    let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
-    let client = s3_client(http_base, &client_id, &client_secret);
-    let bucket = format!("s3-personaldb-column-index-{}", uuid::Uuid::new_v4());
+    let client = s3_client_for_docker_app(&cluster, &actor);
+    let bucket = unique_test_name("s3-personaldb-column-index");
     client
         .create_bucket()
         .bucket(&bucket)
@@ -885,7 +876,7 @@ async fn test_s3_put_personaldb_table_column_triggers_full_text_index_build() {
         .await
         .expect("S3 CreateBucket should succeed");
 
-    let mut index_client = IndexServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut index_client = IndexServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
     index_client
@@ -906,7 +897,7 @@ async fn test_s3_put_personaldb_table_column_triggers_full_text_index_build() {
 
                 options: None,
             },
-            &cluster.token,
+            &actor.token,
         ))
         .await
         .unwrap();
@@ -944,7 +935,7 @@ async fn test_s3_put_personaldb_table_column_triggers_full_text_index_build() {
                     require_caught_up_to_watch_cursor: String::new(),
                     lag_timeout_ms: 0,
                 },
-                &cluster.token,
+                &actor.token,
             ))
             .await;
         if let Ok(query) = query {
@@ -970,16 +961,11 @@ async fn test_s3_put_personaldb_table_column_triggers_full_text_index_build() {
 
 #[tokio::test]
 async fn test_s3_put_media_transcript_triggers_full_text_index_build() {
-    let mut cluster = TestCluster::new(&["s3-media-index-region"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_app(&cluster, "s3-media-index").await;
 
-    let app_name = format!("s3-media-index-{}", uuid::Uuid::new_v4());
-    let (client_id, client_secret) = create_app(&cluster, &app_name).await;
-    grant_storage_tenant_owner_for_test(&cluster, &app_name).await;
-
-    let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
-    let client = s3_client(http_base, &client_id, &client_secret);
-    let bucket = format!("s3-media-index-{}", uuid::Uuid::new_v4());
+    let client = s3_client_for_docker_app(&cluster, &actor);
+    let bucket = unique_test_name("s3-media-index");
     client
         .create_bucket()
         .bucket(&bucket)
@@ -987,7 +973,7 @@ async fn test_s3_put_media_transcript_triggers_full_text_index_build() {
         .await
         .expect("S3 CreateBucket should succeed");
 
-    let mut index_client = IndexServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut index_client = IndexServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
     index_client
@@ -1003,7 +989,7 @@ async fn test_s3_put_media_transcript_triggers_full_text_index_build() {
 
                 options: None,
             },
-            &cluster.token,
+            &actor.token,
         ))
         .await
         .unwrap();
@@ -1041,7 +1027,7 @@ async fn test_s3_put_media_transcript_triggers_full_text_index_build() {
                     require_caught_up_to_watch_cursor: String::new(),
                     lag_timeout_ms: 0,
                 },
-                &cluster.token,
+                &actor.token,
             ))
             .await;
         if let Ok(query) = query {
@@ -1067,16 +1053,11 @@ async fn test_s3_put_media_transcript_triggers_full_text_index_build() {
 
 #[tokio::test]
 async fn test_s3_put_triggers_vector_index_build() {
-    let mut cluster = TestCluster::new(&["s3-vector-index-region"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_app(&cluster, "s3-vector-index").await;
 
-    let app_name = format!("s3-vector-index-{}", uuid::Uuid::new_v4());
-    let (client_id, client_secret) = create_app(&cluster, &app_name).await;
-    grant_storage_tenant_owner_for_test(&cluster, &app_name).await;
-
-    let http_base = cluster.grpc_addrs[0].trim_end_matches('/');
-    let client = s3_client(http_base, &client_id, &client_secret);
-    let bucket = format!("s3-vector-index-{}", uuid::Uuid::new_v4());
+    let client = s3_client_for_docker_app(&cluster, &actor);
+    let bucket = unique_test_name("s3-vector-index");
     client
         .create_bucket()
         .bucket(&bucket)
@@ -1084,7 +1065,7 @@ async fn test_s3_put_triggers_vector_index_build() {
         .await
         .expect("S3 CreateBucket should succeed");
 
-    let mut index_client = IndexServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut index_client = IndexServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
     index_client
@@ -1106,7 +1087,7 @@ async fn test_s3_put_triggers_vector_index_build() {
 
                 options: None,
             },
-            &cluster.token,
+            &actor.token,
         ))
         .await
         .unwrap();
@@ -1143,7 +1124,7 @@ async fn test_s3_put_triggers_vector_index_build() {
                     require_caught_up_to_watch_cursor: String::new(),
                     lag_timeout_ms: 0,
                 },
-                &cluster.token,
+                &actor.token,
             ))
             .await;
         if let Ok(query) = query {
@@ -1165,5 +1146,4 @@ async fn test_s3_put_triggers_vector_index_build() {
     assert_eq!(response.index_kind, IndexKind::Vector as i32);
     assert!(response.index_generation >= 1);
     assert_eq!(response.hits[0].object_key, "docs/s3-vector.json");
-    wait_for_completed_index_build(&cluster, Duration::from_secs(90)).await;
 }

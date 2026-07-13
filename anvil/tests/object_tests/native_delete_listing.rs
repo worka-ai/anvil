@@ -18,15 +18,16 @@ async fn write_remote_bucket_locator_for_node0(
     let state = &cluster.states[0];
     let signing_key = hex::decode(&state.config.anvil_secret_encryption_key).unwrap();
     let bucket_name = BucketName::canonicalize(bucket_name).unwrap();
+    let bucket_name_string = bucket_name.as_str().to_string();
     let locator = BucketLocatorDescriptor::active(
         MeshId::new("test-mesh").unwrap(),
         TenantId::new("1").unwrap(),
         bucket_name,
-        BucketId::new(format!("bucket-{region}")).unwrap(),
+        BucketId::new(format!("bucket-{bucket_name_string}-{region}")).unwrap(),
         RegionName::new(region.to_string()).unwrap(),
         CellId::new("remote-cell").unwrap(),
         "regional-primary",
-        &format!("objects/1/remote-bucket/{region}/"),
+        &format!("objects/1/{bucket_name_string}/{region}/"),
         "2026-07-02T00:00:00Z",
     )
     .unwrap();
@@ -76,10 +77,10 @@ async fn write_remote_bucket_locator_for_node0(
 
 #[tokio::test]
 async fn native_object_routes_apply_cross_region_policy_before_local_metadata() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
+    let bucket_name = unique_test_name("remote-route");
 
-    write_remote_bucket_locator_for_node0(&cluster, "remote-bucket", "test-region-2").await;
+    write_remote_bucket_locator_for_node0(&cluster, &bucket_name, "test-region-2").await;
 
     let token = cluster.token.clone();
     let mut object_client = ObjectServiceClient::connect(cluster.grpc_addrs[0].clone())
@@ -89,7 +90,7 @@ async fn native_object_routes_apply_cross_region_policy_before_local_metadata() 
     let err = object_client
         .get_object(authorized(
             GetObjectRequest {
-                bucket_name: "remote-bucket".to_string(),
+                bucket_name: bucket_name.clone(),
                 object_key: "any.txt".to_string(),
                 version_id: None,
                 range: None,
@@ -113,14 +114,19 @@ async fn native_object_routes_apply_cross_region_policy_before_local_metadata() 
 
 #[tokio::test]
 async fn native_object_routes_report_proxy_required_as_unavailable_when_proxy_is_absent() {
-    let mut cluster = TestCluster::new_with_config(&["test-region-1"], |config| {
-        config.cross_region_routing_policy =
-            anvil::routing::CrossRegionRoutingPolicy::ProxyRequired;
-    })
+    let mut cluster = isolated_test_cluster_with_config(
+        "uses a custom cross-region proxy-required routing policy",
+        &["test-region-1"],
+        |config| {
+            config.cross_region_routing_policy =
+                anvil::routing::CrossRegionRoutingPolicy::ProxyRequired;
+        },
+    )
     .await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
-    write_remote_bucket_locator_for_node0(&cluster, "remote-bucket", "test-region-2").await;
+    let bucket_name = unique_test_name("remote-proxy");
+    write_remote_bucket_locator_for_node0(&cluster, &bucket_name, "test-region-2").await;
 
     let token = cluster.token.clone();
     let mut object_client = ObjectServiceClient::connect(cluster.grpc_addrs[0].clone())
@@ -130,7 +136,7 @@ async fn native_object_routes_report_proxy_required_as_unavailable_when_proxy_is
     let err = object_client
         .list_objects(authorized(
             ListObjectsRequest {
-                bucket_name: "remote-bucket".to_string(),
+                bucket_name: bucket_name.clone(),
                 prefix: String::new(),
                 start_after: String::new(),
                 delimiter: String::new(),
@@ -155,16 +161,16 @@ async fn native_object_routes_report_proxy_required_as_unavailable_when_proxy_is
 
 #[tokio::test]
 async fn test_native_mutations_require_valid_context() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_object_test_actor(&cluster, "native-mutations-require-valid-context").await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
     let mut bucket_client = BucketServiceClient::connect(grpc_addr).await.unwrap();
-    let bucket_name = format!("native-context-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("native-context");
 
     let mut create_req = Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
@@ -200,7 +206,7 @@ async fn test_native_mutations_require_valid_context() {
     assert_eq!(err.code(), Code::InvalidArgument);
     assert!(err.message().contains("Missing native mutation context"));
 
-    let mut wrong_principal = native_mutation_context(bucket_id, "wrong-principal");
+    let mut wrong_principal = native_mutation_context(&actor, bucket_id, "wrong-principal");
     wrong_principal.principal = "other-app".to_string();
     let mut wrong_principal_req = Request::new(tokio_stream::iter(put_object_chunks(
         &bucket_name,
@@ -219,7 +225,7 @@ async fn test_native_mutations_require_valid_context() {
     assert_eq!(err.code(), Code::PermissionDenied);
     assert!(err.message().contains("principal mismatch"));
 
-    let mut wrong_tenant = native_mutation_context(bucket_id, "wrong-tenant");
+    let mut wrong_tenant = native_mutation_context(&actor, bucket_id, "wrong-tenant");
     wrong_tenant.tenant_id = 2;
     let mut wrong_tenant_req = Request::new(tokio_stream::iter(put_object_chunks(
         &bucket_name,
@@ -238,7 +244,7 @@ async fn test_native_mutations_require_valid_context() {
     assert_eq!(err.code(), Code::PermissionDenied);
     assert!(err.message().contains("tenant mismatch"));
 
-    let mut wrong_bucket = native_mutation_context(bucket_id + 1, "wrong-bucket");
+    let mut wrong_bucket = native_mutation_context(&actor, bucket_id + 1, "wrong-bucket");
     let mut wrong_bucket_req = Request::new(tokio_stream::iter(put_object_chunks(
         &bucket_name,
         "wrong-bucket.txt",
@@ -275,7 +281,7 @@ async fn test_native_mutations_require_valid_context() {
     assert_eq!(err.code(), Code::InvalidArgument);
     assert!(err.message().contains("request_id"));
 
-    let mut stale_zookie = native_mutation_context(bucket_id, "stale-zookie");
+    let mut stale_zookie = native_mutation_context(&actor, bucket_id, "stale-zookie");
     stale_zookie.authz_zookie_optional = "authz:999999".to_string();
     let mut stale_zookie_req = Request::new(tokio_stream::iter(put_object_chunks(
         &bucket_name,
@@ -297,16 +303,18 @@ async fn test_native_mutations_require_valid_context() {
 
 #[tokio::test]
 async fn test_native_object_mutation_preconditions_are_enforced() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor =
+        create_object_test_actor(&cluster, "native-object-mutation-preconditions-are-enforce")
+            .await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
     let mut bucket_client = BucketServiceClient::connect(grpc_addr).await.unwrap();
-    let bucket_name = format!("native-preconditions-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("native-precond");
     let object_key = "docs/preconditioned.txt";
 
     let bucket_id = bucket_client
@@ -330,7 +338,7 @@ async fn test_native_object_mutation_preconditions_are_enforced() {
         &bucket_name,
         object_key,
         b"first",
-        native_mutation_context_with_precondition(bucket_id, "first", "not_exists"),
+        native_mutation_context_with_precondition(&actor, bucket_id, "first", "not_exists"),
     )
     .await
     .expect("not_exists precondition should allow initial object creation");
@@ -342,7 +350,7 @@ async fn test_native_object_mutation_preconditions_are_enforced() {
         &bucket_name,
         object_key,
         b"duplicate",
-        native_mutation_context_with_precondition(bucket_id, "duplicate", "not_exists"),
+        native_mutation_context_with_precondition(&actor, bucket_id, "duplicate", "not_exists"),
     )
     .await
     .expect_err("not_exists precondition must reject an existing object");
@@ -355,7 +363,12 @@ async fn test_native_object_mutation_preconditions_are_enforced() {
         &bucket_name,
         object_key,
         b"wrong-etag",
-        native_mutation_context_with_precondition(bucket_id, "wrong-etag", "etag:not-current"),
+        native_mutation_context_with_precondition(
+            &actor,
+            bucket_id,
+            "wrong-etag",
+            "etag:not-current",
+        ),
     )
     .await
     .expect_err("etag precondition must reject a mismatched object etag");
@@ -368,6 +381,7 @@ async fn test_native_object_mutation_preconditions_are_enforced() {
         object_key,
         b"second",
         native_mutation_context_with_precondition(
+            &actor,
             bucket_id,
             "matching-etag",
             &format!("etag:\"{}\"", first.etag),
@@ -384,6 +398,7 @@ async fn test_native_object_mutation_preconditions_are_enforced() {
         object_key,
         b"third",
         native_mutation_context_with_precondition(
+            &actor,
             bucket_id,
             "matching-version",
             &format!("version:{}", second.version_id),
@@ -399,7 +414,7 @@ async fn test_native_object_mutation_preconditions_are_enforced() {
         &bucket_name,
         object_key,
         b"unsupported",
-        native_mutation_context_with_precondition(bucket_id, "unsupported", "after:123"),
+        native_mutation_context_with_precondition(&actor, bucket_id, "unsupported", "after:123"),
     )
     .await
     .expect_err("unsupported native precondition syntax must fail");
@@ -413,6 +428,7 @@ async fn test_native_object_mutation_preconditions_are_enforced() {
                 object_key: object_key.to_string(),
                 version_id: None,
                 mutation_context: Some(native_mutation_context_with_precondition(
+                    &actor,
                     bucket_id,
                     "delete-existing",
                     "exists",
@@ -434,7 +450,7 @@ async fn test_native_object_mutation_preconditions_are_enforced() {
         &bucket_name,
         object_key,
         b"recreated",
-        native_mutation_context_with_precondition(bucket_id, "recreated", "not_exists"),
+        native_mutation_context_with_precondition(&actor, bucket_id, "recreated", "not_exists"),
     )
     .await
     .expect("not_exists should treat the current delete marker as absent");
@@ -443,16 +459,18 @@ async fn test_native_object_mutation_preconditions_are_enforced() {
 
 #[tokio::test]
 async fn test_native_object_mutation_idempotency_replays_without_duplicate_mutation() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor =
+        create_object_test_actor(&cluster, "native-object-mutation-idempotency-replays-witho")
+            .await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
     let mut bucket_client = BucketServiceClient::connect(grpc_addr).await.unwrap();
-    let bucket_name = format!("native-idempotency-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("native-idem");
     let object_key = "docs/idempotent.txt";
 
     let bucket_id = bucket_client
@@ -470,7 +488,7 @@ async fn test_native_object_mutation_idempotency_replays_without_duplicate_mutat
         .into_inner()
         .bucket_id;
 
-    let put_context = native_mutation_context(bucket_id, "idempotent-put");
+    let put_context = native_mutation_context(&actor, bucket_id, "idempotent-put");
     let put_idempotency_key = put_context.idempotency_key.clone();
     let first = put_object_for_test(
         &mut object_client,
@@ -528,7 +546,7 @@ async fn test_native_object_mutation_idempotency_replays_without_duplicate_mutat
     );
     assert_eq!(versions[0].version_id, first.version_id);
 
-    let mut reused_context = native_mutation_context(bucket_id, "reused-target");
+    let mut reused_context = native_mutation_context(&actor, bucket_id, "reused-target");
     reused_context.idempotency_key = put_idempotency_key;
     let conflict = put_object_for_test(
         &mut object_client,
@@ -543,7 +561,7 @@ async fn test_native_object_mutation_idempotency_replays_without_duplicate_mutat
     assert_eq!(conflict.code(), Code::FailedPrecondition);
     assert!(conflict.message().contains("different mutation target"));
 
-    let delete_context = native_mutation_context(bucket_id, "idempotent-delete");
+    let delete_context = native_mutation_context(&actor, bucket_id, "idempotent-delete");
     let delete_first = object_client
         .delete_object(authorized(
             DeleteObjectRequest {
@@ -606,13 +624,15 @@ async fn test_native_object_mutation_idempotency_replays_without_duplicate_mutat
 
 #[tokio::test]
 async fn test_repair_rebuilds_missing_directory_segment_from_metadata_journal() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
+    let actor =
+        create_object_test_actor(&cluster, "repair-rebuilds-missing-directory-segment-from-m")
+            .await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let persistence = &cluster.states[0].persistence;
-    let bucket_name = format!("directory-repair-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("dir-repair");
     let mut bucket_client = BucketServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
@@ -630,7 +650,7 @@ async fn test_repair_rebuilds_missing_directory_segment_from_metadata_journal() 
         .into_inner()
         .bucket_id;
     let bucket = persistence
-        .get_bucket_by_name(1, &bucket_name)
+        .get_bucket_by_name(actor.tenant_id, &bucket_name)
         .await
         .unwrap()
         .expect("service-created bucket should be visible to persistence");
@@ -639,6 +659,7 @@ async fn test_repair_rebuilds_missing_directory_segment_from_metadata_journal() 
         .await
         .unwrap();
     put_native_object_bytes(
+        &actor,
         &mut object_client,
         &token,
         &bucket_name,
@@ -649,6 +670,7 @@ async fn test_repair_rebuilds_missing_directory_segment_from_metadata_journal() 
     )
     .await;
     put_native_object_bytes(
+        &actor,
         &mut object_client,
         &token,
         &bucket_name,
@@ -744,11 +766,11 @@ async fn test_repair_rebuilds_missing_directory_segment_from_metadata_journal() 
 
 #[tokio::test]
 async fn test_delete_object_creates_delete_marker() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_object_test_actor(&cluster, "delete-object-creates-delete-marker").await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
@@ -756,7 +778,7 @@ async fn test_delete_object_creates_delete_marker() {
         .await
         .unwrap();
 
-    let bucket_name = "test-delete-bucket".to_string();
+    let bucket_name = unique_test_name("delete-object");
     let object_key = "test-delete-object".to_string();
 
     let mut create_req = Request::new(CreateBucketRequest {
@@ -780,7 +802,11 @@ async fn test_delete_object_creates_delete_marker() {
     let metadata = ObjectMetadata {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
-        mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+        mutation_context: Some(native_mutation_context(
+            &actor,
+            bucket_id,
+            "object-metadata",
+        )),
         content_type: None,
         user_metadata_json: String::new(),
         storage_class: None,
@@ -830,7 +856,7 @@ async fn test_delete_object_creates_delete_marker() {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         version_id: None,
-        mutation_context: Some(native_mutation_context(bucket_id, "delete-object")),
+        mutation_context: Some(native_mutation_context(&actor, bucket_id, "delete-object")),
     });
     del_req.metadata_mut().insert(
         "authorization",
@@ -892,11 +918,13 @@ async fn test_delete_object_creates_delete_marker() {
 
 #[tokio::test]
 async fn test_delete_object_specific_version_removes_only_that_version() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor =
+        create_object_test_actor(&cluster, "delete-object-specific-version-removes-only-that")
+            .await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
@@ -904,7 +932,7 @@ async fn test_delete_object_specific_version_removes_only_that_version() {
         .await
         .unwrap();
 
-    let bucket_name = "test-delete-specific-version".to_string();
+    let bucket_name = unique_test_name("delete-version");
     let object_key = "versioned-object".to_string();
 
     let mut create_req = Request::new(CreateBucketRequest {
@@ -930,7 +958,11 @@ async fn test_delete_object_specific_version_removes_only_that_version() {
                 ObjectMetadata {
                     bucket_name: bucket_name.clone(),
                     object_key: object_key.clone(),
-                    mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                    mutation_context: Some(native_mutation_context(
+                        &actor,
+                        bucket_id,
+                        "object-metadata",
+                    )),
                     content_type: None,
                     user_metadata_json: String::new(),
                     storage_class: None,
@@ -960,7 +992,11 @@ async fn test_delete_object_specific_version_removes_only_that_version() {
                 ObjectMetadata {
                     bucket_name: bucket_name.clone(),
                     object_key: object_key.clone(),
-                    mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                    mutation_context: Some(native_mutation_context(
+                        &actor,
+                        bucket_id,
+                        "object-metadata",
+                    )),
                     content_type: None,
                     user_metadata_json: String::new(),
                     storage_class: None,
@@ -1036,7 +1072,7 @@ async fn test_delete_object_specific_version_removes_only_that_version() {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
         version_id: Some(first_put.version_id.clone()),
-        mutation_context: Some(native_mutation_context(bucket_id, "delete-object")),
+        mutation_context: Some(native_mutation_context(&actor, bucket_id, "delete-object")),
     });
     delete_req.metadata_mut().insert(
         "authorization",
@@ -1071,17 +1107,18 @@ async fn test_delete_object_specific_version_removes_only_that_version() {
 
 #[tokio::test]
 async fn test_get_object_without_version_id_returns_latest_version() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor =
+        create_object_test_actor(&cluster, "get-object-without-version-id-returns-laversion").await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
     let mut bucket_client = BucketServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = format!("latest-get-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("latest-get");
     let object_key = "docs/versioned.txt";
 
     let bucket_id = bucket_client
@@ -1105,7 +1142,7 @@ async fn test_get_object_without_version_id_returns_latest_version() {
         &bucket_name,
         object_key,
         b"version-one",
-        native_mutation_context(bucket_id, "put-first"),
+        native_mutation_context(&actor, bucket_id, "put-first"),
     )
     .await
     .unwrap();
@@ -1115,7 +1152,7 @@ async fn test_get_object_without_version_id_returns_latest_version() {
         &bucket_name,
         object_key,
         b"version-two",
-        native_mutation_context(bucket_id, "put-second"),
+        native_mutation_context(&actor, bucket_id, "put-second"),
     )
     .await
     .unwrap();
@@ -1125,7 +1162,7 @@ async fn test_get_object_without_version_id_returns_latest_version() {
         &bucket_name,
         object_key,
         b"version-three-latest",
-        native_mutation_context(bucket_id, "put-latest"),
+        native_mutation_context(&actor, bucket_id, "put-latest"),
     )
     .await
     .unwrap();
@@ -1203,11 +1240,11 @@ async fn test_get_object_without_version_id_returns_latest_version() {
 
 #[tokio::test]
 async fn test_utf8_object_keys_with_spaces_round_trip() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_object_test_actor(&cluster, "utf8-object-keys-with-spaces-round-trip").await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
@@ -1215,7 +1252,7 @@ async fn test_utf8_object_keys_with_spaces_round_trip() {
         .await
         .unwrap();
 
-    let bucket_name = "test-utf8-object-keys".to_string();
+    let bucket_name = unique_test_name("utf8-keys");
     let object_key = "folder/my café document 📄.txt".to_string();
     let payload = b"utf8 object key payload".to_vec();
     let mut create_req = Request::new(CreateBucketRequest {
@@ -1241,7 +1278,11 @@ async fn test_utf8_object_keys_with_spaces_round_trip() {
                 ObjectMetadata {
                     bucket_name: bucket_name.clone(),
                     object_key: object_key.clone(),
-                    mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                    mutation_context: Some(native_mutation_context(
+                        &actor,
+                        bucket_id,
+                        "object-metadata",
+                    )),
                     content_type: None,
                     user_metadata_json: String::new(),
                     storage_class: None,
@@ -1299,6 +1340,7 @@ async fn test_utf8_object_keys_with_spaces_round_trip() {
                         bucket_name: bucket_name.clone(),
                         object_key: key.to_string(),
                         mutation_context: Some(native_mutation_context(
+                            &actor,
                             bucket_id,
                             "object-metadata",
                         )),
@@ -1369,11 +1411,12 @@ async fn test_utf8_object_keys_with_spaces_round_trip() {
 
 #[tokio::test]
 async fn test_listing_omits_reserved_internal_object_keys() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
+    let actor =
+        create_object_test_actor(&cluster, "listing-omits-reserved-internal-object-keys").await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
@@ -1381,7 +1424,7 @@ async fn test_listing_omits_reserved_internal_object_keys() {
         .await
         .unwrap();
 
-    let bucket_name = "test-listing-hides-internal".to_string();
+    let bucket_name = unique_test_name("hides-internal");
     let visible_key = "visible/object.txt".to_string();
     let reserved_key = "_anvil/authz/tuples".to_string();
 
@@ -1408,7 +1451,11 @@ async fn test_listing_omits_reserved_internal_object_keys() {
                 ObjectMetadata {
                     bucket_name: bucket_name.clone(),
                     object_key: visible_key.clone(),
-                    mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+                    mutation_context: Some(native_mutation_context(
+                        &actor,
+                        bucket_id,
+                        "object-metadata",
+                    )),
                     content_type: None,
                     user_metadata_json: String::new(),
                     storage_class: None,
@@ -1430,7 +1477,7 @@ async fn test_listing_omits_reserved_internal_object_keys() {
 
     let bucket = cluster.states[0]
         .persistence
-        .get_bucket_by_name(1, &bucket_name)
+        .get_bucket_by_name(actor.tenant_id, &bucket_name)
         .await
         .unwrap()
         .expect("bucket metadata should exist");

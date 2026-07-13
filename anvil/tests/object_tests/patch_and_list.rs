@@ -2,11 +2,12 @@ use super::*;
 
 #[tokio::test]
 async fn test_patch_json_object_writes_new_merged_version() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor =
+        create_object_test_actor(&cluster, "patch-json-object-writes-new-merged-version").await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
@@ -14,12 +15,12 @@ async fn test_patch_json_object_writes_new_merged_version() {
         .await
         .unwrap();
 
-    let bucket_name = "test-json-patch-bucket".to_string();
+    let bucket_name = unique_test_name("json-patch");
     let object_key = "document.json".to_string();
 
     let mut create_req = Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
-        region: "test-region-1".to_string(),
+        region: actor.region.clone(),
 
         options: None,
     });
@@ -37,7 +38,11 @@ async fn test_patch_json_object_writes_new_merged_version() {
     let metadata = ObjectMetadata {
         bucket_name: bucket_name.clone(),
         object_key: object_key.clone(),
-        mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+        mutation_context: Some(native_mutation_context(
+            &actor,
+            bucket_id,
+            "object-metadata",
+        )),
         content_type: None,
         user_metadata_json: String::new(),
         storage_class: None,
@@ -71,7 +76,11 @@ async fn test_patch_json_object_writes_new_merged_version() {
         object_key: object_key.clone(),
         base_version_id: Some(put_res.version_id.clone()),
         merge_patch_json: r#"{"title":"new","stats":{"open":3},"remove_me":null}"#.to_string(),
-        mutation_context: Some(native_mutation_context(bucket_id, "patch-json-object")),
+        mutation_context: Some(native_mutation_context(
+            &actor,
+            bucket_id,
+            "patch-json-object",
+        )),
         precondition: None,
     });
     patch_req.metadata_mut().insert(
@@ -121,11 +130,11 @@ async fn test_patch_json_object_writes_new_merged_version() {
 
 #[tokio::test]
 async fn test_list_objects_with_delimiter() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_object_test_actor(&cluster, "list-objects-with-delimiter").await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut object_client = ObjectServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
@@ -133,10 +142,10 @@ async fn test_list_objects_with_delimiter() {
         .await
         .unwrap();
 
-    let bucket_name = "test-delimiter-bucket".to_string();
+    let bucket_name = unique_test_name("delimiter");
     let mut create_req = Request::new(CreateBucketRequest {
         bucket_name: bucket_name.clone(),
-        region: "test-region-1".to_string(),
+        region: actor.region.clone(),
 
         options: None,
     });
@@ -156,7 +165,11 @@ async fn test_list_objects_with_delimiter() {
         let metadata = ObjectMetadata {
             bucket_name: bucket_name.clone(),
             object_key: key.to_string(),
-            mutation_context: Some(native_mutation_context(bucket_id, "object-metadata")),
+            mutation_context: Some(native_mutation_context(
+                &actor,
+                bucket_id,
+                "object-metadata",
+            )),
             content_type: None,
             user_metadata_json: String::new(),
             storage_class: None,
