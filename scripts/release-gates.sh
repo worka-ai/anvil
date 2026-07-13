@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export ANVIL_TEST_LOG="${ANVIL_TEST_LOG:-warn}"
+
 ./scripts/check-no-external-db.sh
 ./scripts/check-no-public-unfenced-journal-writes.sh
 ./scripts/check-docs-hardening.sh
