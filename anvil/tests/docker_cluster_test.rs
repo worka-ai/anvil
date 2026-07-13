@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use reqwest::header::HOST;
+
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::{CreateBucketRequest, SetPublicAccessRequest};
@@ -99,34 +101,71 @@ async fn docker_cluster_end_to_end() {
     let data = resp.body.collect().await.unwrap().into_bytes();
     assert_eq!(data.as_ref(), private_content);
 
-    let public_url = format!("/{}/{}", public_bucket, public_key);
-    let public_url = format!("{}{}", actor.grpc_addr.trim_end_matches('/'), public_url);
-    let public_resp = reqwest::get(&public_url).await.unwrap();
+    let tenant_name = actor
+        .tenant_name
+        .as_deref()
+        .expect("docker storage actor has a routed tenant name");
+    let public_url = format!(
+        "{}/{}/{}/{}",
+        actor.grpc_addr.trim_end_matches('/'),
+        tenant_name,
+        public_bucket,
+        public_key
+    );
+    let client = reqwest::Client::new();
+    let public_resp = client
+        .get(&public_url)
+        .header(HOST, &cluster.public_region_host)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(public_resp.status(), 200);
     let public_data = public_resp.bytes().await.unwrap();
     assert_eq!(public_data.as_ref(), public_content);
 
-    let private_url = format!("/{}/{}", private_bucket, private_key);
-    let private_url = format!("{}{}", actor.grpc_addr.trim_end_matches('/'), private_url);
-    let private_resp = reqwest::get(&private_url).await.unwrap();
+    let private_url = format!(
+        "{}/{}/{}/{}",
+        actor.grpc_addr.trim_end_matches('/'),
+        tenant_name,
+        private_bucket,
+        private_key
+    );
+    let private_resp = client
+        .get(&private_url)
+        .header(HOST, &cluster.public_region_host)
+        .send()
+        .await
+        .unwrap();
     assert!(private_resp.status() == 403 || private_resp.status() == 404);
 
     let public_list_url = format!(
-        "{}/{}?list-type=2",
+        "{}/{}/{}?list-type=2",
         actor.grpc_addr.trim_end_matches('/'),
+        tenant_name,
         public_bucket
     );
-    let public_list_resp = reqwest::get(&public_list_url).await.unwrap();
+    let public_list_resp = client
+        .get(&public_list_url)
+        .header(HOST, &cluster.public_region_host)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(public_list_resp.status(), 200);
     let public_list_body = public_list_resp.text().await.unwrap();
     assert!(public_list_body.contains("<ListBucketResult"));
 
     let private_list_url = format!(
-        "{}/{}?list-type=2",
+        "{}/{}/{}?list-type=2",
         actor.grpc_addr.trim_end_matches('/'),
+        tenant_name,
         private_bucket
     );
-    let private_list_resp = reqwest::get(&private_list_url).await.unwrap();
+    let private_list_resp = client
+        .get(&private_list_url)
+        .header(HOST, &cluster.public_region_host)
+        .send()
+        .await
+        .unwrap();
     assert!(private_list_resp.status() == 401 || private_list_resp.status() == 403);
 
     let list = s3

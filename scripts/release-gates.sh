@@ -85,7 +85,6 @@ server_core_integration_gates() {
     corestore_conformance_rfc0007_transactions
     corestore_conformance_rfc0007_writer_segments
     corestore_source_size
-    grpc
     hardening_static
     performance_tests
   )
@@ -139,6 +138,7 @@ docker_mesh_gates() {
   local tests=(
     distributed_tests
     docker_cluster_test
+    grpc
   )
   for test_name in "${tests[@]}"; do
     run_cargo_test "Docker mesh integration ${test_name}" -p anvil-server --test "${test_name}"
