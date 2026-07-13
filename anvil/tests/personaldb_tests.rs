@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::personal_db_service_client::PersonalDbServiceClient;
 use anvil::anvil_api::repair_service_client::RepairServiceClient;
@@ -8,6 +10,7 @@ use anvil::anvil_api::{
     WatchPersonalDbProjectionRequest, WriteAuthzTupleRequest,
 };
 use anvil::anvil_personaldb_sqlite_changeset::iterate_changeset;
+use anvil::authz_scope::DEFAULT_AUTHZ_REALM_ID;
 use anvil::formats::hash32;
 use anvil::partition_fence::{
     AcquireOwnership, ForceExpireOwnership, MAX_OWNERSHIP_LEASE_MS, OwnershipPrincipal,
@@ -65,6 +68,27 @@ fn authorized<T>(message: T, token: &str) -> Request<T> {
     request
 }
 
+async fn create_personaldb_test_actor(
+    cluster: &DockerTestCluster,
+    label: &str,
+) -> DockerTestStorageActor {
+    create_docker_storage_test_actor(cluster, label).await
+}
+
+async fn grant_default_authz_tuple_writer(
+    cluster: &DockerTestCluster,
+    actor: &DockerTestStorageActor,
+) {
+    cluster
+        .grant_application_policy(
+            actor.tenant_id,
+            &actor.app_name,
+            "authz:tuple_write",
+            DEFAULT_AUTHZ_REALM_ID,
+        )
+        .await;
+}
+
 #[path = "personaldb_tests/groups_and_commits.rs"]
 mod groups_and_commits;
 #[path = "personaldb_tests/projections_and_writeback.rs"]
@@ -79,6 +103,14 @@ fn valid_submit_request(
 ) -> SubmitPersonalDbChangesetRequest {
     let changeset_bytes = sqlite_insert_changeset();
     submit_request(database_id, genesis_hash, session_token, changeset_bytes)
+}
+
+fn valid_submit_request_for_actor(
+    actor: &DockerTestStorageActor,
+    database_id: &str,
+    genesis_hash: &str,
+) -> SubmitPersonalDbChangesetRequest {
+    submit_request_for_actor(actor, database_id, genesis_hash, sqlite_insert_changeset())
 }
 
 async fn create_group(
@@ -129,9 +161,17 @@ fn projection_definition(
     projection_database_id: &str,
     source_database_id: &str,
 ) -> ProjectionDefinition {
+    projection_definition_for_tenant(1, projection_database_id, source_database_id)
+}
+
+fn projection_definition_for_tenant(
+    tenant_id: i64,
+    projection_database_id: &str,
+    source_database_id: &str,
+) -> ProjectionDefinition {
     ProjectionDefinition {
         format_version: 1,
-        tenant_id: "1".to_string(),
+        tenant_id: tenant_id.to_string(),
         database_id: projection_database_id.to_string(),
         projection_id: "projection-items".to_string(),
         source_database_ids: vec![source_database_id.to_string()],
@@ -173,11 +213,13 @@ fn projection_definition(
     }
 }
 
-fn projection_definition_allowing_name_writeback(
+fn projection_definition_allowing_name_writeback_for_tenant(
+    tenant_id: i64,
     projection_database_id: &str,
     source_database_id: &str,
 ) -> ProjectionDefinition {
-    let mut definition = projection_definition(projection_database_id, source_database_id);
+    let mut definition =
+        projection_definition_for_tenant(tenant_id, projection_database_id, source_database_id);
     definition.writeback_policy = WriteBackPolicy::AllowMappedColumns {
         protected_columns: vec!["id".to_string()],
         allowed_columns: vec!["name".to_string()],
@@ -185,11 +227,13 @@ fn projection_definition_allowing_name_writeback(
     definition
 }
 
-fn projection_definition_with_resource_filter(
+fn projection_definition_with_resource_filter_for_tenant(
+    tenant_id: i64,
     projection_database_id: &str,
     source_database_id: &str,
 ) -> ProjectionDefinition {
-    let mut definition = projection_definition(projection_database_id, source_database_id);
+    let mut definition =
+        projection_definition_for_tenant(tenant_id, projection_database_id, source_database_id);
     definition.row_filters = vec![RowFilter::ResourceRelationAllows {
         table: "items".to_string(),
         resource_id_field: "id".to_string(),
@@ -198,11 +242,13 @@ fn projection_definition_with_resource_filter(
     definition
 }
 
-fn projection_definition_allowing_id_name_writeback(
+fn projection_definition_allowing_id_name_writeback_for_tenant(
+    tenant_id: i64,
     projection_database_id: &str,
     source_database_id: &str,
 ) -> ProjectionDefinition {
-    let mut definition = projection_definition(projection_database_id, source_database_id);
+    let mut definition =
+        projection_definition_for_tenant(tenant_id, projection_database_id, source_database_id);
     definition.writeback_policy = WriteBackPolicy::AllowMappedColumns {
         protected_columns: Vec::new(),
         allowed_columns: vec!["id".to_string(), "name".to_string()],
@@ -210,12 +256,14 @@ fn projection_definition_allowing_id_name_writeback(
     definition
 }
 
-fn projection_definition_with_ambiguous_writeback(
+fn projection_definition_with_ambiguous_writeback_for_tenant(
+    tenant_id: i64,
     projection_database_id: &str,
     first_source_database_id: &str,
     second_source_database_id: &str,
 ) -> ProjectionDefinition {
-    let mut definition = projection_definition_allowing_name_writeback(
+    let mut definition = projection_definition_allowing_name_writeback_for_tenant(
+        tenant_id,
         projection_database_id,
         first_source_database_id,
     );
@@ -252,6 +300,15 @@ fn submit_request(
     submit_request_at_base(database_id, 0, genesis_hash, session_token, changeset_bytes)
 }
 
+fn submit_request_for_actor(
+    actor: &DockerTestStorageActor,
+    database_id: &str,
+    genesis_hash: &str,
+    changeset_bytes: Vec<u8>,
+) -> SubmitPersonalDbChangesetRequest {
+    submit_request_at_base_for_actor(actor, database_id, 0, genesis_hash, changeset_bytes)
+}
+
 fn submit_request_at_base(
     database_id: &str,
     base_log_index: u64,
@@ -269,6 +326,24 @@ fn submit_request_at_base(
     )
 }
 
+fn submit_request_at_base_for_actor(
+    actor: &DockerTestStorageActor,
+    database_id: &str,
+    base_log_index: u64,
+    base_log_hash: &str,
+    changeset_bytes: Vec<u8>,
+) -> SubmitPersonalDbChangesetRequest {
+    submit_request_at_base_for_tenant_and_principal(
+        actor.tenant_id,
+        database_id,
+        base_log_index,
+        base_log_hash,
+        &actor.app_id,
+        &actor.token,
+        changeset_bytes,
+    )
+}
+
 fn submit_request_at_base_for_principal(
     database_id: &str,
     base_log_index: u64,
@@ -277,8 +352,28 @@ fn submit_request_at_base_for_principal(
     session_token: &str,
     changeset_bytes: Vec<u8>,
 ) -> SubmitPersonalDbChangesetRequest {
+    submit_request_at_base_for_tenant_and_principal(
+        1,
+        database_id,
+        base_log_index,
+        base_log_hash,
+        principal,
+        session_token,
+        changeset_bytes,
+    )
+}
+
+fn submit_request_at_base_for_tenant_and_principal(
+    tenant_id: i64,
+    database_id: &str,
+    base_log_index: u64,
+    base_log_hash: &str,
+    principal: &str,
+    session_token: &str,
+    changeset_bytes: Vec<u8>,
+) -> SubmitPersonalDbChangesetRequest {
     SubmitPersonalDbChangesetRequest {
-        tenant_id: 1,
+        tenant_id,
         database_id: database_id.to_string(),
         principal: principal.to_string(),
         session_token: session_token.to_string(),

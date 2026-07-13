@@ -2,11 +2,11 @@ use super::*;
 
 #[tokio::test]
 async fn personaldb_group_create_get_and_catch_up_are_native_api_backed() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_personaldb_test_actor(&cluster, "personaldb-group").await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut client = PersonalDbServiceClient::connect(grpc_addr).await.unwrap();
     let database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
     let schema_hash = personaldb_test_schema_hash();
@@ -27,7 +27,7 @@ async fn personaldb_group_create_get_and_catch_up_are_native_api_backed() {
         .into_inner();
 
     let manifest = created.manifest.expect("group manifest");
-    assert_eq!(manifest.tenant_id, "1");
+    assert_eq!(manifest.tenant_id, actor.tenant_id.to_string());
     assert_eq!(manifest.database_id, database_id);
     assert_eq!(manifest.schema_hash, schema_hash);
     assert_eq!(manifest.genesis_hash, genesis_hash);
@@ -47,7 +47,7 @@ async fn personaldb_group_create_get_and_catch_up_are_native_api_backed() {
     let fetched = client
         .get_personal_db_group(authorized(
             GetPersonalDbGroupRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: database_id.clone(),
             },
             &token,
@@ -61,9 +61,9 @@ async fn personaldb_group_create_get_and_catch_up_are_native_api_backed() {
     let caught_up = client
         .catch_up_personal_db(authorized(
             PersonalDbCatchUpRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: database_id.clone(),
-                principal: "2".to_string(),
+                principal: actor.app_id.clone(),
                 replica_id: "replica-a".to_string(),
                 have_log_index: 0,
                 have_log_hash: genesis_hash.clone(),
@@ -81,9 +81,9 @@ async fn personaldb_group_create_get_and_catch_up_are_native_api_backed() {
     let divergent = client
         .catch_up_personal_db(authorized(
             PersonalDbCatchUpRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id,
-                principal: "2".to_string(),
+                principal: actor.app_id.clone(),
                 replica_id: "replica-a".to_string(),
                 have_log_index: 0,
                 have_log_hash: hex::encode([9; 32]),
@@ -99,14 +99,16 @@ async fn personaldb_group_create_get_and_catch_up_are_native_api_backed() {
 }
 
 #[tokio::test]
+// Internal-only: seeds and reads ownership fences through cluster storage and
+// the local secret key, which are not exposed by public/admin APIs.
 async fn personaldb_group_creation_requires_current_rfc_ownership_fence() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
     let mut client = PersonalDbServiceClient::connect(grpc_addr).await.unwrap();
     let database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
+    let conflicting_owner_id = unique_test_name("other-node-personaldb-owner");
     let resource = OwnershipResource {
         resource_kind: OwnershipResourceKind::PersonalDbGroup,
         resource_id: format!("tenant/1/personaldb/{database_id}"),
@@ -116,15 +118,15 @@ async fn personaldb_group_creation_requires_current_rfc_ownership_fence() {
     acquire_ownership(
         &cluster.states[0].storage,
         AcquireOwnership {
-            request_id: "other-node-personaldb-owner".to_string(),
-            idempotency_key: "other-node-personaldb-owner".to_string(),
+            request_id: format!("{conflicting_owner_id}-request"),
+            idempotency_key: format!("{conflicting_owner_id}-idempotency"),
             resource: resource.clone(),
             owner: OwnershipPrincipal {
                 tenant_id: 0,
                 principal_kind: "node".to_string(),
-                principal_id: "other-node".to_string(),
-                actor_instance_id: "other-node".to_string(),
-                display_name: "other-node".to_string(),
+                principal_id: conflicting_owner_id.clone(),
+                actor_instance_id: conflicting_owner_id.clone(),
+                display_name: conflicting_owner_id.clone(),
                 region: "test-region-1".to_string(),
                 cell: "default".to_string(),
             },
@@ -165,13 +167,13 @@ async fn personaldb_group_creation_requires_current_rfc_ownership_fence() {
     .await
     .unwrap()
     .expect("conflicting owner fence remains durable");
-    assert_eq!(fence.owner.principal_id, "other-node");
+    assert_eq!(fence.owner.principal_id, conflicting_owner_id);
 }
 
 #[tokio::test]
+// Internal-only: mints custom JWTs and reads the row index from local storage.
 async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -354,9 +356,10 @@ async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
 }
 
 #[tokio::test]
+// Internal-only: removes a PersonalDB payload locator directly from storage to
+// force the repair finding under test.
 async fn personaldb_repair_verifies_log_chain_and_reports_missing_payload() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
@@ -431,11 +434,11 @@ async fn personaldb_repair_verifies_log_chain_and_reports_missing_payload() {
 
 #[tokio::test]
 async fn personaldb_concurrent_same_base_submits_publish_one_witness_commit() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_personaldb_test_actor(&cluster, "personaldb-concurrent").await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut setup_client = PersonalDbServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
@@ -449,19 +452,19 @@ async fn personaldb_concurrent_same_base_submits_publish_one_witness_commit() {
         .await
         .unwrap();
     let first = first_client.submit_personal_db_changeset(authorized(
-        submit_request(
+        submit_request_for_actor(
+            &actor,
             &database_id,
             &genesis_hash,
-            &token,
             sqlite_insert_changeset_with_item(1, "alpha", &[1_u8, 2, 3]),
         ),
         &token,
     ));
     let second = second_client.submit_personal_db_changeset(authorized(
-        submit_request(
+        submit_request_for_actor(
+            &actor,
             &database_id,
             &genesis_hash,
-            &token,
             sqlite_insert_changeset_with_item(2, "beta", &[4_u8, 5, 6]),
         ),
         &token,
@@ -489,7 +492,7 @@ async fn personaldb_concurrent_same_base_submits_publish_one_witness_commit() {
     let fetched = setup_client
         .get_personal_db_group(authorized(
             GetPersonalDbGroupRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: database_id.clone(),
             },
             &token,
@@ -504,9 +507,9 @@ async fn personaldb_concurrent_same_base_submits_publish_one_witness_commit() {
     let caught_up = setup_client
         .catch_up_personal_db(authorized(
             PersonalDbCatchUpRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: database_id.clone(),
-                principal: "2".to_string(),
+                principal: actor.app_id.clone(),
                 replica_id: "replica-a".to_string(),
                 have_log_index: 0,
                 have_log_hash: genesis_hash,
@@ -534,17 +537,10 @@ async fn personaldb_concurrent_same_base_submits_publish_one_witness_commit() {
 }
 
 #[tokio::test]
+// Internal-only: inspects and force-expires partition ownership records through
+// local cluster storage and node configuration.
 async fn personaldb_group_owner_handoff_after_force_expiry_commits_once_across_nodes() {
-    let mut cluster = TestCluster::new(&[
-        "test-region-1",
-        "test-region-1",
-        "test-region-1",
-        "test-region-1",
-        "test-region-1",
-        "test-region-1",
-    ])
-    .await;
-    cluster.start_and_converge(Duration::from_secs(30)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let token = cluster.token.clone();
     let database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
@@ -704,11 +700,12 @@ async fn personaldb_group_owner_handoff_after_force_expiry_commits_once_across_n
 
 #[tokio::test]
 async fn personaldb_row_mutation_can_be_authorized_by_relationship_tuple() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_personaldb_test_actor(&cluster, "personaldb-row-auth").await;
+    grant_default_authz_tuple_writer(&cluster, &actor).await;
 
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
+    let grpc_addr = actor.grpc_addr.clone();
+    let token = actor.token.clone();
     let mut personaldb = PersonalDbServiceClient::connect(grpc_addr.clone())
         .await
         .unwrap();
@@ -731,7 +728,7 @@ async fn personaldb_row_mutation_can_be_authorized_by_relationship_tuple() {
 
     let inserted = personaldb
         .submit_personal_db_changeset(authorized(
-            valid_submit_request(&database_id, &genesis_hash, &token),
+            valid_submit_request_for_actor(&actor, &database_id, &genesis_hash),
             &token,
         ))
         .await
@@ -739,29 +736,21 @@ async fn personaldb_row_mutation_can_be_authorized_by_relationship_tuple() {
         .into_inner();
     assert_eq!(inserted.log_index, 1);
 
-    let delegate_principal = "delegate-app";
-    let delegate_token = cluster.states[0]
-        .jwt_manager
-        .mint_token(delegate_principal.to_string(), 1)
-        .unwrap();
-    anvil::access_control::write_delegated_action_tuple(
-        &cluster.states[0].storage,
-        &cluster.states[0].persistence,
-        1,
-        delegate_principal,
-        anvil::permissions::AnvilAction::PersonalDbCommit,
-        &database_id,
-        "add",
-        "test",
-        "grant delegate PersonalDB group commit",
-    )
-    .await
-    .unwrap();
+    let delegate = cluster
+        .create_actor_in_tenant(
+            actor.tenant_id,
+            "personaldb-row-delegate",
+            &[("personaldb:commit", &database_id)],
+        )
+        .await;
+    let delegate_principal = delegate.app_id.as_str();
+    let delegate_token = delegate.token.as_str();
 
     let changeset_bytes = sqlite_item_update_changeset();
     let denied = personaldb
         .submit_personal_db_changeset(authorized(
-            submit_request_at_base_for_principal(
+            submit_request_at_base_for_tenant_and_principal(
+                actor.tenant_id,
                 &database_id,
                 inserted.log_index,
                 &inserted.log_hash,
@@ -777,7 +766,7 @@ async fn personaldb_row_mutation_can_be_authorized_by_relationship_tuple() {
 
     let changes = iterate_changeset(&changeset_bytes).unwrap();
     let envelope = derive_verified_mutation_envelope(PersonalDbEnvelopeDerivationInput {
-        tenant_id: 1,
+        tenant_id: actor.tenant_id,
         database_id: &database_id,
         principal: delegate_principal,
         base_log_index: inserted.log_index,
@@ -796,8 +785,8 @@ async fn personaldb_row_mutation_can_be_authorized_by_relationship_tuple() {
         .expect("update changeset should derive one effect");
     let binding = &effect.source_resource_binding;
     let resource = format!(
-        "tenant-1/{}/{}/{}",
-        database_id, binding.resource_type, binding.resource_id
+        "tenant-{}/{}/{}/{}",
+        actor.tenant_id, database_id, binding.resource_type, binding.resource_id
     );
     let permission = effect
         .required_permissions
@@ -825,7 +814,8 @@ async fn personaldb_row_mutation_can_be_authorized_by_relationship_tuple() {
 
     let committed = personaldb
         .submit_personal_db_changeset(authorized(
-            submit_request_at_base_for_principal(
+            submit_request_at_base_for_tenant_and_principal(
+                actor.tenant_id,
                 &database_id,
                 inserted.log_index,
                 &inserted.log_hash,
@@ -843,9 +833,19 @@ async fn personaldb_row_mutation_can_be_authorized_by_relationship_tuple() {
 }
 
 #[tokio::test]
+// Internal-only: requires custom snapshot-threshold config and reads snapshot
+// manifests/objects from local storage.
 async fn personaldb_submit_builds_snapshot_when_threshold_is_reached() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    std::sync::Arc::make_mut(&mut cluster.states[0].config).personaldb_snapshot_entry_threshold = 1;
+    // Keep isolated: the snapshot threshold is lowered to force snapshot
+    // creation after one commit without changing the shared cluster profile.
+    let mut cluster = isolated_test_cluster_with_config(
+        "PersonalDB snapshot test lowers the snapshot threshold for this topology",
+        &["test-region-1"],
+        |config| {
+            config.personaldb_snapshot_entry_threshold = 1;
+        },
+    )
+    .await;
     cluster.start_and_converge(Duration::from_secs(5)).await;
 
     let token = cluster.token.clone();

@@ -1,9 +1,10 @@
 use super::*;
 
 #[tokio::test]
+// Internal-only: appends a reserved PersonalDB watch event directly through
+// local storage before reading it over the public watch API.
 async fn personaldb_group_watch_streams_reserved_internal_events_through_native_api() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
     let token = cluster.token.clone();

@@ -13,7 +13,7 @@ use anvil_core::core_store::{
 };
 use anvil_core::perf_baseline::{BaselineManifest, BaselineRunSummary, BaselineScenarioSummary};
 use anvil_core::storage::Storage;
-use anvil_test_utils::{TestCluster, emit_test_timing};
+use anvil_test_utils::{emit_test_timing, isolated_test_cluster, unique_test_name};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -277,7 +277,7 @@ async fn performance_native_api_smoke() {
                         bytes: payload.clone(),
                         boundary_values: Vec::new(),
                         region_id: "perf-region-1".to_string(),
-                        mutation_id: format!("perf-put-blob-{}", uuid::Uuid::new_v4()),
+                        mutation_id: unique_test_name("perf-put-blob"),
                     })
                     .await
                     .unwrap()
@@ -341,7 +341,7 @@ async fn performance_native_api_smoke() {
             .measure("corestore_coremeta_row_create", || async {
                 store
                     .commit_mutation_batch(CoreMutationBatch {
-                        transaction_id: format!("perf-coremeta-{}", uuid::Uuid::new_v4()),
+                        transaction_id: unique_test_name("perf-coremeta"),
                         scope_partition: "perf".to_string(),
                         committed_by_principal: "perf-principal".to_string(),
                         preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
@@ -392,7 +392,7 @@ async fn performance_native_api_smoke() {
             .measure("corestore_mutation_batch_coremeta_and_stream", || async {
                 store
                     .commit_mutation_batch(CoreMutationBatch {
-                        transaction_id: format!("perf-batch-{}", uuid::Uuid::new_v4()),
+                        transaction_id: unique_test_name("perf-batch"),
                         scope_partition: "perf".to_string(),
                         committed_by_principal: "perf-principal".to_string(),
                         preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
@@ -452,7 +452,11 @@ async fn performance_native_api_smoke() {
 
     let mut cluster = report
         .measure("cluster_start_single_node", || async {
-            let mut cluster = TestCluster::new(&["perf-region-1"]).await;
+            let mut cluster = isolated_test_cluster(
+                "performance benchmark measures single-node cluster startup and aborts nodes",
+                &["perf-region-1"],
+            )
+            .await;
             cluster.start_and_converge(Duration::from_secs(5)).await;
             cluster
         })
@@ -470,7 +474,7 @@ async fn performance_native_api_smoke() {
         .await
         .unwrap();
 
-    let bucket_name = format!("perf-bucket-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("perf-bucket");
     let bucket_id = report
         .measure("grpc_create_bucket", || async {
             bucket_client

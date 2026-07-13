@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use anvil_storage::AnvilClient;
 use anvil_storage::proto::get_object_response;
 use anvil_storage::proto::put_object_request;
@@ -7,14 +5,21 @@ use anvil_storage::proto::{
     CreateBucketRequest, GetObjectRequest, ListBucketsRequest, NativeMutationContext,
     ObjectMetadata, PutObjectRequest,
 };
-use anvil_test_utils::TestCluster;
+use anvil_test_utils::{
+    create_docker_storage_test_actor, shared_docker_test_cluster, unique_test_name,
+};
 
-fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
+fn native_mutation_context(
+    tenant_id: i64,
+    principal: &str,
+    bucket_id: i64,
+    tag: &str,
+) -> NativeMutationContext {
     let nonce = uuid::Uuid::new_v4();
     NativeMutationContext {
-        tenant_id: 1,
+        tenant_id,
         bucket_id,
-        principal: "2".to_string(),
+        principal: principal.to_string(),
         request_id: format!("{tag}-{nonce}-request"),
         precondition: "none".to_string(),
         authz_zookie_optional: String::new(),
@@ -25,19 +30,19 @@ fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
 
 #[tokio::test]
 async fn rust_client_calls_live_native_api() {
-    let mut cluster = TestCluster::new(&["rust-client-region"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_storage_test_actor(&cluster, "rust-client").await;
 
-    let client = AnvilClient::connect_with_bearer(cluster.grpc_addrs[0].clone(), &cluster.token)
+    let client = AnvilClient::connect_with_bearer(actor.grpc_addr.clone(), &actor.token)
         .await
         .expect("rust client should connect to live test node");
 
-    let bucket_name = format!("rust-client-{}", uuid::Uuid::new_v4());
+    let bucket_name = unique_test_name("rust-client");
     let bucket = client
         .buckets()
         .create_bucket(CreateBucketRequest {
             bucket_name: bucket_name.clone(),
-            region: "rust-client-region".to_string(),
+            region: "test-region-1".to_string(),
 
             options: None,
         })
@@ -65,7 +70,12 @@ async fn rust_client_calls_live_native_api() {
             data: Some(put_object_request::Data::Metadata(ObjectMetadata {
                 bucket_name: bucket_name.clone(),
                 object_key: object_key.clone(),
-                mutation_context: Some(native_mutation_context(bucket.bucket_id, "put-object")),
+                mutation_context: Some(native_mutation_context(
+                    actor.tenant_id,
+                    &actor.app_id,
+                    bucket.bucket_id,
+                    "put-object",
+                )),
                 content_type: None,
                 user_metadata_json: String::new(),
                 storage_class: None,

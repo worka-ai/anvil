@@ -1,9 +1,10 @@
 use super::*;
 
 #[tokio::test]
+// Internal-only: seeds a projection watch record directly through local
+// cluster storage to assert reserved watch-envelope details.
 async fn personaldb_projection_definition_create_get_and_watch_are_native_api_backed() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
 
     let token = cluster.token.clone();
     let mut client = PersonalDbServiceClient::connect(cluster.grpc_addrs[0].clone())
@@ -120,11 +121,11 @@ async fn personaldb_projection_definition_create_get_and_watch_are_native_api_ba
 
 #[tokio::test]
 async fn personaldb_source_commit_builds_projection_group_and_watch_event() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_personaldb_test_actor(&cluster, "personaldb-projection").await;
 
-    let token = cluster.token.clone();
-    let mut client = PersonalDbServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let token = actor.token.clone();
+    let mut client = PersonalDbServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
     let source_database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
@@ -139,11 +140,15 @@ async fn personaldb_source_commit_builds_projection_group_and_watch_event() {
     )
     .await;
 
-    let definition = projection_definition(&projection_database_id, &source_database_id);
+    let definition = projection_definition_for_tenant(
+        actor.tenant_id,
+        &projection_database_id,
+        &source_database_id,
+    );
     let created = client
         .create_personal_db_projection(authorized(
             CreatePersonalDbProjectionRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: projection_database_id.clone(),
                 projection_definition_json: serde_json::to_string(&definition).unwrap(),
             },
@@ -157,7 +162,7 @@ async fn personaldb_source_commit_builds_projection_group_and_watch_event() {
 
     let source_commit = client
         .submit_personal_db_changeset(authorized(
-            valid_submit_request(&source_database_id, &source_genesis, &token),
+            valid_submit_request_for_actor(&actor, &source_database_id, &source_genesis),
             &token,
         ))
         .await
@@ -168,9 +173,9 @@ async fn personaldb_source_commit_builds_projection_group_and_watch_event() {
     let projected = client
         .catch_up_personal_db(authorized(
             PersonalDbCatchUpRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: projection_database_id.clone(),
-                principal: "2".to_string(),
+                principal: actor.app_id.clone(),
                 replica_id: "replica-projection".to_string(),
                 have_log_index: 0,
                 have_log_hash: projection_genesis,
@@ -210,7 +215,7 @@ async fn personaldb_source_commit_builds_projection_group_and_watch_event() {
     let watch = client
         .watch_personal_db_projection(authorized(
             WatchPersonalDbProjectionRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: projection_database_id.clone(),
                 projection_id: "projection-items".to_string(),
                 after_cursor_low: 0,
@@ -237,14 +242,15 @@ async fn personaldb_source_commit_builds_projection_group_and_watch_event() {
 
 #[tokio::test]
 async fn personaldb_projection_resource_relation_filter_uses_authz_index() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_personaldb_test_actor(&cluster, "personaldb-projection-authz").await;
+    grant_default_authz_tuple_writer(&cluster, &actor).await;
 
-    let token = cluster.token.clone();
-    let mut client = PersonalDbServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let token = actor.token.clone();
+    let mut client = PersonalDbServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
-    let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut auth_client = AuthServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
     let source_database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
@@ -259,12 +265,15 @@ async fn personaldb_projection_resource_relation_filter_uses_authz_index() {
     )
     .await;
 
-    let definition =
-        projection_definition_with_resource_filter(&projection_database_id, &source_database_id);
+    let definition = projection_definition_with_resource_filter_for_tenant(
+        actor.tenant_id,
+        &projection_database_id,
+        &source_database_id,
+    );
     client
         .create_personal_db_projection(authorized(
             CreatePersonalDbProjectionRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: projection_database_id.clone(),
                 projection_definition_json: serde_json::to_string(&definition).unwrap(),
             },
@@ -277,7 +286,7 @@ async fn personaldb_projection_resource_relation_filter_uses_authz_index() {
         .write_authz_tuple(authorized(
             WriteAuthzTupleRequest {
                 namespace: "personaldb_row".to_string(),
-                object_id: format!("tenant-1/{source_database_id}/items/1"),
+                object_id: format!("tenant-{}/{source_database_id}/items/1", actor.tenant_id),
                 relation: "viewer".to_string(),
                 subject_kind: "app".to_string(),
                 subject_id: "scope-primary".to_string(),
@@ -293,7 +302,7 @@ async fn personaldb_projection_resource_relation_filter_uses_authz_index() {
 
     let source_commit = client
         .submit_personal_db_changeset(authorized(
-            valid_submit_request(&source_database_id, &source_genesis, &token),
+            valid_submit_request_for_actor(&actor, &source_database_id, &source_genesis),
             &token,
         ))
         .await
@@ -304,9 +313,9 @@ async fn personaldb_projection_resource_relation_filter_uses_authz_index() {
     let projected = client
         .catch_up_personal_db(authorized(
             PersonalDbCatchUpRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: projection_database_id.clone(),
-                principal: "2".to_string(),
+                principal: actor.app_id.clone(),
                 replica_id: "replica-projection-authz".to_string(),
                 have_log_index: 0,
                 have_log_hash: projection_genesis,
@@ -327,11 +336,11 @@ async fn personaldb_projection_resource_relation_filter_uses_authz_index() {
 
 #[tokio::test]
 async fn personaldb_projection_group_submit_rejects_direct_writeback_when_policy_denies() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_personaldb_test_actor(&cluster, "personaldb-writeback-deny").await;
 
-    let token = cluster.token.clone();
-    let mut client = PersonalDbServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let token = actor.token.clone();
+    let mut client = PersonalDbServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
     let source_database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
@@ -346,11 +355,15 @@ async fn personaldb_projection_group_submit_rejects_direct_writeback_when_policy
     )
     .await;
 
-    let definition = projection_definition(&projection_database_id, &source_database_id);
+    let definition = projection_definition_for_tenant(
+        actor.tenant_id,
+        &projection_database_id,
+        &source_database_id,
+    );
     client
         .create_personal_db_projection(authorized(
             CreatePersonalDbProjectionRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: projection_database_id.clone(),
                 projection_definition_json: serde_json::to_string(&definition).unwrap(),
             },
@@ -360,7 +373,7 @@ async fn personaldb_projection_group_submit_rejects_direct_writeback_when_policy
         .unwrap();
     client
         .submit_personal_db_changeset(authorized(
-            valid_submit_request(&source_database_id, &source_genesis, &token),
+            valid_submit_request_for_actor(&actor, &source_database_id, &source_genesis),
             &token,
         ))
         .await
@@ -369,7 +382,7 @@ async fn personaldb_projection_group_submit_rejects_direct_writeback_when_policy
     let projection_head_before = client
         .get_personal_db_group(authorized(
             GetPersonalDbGroupRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: projection_database_id.clone(),
             },
             &token,
@@ -383,11 +396,11 @@ async fn personaldb_projection_group_submit_rejects_direct_writeback_when_policy
 
     let err = client
         .submit_personal_db_changeset(authorized(
-            submit_request_at_base(
+            submit_request_at_base_for_actor(
+                &actor,
                 &projection_database_id,
                 projection_head_before.log_index,
                 &projection_head_before.log_hash,
-                &token,
                 sqlite_projection_update_changeset(),
             ),
             &token,
@@ -403,7 +416,7 @@ async fn personaldb_projection_group_submit_rejects_direct_writeback_when_policy
     let projection_head_after = client
         .get_personal_db_group(authorized(
             GetPersonalDbGroupRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: projection_database_id,
             },
             &token,
@@ -425,11 +438,11 @@ async fn personaldb_projection_group_submit_rejects_direct_writeback_when_policy
 
 #[tokio::test]
 async fn personaldb_projection_writeback_updates_source_and_rebuilds_projection_when_allowed() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_personaldb_test_actor(&cluster, "personaldb-writeback").await;
 
-    let token = cluster.token.clone();
-    let mut client = PersonalDbServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let token = actor.token.clone();
+    let mut client = PersonalDbServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
     let source_database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
@@ -444,12 +457,15 @@ async fn personaldb_projection_writeback_updates_source_and_rebuilds_projection_
     )
     .await;
 
-    let definition =
-        projection_definition_allowing_name_writeback(&projection_database_id, &source_database_id);
+    let definition = projection_definition_allowing_name_writeback_for_tenant(
+        actor.tenant_id,
+        &projection_database_id,
+        &source_database_id,
+    );
     client
         .create_personal_db_projection(authorized(
             CreatePersonalDbProjectionRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: projection_database_id.clone(),
                 projection_definition_json: serde_json::to_string(&definition).unwrap(),
             },
@@ -459,7 +475,7 @@ async fn personaldb_projection_writeback_updates_source_and_rebuilds_projection_
         .unwrap();
     let source_insert = client
         .submit_personal_db_changeset(authorized(
-            valid_submit_request(&source_database_id, &source_genesis, &token),
+            valid_submit_request_for_actor(&actor, &source_database_id, &source_genesis),
             &token,
         ))
         .await
@@ -469,7 +485,7 @@ async fn personaldb_projection_writeback_updates_source_and_rebuilds_projection_
     let projection_head = client
         .get_personal_db_group(authorized(
             GetPersonalDbGroupRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: projection_database_id.clone(),
             },
             &token,
@@ -483,11 +499,11 @@ async fn personaldb_projection_writeback_updates_source_and_rebuilds_projection_
 
     let source_writeback = client
         .submit_personal_db_changeset(authorized(
-            submit_request_at_base(
+            submit_request_at_base_for_actor(
+                &actor,
                 &projection_database_id,
                 projection_head.log_index,
                 &projection_head.log_hash,
-                &token,
                 sqlite_projection_update_changeset(),
             ),
             &token,
@@ -501,9 +517,9 @@ async fn personaldb_projection_writeback_updates_source_and_rebuilds_projection_
     let source_catchup = client
         .catch_up_personal_db(authorized(
             PersonalDbCatchUpRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: source_database_id.clone(),
-                principal: "2".to_string(),
+                principal: actor.app_id.clone(),
                 replica_id: "replica-source".to_string(),
                 have_log_index: 0,
                 have_log_hash: source_genesis,
@@ -534,9 +550,9 @@ async fn personaldb_projection_writeback_updates_source_and_rebuilds_projection_
     let projection_catchup = client
         .catch_up_personal_db(authorized(
             PersonalDbCatchUpRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: projection_database_id,
-                principal: "2".to_string(),
+                principal: actor.app_id.clone(),
                 replica_id: "replica-projection".to_string(),
                 have_log_index: 0,
                 have_log_hash: projection_genesis,
@@ -581,11 +597,11 @@ async fn personaldb_projection_writeback_updates_source_and_rebuilds_projection_
 
 #[tokio::test]
 async fn personaldb_projection_writeback_insert_and_delete_round_trip_through_source_group() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_personaldb_test_actor(&cluster, "personaldb-insert-delete").await;
 
-    let token = cluster.token.clone();
-    let mut client = PersonalDbServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let token = actor.token.clone();
+    let mut client = PersonalDbServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
     let source_database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
@@ -600,14 +616,15 @@ async fn personaldb_projection_writeback_insert_and_delete_round_trip_through_so
     )
     .await;
 
-    let definition = projection_definition_allowing_id_name_writeback(
+    let definition = projection_definition_allowing_id_name_writeback_for_tenant(
+        actor.tenant_id,
         &projection_database_id,
         &source_database_id,
     );
     client
         .create_personal_db_projection(authorized(
             CreatePersonalDbProjectionRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: projection_database_id.clone(),
                 projection_definition_json: serde_json::to_string(&definition).unwrap(),
             },
@@ -618,11 +635,11 @@ async fn personaldb_projection_writeback_insert_and_delete_round_trip_through_so
 
     let inserted = client
         .submit_personal_db_changeset(authorized(
-            submit_request_at_base(
+            submit_request_at_base_for_actor(
+                &actor,
                 &projection_database_id,
                 0,
                 &projection_genesis,
-                &token,
                 sqlite_projection_insert_changeset(),
             ),
             &token,
@@ -635,7 +652,7 @@ async fn personaldb_projection_writeback_insert_and_delete_round_trip_through_so
     let projection_head_after_insert = client
         .get_personal_db_group(authorized(
             GetPersonalDbGroupRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: projection_database_id.clone(),
             },
             &token,
@@ -649,11 +666,11 @@ async fn personaldb_projection_writeback_insert_and_delete_round_trip_through_so
 
     let deleted = client
         .submit_personal_db_changeset(authorized(
-            submit_request_at_base(
+            submit_request_at_base_for_actor(
+                &actor,
                 &projection_database_id,
                 projection_head_after_insert.log_index,
                 &projection_head_after_insert.log_hash,
-                &token,
                 sqlite_projection_delete_changeset(),
             ),
             &token,
@@ -666,9 +683,9 @@ async fn personaldb_projection_writeback_insert_and_delete_round_trip_through_so
     let source_catchup = client
         .catch_up_personal_db(authorized(
             PersonalDbCatchUpRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: source_database_id.clone(),
-                principal: "2".to_string(),
+                principal: actor.app_id.clone(),
                 replica_id: "replica-source-insert-delete".to_string(),
                 have_log_index: 0,
                 have_log_hash: source_genesis,
@@ -701,9 +718,9 @@ async fn personaldb_projection_writeback_insert_and_delete_round_trip_through_so
     let projection_catchup = client
         .catch_up_personal_db(authorized(
             PersonalDbCatchUpRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: projection_database_id,
-                principal: "2".to_string(),
+                principal: actor.app_id.clone(),
                 replica_id: "replica-projection-insert-delete".to_string(),
                 have_log_index: 0,
                 have_log_hash: projection_genesis,
@@ -740,11 +757,11 @@ async fn personaldb_projection_writeback_insert_and_delete_round_trip_through_so
 
 #[tokio::test]
 async fn personaldb_projection_writeback_rejects_protected_column_mutation() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_personaldb_test_actor(&cluster, "personaldb-protected").await;
 
-    let token = cluster.token.clone();
-    let mut client = PersonalDbServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let token = actor.token.clone();
+    let mut client = PersonalDbServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
     let source_database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
@@ -759,12 +776,15 @@ async fn personaldb_projection_writeback_rejects_protected_column_mutation() {
     )
     .await;
 
-    let definition =
-        projection_definition_allowing_name_writeback(&projection_database_id, &source_database_id);
+    let definition = projection_definition_allowing_name_writeback_for_tenant(
+        actor.tenant_id,
+        &projection_database_id,
+        &source_database_id,
+    );
     client
         .create_personal_db_projection(authorized(
             CreatePersonalDbProjectionRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: projection_database_id.clone(),
                 projection_definition_json: serde_json::to_string(&definition).unwrap(),
             },
@@ -774,7 +794,7 @@ async fn personaldb_projection_writeback_rejects_protected_column_mutation() {
         .unwrap();
     client
         .submit_personal_db_changeset(authorized(
-            valid_submit_request(&source_database_id, &source_genesis, &token),
+            valid_submit_request_for_actor(&actor, &source_database_id, &source_genesis),
             &token,
         ))
         .await
@@ -783,7 +803,7 @@ async fn personaldb_projection_writeback_rejects_protected_column_mutation() {
     let source_head_before = client
         .get_personal_db_group(authorized(
             GetPersonalDbGroupRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: source_database_id.clone(),
             },
             &token,
@@ -796,7 +816,7 @@ async fn personaldb_projection_writeback_rejects_protected_column_mutation() {
     let projection_head_before = client
         .get_personal_db_group(authorized(
             GetPersonalDbGroupRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: projection_database_id.clone(),
             },
             &token,
@@ -809,11 +829,11 @@ async fn personaldb_projection_writeback_rejects_protected_column_mutation() {
 
     let err = client
         .submit_personal_db_changeset(authorized(
-            submit_request_at_base(
+            submit_request_at_base_for_actor(
+                &actor,
                 &projection_database_id,
                 projection_head_before.log_index,
                 &projection_head_before.log_hash,
-                &token,
                 sqlite_projection_id_update_changeset(),
             ),
             &token,
@@ -829,7 +849,7 @@ async fn personaldb_projection_writeback_rejects_protected_column_mutation() {
     let source_head_after = client
         .get_personal_db_group(authorized(
             GetPersonalDbGroupRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: source_database_id,
             },
             &token,
@@ -845,11 +865,11 @@ async fn personaldb_projection_writeback_rejects_protected_column_mutation() {
 
 #[tokio::test]
 async fn personaldb_projection_writeback_rejects_ambiguous_source_binding() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_personaldb_test_actor(&cluster, "personaldb-ambiguous").await;
 
-    let token = cluster.token.clone();
-    let mut client = PersonalDbServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let token = actor.token.clone();
+    let mut client = PersonalDbServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
     let first_source_database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
@@ -866,7 +886,8 @@ async fn personaldb_projection_writeback_rejects_ambiguous_source_binding() {
     )
     .await;
 
-    let definition = projection_definition_with_ambiguous_writeback(
+    let definition = projection_definition_with_ambiguous_writeback_for_tenant(
+        actor.tenant_id,
         &projection_database_id,
         &first_source_database_id,
         &second_source_database_id,
@@ -874,7 +895,7 @@ async fn personaldb_projection_writeback_rejects_ambiguous_source_binding() {
     client
         .create_personal_db_projection(authorized(
             CreatePersonalDbProjectionRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: projection_database_id.clone(),
                 projection_definition_json: serde_json::to_string(&definition).unwrap(),
             },
@@ -886,7 +907,7 @@ async fn personaldb_projection_writeback_rejects_ambiguous_source_binding() {
     let projection_head_before = client
         .get_personal_db_group(authorized(
             GetPersonalDbGroupRequest {
-                tenant_id: 1,
+                tenant_id: actor.tenant_id,
                 database_id: projection_database_id.clone(),
             },
             &token,
@@ -899,11 +920,11 @@ async fn personaldb_projection_writeback_rejects_ambiguous_source_binding() {
 
     let err = client
         .submit_personal_db_changeset(authorized(
-            submit_request_at_base(
+            submit_request_at_base_for_actor(
+                &actor,
                 &projection_database_id,
                 projection_head_before.log_index,
                 &projection_head_before.log_hash,
-                &token,
                 sqlite_projection_update_changeset(),
             ),
             &token,
@@ -923,7 +944,7 @@ async fn personaldb_projection_writeback_rejects_ambiguous_source_binding() {
         let source_head = client
             .get_personal_db_group(authorized(
                 GetPersonalDbGroupRequest {
-                    tenant_id: 1,
+                    tenant_id: actor.tenant_id,
                     database_id: database_id.to_string(),
                 },
                 &token,
@@ -940,19 +961,19 @@ async fn personaldb_projection_writeback_rejects_ambiguous_source_binding() {
 
 #[tokio::test]
 async fn personaldb_api_rejects_cross_tenant_request_scope() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_personaldb_test_actor(&cluster, "personaldb-cross-tenant").await;
 
-    let mut client = PersonalDbServiceClient::connect(cluster.grpc_addrs[0].clone())
+    let mut client = PersonalDbServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
     let err = client
         .get_personal_db_group(authorized(
             GetPersonalDbGroupRequest {
-                tenant_id: 999,
+                tenant_id: actor.tenant_id + 1,
                 database_id: "db-alpha".to_string(),
             },
-            &cluster.token,
+            &actor.token,
         ))
         .await
         .unwrap_err();
