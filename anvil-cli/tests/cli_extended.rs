@@ -1,29 +1,12 @@
+#![recursion_limit = "512"]
+
 use std::process::Command;
-use std::sync::OnceLock;
-use std::time::Duration;
 use tempfile::tempdir;
 
 use anvil_test_utils::*;
 
-static CLI_PATH: OnceLock<String> = OnceLock::new();
-
 fn get_cli_path() -> &'static str {
-    CLI_PATH.get_or_init(|| {
-        let status = Command::new("cargo")
-            .args(&["build", "--package", "anvil-storage-cli", "--bin", "anvil"])
-            .status()
-            .expect("Failed to build anvil");
-        assert!(status.success());
-
-        let metadata_output = Command::new("cargo")
-            .arg("metadata")
-            .arg("--format-version=1")
-            .output()
-            .expect("Failed to get cargo metadata");
-        let metadata: serde_json::Value = serde_json::from_slice(&metadata_output.stdout).unwrap();
-        let target_dir = metadata["target_directory"].as_str().unwrap();
-        format!("{}/debug/anvil", target_dir)
-    })
+    env!("CARGO_BIN_EXE_anvil")
 }
 
 async fn run_cli(args: &[&str], config_dir: &std::path::Path) -> std::process::Output {
@@ -62,13 +45,12 @@ async fn run_cli(args: &[&str], config_dir: &std::path::Path) -> std::process::O
 }
 
 async fn setup_test_profile(
-    cluster: &TestCluster,
+    cluster: &DockerTestCluster,
     config_dir: &std::path::Path,
-) -> (String, String) {
-    let app_name = format!("cli-test-app-{}", uuid::Uuid::new_v4());
-    let (client_id, client_secret) = cluster
-        .create_application_with_storage_tenant_owner("default", &app_name)
-        .await;
+) -> DockerTestStorageActor {
+    let actor = create_docker_storage_test_actor(cluster, "cli-test-app").await;
+    let client_id = actor.client_id.clone();
+    let client_secret = actor.client_secret.clone();
 
     let output = run_cli(
         &[
@@ -76,7 +58,7 @@ async fn setup_test_profile(
             "--name",
             "default",
             "--host",
-            &cluster.grpc_addrs[0],
+            &actor.grpc_addr,
             "--client-id",
             &client_id,
             "--client-secret",
@@ -87,24 +69,23 @@ async fn setup_test_profile(
     )
     .await;
     assert!(output.status.success());
-    (client_id, client_secret)
+    actor
 }
 
 #[tokio::test]
 async fn test_cli_auth_get_token() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(10)).await;
+    let cluster = shared_docker_test_cluster().await;
     let config_dir = tempdir().unwrap();
-    let (client_id, client_secret) = setup_test_profile(&cluster, config_dir.path()).await;
+    let actor = setup_test_profile(&cluster, config_dir.path()).await;
 
     let output = run_cli(
         &[
             "auth",
             "get-token",
             "--client-id",
-            &client_id,
+            &actor.client_id,
             "--client-secret",
-            &client_secret,
+            &actor.client_secret,
         ],
         config_dir.path(),
     )
@@ -114,29 +95,33 @@ async fn test_cli_auth_get_token() {
     assert!(!stdout.is_empty());
 }
 
-async fn create_app(cluster: &TestCluster, app_name: &str) -> (String, String) {
-    cluster
-        .create_application_with_storage_tenant_owner("default", app_name)
-        .await
+async fn create_app(
+    cluster: &DockerTestCluster,
+    tenant_id: i64,
+    app_name: &str,
+) -> (String, String) {
+    let (_app_id, client_id, client_secret) = cluster
+        .create_application_with_id(tenant_id, app_name)
+        .await;
+    (client_id, client_secret)
 }
 
 #[tokio::test]
 async fn test_cli_auth_grant() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(10)).await;
+    let cluster = shared_docker_test_cluster().await;
     let config_dir = tempdir().unwrap();
-    let _ = setup_test_profile(&cluster, config_dir.path()).await;
+    let actor = setup_test_profile(&cluster, config_dir.path()).await;
 
     let bucket_name = format!("grant-bucket-{}", uuid::Uuid::new_v4());
     let output = run_cli(
-        &["bucket", "create", &bucket_name, "test-region-1"],
+        &["bucket", "create", &bucket_name, &cluster.region],
         config_dir.path(),
     )
     .await;
     assert!(output.status.success());
 
     let grantee_app_name = format!("grantee-app-{}", uuid::Uuid::new_v4());
-    let (_grantee_client_id, _) = create_app(&cluster, &grantee_app_name).await;
+    let (_grantee_client_id, _) = create_app(&cluster, actor.tenant_id, &grantee_app_name).await;
 
     let output = run_cli(
         &[
@@ -156,21 +141,20 @@ async fn test_cli_auth_grant() {
 
 #[tokio::test]
 async fn test_cli_auth_revoke() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(10)).await;
+    let cluster = shared_docker_test_cluster().await;
     let config_dir = tempdir().unwrap();
-    let _ = setup_test_profile(&cluster, config_dir.path()).await;
+    let actor = setup_test_profile(&cluster, config_dir.path()).await;
 
     let bucket_name = format!("revoke-bucket-{}", uuid::Uuid::new_v4());
     let output = run_cli(
-        &["bucket", "create", &bucket_name, "test-region-1"],
+        &["bucket", "create", &bucket_name, &cluster.region],
         config_dir.path(),
     )
     .await;
     assert!(output.status.success());
 
     let grantee_app_name = format!("grantee-app-{}", uuid::Uuid::new_v4());
-    let (_grantee_client_id, _) = create_app(&cluster, &grantee_app_name).await;
+    let (_grantee_client_id, _) = create_app(&cluster, actor.tenant_id, &grantee_app_name).await;
 
     let output = run_cli(
         &[
@@ -203,14 +187,13 @@ async fn test_cli_auth_revoke() {
 
 #[tokio::test]
 async fn test_cli_bucket_set_public() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(10)).await;
+    let cluster = shared_docker_test_cluster().await;
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
 
     let bucket_name = format!("my-public-bucket-{}", uuid::Uuid::new_v4());
     let output = run_cli(
-        &["bucket", "create", &bucket_name, "test-region-1"],
+        &["bucket", "create", &bucket_name, &cluster.region],
         config_dir.path(),
     )
     .await;
@@ -243,8 +226,7 @@ async fn test_cli_bucket_set_public() {
 
 #[tokio::test]
 async fn test_cli_object_rm() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(10)).await;
+    let cluster = shared_docker_test_cluster().await;
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
 
@@ -253,7 +235,7 @@ async fn test_cli_object_rm() {
     let content = "hello from object rm test";
 
     let output = run_cli(
-        &["bucket", "create", &bucket_name, "test-region-1"],
+        &["bucket", "create", &bucket_name, &cluster.region],
         config_dir.path(),
     )
     .await;
@@ -279,8 +261,7 @@ async fn test_cli_object_rm() {
 
 #[tokio::test]
 async fn test_cli_object_ls() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(10)).await;
+    let cluster = shared_docker_test_cluster().await;
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
 
@@ -289,7 +270,7 @@ async fn test_cli_object_ls() {
     let content = "hello from object ls test";
 
     let output = run_cli(
-        &["bucket", "create", &bucket_name, "test-region-1"],
+        &["bucket", "create", &bucket_name, &cluster.region],
         config_dir.path(),
     )
     .await;
@@ -319,8 +300,7 @@ async fn test_cli_object_ls() {
 
 #[tokio::test]
 async fn test_cli_object_get_to_file() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(10)).await;
+    let cluster = shared_docker_test_cluster().await;
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
 
@@ -329,7 +309,7 @@ async fn test_cli_object_get_to_file() {
     let content = "hello from object get to file test";
 
     let output = run_cli(
-        &["bucket", "create", &bucket_name, "test-region-1"],
+        &["bucket", "create", &bucket_name, &cluster.region],
         config_dir.path(),
     )
     .await;
@@ -360,8 +340,7 @@ async fn test_cli_object_get_to_file() {
 
 #[tokio::test]
 async fn test_cli_hf_key_ls() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(10)).await;
+    let cluster = shared_docker_test_cluster().await;
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
 
@@ -389,8 +368,7 @@ async fn test_cli_hf_key_ls() {
 
 #[tokio::test]
 async fn test_cli_hf_key_rm() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(10)).await;
+    let cluster = shared_docker_test_cluster().await;
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
 
@@ -418,8 +396,7 @@ async fn test_cli_hf_key_rm() {
 
 #[tokio::test]
 async fn test_cli_hf_ingest_cancel() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(10)).await;
+    let cluster = shared_docker_test_cluster().await;
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
 
@@ -441,7 +418,7 @@ async fn test_cli_hf_ingest_cancel() {
 
     let bucket_name = format!("my-hf-ingest-cancel-bucket-{}", uuid::Uuid::new_v4());
     let output = run_cli(
-        &["bucket", "create", &bucket_name, "test-region-1"],
+        &["bucket", "create", &bucket_name, &cluster.region],
         config_dir.path(),
     )
     .await;
@@ -459,7 +436,7 @@ async fn test_cli_hf_ingest_cancel() {
             "--bucket",
             &bucket_name,
             "--target-region",
-            "test-region-1",
+            &cluster.region,
         ],
         config_dir.path(),
     )
@@ -480,8 +457,7 @@ async fn test_cli_hf_ingest_cancel() {
 
 #[tokio::test]
 async fn test_cli_hf_ingest_start_with_options() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(10)).await;
+    let cluster = shared_docker_test_cluster().await;
     let config_dir = tempdir().unwrap();
     let _ = setup_test_profile(&cluster, config_dir.path()).await;
 
@@ -503,7 +479,7 @@ async fn test_cli_hf_ingest_start_with_options() {
 
     let bucket_name = format!("hf-ingest-opts-{}", uuid::Uuid::new_v4());
     let output = run_cli(
-        &["bucket", "create", &bucket_name, "test-region-1"],
+        &["bucket", "create", &bucket_name, &cluster.region],
         config_dir.path(),
     )
     .await;
@@ -521,7 +497,7 @@ async fn test_cli_hf_ingest_start_with_options() {
             "--bucket",
             &bucket_name,
             "--target-region",
-            "test-region-1",
+            &cluster.region,
             "--revision",
             "main",
             "--prefix",
@@ -539,12 +515,10 @@ async fn test_cli_hf_ingest_start_with_options() {
 
 #[tokio::test]
 async fn test_cli_configure_interactive() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(10)).await;
+    let cluster = shared_docker_test_cluster().await;
     let config_dir = tempdir().unwrap();
 
-    let app_name = format!("cli-configure-{}", uuid::Uuid::new_v4());
-    let (client_id, client_secret) = create_app(&cluster, &app_name).await;
+    let actor = create_docker_storage_test_actor(&cluster, "cli-configure").await;
 
     let output = run_cli(
         &[
@@ -552,11 +526,11 @@ async fn test_cli_configure_interactive() {
             "--name",
             "configured",
             "--host",
-            &cluster.grpc_addrs[0],
+            &actor.grpc_addr,
             "--client-id",
-            &client_id,
+            &actor.client_id,
             "--client-secret",
-            &client_secret,
+            &actor.client_secret,
             "--default",
         ],
         config_dir.path(),

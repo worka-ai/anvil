@@ -1,33 +1,13 @@
+#![recursion_limit = "512"]
+
 use std::process::Command;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 use anvil_test_utils::*;
 
-static CLI_PATH: OnceLock<String> = OnceLock::new();
-
-fn get_cli_path() -> &'static str {
-    CLI_PATH.get_or_init(|| {
-        let status = Command::new("cargo")
-            .args(&["build", "--package", "anvil-storage-cli", "--bin", "anvil"])
-            .status()
-            .expect("Failed to build anvil");
-        assert!(status.success());
-
-        let metadata_output = Command::new("cargo")
-            .arg("metadata")
-            .arg("--format-version=1")
-            .output()
-            .expect("Failed to get cargo metadata");
-        let metadata: serde_json::Value = serde_json::from_slice(&metadata_output.stdout).unwrap();
-        let target_dir = metadata["target_directory"].as_str().unwrap();
-        format!("{}/debug/anvil", target_dir)
-    })
-}
-
 async fn run_cli(args: &[&str], config_dir: &std::path::Path) -> std::process::Output {
-    let cli_path = get_cli_path().to_string();
+    let cli_path = env!("CARGO_BIN_EXE_anvil").to_string();
     let config_path = config_dir.join("config.toml");
     let mut all_args = vec![
         "--config".to_string(),
@@ -62,11 +42,8 @@ async fn run_cli(args: &[&str], config_dir: &std::path::Path) -> std::process::O
     .unwrap()
 }
 
-async fn setup_test_profile(cluster: &TestCluster, config_dir: &std::path::Path) {
-    let app_name = "cli-test-app";
-    let (client_id, client_secret) = cluster
-        .create_application_with_storage_tenant_owner("default", app_name)
-        .await;
+async fn setup_test_profile(cluster: &DockerTestCluster, config_dir: &std::path::Path) {
+    let actor = create_docker_storage_test_actor(cluster, "cli-test-app").await;
 
     let output = run_cli(
         &[
@@ -74,11 +51,11 @@ async fn setup_test_profile(cluster: &TestCluster, config_dir: &std::path::Path)
             "--name",
             "default",
             "--host",
-            &cluster.grpc_addrs[0],
+            &actor.grpc_addr,
             "--client-id",
-            &client_id,
+            &actor.client_id,
             "--client-secret",
-            &client_secret,
+            &actor.client_secret,
             "--default",
         ],
         config_dir,
@@ -89,14 +66,13 @@ async fn setup_test_profile(cluster: &TestCluster, config_dir: &std::path::Path)
 
 #[tokio::test]
 async fn test_cli_configure_and_bucket_ls() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(10)).await;
+    let cluster = shared_docker_test_cluster().await;
     let config_dir = tempdir().unwrap();
     setup_test_profile(&cluster, config_dir.path()).await;
 
     let bucket_name = format!("my-cli-bucket-{}", uuid::Uuid::new_v4());
     let output = run_cli(
-        &["bucket", "create", &bucket_name, "test-region-1"],
+        &["bucket", "create", &bucket_name, &cluster.region],
         config_dir.path(),
     )
     .await;
@@ -110,15 +86,14 @@ async fn test_cli_configure_and_bucket_ls() {
 
 #[tokio::test]
 async fn test_cli_bucket_create_and_rm() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(10)).await;
+    let cluster = shared_docker_test_cluster().await;
     let config_dir = tempdir().unwrap();
     setup_test_profile(&cluster, config_dir.path()).await;
 
     let bucket_name = format!("my-cli-bucket-{}", uuid::Uuid::new_v4());
 
     let output = run_cli(
-        &["bucket", "create", &bucket_name, "test-region-1"],
+        &["bucket", "create", &bucket_name, &cluster.region],
         config_dir.path(),
     )
     .await;
@@ -138,8 +113,7 @@ async fn test_cli_bucket_create_and_rm() {
 
 #[tokio::test]
 async fn test_cli_object_put_and_get() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(10)).await;
+    let cluster = shared_docker_test_cluster().await;
     let config_dir = tempdir().unwrap();
     setup_test_profile(&cluster, config_dir.path()).await;
 
@@ -148,7 +122,7 @@ async fn test_cli_object_put_and_get() {
     let content = "hello from cli object test";
 
     let output = run_cli(
-        &["bucket", "create", &bucket_name, "test-region-1"],
+        &["bucket", "create", &bucket_name, &cluster.region],
         config_dir.path(),
     )
     .await;
@@ -174,8 +148,7 @@ async fn test_cli_object_put_and_get() {
 
 #[tokio::test]
 async fn test_cli_hf_ingestion() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(10)).await;
+    let cluster = shared_docker_test_cluster().await;
     let config_dir = tempdir().unwrap();
     setup_test_profile(&cluster, config_dir.path()).await;
 
@@ -185,7 +158,7 @@ async fn test_cli_hf_ingestion() {
     let object_key = format!("{}/{}", repo, file);
 
     let output = run_cli(
-        &["bucket", "create", &bucket_name, "test-region-1"],
+        &["bucket", "create", &bucket_name, &cluster.region],
         config_dir.path(),
     )
     .await;
@@ -213,7 +186,7 @@ async fn test_cli_hf_ingestion() {
             "--bucket",
             &bucket_name,
             "--target-region",
-            "test-region-1",
+            &cluster.region,
             "--include",
             file,
         ],
