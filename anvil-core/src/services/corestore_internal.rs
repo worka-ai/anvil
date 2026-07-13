@@ -1361,6 +1361,7 @@ impl AntiEntropyInternal for AppState {
             idempotency_outcome: "accepted".to_string(),
             retry_after_hint: None,
             finalisation_error: None,
+            saga: None,
         }))
     }
 

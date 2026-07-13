@@ -108,6 +108,8 @@ fn write_options(transaction_id: &Option<String>) -> Option<api::WriteOptions> {
             wait_for_finalization: false,
             preconditions: Vec::new(),
             boundary_values: Vec::new(),
-            transaction_id: Some(transaction_id.clone()),
+            execution: Some(api::write_options::Execution::TransactionId(
+                transaction_id.clone(),
+            )),
         })
 }

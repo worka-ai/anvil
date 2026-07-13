@@ -14,6 +14,8 @@ pub mod object;
 pub mod personaldb;
 pub mod registry;
 pub mod repair;
+pub mod saga;
+pub(crate) mod saga_reserved;
 pub mod stream;
 pub mod transaction;
 pub(crate) mod watch_envelope;
@@ -37,7 +39,7 @@ use crate::anvil_api::{
     personal_db_service_server::PersonalDbServiceServer,
     registry_service_server::RegistryServiceServer, repair_service_server::RepairServiceServer,
     root_register_internal_server::RootRegisterInternalServer,
-    stream_service_server::StreamServiceServer,
+    saga_service_server::SagaServiceServer, stream_service_server::StreamServiceServer,
     transaction_service_server::TransactionServiceServer,
 };
 use crate::{AppState, middleware};
@@ -111,6 +113,10 @@ pub fn create_grpc_router(state: AppState, auth_interceptor: AuthInterceptorFn) 
         auth_closure.clone(),
     ))
     .add_service(TransactionServiceServer::with_interceptor(
+        state.clone(),
+        auth_closure.clone(),
+    ))
+    .add_service(SagaServiceServer::with_interceptor(
         state.clone(),
         auth_closure.clone(),
     ))

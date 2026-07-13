@@ -14,19 +14,14 @@ pub(super) fn public_link_context(
     if !create && context.expected_generation == 0 {
         return Err(Status::invalid_argument("expected_generation is required"));
     }
+    crate::services::saga_reserved::reject_public_saga_context(context)?;
     Ok(context)
 }
 
 pub(super) fn public_context_transaction_id(
     context: &PublicMutationContext,
 ) -> Result<Option<&str>, Status> {
-    let Some(transaction_id) = context.transaction_id.as_deref() else {
-        return Ok(None);
-    };
-    if transaction_id.trim().is_empty() {
-        return Err(Status::invalid_argument("transaction_id must not be empty"));
-    }
-    Ok(Some(transaction_id))
+    crate::services::saga_reserved::public_context_transaction_id(context)
 }
 
 pub(super) fn validate_public_tenant_locator(

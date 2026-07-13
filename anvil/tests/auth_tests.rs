@@ -202,6 +202,8 @@ fn native_mutation_context(
         authz_zookie_optional: String::new(),
         idempotency_key: format!("{tag}-{nonce}-idempotency"),
         transaction_id: None,
+        saga_operation: None,
+        saga_compensation_operation: None,
     }
 }
 
@@ -214,6 +216,8 @@ fn public_mutation_context(
         idempotency_key: uuid::Uuid::new_v4().to_string(),
         expected_generation,
         transaction_id: None,
+        saga_operation: None,
+        saga_compensation_operation: None,
     }
 }
 

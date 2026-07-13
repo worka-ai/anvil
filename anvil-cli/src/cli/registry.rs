@@ -187,7 +187,7 @@ fn write_options(transaction_id: Option<String>) -> api::WriteOptions {
         wait_for_finalization: transaction_id.is_none(),
         preconditions: Vec::new(),
         boundary_values: Vec::new(),
-        transaction_id,
+        execution: transaction_id.map(api::write_options::Execution::TransactionId),
     }
 }
 

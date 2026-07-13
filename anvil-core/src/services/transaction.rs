@@ -276,6 +276,7 @@ impl TransactionService for AppState {
             idempotency_outcome: "accepted".to_string(),
             retry_after_hint: None,
             finalisation_error: transaction_error(&transaction),
+            saga: None,
         }))
     }
 

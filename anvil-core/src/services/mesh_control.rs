@@ -11,13 +11,7 @@ use crate::{AppState, access_control, auth, bucket_journal, middleware};
 use tonic::{Request, Response, Status};
 
 fn mesh_transaction_id(options: Option<&WriteOptions>) -> Result<Option<&str>, Status> {
-    let Some(transaction_id) = options.and_then(|options| options.transaction_id.as_deref()) else {
-        return Ok(None);
-    };
-    if transaction_id.trim().is_empty() {
-        return Err(Status::invalid_argument("transaction_id must not be empty"));
-    }
-    Ok(Some(transaction_id))
+    crate::services::saga_reserved::write_options_transaction_id(options)
 }
 
 #[tonic::async_trait]
@@ -1101,6 +1095,7 @@ fn mesh_write_response(
         idempotency_outcome: "accepted".to_string(),
         retry_after_hint: None,
         finalisation_error: None,
+        saga: None,
     }
 }
 

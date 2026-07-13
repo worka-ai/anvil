@@ -2,13 +2,7 @@ use super::*;
 use crate::object_manager;
 
 fn native_transaction_id(context: Option<&NativeMutationContext>) -> Result<Option<&str>, Status> {
-    let Some(transaction_id) = context.and_then(|context| context.transaction_id.as_deref()) else {
-        return Ok(None);
-    };
-    if transaction_id.trim().is_empty() {
-        return Err(Status::invalid_argument("transaction_id must not be empty"));
-    }
-    Ok(Some(transaction_id))
+    crate::services::saga_reserved::native_context_transaction_id(context)
 }
 
 fn write_state_for_transaction(transaction_id: Option<&str>) -> i32 {

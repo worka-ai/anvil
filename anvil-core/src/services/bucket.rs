@@ -13,13 +13,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 fn bucket_transaction_id(options: Option<&WriteOptions>) -> Result<Option<&str>, Status> {
-    let Some(transaction_id) = options.and_then(|options| options.transaction_id.as_deref()) else {
-        return Ok(None);
-    };
-    if transaction_id.trim().is_empty() {
-        return Err(Status::invalid_argument("transaction_id must not be empty"));
-    }
-    Ok(Some(transaction_id))
+    crate::services::saga_reserved::write_options_transaction_id(options)
 }
 
 #[tonic::async_trait]

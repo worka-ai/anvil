@@ -245,13 +245,7 @@ fn registry_namespace_resource(registry_kind: &str, namespace: &str) -> String {
 }
 
 fn registry_transaction_id(options: Option<&WriteOptions>) -> Result<Option<&str>, Status> {
-    let Some(transaction_id) = options.and_then(|options| options.transaction_id.as_deref()) else {
-        return Ok(None);
-    };
-    if transaction_id.trim().is_empty() {
-        return Err(Status::invalid_argument("transaction_id must not be empty"));
-    }
-    Ok(Some(transaction_id))
+    crate::services::saga_reserved::write_options_transaction_id(options)
 }
 
 fn write_response(
@@ -259,10 +253,7 @@ fn write_response(
     mutation_id: String,
     options: Option<&WriteOptions>,
 ) -> WriteResponse {
-    let state = if options
-        .and_then(|options| options.transaction_id.as_deref())
-        .is_some()
-    {
+    let state = if crate::services::saga_reserved::write_options_is_transactional(options) {
         WriteState::Staged
     } else if options
         .map(|options| {
@@ -284,6 +275,7 @@ fn write_response(
         idempotency_outcome: "accepted".to_string(),
         retry_after_hint: None,
         finalisation_error: None,
+        saga: None,
     }
 }
 

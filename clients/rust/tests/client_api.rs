@@ -1,6 +1,6 @@
 use anvil_storage::{
     AnvilClient, BearerInterceptor, BeginTransaction, CommitTransaction, GetTransaction,
-    MutationBatch, RollbackTransaction, bearer_metadata, proto,
+    MutationBatch, RollbackTransaction, bearer_metadata, proto, write_options_with_transaction,
 };
 use tonic::Request;
 use tonic::service::Interceptor;
@@ -64,6 +64,15 @@ fn generated_proto_exports_core_service_types() {
         reason: "test".to_string(),
     };
     assert_eq!(bind.expected_binding_generation, Some(1));
+
+    let start = proto::StartSagaRequest {
+        idempotency_key: "saga-idem".to_string(),
+        realm_id: "realm".to_string(),
+        draft_ttl_ms: 30_000,
+        purpose: "client-test".to_string(),
+        execution_policy: None,
+    };
+    assert_eq!(start.purpose, "client-test");
 }
 
 #[test]
@@ -128,6 +137,8 @@ fn mutation_batch_helper_wraps_typed_operations() {
         authz_zookie_optional: String::new(),
         idempotency_key: "batch-idem".to_string(),
         transaction_id: Some("tx-123".to_string()),
+        saga_operation: None,
+        saga_compensation_operation: None,
     };
     let precondition = proto::WritePrecondition {
         object_versions: Vec::new(),
@@ -174,6 +185,18 @@ fn mutation_batch_helper_wraps_typed_operations() {
 }
 
 #[test]
+fn write_options_helper_uses_execution_oneof() {
+    let options = write_options_with_transaction(proto::WriteOptions::default(), "tx-123");
+
+    match options.execution.as_ref() {
+        Some(proto::write_options::Execution::TransactionId(transaction_id)) => {
+            assert_eq!(transaction_id, "tx-123");
+        }
+        other => panic!("expected transaction execution context, got {other:?}"),
+    }
+}
+
+#[test]
 fn packaged_proto_omits_internal_node_service() {
     let packaged_proto = include_str!("../proto/anvil.proto");
     assert!(!packaged_proto.contains("InternalAnvilService"));
@@ -202,4 +225,5 @@ async fn client_constructs_all_public_service_clients_from_channel() {
     let _hf = client.hf_ingestion();
     let _models = client.models();
     let _transactions = client.transactions();
+    let _sagas = client.sagas();
 }
