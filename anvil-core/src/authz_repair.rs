@@ -291,7 +291,9 @@ mod tests {
     use crate::{
         authz_journal::{AuthzTupleWrite, authz_partition_id, write_authz_tuple_with_permit},
         authz_userset_index::{
-            DEFAULT_DERIVED_USERSET_INDEX_ID, lookup_derived_userset_index_at_revision,
+            DEFAULT_DERIVED_USERSET_INDEX_ID, build_expected_derived_userset_index_at_revision,
+            lookup_derived_userset_index_at_revision, test_delete_derived_userset_index_row,
+            write_derived_userset_index,
         },
         partition_fence::{
             PartitionRecoveryAcquire, PartitionWritePermit, acquire_partition_recovery,
@@ -319,6 +321,8 @@ mod tests {
             "group/eng#member",
         )
         .await;
+        test_delete_derived_userset_index_row(&storage, 42, DEFAULT_DERIVED_USERSET_INDEX_ID)
+            .unwrap();
 
         let report = repair_authz_derived_userset_index(
             &storage,
@@ -393,7 +397,18 @@ mod tests {
         rebuild_derived_userset_index(&storage, 42, DEFAULT_DERIVED_USERSET_INDEX_ID)
             .await
             .unwrap();
+        let stale_index = build_expected_derived_userset_index_at_revision(
+            &storage,
+            42,
+            DEFAULT_DERIVED_USERSET_INDEX_ID,
+            1,
+        )
+        .await
+        .unwrap();
         write_tuple(&storage, &permit, "doc", "beta", "viewer", "user", "bob").await;
+        write_derived_userset_index(&storage, &stale_index)
+            .await
+            .unwrap();
 
         let report = repair_authz_derived_userset_index(
             &storage,

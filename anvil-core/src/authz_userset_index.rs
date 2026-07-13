@@ -430,6 +430,19 @@ pub async fn read_derived_userset_index(
     Ok(Some(index))
 }
 
+#[cfg(test)]
+pub(crate) fn test_delete_derived_userset_index_row(
+    storage: &Storage,
+    tenant_id: i64,
+    derived_index_id: &str,
+) -> Result<()> {
+    CoreMetaStore::open(storage.core_store_meta_path())?.delete(
+        CF_AUTHZ,
+        TABLE_AUTHZ_TUPLE_PAGE_ROW,
+        &derived_userset_index_tuple_key(tenant_id, derived_index_id)?,
+    )
+}
+
 pub async fn write_derived_userset_index(
     storage: &Storage,
     index: &AuthzDerivedUsersetIndex,
