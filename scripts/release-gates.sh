@@ -129,12 +129,18 @@ run_docker_object_test_filter() {
     -p anvil-server --test object_tests "${filter}"
 }
 
+run_docker_s3_test_filter() {
+  local label="$1"
+  local filter="$2"
+  run_docker_cargo_test "Docker storage integration s3_gateway_tests ${label}" \
+    -p anvil-server --test s3_gateway_tests "${filter}"
+}
+
 docker_storage_gates() {
   require_image
   local tests=(
     bucket_tests
     rust_client_tests
-    s3_gateway_tests
   )
   for test_name in "${tests[@]}"; do
     run_docker_cargo_test "Docker storage integration ${test_name}" -p anvil-server --test "${test_name}"
@@ -150,6 +156,14 @@ docker_storage_gates() {
   run_docker_object_test_filter "patch and list" "patch_and_list::"
   run_docker_object_test_filter "planner listing" "planner_listing::"
   run_docker_object_test_filter "reserved head core" "reserved_head_core::"
+
+  # Split S3 gateway tests for the same reason: each module uses the shared
+  # Docker cluster and some tests intentionally wait for asynchronous index or
+  # compaction workers to catch up.
+  run_docker_s3_test_filter "public/private large objects" "public_private_large_object::"
+  run_docker_s3_test_filter "routing public aliases" "routing_public_alias::"
+  run_docker_s3_test_filter "streaming upload" "streaming_upload::"
+  run_docker_s3_test_filter "writes indexes compaction" "writes_indexes_compaction::"
   run_docker_cargo_test "Docker CLI storage integration" -p anvil-storage-cli --test cli
 }
 
