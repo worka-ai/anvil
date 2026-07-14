@@ -14,7 +14,7 @@ use anvil::anvil_api::{
     MutationBatchRequest, NativeMutationContext, ObjectMetadata, PatchJsonObjectRequest,
     PutObjectRequest, ReadAppendStreamRequest, RepairDirectoryIndexRequest,
     SealAppendStreamSegmentRequest, TailAppendStreamRequest, UploadPartMetadata, UploadPartRequest,
-    WatchPrefixRequest, WritePrecondition,
+    WatchPrefixRequest, WritePrecondition, WriteVisibilityOptions,
 };
 use futures_util::StreamExt;
 use std::{future::Future, pin::Pin, time::Duration};
@@ -305,7 +305,18 @@ fn native_mutation_context(
         transaction_id: None,
         saga_operation: None,
         saga_compensation_operation: None,
-        write_visibility: None,
+        write_visibility: Some(strict_write_visibility()),
+    }
+}
+
+fn strict_write_visibility() -> WriteVisibilityOptions {
+    WriteVisibilityOptions {
+        indexes: 1,
+        watches: 1,
+        authz_materialization: 1,
+        boundary_extraction: 1,
+        index_policy_snapshot: 1,
+        authz_revision: 1,
     }
 }
 
