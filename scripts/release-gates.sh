@@ -157,6 +157,14 @@ run_docker_s3_test_filter() {
     -p anvil-server --test s3_gateway_tests "${filter}"
 }
 
+run_docker_s3_test_filter_serial() {
+  local label="$1"
+  local filter="$2"
+  ANVIL_DOCKER_TEST_THREADS=1 \
+    run_docker_cargo_test "Docker storage integration s3_gateway_tests ${label}" \
+      -p anvil-server --test s3_gateway_tests "${filter}"
+}
+
 docker_storage_gates() {
   require_image
   reset_shared_docker_cluster
@@ -196,10 +204,24 @@ docker_storage_gates() {
   # Split S3 gateway tests for the same reason: each module uses the shared
   # Docker cluster and some tests intentionally wait for asynchronous index or
   # compaction workers to catch up.
+  reset_shared_docker_cluster
   run_docker_s3_test_filter "public/private large objects" "public_private_large_object::"
   run_docker_s3_test_filter "routing public aliases" "routing_public_alias::"
   run_docker_s3_test_filter "streaming upload" "streaming_upload::"
-  run_docker_s3_test_filter "writes indexes compaction" "writes_indexes_compaction::"
+  # The write/index/compaction tests intentionally drive background workers.
+  # Running the whole module in one process creates incidental contention between
+  # independent buckets and obscures the actual release signal, so keep the same
+  # coverage while exercising one scenario per process.
+  run_docker_s3_test_filter_serial "S3 write ETag preconditions" "writes_indexes_compaction::test_s3_put_write_etag_preconditions"
+  run_docker_s3_test_filter_serial "S3 version listing authz" "writes_indexes_compaction::test_s3_list_versions_and_get_filter_by_relationship_authorization"
+  run_docker_s3_test_filter_serial "S3 compaction reads/lists" "writes_indexes_compaction::test_s3_reads_and_lists_survive_object_metadata_compaction"
+  run_docker_s3_test_filter_serial "S3 active get compaction" "writes_indexes_compaction::test_s3_active_get_survives_object_metadata_compaction"
+  run_docker_s3_test_filter_serial "S3 worker compaction" "writes_indexes_compaction::test_s3_writes_trigger_worker_metadata_compaction"
+  run_docker_s3_test_filter_serial "S3 body full-text index" "writes_indexes_compaction::test_s3_put_triggers_full_text_index_build"
+  run_docker_s3_test_filter_serial "S3 metadata full-text index" "writes_indexes_compaction::test_s3_put_metadata_field_triggers_full_text_index_build"
+  run_docker_s3_test_filter_serial "S3 PersonalDB full-text index" "writes_indexes_compaction::test_s3_put_personaldb_table_column_triggers_full_text_index_build"
+  run_docker_s3_test_filter_serial "S3 media full-text index" "writes_indexes_compaction::test_s3_put_media_transcript_triggers_full_text_index_build"
+  run_docker_s3_test_filter_serial "S3 vector index" "writes_indexes_compaction::test_s3_put_triggers_vector_index_build"
   run_docker_cargo_test "Docker CLI storage integration" -p anvil-storage-cli --test cli
 }
 
