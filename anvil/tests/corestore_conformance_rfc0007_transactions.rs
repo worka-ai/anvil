@@ -40,30 +40,32 @@ fn assert_contains_none(label: &str, source: &str, terms: &[&str]) {
 fn explicit_transaction_api_is_exposed_in_proto_and_rust_client() {
     let core_proto = workspace_file("anvil-core/proto/anvil.proto");
     let rust_proto = workspace_file("clients/rust/proto/anvil.proto");
-    assert!(
-        core_proto == rust_proto,
-        "Rust client proto must stay byte-for-byte aligned with core proto"
-    );
+    let public_transaction_api = [
+        "service TransactionService {",
+        "rpc BeginTransaction(BeginTransactionRequest) returns (BeginTransactionResponse);",
+        "rpc CommitTransaction(CommitTransactionRequest) returns (WriteResponse);",
+        "rpc RollbackTransaction(RollbackTransactionRequest) returns (RollbackTransactionResponse);",
+        "rpc GetTransaction(GetTransactionRequest) returns (TransactionStatus);",
+        "optional string transaction_id = 8;",
+        "WriteState write_state = 9;",
+        "WriteState write_state = 5;",
+        "message TransactionScope",
+        "message BoundaryValue",
+        "repeated WritePrecondition preconditions = 4;",
+        "repeated BoundaryValue boundary_values = 5;",
+        "message CommitTransactionRequest",
+        "message TransactionStatus",
+    ];
 
     assert_contains_all(
-        "explicit transaction protobuf API",
+        "explicit transaction server protobuf API",
         &core_proto,
-        &[
-            "service TransactionService {",
-            "rpc BeginTransaction(BeginTransactionRequest) returns (BeginTransactionResponse);",
-            "rpc CommitTransaction(CommitTransactionRequest) returns (WriteResponse);",
-            "rpc RollbackTransaction(RollbackTransactionRequest) returns (RollbackTransactionResponse);",
-            "rpc GetTransaction(GetTransactionRequest) returns (TransactionStatus);",
-            "optional string transaction_id = 8;",
-            "WriteState write_state = 9;",
-            "WriteState write_state = 5;",
-            "message TransactionScope",
-            "message BoundaryValue",
-            "repeated WritePrecondition preconditions = 4;",
-            "repeated BoundaryValue boundary_values = 5;",
-            "message CommitTransactionRequest",
-            "message TransactionStatus",
-        ],
+        &public_transaction_api,
+    );
+    assert_contains_all(
+        "explicit transaction Rust client protobuf API",
+        &rust_proto,
+        &public_transaction_api,
     );
 
     let client = workspace_file("clients/rust/src/lib.rs");

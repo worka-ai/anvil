@@ -37,10 +37,9 @@ fn assert_contains_none(label: &str, source: &str, terms: &[&str]) {
 }
 
 #[test]
-fn internal_corestore_protocols_are_defined_in_public_proto_contract() {
+fn internal_corestore_protocols_are_defined_in_core_proto_not_packaged_client_proto() {
     let proto = workspace_file("anvil-core/proto/anvil.proto");
     let client_proto = workspace_file("clients/rust/proto/anvil.proto");
-    assert_eq!(proto, client_proto, "client proto must match core proto");
 
     assert_contains_all(
         "internal CoreStore services",
@@ -59,6 +58,34 @@ fn internal_corestore_protocols_are_defined_in_public_proto_contract() {
             "message GetShardRequest",
             "message RepairShardRequest",
             "message CompareAndSwapRootRequest",
+        ],
+    );
+    assert_contains_none(
+        "packaged public client proto",
+        &client_proto,
+        &[
+            "service BlockStoreInternal",
+            "service RootRegisterInternal",
+            "service CoreMetaReplicationInternal",
+            "service AntiEntropyInternal",
+            "service CrossRegionProxyInternal",
+            "message InternalRequestHeader",
+            "message PutShardRequest",
+            "message GetShardRequest",
+            "message RepairShardRequest",
+            "message CompareAndSwapRootRequest",
+        ],
+    );
+    assert_contains_all(
+        "packaged public client proto public services",
+        &client_proto,
+        &[
+            "service ObjectService",
+            "service BucketService",
+            "service IndexService",
+            "service StreamService",
+            "service RegistryService",
+            "service MeshControlService",
         ],
     );
 }

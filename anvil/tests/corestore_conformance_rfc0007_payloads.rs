@@ -1256,21 +1256,23 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 fn boundary_schemas_are_public_api_and_coremeta_rows_not_refs() {
     let core_proto = workspace_file("anvil-core/proto/anvil.proto");
     let rust_proto = workspace_file("clients/rust/proto/anvil.proto");
-    assert_eq!(
-        core_proto, rust_proto,
-        "client proto must match server proto"
+    let public_boundary_api = [
+        "rpc PutBoundarySchema(PutBoundarySchemaRequest) returns (BoundarySchemaResponse);",
+        "rpc GetBoundarySchema(GetBoundarySchemaRequest) returns (BoundarySchemaResponse);",
+        "message BoundaryDimension",
+        "message BoundarySource",
+        "message BoundarySchemaRecord",
+        "optional uint64 expected_generation = 2;",
+    ];
+    assert_contains_all(
+        "boundary schema server API",
+        &core_proto,
+        &public_boundary_api,
     );
     assert_contains_all(
-        "boundary schema public API",
-        &core_proto,
-        &[
-            "rpc PutBoundarySchema(PutBoundarySchemaRequest) returns (BoundarySchemaResponse);",
-            "rpc GetBoundarySchema(GetBoundarySchemaRequest) returns (BoundarySchemaResponse);",
-            "message BoundaryDimension",
-            "message BoundarySource",
-            "message BoundarySchemaRecord",
-            "optional uint64 expected_generation = 2;",
-        ],
+        "boundary schema Rust client API",
+        &rust_proto,
+        &public_boundary_api,
     );
 
     let stream_control = workspace_file("anvil-core/src/core_store/local_stream_control.rs");
