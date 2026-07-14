@@ -1241,6 +1241,8 @@ impl ObjectManager {
         } else {
             self.persistence
                 .append_stream_record(
+                    tenant_id,
+                    bucket.id,
                     stream.id,
                     object_ref,
                     payload_size,
@@ -1317,7 +1319,9 @@ impl ObjectManager {
                 )
                 .await
         } else {
-            self.persistence.list_append_stream_records(stream.id).await
+            self.persistence
+                .list_append_stream_records(tenant_id, bucket.id, stream.id)
+                .await
         }
         .map_err(|e| Status::internal(e.to_string()))?;
         if records.is_empty() {
@@ -1354,7 +1358,7 @@ impl ObjectManager {
                 .await
         } else {
             self.persistence
-                .seal_append_stream(stream.id, &segment_hash)
+                .seal_append_stream(tenant_id, bucket.id, stream.id, &segment_hash)
                 .await
         }
         .map_err(|e| Status::internal(e.to_string()))?;

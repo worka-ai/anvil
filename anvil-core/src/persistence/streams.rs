@@ -459,21 +459,21 @@ impl Persistence {
 
     pub async fn append_stream_record(
         &self,
+        tenant_id: i64,
+        bucket_id: i64,
         stream_row_id: i64,
         payload_object_ref: CoreObjectRef,
         payload_size: i64,
         content_type: Option<String>,
         user_meta: Option<JsonValue>,
     ) -> Result<AppendStreamRecordMutation> {
-        let (tenant_id, bucket_id) =
-            append_journal::find_append_stream_partition(&self.storage, stream_row_id)
-                .await?
-                .ok_or_else(|| anyhow!("append stream not found"))?;
         let permit = self
             .append_metadata_write_permit(tenant_id, bucket_id)
             .await?;
-        append_journal::append_stream_record_with_permit(
+        append_journal::append_stream_record_with_permit_in_partition(
             &self.storage,
+            tenant_id,
+            bucket_id,
             stream_row_id,
             payload_object_ref,
             payload_size,
@@ -519,9 +519,17 @@ impl Persistence {
 
     pub async fn list_append_stream_records(
         &self,
+        tenant_id: i64,
+        bucket_id: i64,
         stream_row_id: i64,
     ) -> Result<Vec<AppendStreamRecord>> {
-        append_journal::list_append_stream_records(&self.storage, stream_row_id).await
+        append_journal::list_append_stream_records_for_stream(
+            &self.storage,
+            tenant_id,
+            bucket_id,
+            stream_row_id,
+        )
+        .await
     }
 
     pub async fn list_append_stream_records_in_transaction(
@@ -554,22 +562,18 @@ impl Persistence {
 
     pub async fn seal_append_stream(
         &self,
+        tenant_id: i64,
+        bucket_id: i64,
         stream_row_id: i64,
         segment_hash: &str,
     ) -> Result<SealAppendStreamMutation> {
-        let Some((tenant_id, bucket_id)) =
-            append_journal::find_append_stream_partition(&self.storage, stream_row_id).await?
-        else {
-            return Ok(SealAppendStreamMutation {
-                sealed: false,
-                receipt: None,
-            });
-        };
         let permit = self
             .append_metadata_write_permit(tenant_id, bucket_id)
             .await?;
-        append_journal::seal_append_stream_with_permit(
+        append_journal::seal_append_stream_with_permit_in_partition(
             &self.storage,
+            tenant_id,
+            bucket_id,
             stream_row_id,
             segment_hash,
             &permit,

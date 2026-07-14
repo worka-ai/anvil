@@ -787,6 +787,8 @@ async fn persistence_replays_anvil_owned_state_after_fresh_instance_body() {
         .stream;
     persistence
         .append_stream_record(
+            tenant.id,
+            bucket.id,
             append_stream.id,
             payload_ref("event-payload-hash", 42),
             42,
@@ -970,7 +972,7 @@ async fn persistence_replays_anvil_owned_state_after_fresh_instance_body() {
     );
     assert_eq!(
         replayed
-            .list_append_stream_records(append_stream.id)
+            .list_append_stream_records(tenant.id, bucket.id, append_stream.id)
             .await
             .unwrap()
             .len(),
@@ -1461,11 +1463,19 @@ async fn persistence_global_journal_writes_use_current_fence_tokens() {
             .unwrap()
             .stream;
         persistence
-            .append_stream_record(stream.id, payload_ref("payload-hash", 13), 13, None, None)
+            .append_stream_record(
+                1,
+                bucket.id,
+                stream.id,
+                payload_ref("payload-hash", 13),
+                13,
+                None,
+                None,
+            )
             .await
             .unwrap();
         persistence
-            .seal_append_stream(stream.id, "segment-hash")
+            .seal_append_stream(1, bucket.id, stream.id, "segment-hash")
             .await
             .unwrap();
         persistence

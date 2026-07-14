@@ -389,6 +389,7 @@ async fn append_stream_record(
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn append_stream_record_with_permit(
     storage: &Storage,
     stream_row_id: i64,
@@ -417,6 +418,38 @@ pub(crate) async fn append_stream_record_with_permit(
     .await
 }
 
+pub(crate) async fn append_stream_record_with_permit_in_partition(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_id: i64,
+    stream_row_id: i64,
+    payload_object_ref: CoreObjectRef,
+    payload_size: i64,
+    content_type: Option<String>,
+    user_meta: Option<serde_json::Value>,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<AppendStreamRecordMutation> {
+    require_append_metadata_permit(tenant_id, bucket_id, permit)?;
+    let partition_precondition =
+        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    append_stream_record_inner(
+        storage,
+        stream_row_id,
+        payload_object_ref,
+        payload_size,
+        content_type,
+        user_meta,
+        Some(permit),
+        Some(partition_precondition),
+        Some((tenant_id, bucket_id)),
+        None,
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
 pub(crate) async fn append_stream_record_with_permit_in_transaction(
     storage: &Storage,
     stream_row_id: i64,
@@ -550,6 +583,7 @@ async fn append_stream_record_inner(
     Ok(AppendStreamRecordMutation { record, receipt })
 }
 
+#[cfg(test)]
 pub async fn list_append_stream_records(
     storage: &Storage,
     stream_row_id: i64,
@@ -557,6 +591,22 @@ pub async fn list_append_stream_records(
     let Some((tenant_id, bucket_id, _)) = find_stream(storage, stream_row_id).await? else {
         return Ok(Vec::new());
     };
+    let mut records = read_state(storage, tenant_id, bucket_id)
+        .await?
+        .records
+        .into_values()
+        .filter(|record| record.stream_id == stream_row_id)
+        .collect::<Vec<_>>();
+    records.sort_by_key(|record| record.record_sequence);
+    Ok(records)
+}
+
+pub async fn list_append_stream_records_for_stream(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_id: i64,
+    stream_row_id: i64,
+) -> Result<Vec<AppendStreamRecord>> {
     let mut records = read_state(storage, tenant_id, bucket_id)
         .await?
         .records
@@ -644,6 +694,7 @@ async fn seal_append_stream(
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn seal_append_stream_with_permit(
     storage: &Storage,
     stream_row_id: i64,
@@ -666,6 +717,32 @@ pub(crate) async fn seal_append_stream_with_permit(
     .await
 }
 
+pub(crate) async fn seal_append_stream_with_permit_in_partition(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_id: i64,
+    stream_row_id: i64,
+    segment_hash: &str,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<SealAppendStreamMutation> {
+    require_append_metadata_permit(tenant_id, bucket_id, permit)?;
+    let partition_precondition =
+        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    seal_append_stream_inner(
+        storage,
+        stream_row_id,
+        segment_hash,
+        Some(permit),
+        Some(partition_precondition),
+        Some((tenant_id, bucket_id)),
+        None,
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
 pub(crate) async fn seal_append_stream_with_permit_in_transaction(
     storage: &Storage,
     stream_row_id: i64,
@@ -765,6 +842,7 @@ async fn seal_append_stream_inner(
     })
 }
 
+#[cfg(test)]
 pub async fn find_append_stream_partition(
     storage: &Storage,
     stream_row_id: i64,
