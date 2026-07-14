@@ -1026,7 +1026,7 @@ fn docker_compose_create_then_start(
         .iter()
         .find_map(|(key, value)| (key == "ANVIL_IMAGE").then_some(value.as_str()))
         .expect("Docker test compose env includes ANVIL_IMAGE");
-    if docker_project_image_mismatch(project_name, expected_image) {
+    if docker_project_needs_recreate(project_name, expected_image) {
         docker_compose_with_env(
             compose_file,
             project_name,
@@ -1045,7 +1045,8 @@ fn docker_compose_create_then_start(
     }
 }
 
-fn docker_project_image_mismatch(project_name: &str, expected_image: &str) -> bool {
+fn docker_project_needs_recreate(project_name: &str, expected_image: &str) -> bool {
+    let expected_image_id = docker_image_id(expected_image);
     let mut seen_nodes = 0_u8;
     for node in 1..=docker_node_count() {
         let service = docker_node_service(node);
@@ -1072,12 +1073,15 @@ fn docker_project_image_mismatch(project_name: &str, expected_image: &str) -> bo
             [] => continue,
             [id] => {
                 seen_nodes += 1;
-                let image = command_with_docker_env("docker")
-                    .args(["inspect", "--format", "{{.Image}}", id])
-                    .output()
-                    .expect("failed to inspect Docker test container image");
-                if !image.status.success()
-                    || String::from_utf8_lossy(&image.stdout).trim() != expected_image
+                if docker_container_image_id(id) != expected_image_id {
+                    return true;
+                }
+                if !docker_container_publishes_port(id, "50051/tcp", &docker_host_port(node))
+                    || !docker_container_publishes_port(
+                        id,
+                        "50052/tcp",
+                        &docker_host_admin_port(node),
+                    )
                 {
                     return true;
                 }
@@ -1086,6 +1090,46 @@ fn docker_project_image_mismatch(project_name: &str, expected_image: &str) -> bo
         }
     }
     seen_nodes != 0 && seen_nodes != docker_node_count()
+}
+
+fn docker_image_id(image: &str) -> Option<String> {
+    let output = command_with_docker_env("docker")
+        .args(["image", "inspect", "--format", "{{.Id}}", image])
+        .output()
+        .expect("failed to inspect Docker test image");
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn docker_container_image_id(container_id: &str) -> Option<String> {
+    let output = command_with_docker_env("docker")
+        .args(["inspect", "--format", "{{.Image}}", container_id])
+        .output()
+        .expect("failed to inspect Docker test container image");
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn docker_container_publishes_port(
+    container_id: &str,
+    container_port: &str,
+    host_port: &str,
+) -> bool {
+    let output = command_with_docker_env("docker")
+        .args(["port", container_id, container_port])
+        .output()
+        .expect("failed to inspect Docker test container port mapping");
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+            line.rsplit_once(':')
+                .is_some_and(|(_, port)| port == host_port)
+        })
 }
 
 fn docker_container_command(project_name: &str, node: u8, operation: &str) {
