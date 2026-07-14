@@ -122,17 +122,34 @@ docker_auth_gates() {
   run_docker_cargo_test "Docker CLI auth integration" -p anvil-storage-cli --test cli_auth
 }
 
+run_docker_object_test_filter() {
+  local label="$1"
+  local filter="$2"
+  run_docker_cargo_test "Docker storage integration object_tests ${label}" \
+    -p anvil-server --test object_tests "${filter}"
+}
+
 docker_storage_gates() {
   require_image
   local tests=(
     bucket_tests
-    object_tests
     rust_client_tests
     s3_gateway_tests
   )
   for test_name in "${tests[@]}"; do
     run_docker_cargo_test "Docker storage integration ${test_name}" -p anvil-server --test "${test_name}"
   done
+  # object_tests is intentionally split by module. The suite exercises the
+  # shared Docker cluster, CoreMeta quorum commits and background maintenance;
+  # one aggregate process can exceed a per-step timeout while providing no extra
+  # coverage beyond the same test set run as fresh filtered processes.
+  run_docker_object_test_filter "batch CAS multipart" "batch_cas_multipart::"
+  run_docker_object_test_filter "copy private watch stream" "copy_private_watch_stream::"
+  run_docker_object_test_filter "native delete listing" "native_delete_listing::"
+  run_docker_object_test_filter "mesh locator routing" "native_object_routes_use_mesh_locator_before_local_bucket_metadata"
+  run_docker_object_test_filter "patch and list" "patch_and_list::"
+  run_docker_object_test_filter "planner listing" "planner_listing::"
+  run_docker_object_test_filter "reserved head core" "reserved_head_core::"
   run_docker_cargo_test "Docker CLI storage integration" -p anvil-storage-cli --test cli
 }
 
