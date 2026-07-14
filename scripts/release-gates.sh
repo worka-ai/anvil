@@ -142,6 +142,14 @@ run_docker_object_test_filter() {
     -p anvil-server --test object_tests "${filter}"
 }
 
+run_docker_object_test_filter_serial() {
+  local label="$1"
+  local filter="$2"
+  ANVIL_DOCKER_TEST_THREADS=1 \
+    run_docker_cargo_test "Docker storage integration object_tests ${label}" \
+      -p anvil-server --test object_tests "${filter}"
+}
+
 run_docker_s3_test_filter() {
   local label="$1"
   local filter="$2"
@@ -165,7 +173,21 @@ docker_storage_gates() {
   # coverage beyond the same test set run as fresh filtered processes.
   run_docker_object_test_filter "batch CAS multipart" "batch_cas_multipart::"
   run_docker_object_test_filter "copy private watch stream" "copy_private_watch_stream::"
-  run_docker_object_test_filter "native delete listing" "native_delete_listing::"
+  # These tests exercise version/delete/read/listing mutations against the
+  # shared Docker cluster. Run each as a single-test process so the release gate
+  # verifies the same behaviour without depending on incidental intra-binary
+  # scheduling between version-state tests.
+  run_docker_object_test_filter_serial "native route redirect" "native_delete_listing::native_object_routes_apply_cross_region_policy_before_local_metadata"
+  run_docker_object_test_filter_serial "native route proxy" "native_delete_listing::native_object_routes_report_proxy_required_as_unavailable_when_proxy_is_absent"
+  run_docker_object_test_filter_serial "native context validation" "native_delete_listing::test_native_mutations_require_valid_context"
+  run_docker_object_test_filter_serial "native preconditions" "native_delete_listing::test_native_object_mutation_preconditions_are_enforced"
+  run_docker_object_test_filter_serial "native idempotency" "native_delete_listing::test_native_object_mutation_idempotency_replays_without_duplicate_mutation"
+  run_docker_object_test_filter_serial "native repair" "native_delete_listing::test_repair_rebuilds_missing_directory_segment_from_metadata_journal"
+  run_docker_object_test_filter_serial "native delete marker" "native_delete_listing::test_delete_object_creates_delete_marker"
+  run_docker_object_test_filter_serial "native delete version" "native_delete_listing::test_delete_object_specific_version_removes_only_that_version"
+  run_docker_object_test_filter_serial "native latest get" "native_delete_listing::test_get_object_without_version_id_returns_latest_version"
+  run_docker_object_test_filter_serial "native utf8 keys" "native_delete_listing::test_utf8_object_keys_with_spaces_round_trip"
+  run_docker_object_test_filter_serial "native reserved listing" "native_delete_listing::test_listing_omits_reserved_internal_object_keys"
   run_docker_object_test_filter "mesh locator routing" "native_object_routes_use_mesh_locator_before_local_bucket_metadata"
   run_docker_object_test_filter "patch and list" "patch_and_list::"
   run_docker_object_test_filter "planner listing" "planner_listing::"
