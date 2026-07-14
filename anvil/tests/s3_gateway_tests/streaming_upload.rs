@@ -63,7 +63,7 @@ async fn test_streaming_upload_decoding() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // 3. Download the object using a simple HTTP client (reqwest).
-    let tenant = actor.tenant_id.to_string();
+    let tenant = docker_actor_tenant_route(&actor).to_string();
     let object_url = tenant_routed_public_url(http_base, &tenant, &bucket_name, object_key);
     let response = reqwest::Client::new()
         .get(&object_url)

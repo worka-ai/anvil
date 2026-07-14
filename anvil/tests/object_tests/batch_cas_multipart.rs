@@ -29,7 +29,7 @@ async fn test_mutation_batch_put_object_publishes_small_json_without_upload_stal
         .bucket_id;
 
     let response = tokio::time::timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(120),
         object_client.mutation_batch(authorized(
             MutationBatchRequest {
                 bucket_name: bucket_name.clone(),

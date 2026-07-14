@@ -462,25 +462,13 @@ async fn tenant_tutorial_commands_run_without_admin_port_e2e() {
     assert!(stdout(&created_app).contains(&app_name));
     run_anvil(
         &config_dir,
-        &[
-            "auth",
-            "grant",
-            &app_name,
-            "read",
-            &format!("bucket:{bucket}"),
-        ],
+        &["auth", "grant", &app_name, "bucket:read", &bucket],
     );
     let grants = run_anvil(&config_dir, &["auth", "list-grants", &app_name]);
     assert!(stdout(&grants).contains(&app_name));
     run_anvil(
         &config_dir,
-        &[
-            "auth",
-            "revoke",
-            &app_name,
-            "read",
-            &format!("bucket:{bucket}"),
-        ],
+        &["auth", "revoke", &app_name, "bucket:read", &bucket],
     );
     run_anvil(&config_dir, &["app", "rotate-secret", &app_name]);
 

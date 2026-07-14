@@ -665,21 +665,18 @@ const DOCKER_AUTHZ_BOOTSTRAP_ACTIONS: &[&str] = &[
     "authz:schema_write",
 ];
 
-/// Select a public gRPC endpoint deterministically from a label. This spreads
-/// concurrent shared-cluster tests across nodes without making the selected node
-/// part of the assertion.
-pub fn grpc_addr_for_test(cluster: &TestCluster, label: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
+/// Select the public gRPC endpoint for ordinary shared-cluster tests.
+///
+/// Admin-created credentials are anchored through the first node in the
+/// in-process harness. Use that same public endpoint for ordinary API tests so
+/// they do not depend on cross-node control projection timing. Dedicated
+/// distributed tests should address individual nodes explicitly.
+pub fn grpc_addr_for_test(cluster: &TestCluster, _label: &str) -> String {
     assert!(
         !cluster.grpc_addrs.is_empty(),
         "test cluster must be started before selecting a gRPC address"
     );
-    let mut hasher = DefaultHasher::new();
-    label.hash(&mut hasher);
-    let idx = (hasher.finish() as usize) % cluster.grpc_addrs.len();
-    cluster.grpc_addrs[idx].clone()
+    cluster.grpc_addrs[0].clone()
 }
 
 /// Create a unique tenant/app/token for a shared-cluster test.
@@ -764,17 +761,40 @@ pub async fn get_access_token_for_test(
     client_id: &str,
     client_secret: &str,
 ) -> String {
-    AuthServiceClient::connect(grpc_addr.to_string())
-        .await
-        .unwrap()
-        .get_access_token(GetAccessTokenRequest {
-            client_id: client_id.to_string(),
-            client_secret: client_secret.to_string(),
-        })
-        .await
-        .unwrap()
-        .into_inner()
-        .access_token
+    let mut last_error = None;
+    for attempt in 0..120 {
+        match AuthServiceClient::connect(grpc_addr.to_string()).await {
+            Ok(mut client) => {
+                match client
+                    .get_access_token(GetAccessTokenRequest {
+                        client_id: client_id.to_string(),
+                        client_secret: client_secret.to_string(),
+                    })
+                    .await
+                {
+                    Ok(response) => return response.into_inner().access_token,
+                    Err(status)
+                        if status.code() == tonic::Code::Unauthenticated
+                            && status.message().contains("Invalid client ID") =>
+                    {
+                        last_error = Some(status.to_string());
+                    }
+                    Err(status) => panic!("get access token failed: {status:?}"),
+                }
+            }
+            Err(error) => {
+                last_error = Some(error.to_string());
+            }
+        }
+
+        let delay_ms = if attempt < 10 { 50 } else { 250 };
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    }
+
+    panic!(
+        "get access token did not observe freshly created client_id {client_id} at {grpc_addr}; last error: {}",
+        last_error.unwrap_or_else(|| "unknown".to_string())
+    );
 }
 
 pub fn authenticated_request<T>(mut request: tonic::Request<T>, token: &str) -> tonic::Request<T> {

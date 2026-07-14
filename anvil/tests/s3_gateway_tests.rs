@@ -31,6 +31,13 @@ fn tenant_routed_public_url(http_base: &str, tenant: &str, bucket: &str, key: &s
     format!("{http_base}/{tenant}/{bucket}/{key}")
 }
 
+fn docker_actor_tenant_route(actor: &DockerTestStorageActor) -> &str {
+    actor
+        .tenant_name
+        .as_deref()
+        .expect("Docker test actor should retain its routeable tenant name")
+}
+
 fn assert_reserved_namespace_error(error: impl std::fmt::Debug) {
     let rendered = format!("{error:?}");
     assert!(

@@ -963,7 +963,7 @@ async fn run_s3_public_and_private_access() {
     // 6. Test Public Access (Success): Use reqwest (no auth) to get from public bucket
     let public_url = tenant_routed_public_url(
         http_base,
-        &actor.tenant_id.to_string(),
+        docker_actor_tenant_route(&actor),
         &public_bucket,
         public_key,
     );
@@ -980,7 +980,7 @@ async fn run_s3_public_and_private_access() {
     // 7. Test Private Access (Failure): Use reqwest (no auth) to get from private bucket
     let private_url = tenant_routed_public_url(
         http_base,
-        &actor.tenant_id.to_string(),
+        docker_actor_tenant_route(&actor),
         &private_bucket,
         private_key,
     );
@@ -1009,7 +1009,7 @@ async fn run_s3_public_and_private_access() {
         let reserved_key = format!("{reserved_prefix}s3-compat-object");
         let reserved_url = tenant_routed_public_url(
             http_base,
-            &actor.tenant_id.to_string(),
+            docker_actor_tenant_route(&actor),
             &public_bucket,
             &reserved_key,
         );

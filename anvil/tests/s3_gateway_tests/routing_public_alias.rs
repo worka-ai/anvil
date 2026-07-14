@@ -28,7 +28,10 @@ async fn test_s3_regional_host_routing_reads_same_object_and_rejects_dotted_host
 
     let http = reqwest::Client::new();
     let path_style = http
-        .get(format!("{http_base}/{}/{bucket}/{key}", actor.tenant_id))
+        .get(format!(
+            "{http_base}/{}/{bucket}/{key}",
+            docker_actor_tenant_route(&actor)
+        ))
         .header(reqwest::header::HOST, &cluster.public_region_host)
         .send()
         .await
@@ -42,7 +45,8 @@ async fn test_s3_regional_host_routing_reads_same_object_and_rejects_dotted_host
             reqwest::header::HOST,
             format!(
                 "{bucket}.{}.{}",
-                actor.tenant_id, cluster.public_region_host
+                docker_actor_tenant_route(&actor),
+                cluster.public_region_host
             ),
         )
         .send()
@@ -57,7 +61,8 @@ async fn test_s3_regional_host_routing_reads_same_object_and_rejects_dotted_host
             reqwest::header::HOST,
             format!(
                 "assets.{bucket}.{}.{}",
-                actor.tenant_id, cluster.public_region_host
+                docker_actor_tenant_route(&actor),
+                cluster.public_region_host
             ),
         )
         .send()
@@ -71,7 +76,8 @@ async fn test_s3_regional_host_routing_reads_same_object_and_rejects_dotted_host
             reqwest::header::HOST,
             format!(
                 "{bucket}.team.{}.{}",
-                actor.tenant_id, cluster.public_region_host
+                docker_actor_tenant_route(&actor),
+                cluster.public_region_host
             ),
         )
         .send()
@@ -110,7 +116,7 @@ async fn test_s3_public_get_returns_latest_overwritten_inline_object() {
     assert_public_get_body(
         http_base,
         &cluster.public_region_host,
-        &actor.tenant_id.to_string(),
+        docker_actor_tenant_route(&actor),
         &bucket,
         key,
         first,
@@ -127,7 +133,7 @@ async fn test_s3_public_get_returns_latest_overwritten_inline_object() {
     assert_public_get_body(
         http_base,
         &cluster.public_region_host,
-        &actor.tenant_id.to_string(),
+        docker_actor_tenant_route(&actor),
         &bucket,
         key,
         second,
@@ -245,7 +251,7 @@ async fn test_s3_regional_routes_public_reads_to_tenant_scoped_duplicate_bucket(
     let response = reqwest::Client::new()
         .get(format!(
             "{http_base}/{}/{bucket}/{key}",
-            routed_actor.tenant_id
+            docker_actor_tenant_route(&routed_actor)
         ))
         .header(reqwest::header::HOST, &cluster.public_region_host)
         .send()
@@ -258,7 +264,7 @@ async fn test_s3_regional_routes_public_reads_to_tenant_scoped_duplicate_bucket(
     let versions = reqwest::Client::new()
         .get(format!(
             "{http_base}/{}/{bucket}?versions",
-            routed_actor.tenant_id
+            docker_actor_tenant_route(&routed_actor)
         ))
         .header(reqwest::header::HOST, &cluster.public_region_host)
         .send()
@@ -272,7 +278,7 @@ async fn test_s3_regional_routes_public_reads_to_tenant_scoped_duplicate_bucket(
     let link_metadata = reqwest::Client::new()
         .get(format!(
             "{http_base}/{}/{bucket}/{link_key}",
-            routed_actor.tenant_id
+            docker_actor_tenant_route(&routed_actor)
         ))
         .header(reqwest::header::HOST, &cluster.public_region_host)
         .header("x-anvil-link-mode", "metadata")
