@@ -362,53 +362,67 @@ impl CoreStore {
                 input.placement.node_id
             )
         })?;
-        let channel = self
-            .internal_grpc_channel(endpoint, "CoreStore block service")
-            .await?;
-        let mut client = BlockStoreInternalClient::new(channel);
         let (range_start, range_end_exclusive) = input
             .range
             .map(|range| (range.start, range.end_exclusive))
             .unwrap_or((0, 0));
-        let mut request = tonic::Request::new(GetShardRequest {
-            header: Some(self.internal_request_header("block.get_shard")?),
-            block_id: input.block_id.to_string(),
-            shard_index: u32::from(input.placement.shard_index),
-            range_start,
-            range_end_exclusive,
-            erasure_profile_id: input.profile.id.to_string(),
-            placement_epoch: input.placement.placement_epoch,
-            shard_hash: input.placement.shard_hash.clone(),
-            boundary_summary_hash: input.boundary_summary_hash.to_string(),
-        });
-        request.metadata_mut().insert(
-            "authorization",
-            MetadataValue::try_from(format!("Bearer {bearer}"))
-                .context("encode CoreStore internal bearer token")?,
-        );
-        let mut stream = client
-            .get_shard(request)
+        let block_id = input.block_id.to_string();
+        let shard_index = u32::from(input.placement.shard_index);
+        let erasure_profile_id = input.profile.id.to_string();
+        let placement_epoch = input.placement.placement_epoch;
+        let shard_hash = input.placement.shard_hash.clone();
+        let boundary_summary_hash = input.boundary_summary_hash.to_string();
+        let authorization = MetadataValue::try_from(format!("Bearer {bearer}"))
+            .context("encode CoreStore internal bearer token")?;
+        let bytes = self
+            .internal_grpc_request(endpoint, "get CoreStore shard", move |channel| {
+                let block_id = block_id.clone();
+                let erasure_profile_id = erasure_profile_id.clone();
+                let shard_hash = shard_hash.clone();
+                let boundary_summary_hash = boundary_summary_hash.clone();
+                let authorization = authorization.clone();
+                async move {
+                    let mut client = BlockStoreInternalClient::new(channel);
+                    let mut request = tonic::Request::new(GetShardRequest {
+                        header: Some(self.internal_request_header("block.get_shard").map_err(
+                            |err| tonic::Status::internal(format!("build internal header: {err}")),
+                        )?),
+                        block_id: block_id.clone(),
+                        shard_index,
+                        range_start,
+                        range_end_exclusive,
+                        erasure_profile_id,
+                        placement_epoch,
+                        shard_hash,
+                        boundary_summary_hash,
+                    });
+                    request
+                        .metadata_mut()
+                        .insert("authorization", authorization.clone());
+                    let mut stream = client.get_shard(request).await?.into_inner();
+                    let mut bytes = Vec::new();
+                    while let Some(chunk) = stream.next().await {
+                        let chunk = chunk?;
+                        if chunk.block_id != block_id || chunk.shard_index != shard_index {
+                            return Err(tonic::Status::internal(
+                                "CoreStore remote shard chunk scope mismatch",
+                            ));
+                        }
+                        bytes.extend_from_slice(&chunk.data);
+                        if chunk.eof {
+                            break;
+                        }
+                    }
+                    Ok(bytes)
+                }
+            })
             .await
             .with_context(|| {
                 format!(
                     "read CoreStore shard {}:{} from {}",
                     input.block_id, input.placement.shard_index, input.placement.node_id
                 )
-            })?
-            .into_inner();
-        let mut bytes = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("read CoreStore remote shard chunk")?;
-            if chunk.block_id != input.block_id
-                || chunk.shard_index != u32::from(input.placement.shard_index)
-            {
-                bail!("CoreStore remote shard chunk scope mismatch");
-            }
-            bytes.extend_from_slice(&chunk.data);
-            if chunk.eof {
-                break;
-            }
-        }
+            })?;
         if let Some(range) = input.range {
             if bytes.len() as u64 != range.end_exclusive.saturating_sub(range.start) {
                 bail!("CoreStore remote shard range length mismatch");

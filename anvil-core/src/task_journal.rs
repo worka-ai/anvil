@@ -317,6 +317,37 @@ async fn enqueue_task_inner(
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
+    let mut attempts = 0_u8;
+    loop {
+        attempts += 1;
+        let result = enqueue_task_inner_once(
+            storage,
+            task_type,
+            payload.clone(),
+            priority,
+            fence_token,
+            partition_precondition.clone(),
+        )
+        .await;
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if attempts < 5 && is_retryable_task_id_collision(&error) => {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn enqueue_task_inner_once(
+    storage: &Storage,
+    task_type: TaskType,
+    payload: JsonValue,
+    priority: i32,
+    fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
+) -> Result<()> {
     let state = read_task_queue_state(storage).await?;
     let now = Utc::now();
     let task = TaskRecord {
@@ -338,6 +369,13 @@ async fn enqueue_task_inner(
         partition_precondition,
     )
     .await
+}
+
+fn is_retryable_task_id_collision(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    message.contains("CoreMeta row")
+        && message.contains(&format!("{TABLE_TASK_CURRENT_ROW:#06x}"))
+        && message.contains("must be absent")
 }
 
 #[cfg(test)]
@@ -575,13 +613,22 @@ async fn append_task_event(
     if let Some(precondition) = current_update.precondition.as_ref() {
         preconditions.push(precondition.clone());
     }
-    let operations = vec![CoreMutationOperation::StreamAppend {
+    let mut operations = vec![CoreMutationOperation::StreamAppend {
         partition_id: partition_id.clone(),
         stream_id,
         record_kind: TASK_QUEUE_AUDIT_RECORD_KIND.to_string(),
         payload,
         idempotency_key: Some(format!("task-queue-audit:{mutation_id}")),
     }];
+    if let Some(row) = current_update.row.as_ref() {
+        operations.push(CoreMutationOperation::CoreMetaPut {
+            partition_id: partition_id.clone(),
+            cf: CF_LEASES_FENCES.to_string(),
+            table_id: TABLE_TASK_CURRENT_ROW,
+            tuple_key: task_current_row_key(row.task.id)?,
+            payload: encode_task_current_row(row)?,
+        });
+    }
     core_store
         .commit_mutation_batch(CoreMutationBatch {
             transaction_id,
@@ -591,9 +638,6 @@ async fn append_task_event(
             operations,
         })
         .await?;
-    if let Some(row) = current_update.row {
-        write_task_current_row(storage, &meta, &row, current_update.precondition.as_ref()).await?;
-    }
     Ok(())
 }
 

@@ -277,24 +277,45 @@ impl CoreStore {
                 replica.node_id
             )
         })?;
-        let channel = self
-            .internal_grpc_channel(&replica.public_api_addr, "root register")
-            .await?;
-        let mut client = RootRegisterInternalClient::new(channel);
-        let mut request = tonic::Request::new(PrepareRootRequest {
-            header: Some(self.internal_request_header("root.prepare")?),
-            root_key_hash: anchor.root_key_hash.clone(),
-            expected_generation,
-            expected_root_hash: expected_root_hash.to_string(),
-            new_root_anchor_record: anchor_bytes.to_vec(),
-            partition_owner_fence: anchor.partition_owner_fence,
-        });
-        request.metadata_mut().insert(
-            "authorization",
-            MetadataValue::try_from(format!("Bearer {bearer}"))
-                .context("encode root register internal bearer token")?,
-        );
-        Ok(client.prepare_root(request).await?.into_inner())
+        let bearer = bearer.to_string();
+        let public_api_addr = replica.public_api_addr.clone();
+        let root_key_hash = anchor.root_key_hash.clone();
+        let expected_root_hash = expected_root_hash.to_string();
+        let new_root_anchor_record = anchor_bytes.to_vec();
+        let partition_owner_fence = anchor.partition_owner_fence;
+        self.internal_grpc_request(&public_api_addr, "root.prepare", move |channel| {
+            let bearer = bearer.clone();
+            let root_key_hash = root_key_hash.clone();
+            let expected_root_hash = expected_root_hash.clone();
+            let new_root_anchor_record = new_root_anchor_record.clone();
+            async move {
+                let mut client = RootRegisterInternalClient::new(channel);
+                let mut request =
+                    tonic::Request::new(PrepareRootRequest {
+                        header: Some(self.internal_request_header("root.prepare").map_err(
+                            |err| tonic::Status::internal(format!("build internal header: {err}")),
+                        )?),
+                        root_key_hash,
+                        expected_generation,
+                        expected_root_hash,
+                        new_root_anchor_record,
+                        partition_owner_fence,
+                    });
+                request.metadata_mut().insert(
+                    "authorization",
+                    MetadataValue::try_from(format!("Bearer {bearer}")).map_err(|err| {
+                        tonic::Status::internal(format!(
+                            "encode root register internal bearer token: {err}"
+                        ))
+                    })?,
+                );
+                client
+                    .prepare_root(request)
+                    .await
+                    .map(|response| response.into_inner())
+            }
+        })
+        .await
     }
 
     async fn compare_and_swap_root_anchor_locally(
@@ -330,28 +351,57 @@ impl CoreStore {
                 replica.node_id
             )
         })?;
-        let channel = self
-            .internal_grpc_channel(&replica.public_api_addr, "root register")
-            .await?;
-        let mut client = RootRegisterInternalClient::new(channel);
-        let mut request = tonic::Request::new(CompareAndSwapRootRequest {
-            header: Some(self.internal_request_header("root.compare_and_swap")?),
-            root_key_hash: anchor.root_key_hash.clone(),
-            expected_generation,
-            expected_root_hash: expected_root_hash.to_string(),
-            new_root_anchor_record: anchor_bytes.to_vec(),
-            partition_owner_fence: anchor.partition_owner_fence,
-            core_meta_commit_certificate: Some(certificate.clone()),
-            core_meta_commit_certificate_hash: certificate.certificate_hash.clone(),
-            certificate_persist_receipts: certificate_persist_receipts.to_vec(),
-            prepare_receipts: prepare_receipts.to_vec(),
-        });
-        request.metadata_mut().insert(
-            "authorization",
-            MetadataValue::try_from(format!("Bearer {bearer}"))
-                .context("encode root register internal bearer token")?,
-        );
-        Ok(client.compare_and_swap_root(request).await?.into_inner())
+        let bearer = bearer.to_string();
+        let public_api_addr = replica.public_api_addr.clone();
+        let root_key_hash = anchor.root_key_hash.clone();
+        let expected_root_hash = expected_root_hash.to_string();
+        let new_root_anchor_record = anchor_bytes.to_vec();
+        let partition_owner_fence = anchor.partition_owner_fence;
+        let certificate = certificate.clone();
+        let certificate_persist_receipts = certificate_persist_receipts.to_vec();
+        let prepare_receipts = prepare_receipts.to_vec();
+        self.internal_grpc_request(&public_api_addr, "root.compare_and_swap", move |channel| {
+            let bearer = bearer.clone();
+            let root_key_hash = root_key_hash.clone();
+            let expected_root_hash = expected_root_hash.clone();
+            let new_root_anchor_record = new_root_anchor_record.clone();
+            let certificate = certificate.clone();
+            let certificate_persist_receipts = certificate_persist_receipts.clone();
+            let prepare_receipts = prepare_receipts.clone();
+            async move {
+                let mut client = RootRegisterInternalClient::new(channel);
+                let mut request = tonic::Request::new(CompareAndSwapRootRequest {
+                    header: Some(
+                        self.internal_request_header("root.compare_and_swap")
+                            .map_err(|err| {
+                                tonic::Status::internal(format!("build internal header: {err}"))
+                            })?,
+                    ),
+                    root_key_hash,
+                    expected_generation,
+                    expected_root_hash,
+                    new_root_anchor_record,
+                    partition_owner_fence,
+                    core_meta_commit_certificate: Some(certificate.clone()),
+                    core_meta_commit_certificate_hash: certificate.certificate_hash.clone(),
+                    certificate_persist_receipts,
+                    prepare_receipts,
+                });
+                request.metadata_mut().insert(
+                    "authorization",
+                    MetadataValue::try_from(format!("Bearer {bearer}")).map_err(|err| {
+                        tonic::Status::internal(format!(
+                            "encode root register internal bearer token: {err}"
+                        ))
+                    })?,
+                );
+                client
+                    .compare_and_swap_root(request)
+                    .await
+                    .map(|response| response.into_inner())
+            }
+        })
+        .await
     }
 
     async fn validate_root_cas_precondition(
