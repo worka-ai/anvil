@@ -201,6 +201,7 @@ async fn proxy_put(
                 transaction_id: None,
                 transaction_principal: None,
                 storage_class_id: None,
+                ..Default::default()
             },
         )
         .await?;

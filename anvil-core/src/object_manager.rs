@@ -26,14 +26,24 @@ use anyhow::{Result as AnyhowResult, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{Stream, StreamExt};
 use serde_json::Value as JsonValue;
+use std::collections::HashSet;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 use tonic::metadata::MetadataValue;
 use tracing::info;
+
+mod write_visibility;
+pub use write_visibility::{
+    AuthzMaterializationVisibility, AuthzRevisionVisibility, BoundaryExtractionVisibility,
+    IndexMaintenanceVisibility, IndexPolicySnapshotVisibility, ObjectWriteOptions,
+    ObjectWriteVisibility, WatchVisibility,
+};
 
 #[derive(Debug, Clone)]
 pub struct ObjectManager {
@@ -79,20 +89,13 @@ pub struct AbortMultipartUploadResult {
     pub receipt: MetadataMutationReceipt,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ObjectWriteOptions {
-    pub content_type: Option<String>,
-    pub user_metadata: Option<JsonValue>,
-    pub transaction_id: Option<String>,
-    pub transaction_principal: Option<String>,
-    pub storage_class_id: Option<String>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectLinkReadMode {
     Follow,
     Metadata,
 }
+
+static DEFERRED_OBJECT_MAINTENANCE: OnceLock<Mutex<HashSet<(i64, i64)>>> = OnceLock::new();
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ObjectReadConsistency {
     #[default]
@@ -289,6 +292,82 @@ impl ObjectManager {
         .map_err(|error| Status::invalid_argument(error.to_string()))
     }
 
+    async fn object_write_boundary_values_from_hints(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+        object_key: &str,
+        content_type: Option<&str>,
+        user_metadata: Option<&JsonValue>,
+        payload_len: u64,
+    ) -> Result<Vec<CoreBoundaryValue>, Status> {
+        let boundary_schema_key =
+            crate::core_store::boundary_schema_bucket_key(tenant_id, bucket_name);
+        let Some(schema) = self
+            .core_store
+            .read_boundary_schema(&boundary_schema_key)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?
+        else {
+            return Ok(Vec::new());
+        };
+        if schema.dimensions.iter().any(|dimension| {
+            matches!(
+                &dimension.source,
+                CoreBoundarySource::BodyJsonPointer { .. }
+            )
+        }) {
+            return Err(Status::failed_precondition(format!(
+                "{}: bucket boundary schema requires payload-derived boundary extraction; set boundary_extraction=BOUNDARY_EXTRACTION_PAYLOAD_NOW or supply non-payload boundary dimensions",
+                AnvilErrorCode::BoundaryExtractorUnsupportedContentType.as_str()
+            )));
+        }
+        extract_object_boundary_values(
+            &schema,
+            tenant_id,
+            bucket_name,
+            object_key,
+            content_type,
+            user_metadata,
+            payload_len,
+            &[],
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))
+    }
+
+    fn schedule_deferred_object_maintenance(&self, bucket: Bucket) {
+        let key = (bucket.tenant_id, bucket.id);
+        let pending = DEFERRED_OBJECT_MAINTENANCE.get_or_init(|| Mutex::new(HashSet::new()));
+        {
+            let mut guard = pending.lock().expect("deferred maintenance lock poisoned");
+            if !guard.insert(key) {
+                return;
+            }
+        }
+
+        let persistence = self.persistence.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if let Err(error) = persistence
+                .enqueue_object_write_maintenance_if_due(&bucket, true, true)
+                .await
+            {
+                tracing::warn!(
+                    tenant_id = bucket.tenant_id,
+                    bucket_id = bucket.id,
+                    bucket_name = %bucket.name,
+                    %error,
+                    "deferred object write maintenance failed"
+                );
+            }
+            if let Some(pending) = DEFERRED_OBJECT_MAINTENANCE.get()
+                && let Ok(mut guard) = pending.lock()
+            {
+                guard.remove(&key);
+            }
+        });
+    }
+
     pub async fn put_object(
         &self,
         claims: &auth::Claims,
@@ -310,6 +389,14 @@ impl ObjectManager {
         let tenant_id = claims.tenant_id;
         let transaction_id = options.transaction_id.clone();
         let total_start = std::time::Instant::now();
+        if matches!(
+            options.visibility.indexes,
+            IndexMaintenanceVisibility::CaughtUp
+        ) {
+            return Err(Status::unimplemented(
+                "INDEX_MAINTENANCE_CAUGHT_UP is reserved but not yet available for object writes; use INDEX_MAINTENANCE_ENQUEUED to synchronously enqueue catch-up work",
+            ));
+        }
 
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
@@ -348,8 +435,8 @@ impl ObjectManager {
         );
         let total_bytes_u64 =
             u64::try_from(total_bytes).map_err(|_| Status::internal("Negative payload size"))?;
-        let boundary_values = self
-            .object_write_boundary_values_from_file(
+        let boundary_values = if options.visibility.requires_payload_boundary_extraction() {
+            self.object_write_boundary_values_from_file(
                 tenant_id,
                 &bucket.name,
                 object_key,
@@ -358,7 +445,18 @@ impl ObjectManager {
                 &temp_path,
                 total_bytes_u64,
             )
-            .await?;
+            .await?
+        } else {
+            self.object_write_boundary_values_from_hints(
+                tenant_id,
+                &bucket.name,
+                object_key,
+                options.content_type.as_deref(),
+                options.user_metadata.as_ref(),
+                total_bytes_u64,
+            )
+            .await?
+        };
         let step_start = std::time::Instant::now();
         let effective_storage_class_id = self
             .core_store
@@ -459,7 +557,7 @@ impl ObjectManager {
         let step_start = std::time::Instant::now();
         let object = self
             .persistence
-            .create_object_with_storage_class(
+            .create_object_with_storage_class_with_options(
                 tenant_id,
                 bucket.id,
                 object_key,
@@ -473,6 +571,7 @@ impl ObjectManager {
                 transaction_id.as_deref(),
                 options.transaction_principal.as_deref(),
                 Some(effective_storage_class_id),
+                options.visibility.persistence_options(),
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -481,26 +580,52 @@ impl ObjectManager {
             step_start.elapsed(),
         );
         if transaction_id.is_none() {
-            let step_start = std::time::Instant::now();
-            access_control::grant_object_defaults(
-                &self.persistence,
-                &bucket,
-                object_key,
-                "grant object parent bucket relation",
-            )
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-            crate::emit_test_timing(
-                "object_manager.put_object grant_object_defaults",
-                step_start.elapsed(),
-            );
-            let step_start = std::time::Instant::now();
-            self.publish_object_watch_event(tenant_id, &bucket, &object, "put", false)
-                .await?;
-            crate::emit_test_timing(
-                "object_manager.put_object publish_object_watch_event",
-                step_start.elapsed(),
-            );
+            if options.visibility.defers_write_maintenance() {
+                self.schedule_deferred_object_maintenance(bucket.clone());
+            }
+            if options.visibility.requires_authz_materialization() {
+                let step_start = std::time::Instant::now();
+                access_control::grant_object_defaults(
+                    &self.persistence,
+                    &bucket,
+                    object_key,
+                    "grant object parent bucket relation",
+                )
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+                crate::emit_test_timing(
+                    "object_manager.put_object grant_object_defaults",
+                    step_start.elapsed(),
+                );
+            }
+            if options.visibility.requires_watch_visible() {
+                let step_start = std::time::Instant::now();
+                self.publish_object_watch_event(tenant_id, &bucket, &object, "put", false)
+                    .await?;
+                crate::emit_test_timing(
+                    "object_manager.put_object publish_object_watch_event",
+                    step_start.elapsed(),
+                );
+            } else {
+                let manager = self.clone();
+                let bucket = bucket.clone();
+                let object = object.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = manager
+                        .publish_object_watch_event(tenant_id, &bucket, &object, "put", false)
+                        .await
+                    {
+                        tracing::warn!(
+                            tenant_id,
+                            bucket_id = bucket.id,
+                            bucket_name = %bucket.name,
+                            object_key = %object.key,
+                            %error,
+                            "deferred object watch publication failed"
+                        );
+                    }
+                });
+            }
         }
         crate::emit_test_timing("object_manager.put_object total", total_start.elapsed());
 
@@ -774,6 +899,7 @@ impl ObjectManager {
                 ObjectWriteOptions {
                     transaction_id: transaction_id.map(ToOwned::to_owned),
                     transaction_principal: transaction_principal.map(ToOwned::to_owned),
+                    visibility: ObjectWriteVisibility::strict(),
                     ..Default::default()
                 },
             )

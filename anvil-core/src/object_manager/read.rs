@@ -1143,6 +1143,7 @@ impl ObjectManager {
             composed_stream,
             ObjectWriteOptions {
                 transaction_id: transaction_id.map(ToOwned::to_owned),
+                visibility: ObjectWriteVisibility::strict(),
                 ..Default::default()
             },
         )
@@ -1190,6 +1191,7 @@ impl ObjectManager {
                 transaction_principal: transaction_id
                     .map(|_| crate::object_manager::transaction_principal_from_claims(&claims)),
                 storage_class_id: None,
+                visibility: ObjectWriteVisibility::strict(),
             },
         )
         .await

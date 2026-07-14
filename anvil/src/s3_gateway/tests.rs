@@ -312,6 +312,7 @@ async fn seeded_local_object_link() -> (tempfile::TempDir, AppState, Claims, Str
                 transaction_id: None,
                 transaction_principal: None,
                 storage_class_id: None,
+                ..Default::default()
             },
         )
         .await

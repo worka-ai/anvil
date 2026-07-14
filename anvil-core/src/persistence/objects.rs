@@ -1,5 +1,32 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy)]
+pub struct ObjectCreateOptions {
+    pub exact_index_policy_snapshot: bool,
+    pub exact_authz_revision: bool,
+    pub enqueue_index_maintenance: bool,
+    pub enqueue_metadata_compaction: bool,
+}
+
+impl ObjectCreateOptions {
+    pub fn strict() -> Self {
+        Self {
+            exact_index_policy_snapshot: true,
+            exact_authz_revision: true,
+            enqueue_index_maintenance: true,
+            enqueue_metadata_compaction: true,
+        }
+    }
+}
+
+fn deferred_index_policy_snapshot_hash(tenant_id: i64, bucket_id: i64) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"anvil.deferred_index_policy_snapshot.v1");
+    hasher.update(&tenant_id.to_le_bytes());
+    hasher.update(&bucket_id.to_le_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
 impl Persistence {
     pub async fn create_object(
         &self,
@@ -49,6 +76,42 @@ impl Persistence {
         transaction_principal: Option<&str>,
         storage_class: Option<String>,
     ) -> Result<Object> {
+        self.create_object_with_storage_class_with_options(
+            tenant_id,
+            bucket_id,
+            key,
+            content_hash,
+            size,
+            etag,
+            content_type,
+            user_meta,
+            shard_map,
+            payload,
+            transaction_id,
+            transaction_principal,
+            storage_class,
+            ObjectCreateOptions::strict(),
+        )
+        .await
+    }
+
+    pub async fn create_object_with_storage_class_with_options(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        key: &str,
+        content_hash: &str,
+        size: i64,
+        etag: &str,
+        content_type: Option<&str>,
+        user_meta: Option<JsonValue>,
+        shard_map: Option<JsonValue>,
+        payload: Option<Vec<u8>>,
+        transaction_id: Option<&str>,
+        transaction_principal: Option<&str>,
+        storage_class: Option<String>,
+        options: ObjectCreateOptions,
+    ) -> Result<Object> {
         let total_start = std::time::Instant::now();
         let step_start = std::time::Instant::now();
         let bucket = bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id)
@@ -75,16 +138,23 @@ impl Persistence {
         };
         crate::emit_test_timing("persistence.create_object shard_map", step_start.elapsed());
         let step_start = std::time::Instant::now();
-        let index_policy_snapshot = self
-            .active_index_policy_snapshot_hash(tenant_id, bucket_id)
-            .await?;
+        let index_policy_snapshot = if options.exact_index_policy_snapshot {
+            self.active_index_policy_snapshot_hash(tenant_id, bucket_id)
+                .await?
+        } else {
+            deferred_index_policy_snapshot_hash(tenant_id, bucket_id)
+        };
         crate::emit_test_timing(
             "persistence.create_object active_index_policy_snapshot_hash",
             step_start.elapsed(),
         );
         let step_start = std::time::Instant::now();
         let user_metadata_hash = user_metadata_hash(user_meta.as_ref());
-        let authz_revision = self.latest_authz_revision(tenant_id).await?;
+        let authz_revision = if options.exact_authz_revision {
+            self.latest_authz_revision(tenant_id).await?
+        } else {
+            0
+        };
         crate::emit_test_timing(
             "persistence.create_object latest_authz_revision",
             step_start.elapsed(),
@@ -177,19 +247,23 @@ impl Persistence {
             step_start.elapsed(),
         );
         if transaction_id.is_none() {
-            let step_start = std::time::Instant::now();
-            self.enqueue_index_builds_for_bucket(&bucket).await?;
-            crate::emit_test_timing(
-                "persistence.create_object enqueue_index_builds_for_bucket",
-                step_start.elapsed(),
-            );
-            let step_start = std::time::Instant::now();
-            self.enqueue_object_metadata_compaction_if_due(&bucket)
-                .await?;
-            crate::emit_test_timing(
-                "persistence.create_object enqueue_object_metadata_compaction_if_due",
-                step_start.elapsed(),
-            );
+            if options.enqueue_index_maintenance {
+                let step_start = std::time::Instant::now();
+                self.enqueue_index_builds_for_bucket(&bucket).await?;
+                crate::emit_test_timing(
+                    "persistence.create_object enqueue_index_builds_for_bucket",
+                    step_start.elapsed(),
+                );
+            }
+            if options.enqueue_metadata_compaction {
+                let step_start = std::time::Instant::now();
+                self.enqueue_object_metadata_compaction_if_due(&bucket)
+                    .await?;
+                crate::emit_test_timing(
+                    "persistence.create_object enqueue_object_metadata_compaction_if_due",
+                    step_start.elapsed(),
+                );
+            }
         }
         crate::emit_test_timing("persistence.create_object total", total_start.elapsed());
         Ok(object)
@@ -989,5 +1063,23 @@ impl Persistence {
         )
         .await?;
         Ok(())
+    }
+
+    pub async fn enqueue_object_write_maintenance_if_due(
+        &self,
+        bucket: &Bucket,
+        enqueue_indexes: bool,
+        enqueue_compaction: bool,
+    ) -> Result<usize> {
+        let mut scheduled = 0usize;
+        if enqueue_indexes {
+            scheduled =
+                scheduled.saturating_add(self.enqueue_index_builds_for_bucket(bucket).await?);
+        }
+        if enqueue_compaction {
+            self.enqueue_object_metadata_compaction_if_due(bucket)
+                .await?;
+        }
+        Ok(scheduled)
     }
 }

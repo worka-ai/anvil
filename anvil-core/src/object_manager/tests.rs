@@ -125,6 +125,7 @@ async fn seeded_core_store_link() -> (TempDir, ObjectManager, Bucket, Object, Ob
                 transaction_id: None,
                 transaction_principal: None,
                 storage_class_id: None,
+                ..Default::default()
             },
         )
         .await
@@ -317,6 +318,50 @@ fn object_boundary_extraction_rejects_non_json_body_source() {
             .to_string()
             .contains(AnvilErrorCode::BoundaryExtractorUnsupportedContentType.as_str())
     );
+}
+
+#[test]
+fn default_write_visibility_defers_expensive_follow_up_work() {
+    let visibility = ObjectWriteVisibility::default();
+    let options = visibility.persistence_options();
+
+    assert_eq!(visibility.indexes, IndexMaintenanceVisibility::Deferred);
+    assert_eq!(visibility.watches, WatchVisibility::Deferred);
+    assert_eq!(
+        visibility.authz_materialization,
+        AuthzMaterializationVisibility::InheritedOk
+    );
+    assert_eq!(
+        visibility.boundary_extraction,
+        BoundaryExtractionVisibility::HintsOnly
+    );
+    assert_eq!(
+        visibility.index_policy_snapshot,
+        IndexPolicySnapshotVisibility::Cached
+    );
+    assert_eq!(
+        visibility.authz_revision,
+        AuthzRevisionVisibility::CurrentKnown
+    );
+    assert!(!options.exact_index_policy_snapshot);
+    assert!(!options.exact_authz_revision);
+    assert!(!options.enqueue_index_maintenance);
+    assert!(!options.enqueue_metadata_compaction);
+}
+
+#[test]
+fn strict_write_visibility_preserves_previous_synchronous_behaviour() {
+    let visibility = ObjectWriteVisibility::strict();
+    let options = visibility.persistence_options();
+
+    assert_eq!(visibility.indexes, IndexMaintenanceVisibility::Enqueued);
+    assert!(visibility.requires_watch_visible());
+    assert!(visibility.requires_payload_boundary_extraction());
+    assert!(visibility.requires_authz_materialization());
+    assert!(options.exact_index_policy_snapshot);
+    assert!(options.exact_authz_revision);
+    assert!(options.enqueue_index_maintenance);
+    assert!(options.enqueue_metadata_compaction);
 }
 
 #[tokio::test]

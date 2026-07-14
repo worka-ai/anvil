@@ -3,7 +3,11 @@ use crate::anvil_api::*;
 use crate::mesh_lifecycle::{CreateHostAliasDescriptor, LifecycleError};
 use crate::native_idempotency::{self, NativeIdempotencyTarget};
 use crate::object_links;
-use crate::object_manager::ObjectWriteOptions;
+use crate::object_manager::{
+    AuthzMaterializationVisibility, AuthzRevisionVisibility, BoundaryExtractionVisibility,
+    IndexMaintenanceVisibility, IndexPolicySnapshotVisibility, ObjectWriteOptions,
+    ObjectWriteVisibility, WatchVisibility,
+};
 use crate::permissions::AnvilAction;
 use crate::routing::{
     self, HostAliasDescriptor as CoreHostAliasDescriptor, HostAliasState as CoreHostAliasState,

@@ -36,6 +36,55 @@ fn write_state_for_transaction(transaction_id: Option<&str>) -> i32 {
     }
 }
 
+fn object_write_visibility(
+    context: Option<&NativeMutationContext>,
+) -> Result<ObjectWriteVisibility, Status> {
+    let Some(options) = context.and_then(|context| context.write_visibility.as_ref()) else {
+        return Ok(ObjectWriteVisibility::default());
+    };
+    Ok(ObjectWriteVisibility {
+        indexes: match options.indexes {
+            0 => IndexMaintenanceVisibility::Deferred,
+            1 => IndexMaintenanceVisibility::Enqueued,
+            2 => IndexMaintenanceVisibility::CaughtUp,
+            _ => return Err(Status::invalid_argument("Invalid index maintenance mode")),
+        },
+        watches: match options.watches {
+            0 => WatchVisibility::Deferred,
+            1 => WatchVisibility::Published,
+            _ => return Err(Status::invalid_argument("Invalid watch visibility mode")),
+        },
+        authz_materialization: match options.authz_materialization {
+            0 => AuthzMaterializationVisibility::InheritedOk,
+            1 => AuthzMaterializationVisibility::Materialized,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "Invalid authz materialization mode",
+                ));
+            }
+        },
+        boundary_extraction: match options.boundary_extraction {
+            0 => BoundaryExtractionVisibility::HintsOnly,
+            1 => BoundaryExtractionVisibility::PayloadNow,
+            _ => return Err(Status::invalid_argument("Invalid boundary extraction mode")),
+        },
+        index_policy_snapshot: match options.index_policy_snapshot {
+            0 => IndexPolicySnapshotVisibility::Cached,
+            1 => IndexPolicySnapshotVisibility::Exact,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "Invalid index policy snapshot mode",
+                ));
+            }
+        },
+        authz_revision: match options.authz_revision {
+            0 => AuthzRevisionVisibility::CurrentKnown,
+            1 => AuthzRevisionVisibility::FenceExact,
+            _ => return Err(Status::invalid_argument("Invalid authz revision mode")),
+        },
+    })
+}
+
 fn ensure_transactional_mutation_batch_supported(
     transaction_id: Option<&str>,
     operations: &[MutationBatchOperation],
@@ -109,6 +158,7 @@ impl ObjectService for AppState {
         validate_native_mutation_context(self, &claims, &bucket_name, mutation_context.as_ref())
             .await?;
         let transaction_id = native_transaction_id(mutation_context.as_ref())?;
+        let write_visibility = object_write_visibility(mutation_context.as_ref())?;
         let target = NativeIdempotencyTarget::new("PutObject", &bucket_name, &object_key);
         let (attempt, replay) = begin_native_mutation::<PutObjectResponse>(
             self,
@@ -153,10 +203,12 @@ impl ObjectService for AppState {
                     transaction_principal: transaction_id
                         .map(|_| crate::object_manager::transaction_principal_from_claims(&claims)),
                     storage_class_id: storage_class,
+                    visibility: write_visibility,
                 },
             )
             .await?;
-        let watch_cursor = if transaction_id.is_some() {
+        let watch_cursor = if transaction_id.is_some() || !write_visibility.requires_watch_visible()
+        {
             0
         } else {
             object_watch_cursor(self, &object).await?
@@ -1079,6 +1131,7 @@ impl ObjectService for AppState {
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?;
         let transaction_id = native_transaction_id(Some(context))?;
+        let write_visibility = object_write_visibility(Some(context))?;
         ensure_transactional_mutation_batch_supported(transaction_id, &req.operations)?;
         let target =
             NativeIdempotencyTarget::new("MutationBatch", &req.bucket_name, "mutation_batch")
@@ -1125,14 +1178,16 @@ impl ObjectService for AppState {
                                     )
                                 }),
                                 storage_class_id: op.storage_class,
+                                visibility: write_visibility,
                             },
                         )
                         .await?;
-                    let watch_cursor = if transaction_id.is_some() {
-                        0
-                    } else {
-                        object_watch_cursor(self, &object).await?
-                    };
+                    let watch_cursor =
+                        if transaction_id.is_some() || !write_visibility.requires_watch_visible() {
+                            0
+                        } else {
+                            object_watch_cursor(self, &object).await?
+                        };
                     max_watch_cursor = max_watch_cursor.max(watch_cursor);
                     receipts.push(MutationBatchOperationReceipt {
                         operation: "put_object".to_string(),

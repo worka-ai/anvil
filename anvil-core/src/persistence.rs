@@ -577,6 +577,7 @@ mod tasks;
 mod tenancy;
 
 use helpers::*;
+pub use objects::ObjectCreateOptions;
 
 #[cfg(test)]
 mod tests;

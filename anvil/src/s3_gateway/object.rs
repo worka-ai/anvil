@@ -552,6 +552,7 @@ pub(super) async fn put_object(
         transaction_id: None,
         transaction_principal: None,
         storage_class_id: None,
+        ..Default::default()
     };
     let body_stream = req.into_body().into_data_stream().map(|r| {
         r.map(|chunk| chunk.to_vec())
