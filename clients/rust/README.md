@@ -2,7 +2,7 @@
 
 Rust gRPC client package for Anvil's native API.
 
-The crate ships generated protocol bindings from `proto/anvil.proto`, a bearer-token interceptor, and typed service-client constructors.
+The crate ships generated protocol bindings from the public `proto/anvil.proto` projection, a bearer-token interceptor, and typed service-client constructors. Node-to-node CoreStore protocols are not part of this public client surface.
 
 ```rust,no_run
 use anvil_storage::{AnvilClient, proto::ListBucketsRequest};

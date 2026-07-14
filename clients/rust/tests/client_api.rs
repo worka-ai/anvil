@@ -200,10 +200,12 @@ fn write_options_helper_uses_execution_oneof() {
 fn packaged_proto_omits_internal_node_service() {
     let packaged_proto = include_str!("../proto/anvil.proto");
     assert!(!packaged_proto.contains("InternalAnvilService"));
+    assert!(!packaged_proto.contains("InternalProxyService"));
     assert!(!packaged_proto.contains("PutShardRequest"));
     assert!(!packaged_proto.contains("CommitShardRequest"));
     assert!(!packaged_proto.contains("GetShardRequest"));
     assert!(!packaged_proto.contains("DeleteShardRequest"));
+    assert!(!packaged_proto.contains("InternalRequestHeader"));
 }
 
 #[tokio::test]

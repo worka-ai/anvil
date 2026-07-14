@@ -222,7 +222,7 @@ jobs:
     name: Docker integration tests (${{ matrix.group }})
     needs: build-image
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -268,6 +268,7 @@ jobs:
         env:
           ANVIL_IMAGE: anvil:test-amd64
           ANVIL_DOCKER_TEST_PROJECT: anvil-release-${{ matrix.group }}-${{ github.run_id }}-${{ github.run_attempt }}
+          ANVIL_GATE_STEP_TIMEOUT_SECONDS: "5400"
         run: ./scripts/release-gates.sh ${{ matrix.group }}
 
   publish:

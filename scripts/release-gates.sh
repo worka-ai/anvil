@@ -2,7 +2,13 @@
 set -euo pipefail
 
 export ANVIL_TEST_LOG="${ANVIL_TEST_LOG:-warn}"
-export ANVIL_TEST_TIMINGS="${ANVIL_TEST_TIMINGS:-1}"
+# Timing instrumentation is intentionally opt-in. Enabling it on release gates
+# can produce hundreds of thousands of log lines and materially slow Docker E2E.
+if [[ -n "${ANVIL_TEST_TIMINGS:-}" ]]; then
+  export ANVIL_TEST_TIMINGS
+else
+  unset ANVIL_TEST_TIMINGS
+fi
 
 group="${1:-all}"
 
@@ -42,6 +48,13 @@ run_cargo_test() {
   run_step "$name" cargo test --no-fail-fast "$@" -- --nocapture
 }
 
+run_docker_cargo_test() {
+  local name="$1"
+  shift
+  local test_threads="${ANVIL_DOCKER_TEST_THREADS:-4}"
+  run_step "$name" cargo test --no-fail-fast "$@" -- --nocapture --test-threads="${test_threads}"
+}
+
 require_image() {
   local configured_anvil_image="${ANVIL_IMAGE:-anvil:test}"
   export ANVIL_IMAGE="$(./scripts/resolve-docker-image-id.sh "$configured_anvil_image")"
@@ -61,7 +74,11 @@ static_gates() {
 rust_unit_gates() {
   run_cargo_test "core library tests" -p anvil-storage-core --lib --bins
   run_cargo_test "server library and binary tests" -p anvil-server --lib --bins
-  run_cargo_test "public CLI package tests" -p anvil-storage-cli --bins --tests
+  run_cargo_test "public CLI binary/unit tests" -p anvil-storage-cli --bins
+  run_cargo_test "public CLI non-Docker integration tests" -p anvil-storage-cli \
+    --test binary_names \
+    --test confy_test \
+    --test public_command_surface
   run_cargo_test "Rust client package tests" -p anvil-storage --lib --tests
   run_cargo_test "test utils package tests" -p anvil-storage-test-utils --lib
   run_cargo_test "CoreStore model package tests" -p anvil-corestore-model --lib --tests
@@ -100,9 +117,9 @@ docker_auth_gates() {
     auth_tests
   )
   for test_name in "${tests[@]}"; do
-    run_cargo_test "Docker auth integration ${test_name}" -p anvil-server --test "${test_name}"
+    run_docker_cargo_test "Docker auth integration ${test_name}" -p anvil-server --test "${test_name}"
   done
-  run_cargo_test "Docker CLI auth integration" -p anvil-storage-cli --test cli_auth
+  run_docker_cargo_test "Docker CLI auth integration" -p anvil-storage-cli --test cli_auth
 }
 
 docker_storage_gates() {
@@ -114,8 +131,9 @@ docker_storage_gates() {
     s3_gateway_tests
   )
   for test_name in "${tests[@]}"; do
-    run_cargo_test "Docker storage integration ${test_name}" -p anvil-server --test "${test_name}"
+    run_docker_cargo_test "Docker storage integration ${test_name}" -p anvil-server --test "${test_name}"
   done
+  run_docker_cargo_test "Docker CLI storage integration" -p anvil-storage-cli --test cli
 }
 
 docker_index_gates() {
@@ -129,8 +147,9 @@ docker_index_gates() {
     personaldb_tests
   )
   for test_name in "${tests[@]}"; do
-    run_cargo_test "Docker index/data integration ${test_name}" -p anvil-server --test "${test_name}"
+    run_docker_cargo_test "Docker index/data integration ${test_name}" -p anvil-server --test "${test_name}"
   done
+  run_docker_cargo_test "Docker CLI extended integration" -p anvil-storage-cli --test cli_extended
 }
 
 docker_mesh_gates() {
@@ -141,7 +160,7 @@ docker_mesh_gates() {
     grpc
   )
   for test_name in "${tests[@]}"; do
-    run_cargo_test "Docker mesh integration ${test_name}" -p anvil-server --test "${test_name}"
+    run_docker_cargo_test "Docker mesh integration ${test_name}" -p anvil-server --test "${test_name}"
   done
 }
 
