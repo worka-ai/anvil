@@ -109,7 +109,7 @@ async fn test_vector_index_builds_from_object_write_task() {
             lag_timeout_ms: 0,
         },
         1,
-        Duration::from_secs(20),
+        INDEX_EVENTUAL_CONSISTENCY_TIMEOUT,
     )
     .await;
 
@@ -138,7 +138,7 @@ async fn test_vector_index_builds_from_object_write_task() {
     assert_eq!(response.hits[0].vector_id, 1);
     let tasks = wait_for_index_builds_for_indexes(
         &cluster,
-        Duration::from_secs(60),
+        INDEX_EVENTUAL_CONSISTENCY_TIMEOUT,
         1,
         bucket_id,
         &[created.index_id as i64],
@@ -285,7 +285,7 @@ async fn test_vector_index_builds_required_media_modalities_from_object_write_ta
 
     let tasks = wait_for_index_builds_for_indexes(
         &cluster,
-        Duration::from_secs(60),
+        INDEX_EVENTUAL_CONSISTENCY_TIMEOUT,
         claims.tenant_id,
         bucket.id,
         &index_ids,
@@ -394,12 +394,12 @@ async fn test_vector_index_build_records_dimension_mismatch_diagnostic() {
         "error",
         "docs/bad-vector.json",
         "VectorDimensionMismatch",
-        Duration::from_secs(20),
+        INDEX_EVENTUAL_CONSISTENCY_TIMEOUT,
     )
     .await;
     let tasks = wait_for_index_builds_for_indexes(
         &cluster,
-        Duration::from_secs(60),
+        INDEX_EVENTUAL_CONSISTENCY_TIMEOUT,
         1,
         bucket_id,
         &[created.index_id as i64],
@@ -537,7 +537,7 @@ async fn test_hybrid_index_builds_text_and_vector_segments_from_object_write_tas
             lag_timeout_ms: 0,
         },
         1,
-        Duration::from_secs(60),
+        INDEX_EVENTUAL_CONSISTENCY_TIMEOUT,
     )
     .await;
 
@@ -566,7 +566,7 @@ async fn test_hybrid_index_builds_text_and_vector_segments_from_object_write_tas
     assert!(response.hits[0].score > 0.0);
     let tasks = wait_for_index_builds_for_indexes(
         &cluster,
-        Duration::from_secs(60),
+        INDEX_EVENTUAL_CONSISTENCY_TIMEOUT,
         1,
         bucket_id,
         &[created.index_id as i64],
@@ -1668,7 +1668,7 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
             lag_timeout_ms: 0,
         },
         1,
-        Duration::from_secs(60),
+        INDEX_EVENTUAL_CONSISTENCY_TIMEOUT,
     )
     .await;
 

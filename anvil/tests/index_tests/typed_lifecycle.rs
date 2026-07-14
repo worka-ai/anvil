@@ -133,7 +133,7 @@ async fn test_typed_json_index_queries_append_record_payloads() {
             lag_timeout_ms: 0,
         },
         2,
-        Duration::from_secs(10),
+        INDEX_EVENTUAL_CONSISTENCY_TIMEOUT,
     )
     .await;
 
@@ -610,7 +610,7 @@ async fn test_query_path_and_metadata_filter_indexes_from_object_metadata() {
     .await;
     wait_for_index_builds_for_indexes(
         &cluster,
-        Duration::from_secs(60),
+        INDEX_EVENTUAL_CONSISTENCY_TIMEOUT,
         1,
         bucket_id,
         &[path_index.index_id as i64, metadata_index.index_id as i64],
@@ -637,7 +637,7 @@ async fn test_query_path_and_metadata_filter_indexes_from_object_metadata() {
             lag_timeout_ms: 0,
         },
         2,
-        Duration::from_secs(60),
+        INDEX_EVENTUAL_CONSISTENCY_TIMEOUT,
     )
     .await;
 
@@ -755,7 +755,7 @@ async fn test_query_path_and_metadata_filter_indexes_from_object_metadata() {
             lag_timeout_ms: 0,
         },
         1,
-        Duration::from_secs(10),
+        INDEX_EVENTUAL_CONSISTENCY_TIMEOUT,
     )
     .await;
 
@@ -859,7 +859,7 @@ async fn test_live_metadata_query_uses_planner_authz_candidates_and_scoped_page_
     .await;
     wait_for_index_builds_for_indexes(
         &cluster,
-        Duration::from_secs(60),
+        INDEX_EVENTUAL_CONSISTENCY_TIMEOUT,
         1,
         bucket_id,
         &[created.index_id as i64],

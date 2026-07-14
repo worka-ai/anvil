@@ -207,10 +207,11 @@ async fn hf_ingestion_single_file_integration() {
 
     // Verify object is not public initially
     let http_base = actor.grpc_addr.trim_end_matches('/');
-    let url = format!(
-        "{}/{}/{}/gpt-oss-20b/config.json",
-        http_base, actor.tenant_id, bucket_name
-    );
+    let tenant_route = actor
+        .tenant_name
+        .as_deref()
+        .expect("Docker storage actor includes tenant route name");
+    let url = format!("{http_base}/{tenant_route}/{bucket_name}/gpt-oss-20b/config.json");
     let http_client = reqwest::Client::new();
     let resp_before = http_client
         .get(&url)

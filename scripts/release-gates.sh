@@ -136,19 +136,44 @@ docker_storage_gates() {
   run_docker_cargo_test "Docker CLI storage integration" -p anvil-storage-cli --test cli
 }
 
+run_docker_index_test_filter() {
+  local label="$1"
+  local filter="$2"
+  ANVIL_DOCKER_TEST_THREADS="${ANVIL_INDEX_TEST_THREADS:-1}" \
+    run_docker_cargo_test "Docker index/data integration index_tests ${label}" \
+      -p anvil-server --test index_tests "${filter}"
+}
+
 docker_index_gates() {
   require_image
   local tests=(
     git_source_tests
     hf_ingestion_e2e
     hf_ingestion_integration
-    index_tests
     internal_proxy_tests
     personaldb_tests
   )
   for test_name in "${tests[@]}"; do
     run_docker_cargo_test "Docker index/data integration ${test_name}" -p anvil-server --test "${test_name}"
   done
+
+  # index_tests intentionally runs as smaller filters. The tests exercise shared
+  # clusters, background index workers and CoreMeta quorum writes; one aggregate
+  # process accumulates enough state to make CI timing unreliable while adding no
+  # extra coverage beyond the same test set run as fresh filtered processes.
+  run_docker_index_test_filter "build_repair" "build_repair::"
+  run_docker_index_test_filter "query authz" "query_spec::test_query_index_results_are_filtered_by_zanzibar_object_relationships"
+  run_docker_index_test_filter "query inherited usersets" "query_spec::test_query_spec_inherit_object_filter_uses_derived_userset_grants"
+  run_docker_index_test_filter "query read-scope intersection" "query_spec::test_query_spec_intersection_filters_inherit_object_hits_by_read_scope"
+  run_docker_index_test_filter "query full-text intersection" "query_spec::test_query_spec_intersects_full_text_with_typed_filter_without_bucket_scan"
+  run_docker_index_test_filter "query hybrid intersection" "query_spec::test_query_spec_intersects_hybrid_with_typed_filter_without_bucket_scan"
+  run_docker_index_test_filter "query vector intersection" "query_spec::test_query_spec_intersects_vector_with_typed_filter_without_bucket_scan"
+  run_docker_index_test_filter "query path authz" "query_spec::test_query_spec_path_filter_intersects_authz_before_results"
+  run_docker_index_test_filter "query typed json" "query_spec::test_typed_json_index_queries_canonical_object_body_with_range_order_and_page_token"
+  run_docker_index_test_filter "typed lifecycle" "typed_lifecycle::"
+  run_docker_index_test_filter "validation diagnostics" "validation_diagnostics::"
+  run_docker_index_test_filter "vector hybrid" "vector_hybrid::"
+
   run_docker_cargo_test "Docker CLI extended integration" -p anvil-storage-cli --test cli_extended
 }
 

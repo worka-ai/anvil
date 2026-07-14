@@ -37,6 +37,8 @@ use std::{
 };
 use tonic::Request;
 
+const INDEX_EVENTUAL_CONSISTENCY_TIMEOUT: Duration = Duration::from_secs(60);
+
 fn authorized<T>(message: T, token: &str) -> Request<T> {
     let mut request = Request::new(message);
     request.metadata_mut().insert(

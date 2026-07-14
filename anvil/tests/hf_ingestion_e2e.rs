@@ -177,10 +177,11 @@ async fn hf_ingestion_config_json() {
     wait_for_ingestion(&mut ing_client, &token, &ingestion_id, "config").await;
 
     let http_base = actor.grpc_addr.trim_end_matches('/');
-    let config_url = format!(
-        "{http_base}/{}/{bucket_name}/gpt-oss-20b/config.json",
-        actor.tenant_id
-    );
+    let tenant_route = actor
+        .tenant_name
+        .as_deref()
+        .expect("Docker storage actor includes tenant route name");
+    let config_url = format!("{http_base}/{tenant_route}/{bucket_name}/gpt-oss-20b/config.json");
     let txt = get_public_text_with_retry(
         &config_url,
         &cluster.public_region_host,
@@ -190,10 +191,8 @@ async fn hf_ingestion_config_json() {
     let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
     assert!(v.is_object());
 
-    let index_url = format!(
-        "{http_base}/{}/{bucket_name}/gpt-oss-20b/anvil-index.json",
-        actor.tenant_id
-    );
+    let index_url =
+        format!("{http_base}/{tenant_route}/{bucket_name}/gpt-oss-20b/anvil-index.json");
     let index_txt = get_public_text_with_retry(
         &index_url,
         &cluster.public_region_host,

@@ -1022,6 +1022,18 @@ fn docker_compose_create_then_start(
     project_name: &str,
     compose_env: &[(String, String)],
 ) {
+    let expected_image = compose_env
+        .iter()
+        .find_map(|(key, value)| (key == "ANVIL_IMAGE").then_some(value.as_str()))
+        .expect("Docker test compose env includes ANVIL_IMAGE");
+    if docker_project_image_mismatch(project_name, expected_image) {
+        docker_compose_with_env(
+            compose_file,
+            project_name,
+            &["down", "-v", "--remove-orphans"],
+            compose_env,
+        );
+    }
     docker_compose_with_env(
         compose_file,
         project_name,
@@ -1031,6 +1043,49 @@ fn docker_compose_create_then_start(
     for node in 1..=docker_node_count() {
         docker_container_command(project_name, node, "start");
     }
+}
+
+fn docker_project_image_mismatch(project_name: &str, expected_image: &str) -> bool {
+    let mut seen_nodes = 0_u8;
+    for node in 1..=docker_node_count() {
+        let service = docker_node_service(node);
+        let output = command_with_docker_env("docker")
+            .args([
+                "ps",
+                "-aq",
+                "--filter",
+                &format!("label=com.docker.compose.project={project_name}"),
+                "--filter",
+                &format!("label=com.docker.compose.service={service}"),
+            ])
+            .output()
+            .expect("failed to inspect Docker test project");
+        if !output.status.success() {
+            return true;
+        }
+        let ids = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        match ids.as_slice() {
+            [] => continue,
+            [id] => {
+                seen_nodes += 1;
+                let image = command_with_docker_env("docker")
+                    .args(["inspect", "--format", "{{.Image}}", id])
+                    .output()
+                    .expect("failed to inspect Docker test container image");
+                if !image.status.success()
+                    || String::from_utf8_lossy(&image.stdout).trim() != expected_image
+                {
+                    return true;
+                }
+            }
+            _ => return true,
+        }
+    }
+    seen_nodes != 0 && seen_nodes != docker_node_count()
 }
 
 fn docker_container_command(project_name: &str, node: u8, operation: &str) {
@@ -1618,6 +1673,22 @@ impl TestCluster {
                     format!("start_and_converge port_ready nodes={node_count}"),
                     start.elapsed(),
                 );
+                let http_ready_start = Instant::now();
+                let ready_addrs = self
+                    .grpc_addrs
+                    .iter()
+                    .chain(self.admin_addrs.iter())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                assert!(
+                    wait_for_all_http_ready(&ready_addrs, timeout.saturating_sub(start.elapsed()))
+                        .await,
+                    "Cluster listeners opened but HTTP readiness probes did not pass for all nodes"
+                );
+                emit_test_timing(
+                    format!("start_and_converge http_ready nodes={node_count}"),
+                    http_ready_start.elapsed(),
+                );
                 let lifecycle_seed_start = Instant::now();
                 self.seed_corestore_mesh_lifecycle(&peer_ids, &listen_addrs)
                     .await;
@@ -1977,6 +2048,28 @@ async fn wait_for_http_ready(base_url: &str, timeout: Duration) -> bool {
         if let Ok(response) = reqwest::get(&ready_url).await
             && response.status().is_success()
         {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    false
+}
+
+async fn wait_for_all_http_ready(base_urls: &[String], timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        let mut all_ready = true;
+        for base_url in base_urls {
+            let ready_url = format!("{}/ready", base_url.trim_end_matches('/'));
+            match reqwest::get(&ready_url).await {
+                Ok(response) if response.status().is_success() => {}
+                _ => {
+                    all_ready = false;
+                    break;
+                }
+            }
+        }
+        if all_ready {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;

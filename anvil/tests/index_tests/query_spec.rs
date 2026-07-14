@@ -136,7 +136,7 @@ async fn test_typed_json_index_queries_canonical_object_body_with_range_order_an
             lag_timeout_ms: 0,
         },
         1,
-        Duration::from_secs(10),
+        INDEX_EVENTUAL_CONSISTENCY_TIMEOUT,
     )
     .await;
     assert_eq!(first_page.hits.len(), 1);
@@ -494,7 +494,7 @@ async fn test_query_index_results_are_filtered_by_zanzibar_object_relationships(
         &token,
         owner_query.clone(),
         2,
-        Duration::from_secs(10),
+        INDEX_EVENTUAL_CONSISTENCY_TIMEOUT,
     )
     .await;
 
@@ -525,7 +525,7 @@ async fn test_query_index_results_are_filtered_by_zanzibar_object_relationships(
         &reader_token,
         owner_query.clone(),
         1,
-        Duration::from_secs(10),
+        INDEX_EVENTUAL_CONSISTENCY_TIMEOUT,
     )
     .await;
     assert_eq!(
@@ -550,7 +550,7 @@ async fn test_query_index_results_are_filtered_by_zanzibar_object_relationships(
         &reader_token,
         owner_query,
         2,
-        Duration::from_secs(10),
+        INDEX_EVENTUAL_CONSISTENCY_TIMEOUT,
     )
     .await;
     assert_eq!(
@@ -1177,7 +1177,7 @@ async fn test_query_spec_path_filter_intersects_authz_before_results() {
             accept_degraded: false,
         },
         1,
-        Duration::from_secs(60),
+        INDEX_EVENTUAL_CONSISTENCY_TIMEOUT,
     )
     .await;
     let result = response.result.expect("query spec result");
@@ -1204,7 +1204,7 @@ async fn test_query_spec_path_filter_intersects_authz_before_results() {
             accept_degraded: false,
         },
         2,
-        Duration::from_secs(60),
+        INDEX_EVENTUAL_CONSISTENCY_TIMEOUT,
     )
     .await
     .result
@@ -1322,7 +1322,7 @@ async fn test_query_spec_inherit_object_filter_uses_derived_userset_grants() {
         "reader",
         "app",
         &reader_subject,
-        Duration::from_secs(10),
+        INDEX_EVENTUAL_CONSISTENCY_TIMEOUT,
     )
     .await;
 
@@ -1367,7 +1367,7 @@ async fn test_query_spec_inherit_object_filter_uses_derived_userset_grants() {
             accept_degraded: false,
         },
         1,
-        Duration::from_secs(10),
+        INDEX_EVENTUAL_CONSISTENCY_TIMEOUT,
     )
     .await;
     let result = response.result.expect("query spec result");
