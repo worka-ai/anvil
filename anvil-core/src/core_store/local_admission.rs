@@ -797,6 +797,9 @@ impl CoreStore {
                 state
             );
         }
+        let _order_guard = self
+            .acquire_pending_mutation_finalisation_turn(admission)
+            .await?;
         let finalisation = CorePendingMutationFinalisationRecord {
             schema: CORE_PENDING_MUTATION_FINALISATION_SCHEMA.to_string(),
             node_id: admission.node_id.clone(),
@@ -936,6 +939,39 @@ impl CoreStore {
             step_started_at.elapsed(),
         );
         Ok(())
+    }
+
+    async fn acquire_pending_mutation_finalisation_turn(
+        &self,
+        admission: &CorePendingMutationRecord,
+    ) -> Result<CoreStoreLock> {
+        let expected_previous_sequence = admission.sequence.saturating_sub(1);
+        for _ in 0..CORE_PROCESS_LOCK_RETRY_ATTEMPTS {
+            let guard = self
+                .acquire_named_lock("pending_mutation_finalisation_order", "core_transaction")
+                .await?;
+            let stream_head = self.read_stream_head_from_meta(CORE_TRANSACTION_STREAM_ID)?;
+            let current_sequence = stream_head
+                .as_ref()
+                .map(|head| head.last_sequence)
+                .unwrap_or(0);
+            if current_sequence == expected_previous_sequence {
+                return Ok(guard);
+            }
+            if current_sequence >= admission.sequence {
+                bail!(
+                    "CoreStore pending mutation finalisation sequence {} is behind transaction stream head {}",
+                    admission.sequence,
+                    current_sequence
+                );
+            }
+            drop(guard);
+            tokio::time::sleep(CORE_PROCESS_LOCK_RETRY_DELAY).await;
+        }
+        bail!(
+            "CoreStore pending mutation finalisation sequence {} did not reach its transaction stream turn",
+            admission.sequence
+        )
     }
 
     async fn remove_finalised_landed_byte_files_after_metadata_cleanup(

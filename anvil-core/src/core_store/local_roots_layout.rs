@@ -682,11 +682,24 @@ impl CoreStore {
                 outcome.root_key_hash == transaction_root_key_hash
                     && outcome.post_root_generation == post_root_generation
             })
-            .ok_or_else(|| {
-                anyhow!(
-                    "CoreStore root publication missing CoreMeta stream metadata commit evidence for generation {post_root_generation}"
-                )
-            })?;
+            .cloned()
+            .or_else(|| None);
+        let root_metadata_commit = match root_metadata_commit {
+            Some(commit) => commit,
+            None => self
+                .recommit_existing_core_transaction_stream_metadata(records, post_root_generation)
+                .await?
+                .into_iter()
+                .find(|outcome| {
+                    outcome.root_key_hash == transaction_root_key_hash
+                        && outcome.post_root_generation == post_root_generation
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "CoreStore root publication missing CoreMeta stream metadata commit evidence for generation {post_root_generation}"
+                    )
+                })?,
+        };
         let transaction = CoreTransactionManifestRecord {
             schema: "anvil.core.transaction_manifest.v1".to_string(),
             mutation_ids: records
@@ -731,6 +744,81 @@ impl CoreStore {
             transaction_manifest,
             current.as_ref(),
             post_root_generation,
+        )
+        .await
+    }
+
+    async fn recommit_existing_core_transaction_stream_metadata(
+        &self,
+        records: &[StreamRecord],
+        post_root_generation: u64,
+    ) -> Result<Vec<CoreMetaQuorumCommitOutcome>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(head_bytes) = self.meta.get(
+            CF_STREAM_HEADS,
+            TABLE_STREAM_HEAD_ROW,
+            &stream_head_key(CORE_TRANSACTION_STREAM_ID),
+        )?
+        else {
+            return Ok(Vec::new());
+        };
+        let head = decode_stream_head_record(&head_bytes)?;
+        if head.stream_id != CORE_TRANSACTION_STREAM_ID {
+            bail!("CoreStore transaction stream head metadata row has invalid scope");
+        }
+        if head.last_sequence != post_root_generation {
+            bail!(
+                "CoreStore transaction stream head is at generation {}, cannot reconstruct missing root generation {}",
+                head.last_sequence,
+                post_root_generation
+            );
+        }
+
+        let mut owned_ops = Vec::with_capacity(records.len() + 1);
+        for record in records {
+            if record.stream_id != CORE_TRANSACTION_STREAM_ID {
+                bail!(
+                    "CoreStore transaction root publication received non-transaction stream record"
+                );
+            }
+            if record.sequence > post_root_generation {
+                bail!("CoreStore transaction stream record exceeds target root generation");
+            }
+            let key = stream_record_key(CORE_TRANSACTION_STREAM_ID, record.sequence);
+            let Some(record_bytes) =
+                self.meta
+                    .get(CF_STREAM_RECORDS, TABLE_STREAM_RECORD_INDEX_ROW, &key)?
+            else {
+                return Ok(Vec::new());
+            };
+            let stored = decode_stream_record_index_row(&record_bytes)?;
+            if stored.stream_id != CORE_TRANSACTION_STREAM_ID
+                || stored.sequence != record.sequence
+                || stored.event_hash != record.event_hash
+            {
+                bail!("CoreStore transaction stream record metadata row has invalid scope");
+            }
+            owned_ops.push(OwnedCoreMetaBatchOp::Put {
+                cf: CF_STREAM_RECORDS,
+                table_id: TABLE_STREAM_RECORD_INDEX_ROW,
+                tuple_key: key,
+                payload: record_bytes,
+                common: None,
+            });
+        }
+        owned_ops.push(OwnedCoreMetaBatchOp::Put {
+            cf: CF_STREAM_HEADS,
+            table_id: TABLE_STREAM_HEAD_ROW,
+            tuple_key: stream_head_key(CORE_TRANSACTION_STREAM_ID),
+            payload: head_bytes,
+            common: None,
+        });
+        let ops = borrow_owned_coremeta_batch_ops(&owned_ops);
+        self.commit_coremeta_batch_by_embedded_roots(
+            &format!("core-transaction-stream-recover:{post_root_generation}"),
+            &ops,
         )
         .await
     }
