@@ -445,7 +445,7 @@ impl PersonalDbService for AppState {
                 have_log_hash: req.have_log_hash,
                 max_entries: nonzero_limit(req.max_entries),
             },
-            self.personaldb_signing_key(),
+            self.persistence.partition_owner_signing_key(),
         )
         .await
         .map_err(internal_status)?;
@@ -660,7 +660,7 @@ impl AppState {
                 recovered_manifest_hash: recovered_manifest_hash.to_string(),
                 now_nanos,
             },
-            self.personaldb_signing_key(),
+            self.persistence.partition_owner_signing_key(),
         )
         .await
         .map_err(internal_status)?;
@@ -678,7 +678,7 @@ impl AppState {
             recovered_through_sequence,
             recovered_manifest_hash,
             now_nanos.saturating_add(1),
-            self.personaldb_signing_key(),
+            self.persistence.partition_owner_signing_key(),
         )
         .await
         .map_err(internal_status)?;
@@ -691,13 +691,17 @@ impl AppState {
         &self,
         permit: &PartitionWritePermit,
     ) -> Result<CoreMutationPrecondition, Status> {
-        partition_write_precondition(&self.storage, permit, self.personaldb_signing_key())
-            .await
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "PersonalDB partition write fence is not current: {err}"
-                ))
-            })
+        partition_write_precondition(
+            &self.storage,
+            permit,
+            self.persistence.partition_owner_signing_key(),
+        )
+        .await
+        .map_err(|err| {
+            Status::failed_precondition(format!(
+                "PersonalDB partition write fence is not current: {err}"
+            ))
+        })
     }
 
     async fn handle_personaldb_projection_writeback(

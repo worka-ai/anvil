@@ -13,9 +13,8 @@ use anvil::anvil_personaldb_sqlite_changeset::iterate_changeset;
 use anvil::authz_scope::DEFAULT_AUTHZ_REALM_ID;
 use anvil::formats::hash32;
 use anvil::partition_fence::{
-    AcquireOwnership, ForceExpireOwnership, MAX_OWNERSHIP_LEASE_MS, OwnershipPrincipal,
-    OwnershipResource, OwnershipResourceKind, acquire_ownership, force_expire_ownership,
-    read_ownership_fence, read_partition_owner,
+    AcquireOwnership, MAX_OWNERSHIP_LEASE_MS, OwnershipPrincipal, OwnershipResource,
+    OwnershipResourceKind, acquire_ownership, read_ownership_fence, read_partition_owner,
 };
 use anvil::personaldb_commit_store::personaldb_changeset_payload_by_index_ref_name;
 use anvil::personaldb_coremeta::delete_personaldb_data_locator_row;

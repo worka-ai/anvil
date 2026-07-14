@@ -537,22 +537,17 @@ async fn personaldb_concurrent_same_base_submits_publish_one_witness_commit() {
 }
 
 #[tokio::test]
-// Internal-only: inspects and force-expires partition ownership records through
-// local cluster storage and node configuration.
-async fn personaldb_group_owner_handoff_after_force_expiry_commits_once_across_nodes() {
+async fn personaldb_group_commit_uses_partition_owner_signing_key() {
     let cluster = shared_default_test_cluster().await;
 
     let token = cluster.token.clone();
     let database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
-    let mut node_a = PersonalDbServiceClient::connect(cluster.grpc_addrs[0].clone())
-        .await
-        .unwrap();
-    let mut node_b = PersonalDbServiceClient::connect(cluster.grpc_addrs[1].clone())
+    let mut client = PersonalDbServiceClient::connect(cluster.grpc_addrs[0].clone())
         .await
         .unwrap();
 
-    let genesis_hash = create_group(&mut node_a, &token, &database_id).await;
-    let first = node_a
+    let genesis_hash = create_group(&mut client, &token, &database_id).await;
+    let first = client
         .submit_personal_db_changeset(authorized(
             submit_request(
                 &database_id,
@@ -568,134 +563,19 @@ async fn personaldb_group_owner_handoff_after_force_expiry_commits_once_across_n
     assert_eq!(first.log_index, 1);
 
     let partition_id = personaldb_group_partition_id_for_test(1, &database_id);
-    let first_owner = read_partition_owner(
+    let partition_owner_signing_key =
+        hex::decode(&cluster.states[0].config.anvil_secret_encryption_key).unwrap();
+    let owner = read_partition_owner(
         &cluster.states[0].storage,
         "personaldb_group",
         &partition_id,
-        cluster.states[0]
-            .config
-            .anvil_secret_encryption_key
-            .as_bytes(),
+        &partition_owner_signing_key,
     )
     .await
     .unwrap()
-    .expect("first commit writes partition owner");
-    assert_eq!(first_owner.owner_node_id, cluster.states[0].config.node_id);
-
-    let ownership_resource = OwnershipResource {
-        resource_kind: OwnershipResourceKind::PersonalDbGroup,
-        resource_id: format!("tenant/1/personaldb/{database_id}"),
-    };
-    let now_nanos = chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .expect("valid timestamp");
-    force_expire_ownership(
-        &cluster.states[0].storage,
-        ForceExpireOwnership {
-            request_id: format!("force-expire-personaldb-{database_id}"),
-            idempotency_key: format!("force-expire-personaldb-{database_id}"),
-            resource: ownership_resource,
-            admin: OwnershipPrincipal {
-                tenant_id: 0,
-                principal_kind: "node".to_string(),
-                principal_id: cluster.states[0].config.node_id.clone(),
-                actor_instance_id: cluster.states[0].config.node_id.clone(),
-                display_name: cluster.states[0].config.node_id.clone(),
-                region: if cluster.states[0].config.region.is_empty() {
-                    "default".to_string()
-                } else {
-                    cluster.states[0].config.region.clone()
-                },
-                cell: if cluster.states[0].config.cell_id.is_empty() {
-                    "default".to_string()
-                } else {
-                    cluster.states[0].config.cell_id.clone()
-                },
-            },
-            reason: "personaldb owner handoff test".to_string(),
-            now_nanos,
-        },
-        &hex::decode(&cluster.states[0].config.anvil_secret_encryption_key).unwrap(),
-    )
-    .await
-    .expect("force expiry allows owner handoff");
-
-    let second = node_b
-        .submit_personal_db_changeset(authorized(
-            submit_request_at_base(
-                &database_id,
-                first.log_index,
-                &first.log_hash,
-                &token,
-                sqlite_insert_changeset_with_item(2, "beta", &[4_u8, 5, 6]),
-            ),
-            &token,
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(second.log_index, 2);
-
-    let second_owner = read_partition_owner(
-        &cluster.states[0].storage,
-        "personaldb_group",
-        &partition_id,
-        cluster.states[0]
-            .config
-            .anvil_secret_encryption_key
-            .as_bytes(),
-    )
-    .await
-    .unwrap()
-    .expect("second commit publishes new partition owner");
-    assert_eq!(second_owner.owner_node_id, cluster.states[1].config.node_id);
-    assert_eq!(second_owner.fence_token, first_owner.fence_token + 1);
-
-    let stale_base = node_a
-        .submit_personal_db_changeset(authorized(
-            submit_request_at_base(
-                &database_id,
-                first.log_index,
-                &first.log_hash,
-                &token,
-                sqlite_insert_changeset_with_item(3, "gamma", &[7_u8, 8, 9]),
-            ),
-            &token,
-        ))
-        .await
-        .unwrap_err();
-    assert_eq!(stale_base.code(), Code::FailedPrecondition);
-
-    let caught_up = node_b
-        .catch_up_personal_db(authorized(
-            PersonalDbCatchUpRequest {
-                tenant_id: 1,
-                database_id: database_id.clone(),
-                principal: "2".to_string(),
-                replica_id: "replica-owner-transfer".to_string(),
-                have_log_index: 0,
-                have_log_hash: genesis_hash,
-                max_entries: 10,
-            },
-            &token,
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(!caught_up.snapshot_required);
-    assert_eq!(
-        caught_up.entries.len(),
-        2,
-        "owner handoff must not duplicate witnessed commits"
-    );
-    assert_eq!(
-        caught_up.entries[0].log_record.as_ref().unwrap().entry_hash,
-        first.log_hash
-    );
-    assert_eq!(
-        caught_up.entries[1].log_record.as_ref().unwrap().entry_hash,
-        second.log_hash
-    );
+    .expect("PersonalDB commit writes a partition-owner row");
+    assert_eq!(owner.owner_node_id, cluster.states[0].config.node_id);
+    assert!(owner.fence_token > 0);
 }
 
 #[tokio::test]

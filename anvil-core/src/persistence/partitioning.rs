@@ -78,6 +78,10 @@ impl Persistence {
         self.task_notify.clone()
     }
 
+    pub(crate) fn partition_owner_signing_key(&self) -> &[u8] {
+        &self.partition_owner_signing_key
+    }
+
     pub(crate) fn owner_node_id(&self) -> &str {
         &self.owner_node_id
     }
