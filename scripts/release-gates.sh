@@ -61,6 +61,18 @@ require_image() {
   echo "[anvil-gate] using ANVIL_IMAGE=${ANVIL_IMAGE}"
 }
 
+reset_shared_docker_cluster() {
+  local project="${ANVIL_DOCKER_TEST_PROJECT:-anvil-shared-test}"
+  local compose_file="anvil/tests/docker-compose.test.yml"
+  local node_count="${ANVIL_DOCKER_TEST_NODE_COUNT:-6}"
+  local node
+  for node in $(seq 1 "${node_count}"); do
+    export "ANVIL_TEST_NODE${node}_TOKEN=release-gate-reset-token-${node}"
+  done
+  rm -f "${TMPDIR:-/tmp}/anvil-test-cluster-locks/docker-shared-cluster.lock"
+  docker compose -p "${project}" -f "${compose_file}" down -v --remove-orphans || true
+}
+
 static_gates() {
   run_step "no external database gate" ./scripts/check-no-external-db.sh
   run_step "no public unfenced journal writes gate" ./scripts/check-no-public-unfenced-journal-writes.sh
@@ -112,6 +124,7 @@ server_core_integration_gates() {
 
 docker_auth_gates() {
   require_image
+  reset_shared_docker_cluster
   local tests=(
     auth
     auth_tests
@@ -138,6 +151,7 @@ run_docker_s3_test_filter() {
 
 docker_storage_gates() {
   require_image
+  reset_shared_docker_cluster
   local tests=(
     bucket_tests
     rust_client_tests
@@ -177,6 +191,7 @@ run_docker_index_test_filter() {
 
 docker_index_gates() {
   require_image
+  reset_shared_docker_cluster
   local tests=(
     git_source_tests
     hf_ingestion_e2e
@@ -212,6 +227,7 @@ docker_index_gates() {
 
 docker_mesh_gates() {
   require_image
+  reset_shared_docker_cluster
   local tests=(
     distributed_tests
     docker_cluster_test
