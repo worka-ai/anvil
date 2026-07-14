@@ -356,10 +356,10 @@ impl CoreStore {
             admission.landed_bytes.first().cloned().ok_or_else(|| {
                 anyhow!("CoreStore put_blob admission did not produce landed bytes")
             })?;
-        let materialised_bytes = self.read_landed_bytes(&landed).await?;
-        let hash = strip_sha256_prefix(&landed.sha256)?.to_string();
-        let object_ref = self
-            .materialise_object_blob_bytes(
+        let object_ref = match async {
+            let materialised_bytes = self.read_landed_bytes(&landed).await?;
+            let hash = strip_sha256_prefix(&landed.sha256)?.to_string();
+            self.materialise_object_blob_bytes(
                 &input.logical_name,
                 request.generation,
                 block_index as u64,
@@ -381,7 +381,26 @@ impl CoreStore {
                     "materialise CoreStore logical-file block logical_file_id={} block_index={} mutation_id={}",
                     request.logical_file_id, block_index, admission.mutation_id
                 )
-            })?;
+            })
+        }
+        .await
+        {
+            Ok(object_ref) => object_ref,
+            Err(error) => {
+                if let Err(finalise_error) = self
+                    .mark_pending_mutation_finalised_unlocked(&admission, "aborted")
+                    .await
+                {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "abort CoreStore logical-file block mutation mutation_id={} after materialisation failure also failed: {finalise_error:#}",
+                            admission.mutation_id
+                        )
+                    });
+                }
+                return Err(error);
+            }
+        };
         self.mark_pending_mutation_finalised_unlocked(&admission, "committed")
             .await
             .with_context(|| {
@@ -494,13 +513,13 @@ impl CoreStore {
             admission.landed_bytes.first().cloned().ok_or_else(|| {
                 anyhow!("CoreStore put_blob admission did not produce landed bytes")
             })?;
-        let materialised_bytes = self.read_landed_bytes(&landed).await?;
-        if landed.sha256 != stored_hash {
-            bail!("CoreStore landed byte hash does not match encoded object hash");
-        }
-        let stored_hash_hex = strip_sha256_prefix(&landed.sha256)?.to_string();
-        let object_ref = self
-            .materialise_object_blob_bytes(
+        let object_ref = match async {
+            let materialised_bytes = self.read_landed_bytes(&landed).await?;
+            if landed.sha256 != stored_hash {
+                bail!("CoreStore landed byte hash does not match encoded object hash");
+            }
+            let stored_hash_hex = strip_sha256_prefix(&landed.sha256)?.to_string();
+            self.materialise_object_blob_bytes(
                 &logical_file_id,
                 0,
                 0,
@@ -516,7 +535,26 @@ impl CoreStore {
                 encryption_algorithm,
                 writer_family,
             )
-            .await?;
+            .await
+        }
+        .await
+        {
+            Ok(object_ref) => object_ref,
+            Err(error) => {
+                if let Err(finalise_error) = self
+                    .mark_pending_mutation_finalised_unlocked(&admission, "aborted")
+                    .await
+                {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "abort CoreStore blob mutation mutation_id={} after materialisation failure also failed: {finalise_error:#}",
+                            admission.mutation_id
+                        )
+                    });
+                }
+                return Err(error);
+            }
+        };
         self.mark_pending_mutation_finalised_unlocked(&admission, "committed")
             .await?;
         Ok(object_ref)
