@@ -115,6 +115,7 @@ mod tests {
             transaction_id: None,
             saga_operation: Some(SagaOperationContext::default()),
             saga_compensation_operation: None,
+            write_visibility: None,
         };
         let public = PublicMutationContext {
             request_id: "public-request".to_string(),

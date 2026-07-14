@@ -518,6 +518,7 @@ mod tests {
             transaction_id: None,
             saga_operation: None,
             saga_compensation_operation: None,
+            write_visibility: None,
         }
     }
 

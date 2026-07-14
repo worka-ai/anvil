@@ -214,6 +214,7 @@ pub(crate) async fn native_mutation_context(
         transaction_id,
         saga_operation: None,
         saga_compensation_operation: None,
+        write_visibility: None,
     })
 }
 
@@ -484,6 +485,7 @@ async fn handle_object_boundary_command(
                     transaction_id: transaction_id.clone(),
                     saga_operation: None,
                     saga_compensation_operation: None,
+                    write_visibility: None,
                 }),
             });
             request.metadata_mut().insert(

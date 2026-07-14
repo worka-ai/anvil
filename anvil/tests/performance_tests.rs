@@ -54,6 +54,7 @@ fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
         transaction_id: None,
         saga_operation: None,
         saga_compensation_operation: None,
+        write_visibility: None,
     }
 }
 
@@ -284,6 +285,7 @@ async fn performance_docker_end_user_flow() {
                 transaction_id: None,
                 saga_operation: None,
                 saga_compensation_operation: None,
+                write_visibility: None,
             };
             let metadata = PutObjectRequest {
                 data: Some(anvil_api::put_object_request::Data::Metadata(

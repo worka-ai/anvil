@@ -139,6 +139,7 @@ fn mutation_batch_helper_wraps_typed_operations() {
         transaction_id: Some("tx-123".to_string()),
         saga_operation: None,
         saga_compensation_operation: None,
+        write_visibility: None,
     };
     let precondition = proto::WritePrecondition {
         object_versions: Vec::new(),
