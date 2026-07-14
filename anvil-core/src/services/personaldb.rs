@@ -445,7 +445,7 @@ impl PersonalDbService for AppState {
                 have_log_hash: req.have_log_hash,
                 max_entries: nonzero_limit(req.max_entries),
             },
-            self.persistence.partition_owner_signing_key(),
+            self.personaldb_signing_key(),
         )
         .await
         .map_err(internal_status)?;
