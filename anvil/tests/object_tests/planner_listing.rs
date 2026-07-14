@@ -68,8 +68,8 @@ fn public_object_listing_fails_closed_when_planner_candidate_path_is_missing() {
     );
     assert!(
         planner_body.contains("CoreStoreQueryPlanner")
-            && planner_body.contains("AuthzSegmentCandidateReader"),
-        "object listing must use the shared planner and revision-bound authz segment candidates"
+            && planner_body.contains("ObjectListingAuthzCandidateReader"),
+        "object listing must use the shared planner and its revision-bound inherited/object authz candidate reader"
     );
 }
 

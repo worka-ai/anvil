@@ -1,12 +1,14 @@
 use super::*;
 use crate::core_store::ReadLogicalRangeRequest;
 use crate::query_planner::{
+    AuthzCandidateReader, AuthzDecision, BoundaryCandidateReader, IndexCandidateReader,
+};
+use crate::query_planner::{
     AuthzCandidateRequest, BoundaryCandidateRequest, CandidateSet, CandidateSetKind,
     CandidateSetScope, CoreDocId, IndexCandidateRequest, ObjectAuthzKey, OrderedDocTuple,
     QueryPlanRequest, RangePlanRequest, ReadRangePlan, stable_doc_ordinal,
 };
-use crate::query_planner::{BoundaryCandidateReader, IndexCandidateReader};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 impl ObjectManager {
     pub async fn get_object(
@@ -918,9 +920,11 @@ impl ObjectManager {
             order_hash: object_listing_hash(&["order", family, order]),
         };
         let reader = ObjectListingCandidateReader::new(scope.clone(), partition_id, docs);
-        let authz_reader = crate::authz_segment::AuthzSegmentCandidateReader::new(
+        let authz_reader = ObjectListingAuthzCandidateReader::new(
             self.storage.clone(),
             crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
+            bucket.clone(),
+            reader.docs.clone(),
         );
         let planner = crate::query_planner::CoreStoreQueryPlanner {
             boundary_reader: &reader,
@@ -1633,6 +1637,171 @@ impl ObjectListingCandidateReader {
             partition_id,
             docs,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ObjectListingAuthzCandidateReader {
+    storage: crate::storage::Storage,
+    tenant_id: i64,
+    bucket: Bucket,
+    docs: Vec<ObjectListingPlanDoc>,
+}
+
+#[derive(Debug, Clone)]
+struct ObjectListingAuthzSubject {
+    subject_kind: String,
+    subject_id: String,
+    caveat_hash: String,
+}
+
+#[derive(Debug, Clone)]
+struct ObjectListingAuthzAllowance {
+    bucket_wide: bool,
+    object_ids: BTreeSet<String>,
+}
+
+impl ObjectListingAuthzCandidateReader {
+    fn new(
+        storage: crate::storage::Storage,
+        tenant_id: i64,
+        bucket: Bucket,
+        docs: Vec<ObjectListingPlanDoc>,
+    ) -> Self {
+        Self {
+            storage,
+            tenant_id,
+            bucket,
+            docs,
+        }
+    }
+
+    async fn allowance(
+        &self,
+        request: &AuthzCandidateRequest,
+    ) -> AnyhowResult<ObjectListingAuthzAllowance> {
+        let subject = object_listing_authz_subject(&request.subject);
+        let mut object_ids = BTreeSet::new();
+        let mut bucket_wide = false;
+
+        let Some(segment) = crate::authz_segment::ensure_authz_tuple_segment_at_revision(
+            &self.storage,
+            self.tenant_id,
+            request.system_revision,
+        )
+        .await?
+        else {
+            if request.system_revision > 0 {
+                bail!("AuthzCandidateSetStale");
+            }
+            return Ok(ObjectListingAuthzAllowance {
+                bucket_wide,
+                object_ids,
+            });
+        };
+        if segment.header.generation != request.system_revision {
+            bail!("AuthzCandidateSetStale");
+        }
+
+        let bucket_namespace =
+            access_control::system_realm_namespace(crate::system_realm::SYSTEM_BUCKET_NAMESPACE);
+        let object_namespace =
+            access_control::system_realm_namespace(crate::system_realm::SYSTEM_OBJECT_NAMESPACE);
+        let bucket_object_id = access_control::bucket_object_id(&self.bucket);
+
+        for row in &segment.list_objects {
+            if row.revision > request.system_revision
+                || !object_listing_authz_row_subject_matches(row, &subject)
+            {
+                continue;
+            }
+            if row.namespace == bucket_namespace
+                && row.relation == "get_object"
+                && row.object_id == bucket_object_id
+            {
+                bucket_wide = true;
+            } else if row.namespace == object_namespace
+                && row.relation == request.relation
+                && row.object_id.starts_with(&format!("{}/", self.bucket.id))
+            {
+                object_ids.insert(row.object_id.clone());
+            }
+        }
+
+        Ok(ObjectListingAuthzAllowance {
+            bucket_wide,
+            object_ids,
+        })
+    }
+}
+
+impl AuthzCandidateReader for ObjectListingAuthzCandidateReader {
+    async fn candidate_set(&self, request: AuthzCandidateRequest) -> AnyhowResult<CandidateSet> {
+        let allowance = self.allowance(&request).await?;
+        if allowance.bucket_wide {
+            return Ok(CandidateSet::all_within_partition(
+                request.candidate_scope,
+                request.partition_id,
+            ));
+        }
+        let doc_ordinals = self
+            .docs
+            .iter()
+            .filter(|doc| {
+                allowance
+                    .object_ids
+                    .contains(&doc.authz_key.canonical_object_id)
+            })
+            .map(|doc| doc.doc_id.ordinal());
+        Ok(CandidateSet::bitmap_from_ordinals(
+            request.candidate_scope,
+            request.partition_id,
+            doc_ordinals,
+        ))
+    }
+
+    async fn verify_page(
+        &self,
+        request: AuthzCandidateRequest,
+        object_keys: Vec<ObjectAuthzKey>,
+    ) -> AnyhowResult<Vec<AuthzDecision>> {
+        let allowance = self.allowance(&request).await?;
+        Ok(object_keys
+            .into_iter()
+            .map(|object_key| AuthzDecision {
+                allowed: allowance.bucket_wide
+                    || allowance
+                        .object_ids
+                        .contains(&object_key.canonical_object_id),
+                object_key,
+                revision: request.system_revision,
+            })
+            .collect())
+    }
+}
+
+fn object_listing_authz_row_subject_matches(
+    row: &crate::authz_segment::AuthzListObjectsRow,
+    subject: &ObjectListingAuthzSubject,
+) -> bool {
+    row.subject_kind == subject.subject_kind
+        && row.subject_id == subject.subject_id
+        && row.caveat_hash == subject.caveat_hash
+}
+
+fn object_listing_authz_subject(subject: &str) -> ObjectListingAuthzSubject {
+    let (subject_kind, rest) = subject
+        .split_once(':')
+        .map(|(kind, id)| (kind.to_string(), id.to_string()))
+        .unwrap_or_else(|| ("user".to_string(), subject.to_string()));
+    let (subject_id, caveat_hash) = rest
+        .split_once('@')
+        .map(|(id, caveat)| (id.to_string(), caveat.to_string()))
+        .unwrap_or((rest, String::new()));
+    ObjectListingAuthzSubject {
+        subject_kind,
+        subject_id,
+        caveat_hash,
     }
 }
 
