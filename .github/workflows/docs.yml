@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: worka-l1
+    runs-on: [self-hosted, worka-builder-1]
 
     steps:
     - name: Checkout repository
@@ -62,7 +62,7 @@ jobs:
 
   deploy:
     needs: build
-    runs-on: worka-l1
+    runs-on: [self-hosted, worka-builder-1]
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
