@@ -125,13 +125,17 @@ server_core_integration_gates() {
 docker_auth_gates() {
   require_image
   reset_shared_docker_cluster
-  local tests=(
-    auth
-    auth_tests
-  )
-  for test_name in "${tests[@]}"; do
-    run_docker_cargo_test "Docker auth integration ${test_name}" -p anvil-server --test "${test_name}"
-  done
+  run_docker_cargo_test "Docker auth integration auth" -p anvil-server --test auth
+  # auth_tests covers several independent authz and tenant-scope suites. Run
+  # each module as its own step so CI keeps useful timeout boundaries while
+  # still exercising the complete public/admin auth surface.
+  run_docker_cargo_test "Docker auth integration auth_tests grpc errors" -p anvil-server --test auth_tests "grpc_error_responses_include_server_request_id"
+  run_docker_cargo_test "Docker auth integration auth_tests access and tuples" -p anvil-server --test auth_tests "access_and_tuple::"
+  run_docker_cargo_test "Docker auth integration auth_tests leases and object authz" -p anvil-server --test auth_tests "leases_and_object_authz::"
+  run_docker_cargo_test "Docker auth integration auth_tests links apps tenant scope" -p anvil-server --test auth_tests "links_apps_and_tenant_scope::"
+  run_docker_cargo_test "Docker auth integration auth_tests object lists schemas" -p anvil-server --test auth_tests "object_lists_and_schemas::"
+  run_docker_cargo_test "Docker auth integration auth_tests public access secret reset" -p anvil-server --test auth_tests "public_access_and_secret_reset::"
+  run_docker_cargo_test "Docker auth integration auth_tests stream authorisation" -p anvil-server --test auth_tests "stream_authorisation::"
   run_docker_cargo_test "Docker CLI auth integration" -p anvil-storage-cli --test cli_auth
 }
 
