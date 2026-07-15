@@ -264,7 +264,19 @@ docker_index_gates() {
   run_docker_index_test_filter "query typed json" "query_spec::test_typed_json_index_queries_canonical_object_body_with_range_order_and_page_token"
   run_docker_index_test_filter "typed lifecycle" "typed_lifecycle::"
   run_docker_index_test_filter "validation diagnostics" "validation_diagnostics::"
-  run_docker_index_test_filter "vector hybrid" "vector_hybrid::"
+  # The vector/hybrid module exercises multiple independent slow background
+  # index-build paths. Keep the same coverage, but avoid one aggregate process
+  # accumulating enough state to trip the per-step timeout.
+  run_docker_index_test_filter "vector hybrid build hybrid" "vector_hybrid::test_hybrid_index_builds_text_and_vector_segments_from_object_write_task"
+  run_docker_index_test_filter "vector hybrid full text latest" "vector_hybrid::test_query_full_text_index_reads_latest_segment"
+  run_docker_index_test_filter "vector hybrid phrase positions" "vector_hybrid::test_query_full_text_phrase_requires_position_enabled_index"
+  run_docker_index_test_filter "vector hybrid query hybrid" "vector_hybrid::test_query_hybrid_index_combines_full_text_and_vector_segments"
+  run_docker_index_test_filter "vector hybrid inherit full text" "vector_hybrid::test_query_inherit_object_full_text_filters_results_by_object_read_scope"
+  run_docker_index_test_filter "vector hybrid inherit vector" "vector_hybrid::test_query_inherit_object_vector_filters_results_by_object_read_scope"
+  run_docker_index_test_filter "vector hybrid vector latest" "vector_hybrid::test_query_vector_index_reads_latest_segment"
+  run_docker_index_test_filter "vector hybrid dimension diagnostic" "vector_hybrid::test_vector_index_build_records_dimension_mismatch_diagnostic"
+  run_docker_index_test_filter "vector hybrid build vector" "vector_hybrid::test_vector_index_builds_from_object_write_task"
+  run_docker_index_test_filter "vector hybrid media modalities" "vector_hybrid::test_vector_index_builds_required_media_modalities_from_object_write_tasks"
 
   run_docker_cargo_test "Docker CLI extended integration" -p anvil-storage-cli --test cli_extended
 }
