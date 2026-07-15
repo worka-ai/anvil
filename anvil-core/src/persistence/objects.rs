@@ -9,6 +9,15 @@ pub struct ObjectCreateOptions {
 }
 
 impl ObjectCreateOptions {
+    pub fn deferred() -> Self {
+        Self {
+            exact_index_policy_snapshot: false,
+            exact_authz_revision: false,
+            enqueue_index_maintenance: false,
+            enqueue_metadata_compaction: false,
+        }
+    }
+
     pub fn strict() -> Self {
         Self {
             exact_index_policy_snapshot: true,
@@ -16,6 +25,12 @@ impl ObjectCreateOptions {
             enqueue_index_maintenance: true,
             enqueue_metadata_compaction: true,
         }
+    }
+}
+
+impl Default for ObjectCreateOptions {
+    fn default() -> Self {
+        Self::deferred()
     }
 }
 
@@ -273,6 +288,15 @@ impl Persistence {
         &self,
         request: object_links::PutObjectLinkRequest,
     ) -> std::result::Result<object_links::ObjectLinkMutation, object_links::ObjectLinkError> {
+        self.put_object_link_with_options(request, ObjectCreateOptions::deferred())
+            .await
+    }
+
+    pub async fn put_object_link_with_options(
+        &self,
+        request: object_links::PutObjectLinkRequest,
+        options: ObjectCreateOptions,
+    ) -> std::result::Result<object_links::ObjectLinkMutation, object_links::ObjectLinkError> {
         if !crate::validation::is_valid_object_key(&request.link_key) {
             return Err(object_links::ObjectLinkError::InvalidLinkKey);
         }
@@ -381,15 +405,22 @@ impl Persistence {
         let etag = object_links::link_metadata_etag(&descriptor);
         let version_id = uuid::Uuid::new_v4();
         let mutation_id = uuid::Uuid::new_v4();
-        let index_policy_snapshot = self
-            .active_index_policy_snapshot_hash(request.tenant_id, bucket.id)
-            .await?;
+        let index_policy_snapshot = if options.exact_index_policy_snapshot {
+            self.active_index_policy_snapshot_hash(request.tenant_id, bucket.id)
+                .await?
+        } else {
+            deferred_index_policy_snapshot_hash(request.tenant_id, bucket.id)
+        };
         let user_meta = Some(serde_json::json!({
             "schema": "anvil.object_link.v1",
             "idempotency_key": request.idempotency_key.clone(),
         }));
         let user_metadata_hash = user_metadata_hash(user_meta.as_ref());
-        let authz_revision = self.latest_authz_revision(request.tenant_id).await?;
+        let authz_revision = if options.exact_authz_revision {
+            self.latest_authz_revision(request.tenant_id).await?
+        } else {
+            0
+        };
         let record_hash = object_version_record_hash(ObjectVersionRecordHashInput {
             tenant_id: request.tenant_id,
             bucket_id: bucket.id,
@@ -468,9 +499,13 @@ impl Persistence {
                 &self.partition_owner_signing_key,
             )
             .await?;
-            self.enqueue_index_builds_for_bucket(&bucket).await?;
-            self.enqueue_object_metadata_compaction_if_due(&bucket)
-                .await?;
+            if options.enqueue_index_maintenance {
+                self.enqueue_index_builds_for_bucket(&bucket).await?;
+            }
+            if options.enqueue_metadata_compaction {
+                self.enqueue_object_metadata_compaction_if_due(&bucket)
+                    .await?;
+            }
         }
         Ok(object_links::ObjectLinkMutation {
             link: object,
@@ -557,6 +592,16 @@ impl Persistence {
         request: object_links::DeleteObjectLinkRequest,
     ) -> std::result::Result<object_links::DeleteObjectLinkResult, object_links::ObjectLinkError>
     {
+        self.delete_object_link_with_options(request, ObjectCreateOptions::deferred())
+            .await
+    }
+
+    pub async fn delete_object_link_with_options(
+        &self,
+        request: object_links::DeleteObjectLinkRequest,
+        options: ObjectCreateOptions,
+    ) -> std::result::Result<object_links::DeleteObjectLinkResult, object_links::ObjectLinkError>
+    {
         if !crate::validation::is_valid_object_key(&request.link_key) {
             return Err(object_links::ObjectLinkError::InvalidLinkKey);
         }
@@ -598,15 +643,22 @@ impl Persistence {
         let mutation_id = uuid::Uuid::new_v4();
         let content_hash = String::new();
         let etag = String::new();
-        let index_policy_snapshot = self
-            .active_index_policy_snapshot_hash(request.tenant_id, bucket.id)
-            .await?;
+        let index_policy_snapshot = if options.exact_index_policy_snapshot {
+            self.active_index_policy_snapshot_hash(request.tenant_id, bucket.id)
+                .await?
+        } else {
+            deferred_index_policy_snapshot_hash(request.tenant_id, bucket.id)
+        };
         let user_meta = Some(serde_json::json!({
             "schema": "anvil.object_link_delete.v1",
             "idempotency_key": request.idempotency_key.clone(),
         }));
         let user_metadata_hash = user_metadata_hash(user_meta.as_ref());
-        let authz_revision = self.latest_authz_revision(request.tenant_id).await?;
+        let authz_revision = if options.exact_authz_revision {
+            self.latest_authz_revision(request.tenant_id).await?
+        } else {
+            0
+        };
         let record_hash = object_version_record_hash(ObjectVersionRecordHashInput {
             tenant_id: request.tenant_id,
             bucket_id: bucket.id,
@@ -684,9 +736,13 @@ impl Persistence {
                 &self.partition_owner_signing_key,
             )
             .await?;
-            self.enqueue_index_builds_for_bucket(&bucket).await?;
-            self.enqueue_object_metadata_compaction_if_due(&bucket)
-                .await?;
+            if options.enqueue_index_maintenance {
+                self.enqueue_index_builds_for_bucket(&bucket).await?;
+            }
+            if options.enqueue_metadata_compaction {
+                self.enqueue_object_metadata_compaction_if_due(&bucket)
+                    .await?;
+            }
         }
         Ok(object_links::DeleteObjectLinkResult {
             link_key: request.link_key,
@@ -836,6 +892,24 @@ impl Persistence {
         transaction_id: Option<&str>,
         transaction_principal: Option<&str>,
     ) -> Result<Option<Object>> {
+        self.soft_delete_object_in_transaction_with_options(
+            bucket_id,
+            key,
+            transaction_id,
+            transaction_principal,
+            ObjectCreateOptions::deferred(),
+        )
+        .await
+    }
+
+    pub async fn soft_delete_object_in_transaction_with_options(
+        &self,
+        bucket_id: i64,
+        key: &str,
+        transaction_id: Option<&str>,
+        transaction_principal: Option<&str>,
+        options: ObjectCreateOptions,
+    ) -> Result<Option<Object>> {
         let Some(bucket) =
             bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
         else {
@@ -893,9 +967,13 @@ impl Persistence {
                 &self.partition_owner_signing_key,
             )
             .await?;
-            self.enqueue_index_builds_for_bucket(&bucket).await?;
-            self.enqueue_object_metadata_compaction_if_due(&bucket)
-                .await?;
+            if options.enqueue_index_maintenance {
+                self.enqueue_index_builds_for_bucket(&bucket).await?;
+            }
+            if options.enqueue_metadata_compaction {
+                self.enqueue_object_metadata_compaction_if_due(&bucket)
+                    .await?;
+            }
         }
         Ok(Some(object))
     }
@@ -917,6 +995,26 @@ impl Persistence {
         version_id: uuid::Uuid,
         transaction_id: Option<&str>,
         transaction_principal: Option<&str>,
+    ) -> Result<Option<Object>> {
+        self.delete_object_version_in_transaction_with_options(
+            bucket_id,
+            key,
+            version_id,
+            transaction_id,
+            transaction_principal,
+            ObjectCreateOptions::deferred(),
+        )
+        .await
+    }
+
+    pub async fn delete_object_version_in_transaction_with_options(
+        &self,
+        bucket_id: i64,
+        key: &str,
+        version_id: uuid::Uuid,
+        transaction_id: Option<&str>,
+        transaction_principal: Option<&str>,
+        options: ObjectCreateOptions,
     ) -> Result<Option<Object>> {
         let Some(bucket) =
             bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
@@ -967,9 +1065,13 @@ impl Persistence {
                 &self.partition_owner_signing_key,
             )
             .await?;
-            self.enqueue_index_builds_for_bucket(&bucket).await?;
-            self.enqueue_object_metadata_compaction_if_due(&bucket)
-                .await?;
+            if options.enqueue_index_maintenance {
+                self.enqueue_index_builds_for_bucket(&bucket).await?;
+            }
+            if options.enqueue_metadata_compaction {
+                self.enqueue_object_metadata_compaction_if_due(&bucket)
+                    .await?;
+            }
         }
         Ok(Some(object))
     }

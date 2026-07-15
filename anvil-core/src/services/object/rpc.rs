@@ -327,6 +327,7 @@ impl ObjectService for AppState {
         )
         .await?;
         let transaction_id = native_transaction_id(req.mutation_context.as_ref())?;
+        let write_visibility = object_write_visibility(req.mutation_context.as_ref())?;
         let target =
             NativeIdempotencyTarget::new("DeleteObject", &req.bucket_name, &req.object_key)
                 .with_parameters(serde_json::json!({
@@ -365,6 +366,7 @@ impl ObjectService for AppState {
                         version_id,
                         transaction_id,
                         transaction_principal.as_deref(),
+                        write_visibility,
                     )
                     .await?
             } else {
@@ -375,10 +377,12 @@ impl ObjectService for AppState {
                         &req.object_key,
                         transaction_id,
                         transaction_principal.as_deref(),
+                        write_visibility,
                     )
                     .await?
             };
-        let watch_cursor = if transaction_id.is_some() {
+        let watch_cursor = if transaction_id.is_some() || !write_visibility.requires_watch_visible()
+        {
             0
         } else {
             object_watch_cursor(self, &deleted).await?
@@ -1243,6 +1247,7 @@ impl ObjectService for AppState {
                                 version_id,
                                 transaction_id,
                                 transaction_principal.as_deref(),
+                                write_visibility,
                             )
                             .await?
                     } else {
@@ -1253,14 +1258,16 @@ impl ObjectService for AppState {
                                 &op.object_key,
                                 transaction_id,
                                 transaction_principal.as_deref(),
+                                write_visibility,
                             )
                             .await?
                     };
-                    let watch_cursor = if transaction_id.is_some() {
-                        0
-                    } else {
-                        object_watch_cursor(self, &deleted).await?
-                    };
+                    let watch_cursor =
+                        if transaction_id.is_some() || !write_visibility.requires_watch_visible() {
+                            0
+                        } else {
+                            object_watch_cursor(self, &deleted).await?
+                        };
                     max_watch_cursor = max_watch_cursor.max(watch_cursor);
                     receipts.push(MutationBatchOperationReceipt {
                         operation: "delete_object".to_string(),

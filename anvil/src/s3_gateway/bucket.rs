@@ -767,12 +767,27 @@ pub(super) async fn delete_objects(
         let delete_result = if let Some(version_id) = version_id {
             state
                 .object_manager
-                .delete_object_version(&claims, &bucket, &key, version_id, None, None)
+                .delete_object_version(
+                    &claims,
+                    &bucket,
+                    &key,
+                    version_id,
+                    None,
+                    None,
+                    ObjectWriteVisibility::default(),
+                )
                 .await
         } else {
             state
                 .object_manager
-                .delete_object(&claims, &bucket, &key, None, None)
+                .delete_object(
+                    &claims,
+                    &bucket,
+                    &key,
+                    None,
+                    None,
+                    ObjectWriteVisibility::default(),
+                )
                 .await
         };
 

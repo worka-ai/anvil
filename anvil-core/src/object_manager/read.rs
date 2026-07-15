@@ -257,6 +257,7 @@ impl ObjectManager {
         object_key: &str,
         transaction_id: Option<&str>,
         transaction_principal: Option<&str>,
+        visibility: ObjectWriteVisibility,
     ) -> Result<Object, Status> {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
@@ -282,18 +283,49 @@ impl ObjectManager {
 
         let delete_marker = self
             .persistence
-            .soft_delete_object_in_transaction(
+            .soft_delete_object_in_transaction_with_options(
                 bucket.id,
                 object_key,
                 transaction_id,
                 transaction_principal,
+                visibility.persistence_options(),
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Object not found"))?;
         if transaction_id.is_none() {
-            self.publish_object_watch_event(tenant_id, &bucket, &delete_marker, "delete", true)
-                .await?;
+            if visibility.defers_write_maintenance() {
+                self.schedule_deferred_object_maintenance(bucket.clone());
+            }
+            if visibility.requires_watch_visible() {
+                self.publish_object_watch_event(tenant_id, &bucket, &delete_marker, "delete", true)
+                    .await?;
+            } else {
+                let manager = self.clone();
+                let bucket = bucket.clone();
+                let delete_marker = delete_marker.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = manager
+                        .publish_object_watch_event(
+                            tenant_id,
+                            &bucket,
+                            &delete_marker,
+                            "delete",
+                            true,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            tenant_id,
+                            bucket_id = bucket.id,
+                            bucket_name = %bucket.name,
+                            object_key = %delete_marker.key,
+                            %error,
+                            "deferred object delete watch publication failed"
+                        );
+                    }
+                });
+            }
         }
 
         Ok(delete_marker)
@@ -307,6 +339,7 @@ impl ObjectManager {
         version_id: uuid::Uuid,
         transaction_id: Option<&str>,
         transaction_principal: Option<&str>,
+        visibility: ObjectWriteVisibility,
     ) -> Result<Object, Status> {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
@@ -337,25 +370,56 @@ impl ObjectManager {
 
         let deleted = self
             .persistence
-            .delete_object_version_in_transaction(
+            .delete_object_version_in_transaction_with_options(
                 bucket.id,
                 object_key,
                 version_id,
                 transaction_id,
                 transaction_principal,
+                visibility.persistence_options(),
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Object version not found"))?;
         if transaction_id.is_none() {
-            self.publish_object_watch_event(
-                tenant_id,
-                &bucket,
-                &deleted,
-                "delete_version",
-                deleted.deleted_at.is_some(),
-            )
-            .await?;
+            if visibility.defers_write_maintenance() {
+                self.schedule_deferred_object_maintenance(bucket.clone());
+            }
+            if visibility.requires_watch_visible() {
+                self.publish_object_watch_event(
+                    tenant_id,
+                    &bucket,
+                    &deleted,
+                    "delete_version",
+                    deleted.deleted_at.is_some(),
+                )
+                .await?;
+            } else {
+                let manager = self.clone();
+                let bucket = bucket.clone();
+                let deleted = deleted.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = manager
+                        .publish_object_watch_event(
+                            tenant_id,
+                            &bucket,
+                            &deleted,
+                            "delete_version",
+                            deleted.deleted_at.is_some(),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            tenant_id,
+                            bucket_id = bucket.id,
+                            bucket_name = %bucket.name,
+                            object_key = %deleted.key,
+                            %error,
+                            "deferred object version delete watch publication failed"
+                        );
+                    }
+                });
+            }
         }
 
         Ok(deleted)

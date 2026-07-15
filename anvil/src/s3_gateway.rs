@@ -10,7 +10,9 @@ use anvil_core::bucket_journal;
 use anvil_core::mesh_directory::{BucketLocatorStatus, TenantNameStatus};
 use anvil_core::mesh_lifecycle::{LifecycleState, NodeCapability};
 use anvil_core::object_links;
-use anvil_core::object_manager::{ObjectLinkReadMode, ObjectReadConsistency, ObjectWriteOptions};
+use anvil_core::object_manager::{
+    ObjectLinkReadMode, ObjectReadConsistency, ObjectWriteOptions, ObjectWriteVisibility,
+};
 use anvil_core::observability::RESERVED_NAMESPACE_REJECTION_COUNT;
 use anvil_core::permissions::AnvilAction;
 use anvil_core::persistence::Object;

@@ -1,6 +1,8 @@
 use crate::anvil_api::internal_proxy_service_server::InternalProxyService;
 use crate::anvil_api::*;
-use crate::object_manager::{ObjectLinkReadMode, ObjectReadConsistency, ObjectWriteOptions};
+use crate::object_manager::{
+    ObjectLinkReadMode, ObjectReadConsistency, ObjectWriteOptions, ObjectWriteVisibility,
+};
 use crate::{AppState, access_control, auth, permissions::AnvilAction};
 use futures_util::StreamExt;
 use http::HeaderValue;
@@ -235,6 +237,7 @@ async fn proxy_delete(
                 version_id,
                 None,
                 None,
+                ObjectWriteVisibility::default(),
             )
             .await?
     } else {
@@ -246,6 +249,7 @@ async fn proxy_delete(
                 &header.object_key,
                 None,
                 None,
+                ObjectWriteVisibility::default(),
             )
             .await?
     };
