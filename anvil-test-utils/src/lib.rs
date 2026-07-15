@@ -279,11 +279,14 @@ impl DockerTestCluster {
         let docker_image = require_docker_image();
         let compose_file = docker_compose_file();
         let project_name = docker_compose_project_name();
-        let compose_env = vec![("ANVIL_IMAGE".to_string(), docker_image)];
+        let mut compose_env = vec![("ANVIL_IMAGE".to_string(), docker_image)];
+        let ports = docker_shared_project_ports(&project_name, &mut compose_env);
         docker_compose_create_then_start(&compose_file, &project_name, &compose_env);
 
-        let grpc_addrs = (1_u8..=docker_node_count())
-            .map(docker_host_api_url)
+        let grpc_addrs = ports
+            .api_ports
+            .iter()
+            .map(|port| format!("http://127.0.0.1:{port}"))
             .collect::<Vec<_>>();
 
         let wait_start = Instant::now();
@@ -295,8 +298,10 @@ impl DockerTestCluster {
         }
         emit_test_timing("docker_shared_cluster ports_ready", wait_start.elapsed());
 
-        let admin_addrs = (1_u8..=docker_node_count())
-            .map(docker_host_admin_url)
+        let admin_addrs = ports
+            .admin_ports
+            .iter()
+            .map(|port| format!("http://127.0.0.1:{port}"))
             .collect::<Vec<_>>();
 
         let admin_token = mint_docker_system_admin_token("docker-system-admin");

@@ -3,6 +3,12 @@ use std::time::{Duration, Instant};
 
 use super::docker_image::configured_docker_image;
 
+#[derive(Debug, Clone)]
+pub(super) struct DockerHostPorts {
+    pub api_ports: Vec<u16>,
+    pub admin_ports: Vec<u16>,
+}
+
 pub(super) fn docker_command_with_env(extra_env: &[(String, String)]) -> std::process::Command {
     let mut command = command_with_docker_env("docker");
     // Docker Desktop can deadlock concurrent container starts for the shared
@@ -39,6 +45,164 @@ pub(super) fn reserve_docker_host_ports(count: usize) -> Vec<u16> {
             port
         })
         .collect()
+}
+
+pub(super) fn docker_shared_project_ports(
+    project_name: &str,
+    compose_env: &mut Vec<(String, String)>,
+) -> DockerHostPorts {
+    let from_env = docker_ports_from_env();
+    let ports = from_env.unwrap_or_else(|| docker_project_port_file(project_name));
+    for (index, port) in ports.api_ports.iter().enumerate() {
+        upsert_compose_env(
+            compose_env,
+            format!("ANVIL_TEST_API{}_PORT", index + 1),
+            port.to_string(),
+        );
+    }
+    for (index, port) in ports.admin_ports.iter().enumerate() {
+        upsert_compose_env(
+            compose_env,
+            format!("ANVIL_TEST_ADMIN{}_PORT", index + 1),
+            port.to_string(),
+        );
+    }
+    ports
+}
+
+fn docker_ports_from_env() -> Option<DockerHostPorts> {
+    let api_ports = read_numbered_ports_from_env("ANVIL_TEST_API")?;
+    let admin_ports = read_numbered_ports_from_env("ANVIL_TEST_ADMIN")?;
+    Some(DockerHostPorts {
+        api_ports,
+        admin_ports,
+    })
+}
+
+fn read_numbered_ports_from_env(prefix: &str) -> Option<Vec<u16>> {
+    let mut ports = Vec::with_capacity(docker_node_count() as usize);
+    for node in 1..=docker_node_count() {
+        let value = std::env::var(format!("{prefix}{node}_PORT")).ok()?;
+        ports.push(value.parse::<u16>().ok()?);
+    }
+    Some(ports)
+}
+
+fn docker_project_port_file(project_name: &str) -> DockerHostPorts {
+    let dir = std::env::temp_dir().join("anvil-test-cluster-locks");
+    std::fs::create_dir_all(&dir).expect("create Docker test port state dir");
+    let port_file = dir.join(format!("{}.ports", sanitize_project_filename(project_name)));
+    let _guard = DockerPortAllocationLock::acquire(&dir);
+    if let Some(ports) = read_project_port_file(&port_file) {
+        return ports;
+    }
+    let reserved = reserve_docker_host_ports((docker_node_count() as usize) * 2);
+    let split_at = docker_node_count() as usize;
+    let ports = DockerHostPorts {
+        api_ports: reserved[..split_at].to_vec(),
+        admin_ports: reserved[split_at..].to_vec(),
+    };
+    write_project_port_file(&port_file, &ports);
+    ports
+}
+
+fn read_project_port_file(path: &std::path::Path) -> Option<DockerHostPorts> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let mut api_ports = Vec::with_capacity(docker_node_count() as usize);
+    let mut admin_ports = Vec::with_capacity(docker_node_count() as usize);
+    for node in 1..=docker_node_count() {
+        api_ports.push(read_port_line(&raw, &format!("ANVIL_TEST_API{node}_PORT"))?);
+        admin_ports.push(read_port_line(
+            &raw,
+            &format!("ANVIL_TEST_ADMIN{node}_PORT"),
+        )?);
+    }
+    Some(DockerHostPorts {
+        api_ports,
+        admin_ports,
+    })
+}
+
+fn read_port_line(raw: &str, key: &str) -> Option<u16> {
+    raw.lines()
+        .find_map(|line| line.strip_prefix(&format!("{key}=")))
+        .and_then(|value| value.trim().parse::<u16>().ok())
+}
+
+fn write_project_port_file(path: &std::path::Path, ports: &DockerHostPorts) {
+    let mut raw = String::new();
+    for (index, port) in ports.api_ports.iter().enumerate() {
+        raw.push_str(&format!("ANVIL_TEST_API{}_PORT={port}\n", index + 1));
+    }
+    for (index, port) in ports.admin_ports.iter().enumerate() {
+        raw.push_str(&format!("ANVIL_TEST_ADMIN{}_PORT={port}\n", index + 1));
+    }
+    std::fs::write(path, raw).expect("write Docker test project port state");
+}
+
+fn upsert_compose_env(compose_env: &mut Vec<(String, String)>, key: String, value: String) {
+    if let Some((_, existing)) = compose_env
+        .iter_mut()
+        .find(|(existing_key, _)| existing_key == &key)
+    {
+        *existing = value;
+    } else {
+        compose_env.push((key, value));
+    }
+}
+
+fn sanitize_project_filename(project_name: &str) -> String {
+    let mut sanitized = project_name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        sanitized = "anvil-shared-test".to_string();
+    }
+    sanitized
+}
+
+struct DockerPortAllocationLock {
+    path: PathBuf,
+}
+
+impl DockerPortAllocationLock {
+    fn acquire(dir: &std::path::Path) -> Self {
+        let path = dir.join("docker-port-allocation.lock");
+        let start = Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    let _ = writeln!(file, "pid={}", std::process::id());
+                    return Self { path };
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if start.elapsed() > Duration::from_secs(30) {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(error) => panic!("acquire Docker test port allocation lock {path:?}: {error}"),
+            }
+        }
+    }
+}
+
+impl Drop for DockerPortAllocationLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 pub(super) fn docker_jwt_secret() -> String {
@@ -142,7 +306,7 @@ pub(super) fn docker_compose_create_then_start(
         .iter()
         .find_map(|(key, value)| (key == "ANVIL_IMAGE").then_some(value.as_str()))
         .expect("Docker test compose env includes ANVIL_IMAGE");
-    if docker_project_needs_recreate(project_name, expected_image) {
+    if docker_project_needs_recreate(project_name, expected_image, compose_env) {
         docker_compose_with_env(
             compose_file,
             project_name,
@@ -161,7 +325,11 @@ pub(super) fn docker_compose_create_then_start(
     }
 }
 
-pub(super) fn docker_project_needs_recreate(project_name: &str, expected_image: &str) -> bool {
+pub(super) fn docker_project_needs_recreate(
+    project_name: &str,
+    expected_image: &str,
+    compose_env: &[(String, String)],
+) -> bool {
     let expected_image_id = docker_image_id(expected_image);
     let mut seen_nodes = 0_u8;
     for node in 1..=docker_node_count() {
@@ -192,13 +360,15 @@ pub(super) fn docker_project_needs_recreate(project_name: &str, expected_image: 
                 if docker_container_image_id(id) != expected_image_id {
                     return true;
                 }
-                if !docker_container_publishes_port(id, "50051/tcp", &docker_host_port(node))
-                    || !docker_container_publishes_port(
-                        id,
-                        "50052/tcp",
-                        &docker_host_admin_port(node),
-                    )
-                {
+                if !docker_container_publishes_port(
+                    id,
+                    "50051/tcp",
+                    &docker_host_port_with_env(node, compose_env),
+                ) || !docker_container_publishes_port(
+                    id,
+                    "50052/tcp",
+                    &docker_host_admin_port_with_env(node, compose_env),
+                ) {
                     return true;
                 }
             }
@@ -358,6 +528,14 @@ pub(super) fn docker_host_port(node: u8) -> String {
     std::env::var(var).unwrap_or_else(|_| default.to_string())
 }
 
+fn docker_host_port_with_env(node: u8, compose_env: &[(String, String)]) -> String {
+    let key = format!("ANVIL_TEST_API{node}_PORT");
+    compose_env
+        .iter()
+        .find_map(|(existing_key, value)| (existing_key == &key).then_some(value.clone()))
+        .unwrap_or_else(|| docker_host_port(node))
+}
+
 pub(super) fn docker_host_api_url(node: u8) -> String {
     format!("http://127.0.0.1:{}", docker_host_port(node))
 }
@@ -376,6 +554,14 @@ pub(super) fn docker_host_admin_port(node: u8) -> String {
         _ => panic!("unsupported Docker test node {node}"),
     };
     std::env::var(var).unwrap_or_else(|_| default.to_string())
+}
+
+fn docker_host_admin_port_with_env(node: u8, compose_env: &[(String, String)]) -> String {
+    let key = format!("ANVIL_TEST_ADMIN{node}_PORT");
+    compose_env
+        .iter()
+        .find_map(|(existing_key, value)| (existing_key == &key).then_some(value.clone()))
+        .unwrap_or_else(|| docker_host_admin_port(node))
 }
 
 pub(super) fn docker_host_admin_url(node: u8) -> String {
