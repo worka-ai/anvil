@@ -17,7 +17,7 @@ permissions:
 jobs:
   build-image:
     name: Build Anvil test image
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, worka-builder-1]
     timeout-minutes: 45
     env:
       ANVIL_DOCKER_PLATFORM: linux/amd64
@@ -80,7 +80,7 @@ jobs:
 
   static:
     name: Static, docs, and packaging gates
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, worka-builder-1]
     timeout-minutes: 45
     steps:
       - name: Checkout repository
@@ -124,8 +124,10 @@ jobs:
 
   rust-unit:
     name: Rust unit and client tests
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, worka-builder-1]
     timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: "2"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -157,24 +159,15 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-v2-
 
-      - name: Prebuild Rust unit test binaries
-        run: |
-          cargo test --no-run --all-targets \
-            -p anvil-storage-core \
-            -p anvil-server \
-            -p anvil-storage-cli \
-            -p anvil-storage \
-            -p anvil-storage-test-utils \
-            -p anvil-corestore-model \
-            -p anvil-documentation
-
       - name: Run Rust unit release gates
         run: ./scripts/release-gates.sh rust
 
   server-core:
     name: Server core integration tests
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, worka-builder-1]
     timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: "2"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -215,8 +208,10 @@ jobs:
   docker-integration:
     name: Docker integration tests (${{ matrix.group }})
     needs: build-image
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, worka-builder-1]
     timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "2"
     strategy:
       fail-fast: false
       matrix:

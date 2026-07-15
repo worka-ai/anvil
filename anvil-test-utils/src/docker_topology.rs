@@ -6,9 +6,7 @@ async fn local_node_descriptors(
 ) -> Vec<anvil::anvil_api::NodeDescriptor> {
     let mut descriptors = Vec::with_capacity(admin_addrs.len());
     for admin_addr in admin_addrs {
-        let mut client = AdminServiceClient::connect(admin_addr.clone())
-            .await
-            .expect("connect Docker admin endpoint for local node descriptor");
+        let mut client = connect_docker_admin(admin_addr).await;
         let mut request = tonic::Request::new(anvil::anvil_api::GetLocalNodeDescriptorRequest {});
         add_docker_admin_bearer(&mut request, admin_token);
         descriptors.push(
@@ -22,6 +20,20 @@ async fn local_node_descriptors(
         );
     }
     descriptors
+}
+
+async fn connect_docker_mesh_control(addr: &str) -> MeshControlServiceClient<Channel> {
+    let mut last_error = None;
+    for attempt in 1..=20 {
+        match MeshControlServiceClient::connect(addr.to_string()).await {
+            Ok(client) => return client,
+            Err(error) => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(100 * attempt)).await;
+            }
+        }
+    }
+    panic!("connect Docker mesh-control endpoint {addr}: {last_error:?}");
 }
 
 fn put_node_request(
@@ -103,9 +115,7 @@ pub(super) async fn ensure_docker_topology(
     // node participates in quorum. Every node therefore starts normal writes
     // with the same active topology instead of independently replaying the
     // lifecycle API and producing divergent root histories.
-    let mut seed_client = MeshControlServiceClient::connect(admin_addrs[0].clone())
-        .await
-        .expect("connect Docker seed admin endpoint for topology bootstrap");
+    let mut seed_client = connect_docker_mesh_control(&admin_addrs[0]).await;
     let mut seed_request = tonic::Request::new(topology.clone());
     add_docker_admin_bearer(&mut seed_request, admin_token);
     let seed = seed_client
@@ -122,9 +132,7 @@ pub(super) async fn ensure_docker_topology(
     );
 
     for admin_addr in admin_addrs.iter().skip(1) {
-        let mut client = MeshControlServiceClient::connect(admin_addr.clone())
-            .await
-            .expect("connect Docker joining admin endpoint for topology bootstrap");
+        let mut client = connect_docker_mesh_control(admin_addr).await;
         let mut join = topology.clone();
         join.canonical_coremeta_rows = seed.canonical_coremeta_rows.clone();
         let mut request = tonic::Request::new(join);

@@ -16,6 +16,7 @@ use aws_sdk_s3::config::Credentials;
 use futures_util::StreamExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
+use tonic::transport::Channel;
 use tracing_subscriber::{self, EnvFilter};
 
 mod coremeta_bootstrap;
@@ -44,6 +45,20 @@ const SHARED_CLUSTER_REGIONS: [&str; 6] = [
     DEFAULT_TEST_REGION,
     DEFAULT_TEST_REGION,
 ];
+
+async fn connect_docker_admin(addr: &str) -> AdminServiceClient<Channel> {
+    let mut last_error = None;
+    for attempt in 1..=20 {
+        match AdminServiceClient::connect(addr.to_string()).await {
+            Ok(client) => return client,
+            Err(error) => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(100 * attempt)).await;
+            }
+        }
+    }
+    panic!("connect Docker admin endpoint {addr}: {last_error:?}");
+}
 
 fn test_cluster_limit() -> usize {
     std::env::var("ANVIL_TEST_CLUSTER_CONCURRENCY")
@@ -393,9 +408,7 @@ impl DockerTestCluster {
 
     pub async fn create_tenant(&self, tenant_name: &str) -> i64 {
         let started_at = Instant::now();
-        let mut client = AdminServiceClient::connect(self.admin_addrs[0].clone())
-            .await
-            .expect("connect Docker admin endpoint");
+        let mut client = connect_docker_admin(&self.admin_addrs[0]).await;
         let mut request = tonic::Request::new(anvil::anvil_api::CreateTenantRequest {
             context: Some(test_admin_context(
                 &format!("create-tenant-{tenant_name}"),
@@ -425,9 +438,7 @@ impl DockerTestCluster {
         app_name: &str,
     ) -> (String, String, String) {
         let started_at = Instant::now();
-        let mut client = AdminServiceClient::connect(self.admin_addrs[0].clone())
-            .await
-            .expect("connect Docker admin endpoint");
+        let mut client = connect_docker_admin(&self.admin_addrs[0]).await;
         let mut request = tonic::Request::new(anvil::anvil_api::CreateApplicationRequest {
             context: Some(test_admin_context(&format!("create-app-{app_name}"), 0)),
             tenant_id: tenant_id.to_string(),
@@ -453,9 +464,7 @@ impl DockerTestCluster {
         let started_at = Instant::now();
         let mut last_error = None;
         for attempt in 1..=5 {
-            let mut client = AdminServiceClient::connect(self.admin_addrs[0].clone())
-                .await
-                .expect("connect Docker admin endpoint");
+            let mut client = connect_docker_admin(&self.admin_addrs[0]).await;
             let mut request =
                 tonic::Request::new(anvil::anvil_api::GrantApplicationPolicyRequest {
                     context: Some(test_admin_context(
@@ -497,9 +506,7 @@ impl DockerTestCluster {
         let started_at = Instant::now();
         let mut last_error = None;
         for attempt in 1..=5 {
-            let mut client = AdminServiceClient::connect(self.admin_addrs[0].clone())
-                .await
-                .expect("connect Docker admin endpoint");
+            let mut client = connect_docker_admin(&self.admin_addrs[0]).await;
             let mut request = tonic::Request::new(anvil::anvil_api::ApplicationPoliciesRequest {
                 context: Some(test_admin_context(
                     &format!("grant-batch-{app_name}-{attempt}"),

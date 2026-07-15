@@ -24,7 +24,7 @@ concurrency:
 jobs:
   build-image:
     name: Build release image (${{ matrix.platform }})
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, worka-builder-1]
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -113,7 +113,7 @@ jobs:
 
   static-and-docs:
     name: Static gates and docs artifact
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, worka-builder-1]
     timeout-minutes: 45
     steps:
       - name: Checkout repository
@@ -165,8 +165,10 @@ jobs:
 
   rust-unit:
     name: Rust unit and client tests
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, worka-builder-1]
     timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: "2"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -201,24 +203,15 @@ jobs:
             ${{ runner.os }}-release-cargo-v2-
             ${{ runner.os }}-cargo-v2-
 
-      - name: Prebuild Rust unit test binaries
-        run: |
-          cargo test --no-run --all-targets \
-            -p anvil-storage-core \
-            -p anvil-server \
-            -p anvil-storage-cli \
-            -p anvil-storage \
-            -p anvil-storage-test-utils \
-            -p anvil-corestore-model \
-            -p anvil-documentation
-
       - name: Run Rust unit release gates
         run: ./scripts/release-gates.sh rust
 
   server-core:
     name: Server core integration tests
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, worka-builder-1]
     timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: "2"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -262,8 +255,10 @@ jobs:
   docker-integration:
     name: Docker integration tests (${{ matrix.group }})
     needs: build-image
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, worka-builder-1]
     timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "2"
     strategy:
       fail-fast: false
       matrix:
@@ -324,7 +319,7 @@ jobs:
   publish:
     name: Publish release artifacts
     needs: [build-image, static-and-docs, rust-unit, server-core, docker-integration]
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, worka-builder-1]
     timeout-minutes: 45
     environment:
       name: github-pages
