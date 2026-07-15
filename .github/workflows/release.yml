@@ -47,10 +47,16 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Protoc
+      - name: Install system build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            pkg-config \
+            protobuf-compiler
 
       - name: Set up QEMU for cross-architecture image smoke checks
         uses: docker/setup-qemu-action@v3
@@ -115,10 +121,16 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Protoc
+      - name: Install system build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            pkg-config \
+            protobuf-compiler
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
@@ -161,10 +173,16 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Protoc
+      - name: Install system build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            pkg-config \
+            protobuf-compiler
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
@@ -196,10 +214,16 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Protoc
+      - name: Install system build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            pkg-config \
+            protobuf-compiler
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
@@ -236,10 +260,16 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Protoc
+      - name: Install system build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            pkg-config \
+            protobuf-compiler
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
