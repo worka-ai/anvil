@@ -98,7 +98,6 @@ fn docker_project_port_file(project_name: &str) -> DockerHostPorts {
     let dir = std::env::temp_dir().join("anvil-test-cluster-locks");
     std::fs::create_dir_all(&dir).expect("create Docker test port state dir");
     let port_file = dir.join(format!("{}.ports", sanitize_project_filename(project_name)));
-    let _guard = docker_test_port_allocation_lock();
     if let Some(ports) = read_project_port_file(&port_file) {
         return ports;
     }
