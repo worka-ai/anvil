@@ -47,9 +47,7 @@ jobs:
           ~/.cargo/registry/index/
           ~/.cargo/registry/cache/
           ~/.cargo/git/db/
-          target/
-          documentation/target/
-        key: ${{ runner.os }}-docs-cargo-${{ hashFiles('**/Cargo.lock', 'documentation/**') }}
+        key: ${{ runner.os }}-docs-cargo-v2-${{ hashFiles('**/Cargo.lock', 'documentation/**') }}
 
     - name: Install Fission CLI
       run: |
