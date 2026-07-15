@@ -37,6 +37,7 @@ jobs:
           cmake \
           libclang-dev \
           pkg-config \
+          libssl-dev \
           protobuf-compiler
 
     - name: Cache Cargo dependencies

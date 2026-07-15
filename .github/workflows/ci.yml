@@ -47,6 +47,7 @@ jobs:
             cmake \
             libclang-dev \
             pkg-config \
+            libssl-dev \
             protobuf-compiler
 
       - name: Set up QEMU for cross-architecture image smoke checks
@@ -117,6 +118,7 @@ jobs:
             cmake \
             libclang-dev \
             pkg-config \
+            libssl-dev \
             protobuf-compiler
 
       - name: Cache Cargo dependencies
@@ -160,6 +162,7 @@ jobs:
             cmake \
             libclang-dev \
             pkg-config \
+            libssl-dev \
             protobuf-compiler
 
       - name: Cache Cargo dependencies
@@ -197,6 +200,7 @@ jobs:
             cmake \
             libclang-dev \
             pkg-config \
+            libssl-dev \
             protobuf-compiler
 
       - name: Cache Cargo dependencies
@@ -239,6 +243,7 @@ jobs:
             cmake \
             libclang-dev \
             pkg-config \
+            libssl-dev \
             protobuf-compiler
 
       - name: Cache Cargo dependencies
