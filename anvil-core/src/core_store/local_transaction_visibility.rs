@@ -272,13 +272,34 @@ impl CoreStore {
                 if prior_transaction_id == transaction.transaction_id {
                     continue;
                 }
-                if !self
-                    .transaction_makes_stream_record_visible(prior, prior_transaction_id)
-                    .await?
-                {
+                let Some(prior_transaction) =
+                    self.read_transaction_unlocked(prior_transaction_id).await?
+                else {
                     bail!(
-                        "TransactionConflict: transaction would expose a stream record before an uncommitted predecessor"
+                        "TransactionConflict: transaction has a staged stream predecessor without transaction metadata"
                     );
+                };
+                match prior_transaction.state {
+                    CoreTransactionState::Committed => {
+                        if !transaction_lists_stream_record(&prior_transaction, prior)? {
+                            bail!(
+                                "TransactionConflict: committed predecessor does not include its staged stream record"
+                            );
+                        }
+                    }
+                    CoreTransactionState::Open | CoreTransactionState::Prepared => {
+                        bail!(
+                            "TransactionConflict: transaction would expose a stream record before an uncommitted predecessor"
+                        );
+                    }
+                    CoreTransactionState::FinalisationFailed
+                    | CoreTransactionState::Aborted
+                    | CoreTransactionState::RolledBack
+                    | CoreTransactionState::Expired
+                    | CoreTransactionState::Failed => {
+                        // Terminal invisible records cannot later become visible, so they do
+                        // not impose commit ordering on subsequent transactions.
+                    }
                 }
             }
         }
