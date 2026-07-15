@@ -632,6 +632,15 @@ impl CoreStore {
         root_key_hash(root_anchor_key)
     }
 
+    pub(crate) async fn infer_explicit_transaction_commit_root_generation(
+        &self,
+        transaction: &CoreTransaction,
+    ) -> Result<u64> {
+        let _guard = self.write_lock.lock().await;
+        self.infer_explicit_transaction_commit_root_generation_unlocked(transaction)
+            .await
+    }
+
     pub async fn begin_explicit_transaction(
         &self,
         input: CoreBeginTransaction,

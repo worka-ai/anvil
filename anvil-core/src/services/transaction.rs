@@ -446,6 +446,7 @@ fn core_store_status(error: anyhow::Error) -> Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::anvil_api::object_service_server::ObjectService;
     use crate::config::Config;
     use crate::core_store::{
         CF_TRANSACTIONS, CoreMetaRowCommonProto, CoreMetaStore, CoreMetaTuplePart,
@@ -529,11 +530,88 @@ mod tests {
         request
     }
 
+    fn with_exact_claims<T>(message: T, claims: &auth::Claims) -> Request<T> {
+        let mut request = Request::new(message);
+        request.extensions_mut().insert(claims.clone());
+        request
+    }
+
     fn scope(root_anchor_key: &str) -> TransactionScope {
         TransactionScope {
             root_anchor_key: root_anchor_key.to_string(),
             root_key_hash: CoreStore::root_key_hash_for_anchor(root_anchor_key),
         }
+    }
+
+    fn absent_objects(bucket_name: &str, object_keys: &[&str]) -> WritePrecondition {
+        WritePrecondition {
+            object_versions: object_keys
+                .iter()
+                .map(|object_key| ObjectVersionPrecondition {
+                    bucket_name: bucket_name.to_string(),
+                    object_key: (*object_key).to_string(),
+                    expected_version_id: None,
+                    must_not_exist: true,
+                })
+                .collect(),
+            lease_fence: None,
+        }
+    }
+
+    fn put_json(object_key: &str, payload: &[u8]) -> MutationBatchOperation {
+        MutationBatchOperation {
+            op: Some(mutation_batch_operation::Op::PutObject(
+                MutationBatchPutObject {
+                    object_key: object_key.to_string(),
+                    payload: payload.to_vec(),
+                    content_type: Some("application/json".to_string()),
+                    user_metadata_json: "{}".to_string(),
+                    storage_class: None,
+                },
+            )),
+        }
+    }
+
+    fn mutation_context(
+        claims: &auth::Claims,
+        bucket_id: i64,
+        request_id: &str,
+        transaction_id: &str,
+    ) -> NativeMutationContext {
+        NativeMutationContext {
+            tenant_id: claims.tenant_id,
+            bucket_id,
+            principal: claims.sub.clone(),
+            request_id: request_id.to_string(),
+            precondition: "none".to_string(),
+            authz_zookie_optional: String::new(),
+            idempotency_key: request_id.to_string(),
+            transaction_id: Some(transaction_id.to_string()),
+            saga_operation: None,
+            saga_compensation_operation: None,
+            write_visibility: None,
+        }
+    }
+
+    async fn assert_object_not_found(
+        state: &AppState,
+        claims: &auth::Claims,
+        bucket_name: &str,
+        object_key: &str,
+    ) {
+        let error = state
+            .head_object(with_exact_claims(
+                HeadObjectRequest {
+                    bucket_name: bucket_name.to_string(),
+                    object_key: object_key.to_string(),
+                    version_id: None,
+                    consistency: None,
+                },
+                claims,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::NotFound);
     }
 
     fn explicit_transaction_tuple_key(transaction_id: &str) -> Vec<u8> {
@@ -726,6 +804,149 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("TransactionScopeMismatch"));
+    }
+
+    #[tokio::test]
+    async fn transaction_service_stages_object_mutation_batch_in_bucket_scope() {
+        let (_temp, state) = test_state().await;
+        let tenant = state
+            .persistence
+            .create_tenant("transaction-objects", "transaction-objects")
+            .await
+            .unwrap();
+        let claims = auth::Claims {
+            sub: "transaction-principal".to_string(),
+            exp: usize::MAX,
+            tenant_id: tenant.id,
+            jti: Some("test-transaction-jti".to_string()),
+        };
+        crate::access_control::grant_storage_tenant_owner(
+            &state.persistence,
+            tenant.id,
+            &claims.sub,
+            "transaction test",
+            "seed transaction tenant owner",
+        )
+        .await
+        .unwrap();
+        let bucket = state
+            .bucket_manager
+            .create_bucket(&claims, "transaction-objects", "local")
+            .await
+            .unwrap();
+        let root = hex::encode(metadata_journal::object_metadata_partition_id(
+            claims.tenant_id,
+            bucket.id,
+        ));
+        let precondition = absent_objects(&bucket.name, &["first.json", "second.json"]);
+        let begin = state
+            .begin_transaction(with_exact_claims(
+                BeginTransactionRequest {
+                    idempotency_key: "service-object-mutation".to_string(),
+                    scope: Some(scope(&root)),
+                    preconditions: vec![precondition.clone()],
+                    boundary_values: Vec::new(),
+                    ttl_ms: 60_000,
+                    purpose: "service object mutation test".to_string(),
+                },
+                &claims,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut request = Request::new(MutationBatchRequest {
+            bucket_name: bucket.name.clone(),
+            mutation_context: Some(mutation_context(
+                &claims,
+                bucket.id,
+                "service-object-mutation",
+                &begin.transaction_id,
+            )),
+            precondition: Some(precondition),
+            operations: vec![
+                put_json("first.json", br#"{"value":1}"#),
+                put_json("second.json", br#"{"value":2}"#),
+            ],
+        });
+        request.extensions_mut().insert(claims.clone());
+
+        state.mutation_batch(request).await.unwrap();
+        assert_object_not_found(&state, &claims, &bucket.name, "first.json").await;
+        assert_object_not_found(&state, &claims, &bucket.name, "second.json").await;
+        let committed = state
+            .commit_transaction(with_exact_claims(
+                CommitTransactionRequest {
+                    transaction_id: begin.transaction_id,
+                    consistency: ConsistencyMode::Committed as i32,
+                    wait_for_finalization: false,
+                    final_preconditions: Vec::new(),
+                },
+                &claims,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(committed.state, WriteState::Committed as i32);
+
+        for object_key in ["first.json", "second.json"] {
+            state
+                .head_object(with_exact_claims(
+                    HeadObjectRequest {
+                        bucket_name: bucket.name.clone(),
+                        object_key: object_key.to_string(),
+                        version_id: None,
+                        consistency: None,
+                    },
+                    &claims,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let rollback_precondition = absent_objects(&bucket.name, &["rolled-back.json"]);
+        let rollback = state
+            .begin_transaction(with_exact_claims(
+                BeginTransactionRequest {
+                    idempotency_key: "service-object-rollback".to_string(),
+                    scope: Some(scope(&root)),
+                    preconditions: vec![rollback_precondition.clone()],
+                    boundary_values: Vec::new(),
+                    ttl_ms: 60_000,
+                    purpose: "service object rollback test".to_string(),
+                },
+                &claims,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut rollback_request = Request::new(MutationBatchRequest {
+            bucket_name: bucket.name.clone(),
+            mutation_context: Some(mutation_context(
+                &claims,
+                bucket.id,
+                "service-object-rollback",
+                &rollback.transaction_id,
+            )),
+            precondition: Some(rollback_precondition),
+            operations: vec![put_json("rolled-back.json", br#"{"value":3}"#)],
+        });
+        rollback_request.extensions_mut().insert(claims.clone());
+        state.mutation_batch(rollback_request).await.unwrap();
+        assert_object_not_found(&state, &claims, &bucket.name, "rolled-back.json").await;
+
+        let rolled_back = state
+            .rollback_transaction(with_exact_claims(
+                RollbackTransactionRequest {
+                    transaction_id: rollback.transaction_id,
+                    reason: "verify rollback visibility".to_string(),
+                },
+                &claims,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(rolled_back.state, "rolled_back");
+        assert_object_not_found(&state, &claims, &bucket.name, "rolled-back.json").await;
     }
 
     #[tokio::test]
