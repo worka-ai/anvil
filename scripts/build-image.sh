@@ -2,6 +2,22 @@
 set -euo pipefail
 
 image="${ANVIL_IMAGE:-anvil:test}"
+build_profile="${ANVIL_BUILD_PROFILE:-release}"
+
+case "${build_profile}" in
+  release)
+    cargo_profile_args=(--release)
+    bin_profile_dir="release"
+    ;;
+  dev|debug)
+    cargo_profile_args=()
+    bin_profile_dir="debug"
+    ;;
+  *)
+    echo "unsupported ANVIL_BUILD_PROFILE=${build_profile}; expected release or dev" >&2
+    exit 2
+    ;;
+esac
 
 case "${ANVIL_DOCKER_PLATFORM:-}" in
   "")
@@ -69,18 +85,18 @@ if [[ "$use_zig" == "1" ]]; then
     exit 2
   fi
 
-  echo "[anvil] building Linux binaries with cargo-zigbuild target=${target}"
-  cargo zigbuild --release --locked --target "${target}" "${build_args[@]}"
+  echo "[anvil] building Linux binaries with cargo-zigbuild target=${target} profile=${build_profile}"
+  cargo zigbuild "${cargo_profile_args[@]}" --locked --target "${target}" "${build_args[@]}"
 else
-  echo "[anvil] building Linux binaries with cargo target=${target}"
-  cargo build --release --locked --target "${target}" "${build_args[@]}"
+  echo "[anvil] building Linux binaries with cargo target=${target} profile=${build_profile}"
+  cargo build "${cargo_profile_args[@]}" --locked --target "${target}" "${build_args[@]}"
 fi
 
 target_dir="$(
   cargo metadata --format-version 1 --no-deps \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])'
 )"
-bin_dir="${target_dir}/${target}/release"
+bin_dir="${target_dir}/${target}/${bin_profile_dir}"
 stage_dir="tmp/docker-bin"
 
 rm -rf "${stage_dir}"
