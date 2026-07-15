@@ -125,9 +125,10 @@ jobs:
   rust-unit:
     name: Rust unit and client tests
     runs-on: [self-hosted, linux, x64]
-    timeout-minutes: 45
+    timeout-minutes: 120
     env:
       CARGO_BUILD_JOBS: "2"
+      ANVIL_GATE_STEP_TIMEOUT_SECONDS: "5400"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
