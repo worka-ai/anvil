@@ -21,6 +21,7 @@ jobs:
     timeout-minutes: 90
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         include:
           - platform: linux/amd64
@@ -79,6 +80,7 @@ jobs:
         env:
           ANVIL_IMAGE: ${{ matrix.image }}
           ANVIL_DOCKER_PLATFORM: ${{ matrix.platform }}
+          CARGO_BUILD_JOBS: "2"
         run: ./scripts/build-image.sh
 
       - name: Smoke check image binaries
