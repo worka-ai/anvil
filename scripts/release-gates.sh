@@ -262,8 +262,16 @@ docker_index_gates() {
   run_docker_index_test_filter "query vector intersection" "query_spec::test_query_spec_intersects_vector_with_typed_filter_without_bucket_scan"
   run_docker_index_test_filter "query path authz" "query_spec::test_query_spec_path_filter_intersects_authz_before_results"
   run_docker_index_test_filter "query typed json" "query_spec::test_typed_json_index_queries_canonical_object_body_with_range_order_and_page_token"
-  run_docker_index_test_filter "typed lifecycle" "typed_lifecycle::"
-  run_docker_index_test_filter "validation diagnostics" "validation_diagnostics::"
+  # Keep typed lifecycle scenarios as separate filtered processes. The append
+  # record scenario is intentionally first because it validates stream-derived
+  # typed rows independently of later lifecycle churn in the shared cluster.
+  run_docker_index_test_filter "typed append records" "typed_lifecycle::test_typed_json_index_queries_append_record_payloads"
+  run_docker_index_test_filter "typed reserved candidates" "typed_lifecycle::test_typed_json_index_omits_reserved_internal_candidates"
+  run_docker_index_test_filter "typed definition lifecycle" "typed_lifecycle::test_index_definition_lifecycle"
+  run_docker_index_test_filter "typed metadata indexes" "typed_lifecycle::test_query_path_and_metadata_filter_indexes_from_object_metadata"
+  run_docker_index_test_filter "typed planner authz" "typed_lifecycle::test_live_metadata_query_uses_planner_authz_candidates_and_scoped_page_tokens"
+  run_docker_index_test_filter "validation invalid policy" "validation_diagnostics::test_index_definition_rejects_invalid_policy_shape"
+  run_docker_index_test_filter "validation diagnostics list" "validation_diagnostics::test_list_index_diagnostics_filters_by_index_and_severity"
   # The vector/hybrid module exercises multiple independent slow background
   # index-build paths. Keep the same coverage, but avoid one aggregate process
   # accumulating enough state to trip the per-step timeout.
@@ -278,10 +286,14 @@ docker_index_gates() {
   run_docker_index_test_filter "vector hybrid build vector" "vector_hybrid::test_vector_index_builds_from_object_write_task"
   run_docker_index_test_filter "vector hybrid media modalities" "vector_hybrid::test_vector_index_builds_required_media_modalities_from_object_write_tasks"
 
-  # CLI extended tests mutate the shared HF control stream and authz policy rows.
-  # Run them serially against the shared Docker cluster so the release gate
-  # validates public CLI behaviour without creating artificial cross-test races.
-  ANVIL_DOCKER_TEST_THREADS=1     run_docker_cargo_test "Docker CLI extended integration" -p anvil-storage-cli --test cli_extended
+  # CLI extended tests validate independent public-CLI workflows and do not
+  # depend on state created by the index tests above. Reset first so a slow or
+  # aborted index run cannot leave retained CoreMeta generations that obscure
+  # CLI regressions. Run serially because the HF CLI tests share one control
+  # stream and authz policy surface.
+  reset_shared_docker_cluster
+  ANVIL_DOCKER_TEST_THREADS=1 \
+    run_docker_cargo_test "Docker CLI extended integration" -p anvil-storage-cli --test cli_extended
 }
 
 docker_mesh_gates() {
