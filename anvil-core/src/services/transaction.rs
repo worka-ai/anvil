@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use crate::anvil_api::transaction_service_server::TransactionService;
 use crate::anvil_api::*;
 use crate::core_store::{CoreBeginTransaction, CoreTransaction, CoreTransactionState};
@@ -116,6 +118,7 @@ impl TransactionService for AppState {
             )
             .await
             .map_err(core_store_status)?;
+        let mut changed_object_keys_by_bucket = BTreeMap::new();
         for projection in object_projections {
             crate::access_control::grant_object_defaults(
                 &self.persistence,
@@ -134,8 +137,17 @@ impl TransactionService for AppState {
                     projection.is_delete_marker,
                 )
                 .await?;
+            let (_, object_keys) = changed_object_keys_by_bucket
+                .entry(projection.bucket.id)
+                .or_insert_with(|| (projection.bucket.clone(), BTreeSet::new()));
+            object_keys.insert(projection.object.key);
+        }
+        for (_, (bucket, object_keys)) in changed_object_keys_by_bucket {
             self.persistence
-                .enqueue_index_builds_for_bucket(&projection.bucket)
+                .enqueue_index_builds_for_object_keys(
+                    &bucket,
+                    object_keys.iter().map(String::as_str),
+                )
                 .await
                 .map_err(core_store_status)?;
         }

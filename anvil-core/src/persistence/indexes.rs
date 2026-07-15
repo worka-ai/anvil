@@ -350,6 +350,33 @@ impl Persistence {
         Ok(scheduled)
     }
 
+    pub async fn enqueue_index_builds_for_object_keys<'a>(
+        &self,
+        bucket: &Bucket,
+        object_keys: impl IntoIterator<Item = &'a str>,
+    ) -> Result<usize> {
+        let object_keys = object_keys.into_iter().collect::<Vec<_>>();
+        if object_keys.is_empty() {
+            return Ok(0);
+        }
+        let indexes = index_journal::read_current_index_definitions(
+            &self.storage,
+            bucket.tenant_id,
+            bucket.id,
+            false,
+        )
+        .await?;
+        let mut scheduled = 0usize;
+        for index in indexes {
+            if index_selects_object_keys(&index, &object_keys)
+                && self.enqueue_index_build_for_index(bucket, &index).await?
+            {
+                scheduled = scheduled.saturating_add(1);
+            }
+        }
+        Ok(scheduled)
+    }
+
     pub async fn build_index_task(
         &self,
         tenant_id: i64,
@@ -709,5 +736,76 @@ impl Persistence {
             },
         )
         .await
+    }
+}
+
+fn index_selects_object_keys(index: &IndexDefinition, object_keys: &[&str]) -> bool {
+    if index.kind == "typed_json"
+        && index
+            .build_policy
+            .get("source_kind")
+            .or_else(|| index.build_policy.get("source"))
+            .and_then(JsonValue::as_str)
+            .is_some_and(|source| source == "append_record")
+    {
+        return false;
+    }
+
+    index
+        .selector
+        .get("prefix")
+        .and_then(JsonValue::as_str)
+        .is_none_or(|prefix| object_keys.iter().any(|key| key.starts_with(prefix)))
+}
+
+#[cfg(test)]
+mod object_index_scheduling_tests {
+    use chrono::Utc;
+    use serde_json::json;
+
+    use super::index_selects_object_keys;
+    use crate::persistence::IndexDefinition;
+
+    fn index(prefix: Option<&str>, source_kind: &str) -> IndexDefinition {
+        IndexDefinition {
+            id: 1,
+            tenant_id: 1,
+            bucket_id: 1,
+            name: "test".into(),
+            kind: "typed_json".into(),
+            selector: prefix.map_or_else(|| json!({}), |prefix| json!({ "prefix": prefix })),
+            extractor: json!({}),
+            authorization_mode: "inherit_object".into(),
+            build_policy: json!({ "source_kind": source_kind }),
+            enabled: true,
+            version: 1,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn object_updates_schedule_only_matching_object_indexes() {
+        let keys = [
+            "operations/one/operation.json",
+            "operations/one/steps/write.json",
+        ];
+
+        assert!(index_selects_object_keys(
+            &index(Some("operations/"), "object_current"),
+            &keys
+        ));
+        assert!(!index_selects_object_keys(
+            &index(Some("templates/"), "object_current"),
+            &keys
+        ));
+        assert!(!index_selects_object_keys(
+            &index(Some("operations/"), "append_record"),
+            &keys
+        ));
+        assert!(index_selects_object_keys(
+            &index(None, "object_current"),
+            &keys
+        ));
     }
 }
