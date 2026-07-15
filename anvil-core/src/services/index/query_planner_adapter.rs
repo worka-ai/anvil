@@ -49,7 +49,7 @@ impl BoundaryCandidateReader for PlannerBoundaryCandidateAdapter {
 #[derive(Debug, Clone)]
 pub(super) struct PlannerAuthzCandidateAdapter {
     storage: crate::storage::Storage,
-    tenant_id: i64,
+    claims: auth::Claims,
     authorization_mode: String,
     bucket: crate::persistence::Bucket,
     snapshot: PlannerCandidateSnapshot,
@@ -58,14 +58,14 @@ pub(super) struct PlannerAuthzCandidateAdapter {
 impl PlannerAuthzCandidateAdapter {
     pub(super) fn new(
         storage: crate::storage::Storage,
-        tenant_id: i64,
+        claims: auth::Claims,
         authorization_mode: impl Into<String>,
         bucket: crate::persistence::Bucket,
         snapshot: PlannerCandidateSnapshot,
     ) -> Self {
         Self {
             storage,
-            tenant_id,
+            claims,
             authorization_mode: authorization_mode.into(),
             bucket,
             snapshot,
@@ -156,13 +156,27 @@ impl PlannerAuthzCandidateAdapter {
         &self,
         request: &AuthzCandidateRequest,
     ) -> anyhow::Result<PlannerAuthzAllowance> {
+        if principal_has_bucket_wide_object_access(
+            &self.storage,
+            &self.claims,
+            &self.bucket,
+            request.system_revision,
+        )
+        .await?
+        {
+            return Ok(PlannerAuthzAllowance {
+                bucket_wide: true,
+                object_ids: BTreeSet::new(),
+            });
+        }
+
         let subject = parse_planner_candidate_subject(&request.subject);
         let mut object_ids = BTreeSet::new();
         let mut bucket_wide = false;
 
         let tenant_reader = crate::authz_segment::AuthzSegmentCandidateReader::new(
             self.storage.clone(),
-            self.tenant_id,
+            self.claims.tenant_id,
         );
         let tenant_candidates = tenant_reader.candidate_set(request.clone()).await?;
         for doc in &self.snapshot.docs {
@@ -225,6 +239,25 @@ impl PlannerAuthzCandidateAdapter {
         let object_key = system_object_id.strip_prefix(&prefix)?;
         Some(format!("{}/{}", self.bucket.name, object_key))
     }
+}
+
+async fn principal_has_bucket_wide_object_access(
+    storage: &crate::storage::Storage,
+    claims: &auth::Claims,
+    bucket: &crate::persistence::Bucket,
+    system_revision: u64,
+) -> anyhow::Result<bool> {
+    let system_revision = i64::try_from(system_revision)
+        .map_err(|_| anyhow::anyhow!("Invalid system authz revision"))?;
+    access_control::system_realm_relationship_allows(
+        storage,
+        claims,
+        crate::system_realm::SYSTEM_BUCKET_NAMESPACE,
+        &access_control::bucket_object_id(bucket),
+        "get_object",
+        Some(system_revision),
+    )
+    .await
 }
 
 fn planner_authz_row_subject_matches(
@@ -292,7 +325,7 @@ pub(super) async fn execute_corestore_query_plan(
     let boundary_reader = PlannerBoundaryCandidateAdapter::new(snapshot.clone());
     let authz_reader = PlannerAuthzCandidateAdapter::new(
         storage.clone(),
-        claims.tenant_id,
+        claims.clone(),
         authorization_mode.to_string(),
         bucket.clone(),
         snapshot.clone(),
@@ -872,6 +905,8 @@ fn descending_score_tuple(score: f32, object_version_id: [u8; 16]) -> Vec<Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{config::Config, persistence::Persistence, storage::Storage};
+    use tempfile::tempdir;
 
     #[test]
     fn empty_index_candidates_produce_an_empty_plan() {
@@ -904,6 +939,87 @@ mod tests {
         assert_eq!(
             result.metrics,
             crate::query_planner::QueryPlanMetrics::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn bucket_wide_candidates_honor_computed_tenant_authorization() {
+        let temp = tempdir().unwrap();
+        let config = Config {
+            jwt_secret: "test-secret".into(),
+            anvil_secret_encryption_key:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            mesh_id: "index-authz-test".into(),
+            region: "test-region".into(),
+            storage_path: temp.path().to_string_lossy().into_owned(),
+            bootstrap_system_admin_subject_kind: "app".into(),
+            bootstrap_system_admin_subject_id: "system-admin".into(),
+            ..Config::default()
+        };
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let persistence = Persistence::new(&config, None).unwrap();
+        crate::system_realm::ensure_bootstrapped(
+            &config,
+            &persistence,
+            &storage,
+            &config.secret_keyring().unwrap(),
+        )
+        .await
+        .unwrap();
+        persistence.create_region("test-region").await.unwrap();
+        let tenant = persistence
+            .create_tenant("index-authz-tenant", "index-authz-tenant")
+            .await
+            .unwrap();
+        let bucket = persistence
+            .create_bucket(tenant.id, "operations", "test-region")
+            .await
+            .unwrap();
+        let owner = auth::Claims {
+            sub: "tenant-owner".into(),
+            exp: usize::MAX,
+            tenant_id: tenant.id,
+            jti: None,
+        };
+        access_control::grant_storage_tenant_owner(
+            &persistence,
+            tenant.id,
+            &owner.sub,
+            "test",
+            "grant computed tenant ownership",
+        )
+        .await
+        .unwrap();
+        access_control::grant_bucket_defaults(
+            &persistence,
+            &bucket,
+            &owner.sub,
+            "test",
+            "connect bucket to tenant",
+        )
+        .await
+        .unwrap();
+        let revision = crate::authz_journal::latest_authz_revision(
+            &storage,
+            crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
+        )
+        .await
+        .unwrap() as u64;
+
+        assert!(
+            principal_has_bucket_wide_object_access(&storage, &owner, &bucket, revision)
+                .await
+                .unwrap()
+        );
+
+        let unrelated = auth::Claims {
+            sub: "unrelated-app".into(),
+            ..owner
+        };
+        assert!(
+            !principal_has_bucket_wide_object_access(&storage, &unrelated, &bucket, revision)
+                .await
+                .unwrap()
         );
     }
 }
