@@ -149,6 +149,7 @@ run_docker_object_test_filter() {
 run_docker_object_test_filter_serial() {
   local label="$1"
   local filter="$2"
+  reset_shared_docker_cluster
   ANVIL_DOCKER_TEST_THREADS=1 \
     run_docker_cargo_test "Docker storage integration object_tests ${label}" \
       -p anvil-server --test object_tests "${filter}"
@@ -164,6 +165,7 @@ run_docker_s3_test_filter() {
 run_docker_s3_test_filter_serial() {
   local label="$1"
   local filter="$2"
+  reset_shared_docker_cluster
   ANVIL_DOCKER_TEST_THREADS=1 \
     run_docker_cargo_test "Docker storage integration s3_gateway_tests ${label}" \
       -p anvil-server --test s3_gateway_tests "${filter}"
