@@ -465,7 +465,7 @@ impl CoreStore {
         Ok(committed_transaction)
     }
 
-    async fn infer_explicit_transaction_commit_root_generation_unlocked(
+    pub(super) async fn infer_explicit_transaction_commit_root_generation_unlocked(
         &self,
         transaction: &CoreTransaction,
     ) -> Result<u64> {

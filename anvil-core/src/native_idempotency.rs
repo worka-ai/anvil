@@ -55,6 +55,8 @@ struct NativeIdempotencyRecord {
     response_json: JsonValue,
     response_hash: String,
     record_hash: String,
+    root_key_hash: String,
+    root_generation: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -135,6 +137,7 @@ where
     })?)
     .to_hex()
     .to_string();
+    let (root_key_hash, root_generation) = native_idempotency_root(storage, context).await?;
     let mut record = NativeIdempotencyRecord {
         format_version: 1,
         tenant_id: context.tenant_id,
@@ -147,6 +150,8 @@ where
         response_json,
         response_hash,
         record_hash: String::new(),
+        root_key_hash,
+        root_generation,
     };
     record.record_hash = record_hash(&record)?;
 
@@ -162,6 +167,36 @@ where
         validate_record_context(&existing, context, target)?;
     }
     Ok(())
+}
+
+async fn native_idempotency_root(
+    storage: &Storage,
+    context: &NativeMutationContext,
+) -> Result<(String, u64), Status> {
+    let Some(transaction_id) = context.transaction_id.as_deref() else {
+        return Ok((
+            native_idempotency_root_key_hash(context.tenant_id, context.bucket_id),
+            1,
+        ));
+    };
+    let core_store = CoreStore::new(storage.clone())
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let transaction = core_store
+        .read_explicit_transaction_for_principal(
+            transaction_id,
+            &native_transaction_principal_from_context(context),
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+    if transaction.state != CoreTransactionState::Open {
+        return Err(Status::failed_precondition("TransactionNotOpen"));
+    }
+    let root_generation = core_store
+        .infer_explicit_transaction_commit_root_generation(&transaction)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+    Ok((transaction.root_key_hash, root_generation))
 }
 
 async fn read_record(
@@ -386,6 +421,8 @@ fn record_from_proto(
         .as_ref()
         .ok_or_else(|| Status::data_loss("Native idempotency record missing CoreMeta common"))?;
     validate_native_idempotency_common(&proto, common)?;
+    let root_key_hash = common.root_key_hash.clone();
+    let root_generation = common.root_generation;
     Ok(NativeIdempotencyRecord {
         format_version: proto
             .format_version
@@ -405,14 +442,16 @@ fn record_from_proto(
         response_json: vec_to_json(&proto.response_json, "native idempotency response")?,
         response_hash: proto.response_hash,
         record_hash: proto.record_hash,
+        root_key_hash,
+        root_generation,
     })
 }
 
 fn native_idempotency_common(record: &NativeIdempotencyRecord) -> CoreMetaRowCommonProto {
     core_meta_committed_row_common(
         format!("tenant/{}", record.tenant_id),
-        native_idempotency_root_key_hash(record.tenant_id, record.bucket_id),
-        1,
+        record.root_key_hash.clone(),
+        record.root_generation,
         record
             .transaction_id
             .clone()
@@ -430,9 +469,18 @@ fn validate_native_idempotency_common(
             "Native idempotency CoreMeta realm mismatch",
         ));
     }
-    if common.root_key_hash != native_idempotency_root_key_hash(proto.tenant_id, proto.bucket_id) {
+    if proto.transaction_id.is_none() {
+        if common.root_key_hash
+            != native_idempotency_root_key_hash(proto.tenant_id, proto.bucket_id)
+            || common.root_generation != 1
+        {
+            return Err(Status::data_loss(
+                "Native idempotency CoreMeta root mismatch",
+            ));
+        }
+    } else if common.root_key_hash.is_empty() || common.root_generation == 0 {
         return Err(Status::data_loss(
-            "Native idempotency CoreMeta root mismatch",
+            "Transactional native idempotency CoreMeta root is missing",
         ));
     }
     let expected_transaction_id = proto
