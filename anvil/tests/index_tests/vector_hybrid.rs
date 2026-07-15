@@ -736,7 +736,7 @@ async fn test_query_full_text_phrase_requires_position_enabled_index() {
         .unwrap();
     let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = unique_test_name("index-query-phrase-no-positions-bucket");
+    let bucket_name = unique_test_name("q-phrase-no-pos");
     bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -1289,7 +1289,7 @@ async fn test_query_inherit_object_vector_filters_results_by_object_read_scope()
         .unwrap();
     let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = unique_test_name("index-query-inherit-vector-bucket");
+    let bucket_name = unique_test_name("q-inherit-vector");
     bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {
@@ -1465,7 +1465,7 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
         .unwrap();
     let mut index_client = IndexServiceClient::connect(grpc_addr).await.unwrap();
 
-    let bucket_name = unique_test_name("index-query-inherit-object-bucket");
+    let bucket_name = unique_test_name("q-inherit-object");
     bucket_client
         .create_bucket(authorized(
             CreateBucketRequest {

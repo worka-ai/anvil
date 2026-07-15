@@ -9,7 +9,7 @@ use anvil::anvil_api::{
     ListIndexDiagnosticsRequest, ListIndexesRequest, ListRepairFindingsRequest,
     NativeMutationContext, ObjectMetadata, PutObjectRequest, QueryIndexRequest, QueryIndexResponse,
     QuerySpecRequest, RepairIndexRequest, UpdateIndexRequest, WatchIndexDefinitionRequest,
-    WatchIndexPartitionRequest, WriteAuthzTupleRequest,
+    WatchIndexPartitionRequest, WriteAuthzTupleRequest, WriteVisibilityOptions,
 };
 use anvil::authz_scope::{DEFAULT_AUTHZ_REALM_ID, encode_realm_namespace};
 use anvil::authz_userset_index::{DEFAULT_DERIVED_USERSET_INDEX_ID, read_derived_userset_index};
@@ -76,7 +76,18 @@ fn native_mutation_context(bucket_id: i64, tag: &str) -> NativeMutationContext {
         transaction_id: None,
         saga_operation: None,
         saga_compensation_operation: None,
-        write_visibility: None,
+        write_visibility: Some(strict_write_visibility()),
+    }
+}
+
+fn strict_write_visibility() -> WriteVisibilityOptions {
+    WriteVisibilityOptions {
+        indexes: 1,
+        watches: 1,
+        authz_materialization: 1,
+        boundary_extraction: 1,
+        index_policy_snapshot: 1,
+        authz_revision: 1,
     }
 }
 
@@ -287,6 +298,7 @@ async fn put_index_object_bytes(
             anvil::object_manager::ObjectWriteOptions {
                 content_type: content_type.map(ToOwned::to_owned),
                 user_metadata: user_meta,
+                visibility: anvil::object_manager::ObjectWriteVisibility::strict(),
                 ..Default::default()
             },
         )
