@@ -144,35 +144,33 @@ struct PlannerAuthzAllowance {
     object_ids: BTreeSet<String>,
 }
 
-#[derive(Debug, Clone)]
-struct PlannerCandidateSubject {
-    subject_kind: String,
-    subject_id: String,
-    caveat_hash: String,
-}
-
 impl PlannerAuthzCandidateAdapter {
     async fn inherited_object_allowance(
         &self,
         request: &AuthzCandidateRequest,
     ) -> anyhow::Result<PlannerAuthzAllowance> {
-        if principal_has_bucket_wide_object_access(
+        let bucket_wide = principal_has_bucket_wide_object_access(
             &self.storage,
             &self.claims,
             &self.bucket,
             request.system_revision,
         )
-        .await?
-        {
+        .await?;
+        tracing::debug!(
+            bucket_id = self.bucket.id,
+            system_revision = request.system_revision,
+            bucket_wide,
+            candidate_count = self.snapshot.docs.len(),
+            "resolved inherited-object planner allowance"
+        );
+        if bucket_wide {
             return Ok(PlannerAuthzAllowance {
                 bucket_wide: true,
                 object_ids: BTreeSet::new(),
             });
         }
 
-        let subject = parse_planner_candidate_subject(&request.subject);
         let mut object_ids = BTreeSet::new();
-        let mut bucket_wide = false;
 
         let tenant_reader = crate::authz_segment::AuthzSegmentCandidateReader::new(
             self.storage.clone(),
@@ -186,59 +184,57 @@ impl PlannerAuthzCandidateAdapter {
             }
         }
 
-        if let Some(system_segment) = crate::authz_segment::ensure_authz_tuple_segment_at_revision(
-            &self.storage,
-            crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
-            request.system_revision,
-        )
-        .await?
-        {
-            if system_segment.header.generation != request.system_revision {
-                anyhow::bail!("AuthzCandidateSetStale");
+        // Direct object reads resolve the complete system-realm relationship,
+        // including inherited and tuple-to-userset rules. Candidate planning
+        // must use the same decision rather than considering direct rows only.
+        for doc in &self.snapshot.docs {
+            let Some(object_key) =
+                self.object_key_for_default_object_id(&doc.authz_key.canonical_object_id)
+            else {
+                continue;
+            };
+            if principal_has_system_object_access(
+                &self.storage,
+                &self.claims,
+                &self.bucket,
+                object_key,
+                request.system_revision,
+            )
+            .await?
+            {
+                object_ids.insert(doc.authz_key.canonical_object_id.clone());
             }
-            let system_revision = request.system_revision;
-            let system_object_namespace = access_control::system_realm_namespace(
-                crate::system_realm::SYSTEM_OBJECT_NAMESPACE,
-            );
-            let system_bucket_namespace = access_control::system_realm_namespace(
-                crate::system_realm::SYSTEM_BUCKET_NAMESPACE,
-            );
-            let bucket_object_id = access_control::bucket_object_id(&self.bucket);
-
-            for row in &system_segment.list_objects {
-                if !planner_authz_row_subject_matches(row, &subject)
-                    || row.revision > system_revision
-                {
-                    continue;
-                }
-                if row.namespace == system_bucket_namespace
-                    && row.relation == "get_object"
-                    && row.object_id == bucket_object_id
-                {
-                    bucket_wide = true;
-                } else if row.namespace == system_object_namespace && row.relation == "get" {
-                    if let Some(default_object_id) =
-                        self.default_object_id_for_system_object_id(&row.object_id)
-                    {
-                        object_ids.insert(default_object_id);
-                    }
-                }
-            }
-        } else if request.system_revision > 0 {
-            anyhow::bail!("AuthzCandidateSetStale");
         }
 
         Ok(PlannerAuthzAllowance {
-            bucket_wide,
+            bucket_wide: false,
             object_ids,
         })
     }
 
-    fn default_object_id_for_system_object_id(&self, system_object_id: &str) -> Option<String> {
-        let prefix = format!("{}/", self.bucket.id);
-        let object_key = system_object_id.strip_prefix(&prefix)?;
-        Some(format!("{}/{}", self.bucket.name, object_key))
+    fn object_key_for_default_object_id<'a>(&self, default_object_id: &'a str) -> Option<&'a str> {
+        default_object_id.strip_prefix(&format!("{}/", self.bucket.name))
     }
+}
+
+async fn principal_has_system_object_access(
+    storage: &crate::storage::Storage,
+    claims: &auth::Claims,
+    bucket: &crate::persistence::Bucket,
+    object_key: &str,
+    system_revision: u64,
+) -> anyhow::Result<bool> {
+    let system_revision = i64::try_from(system_revision)
+        .map_err(|_| anyhow::anyhow!("Invalid system authz revision"))?;
+    access_control::system_realm_relationship_allows(
+        storage,
+        claims,
+        crate::system_realm::SYSTEM_OBJECT_NAMESPACE,
+        &access_control::object_object_id(bucket, object_key),
+        "get",
+        Some(system_revision),
+    )
+    .await
 }
 
 async fn principal_has_bucket_wide_object_access(
@@ -258,31 +254,6 @@ async fn principal_has_bucket_wide_object_access(
         Some(system_revision),
     )
     .await
-}
-
-fn planner_authz_row_subject_matches(
-    row: &crate::authz_segment::AuthzListObjectsRow,
-    subject: &PlannerCandidateSubject,
-) -> bool {
-    row.subject_kind == subject.subject_kind
-        && row.subject_id == subject.subject_id
-        && row.caveat_hash == subject.caveat_hash
-}
-
-fn parse_planner_candidate_subject(subject: &str) -> PlannerCandidateSubject {
-    let (subject_kind, rest) = subject
-        .split_once(':')
-        .map(|(kind, id)| (kind.to_string(), id.to_string()))
-        .unwrap_or_else(|| ("user".to_string(), subject.to_string()));
-    let (subject_id, caveat_hash) = rest
-        .split_once('@')
-        .map(|(id, caveat)| (id.to_string(), caveat.to_string()))
-        .unwrap_or((rest, String::new()));
-    PlannerCandidateSubject {
-        subject_kind,
-        subject_id,
-        caveat_hash,
-    }
 }
 
 #[derive(Debug, Clone)]
