@@ -947,6 +947,137 @@ mod tests {
             .into_inner();
         assert_eq!(rolled_back.state, "rolled_back");
         assert_object_not_found(&state, &claims, &bucket.name, "rolled-back.json").await;
+
+        let successor_precondition = absent_objects(&bucket.name, &["after-rollback.json"]);
+        let successor = state
+            .begin_transaction(with_exact_claims(
+                BeginTransactionRequest {
+                    idempotency_key: "service-object-after-rollback".to_string(),
+                    scope: Some(scope(&root)),
+                    preconditions: vec![successor_precondition.clone()],
+                    boundary_values: Vec::new(),
+                    ttl_ms: 60_000,
+                    purpose: "service object after rollback test".to_string(),
+                },
+                &claims,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut successor_request = Request::new(MutationBatchRequest {
+            bucket_name: bucket.name.clone(),
+            mutation_context: Some(mutation_context(
+                &claims,
+                bucket.id,
+                "service-object-after-rollback",
+                &successor.transaction_id,
+            )),
+            precondition: Some(successor_precondition),
+            operations: vec![put_json("after-rollback.json", br#"{"value":4}"#)],
+        });
+        successor_request.extensions_mut().insert(claims.clone());
+        state.mutation_batch(successor_request).await.unwrap();
+
+        let committed_after_rollback = state
+            .commit_transaction(with_exact_claims(
+                CommitTransactionRequest {
+                    transaction_id: successor.transaction_id,
+                    consistency: ConsistencyMode::Committed as i32,
+                    wait_for_finalization: false,
+                    final_preconditions: Vec::new(),
+                },
+                &claims,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(committed_after_rollback.state, WriteState::Committed as i32);
+        state
+            .head_object(with_exact_claims(
+                HeadObjectRequest {
+                    bucket_name: bucket.name.clone(),
+                    object_key: "after-rollback.json".to_string(),
+                    version_id: None,
+                    consistency: None,
+                },
+                &claims,
+            ))
+            .await
+            .unwrap();
+
+        let open_precondition = absent_objects(&bucket.name, &["open-predecessor.json"]);
+        let open_predecessor = state
+            .begin_transaction(with_exact_claims(
+                BeginTransactionRequest {
+                    idempotency_key: "service-object-open-predecessor".to_string(),
+                    scope: Some(scope(&root)),
+                    preconditions: vec![open_precondition.clone()],
+                    boundary_values: Vec::new(),
+                    ttl_ms: 60_000,
+                    purpose: "service open predecessor test".to_string(),
+                },
+                &claims,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut open_request = Request::new(MutationBatchRequest {
+            bucket_name: bucket.name.clone(),
+            mutation_context: Some(mutation_context(
+                &claims,
+                bucket.id,
+                "service-object-open-predecessor",
+                &open_predecessor.transaction_id,
+            )),
+            precondition: Some(open_precondition),
+            operations: vec![put_json("open-predecessor.json", br#"{"value":5}"#)],
+        });
+        open_request.extensions_mut().insert(claims.clone());
+        state.mutation_batch(open_request).await.unwrap();
+
+        let blocked_precondition = absent_objects(&bucket.name, &["blocked-successor.json"]);
+        let blocked_successor = state
+            .begin_transaction(with_exact_claims(
+                BeginTransactionRequest {
+                    idempotency_key: "service-object-blocked-successor".to_string(),
+                    scope: Some(scope(&root)),
+                    preconditions: vec![blocked_precondition.clone()],
+                    boundary_values: Vec::new(),
+                    ttl_ms: 60_000,
+                    purpose: "service blocked successor test".to_string(),
+                },
+                &claims,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut blocked_request = Request::new(MutationBatchRequest {
+            bucket_name: bucket.name.clone(),
+            mutation_context: Some(mutation_context(
+                &claims,
+                bucket.id,
+                "service-object-blocked-successor",
+                &blocked_successor.transaction_id,
+            )),
+            precondition: Some(blocked_precondition),
+            operations: vec![put_json("blocked-successor.json", br#"{"value":6}"#)],
+        });
+        blocked_request.extensions_mut().insert(claims.clone());
+        state.mutation_batch(blocked_request).await.unwrap();
+
+        let blocked = state
+            .commit_transaction(with_exact_claims(
+                CommitTransactionRequest {
+                    transaction_id: blocked_successor.transaction_id,
+                    consistency: ConsistencyMode::Committed as i32,
+                    wait_for_finalization: false,
+                    final_preconditions: Vec::new(),
+                },
+                &claims,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(blocked.code(), tonic::Code::Aborted);
     }
 
     #[tokio::test]
