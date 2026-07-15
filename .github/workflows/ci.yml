@@ -23,7 +23,7 @@ jobs:
       ANVIL_DOCKER_PLATFORM: linux/amd64
       ANVIL_IMAGE: anvil:test-amd64
       ANVIL_USE_NATIVE_CARGO: "1"
-      ANVIL_BUILD_PROFILE: dev
+      ANVIL_BUILD_PROFILE: ci
       ANVIL_RUNTIME_BASE: ubuntu:24.04
       CARGO_BUILD_JOBS: "4"
     steps:

@@ -212,8 +212,8 @@ fn release_workflow_uses_shared_release_gates() {
         "PR CI workflow must build its Docker test image through scripts/build-image.sh"
     );
     assert!(
-        ci.contains("ANVIL_BUILD_PROFILE: dev"),
-        "PR CI workflow must use a fast dev-profile test image; release workflow owns release builds"
+        ci.contains("ANVIL_BUILD_PROFILE: ci"),
+        "PR CI workflow must use a fast ci-profile test image; release workflow owns release builds"
     );
     assert!(
         ci.contains("ANVIL_USE_NATIVE_CARGO"),

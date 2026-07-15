@@ -22,3 +22,9 @@ homepage = "https://github.com/worka-ai/anvil"
 repository = "https://github.com/worka-ai/anvil"
 documentation = "https://github.com/worka-ai/anvil/tree/main/documentation"
 rust-version = "1.96.0"
+
+[profile.ci]
+inherits = "dev"
+debug = 0
+strip = "debuginfo"
+incremental = false

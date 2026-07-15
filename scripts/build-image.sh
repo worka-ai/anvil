@@ -2,19 +2,23 @@
 set -euo pipefail
 
 image="${ANVIL_IMAGE:-anvil:test}"
-build_profile="${ANVIL_BUILD_PROFILE:-dev}"
+build_profile="${ANVIL_BUILD_PROFILE:-ci}"
 
 case "${build_profile}" in
   release)
     cargo_profile_args=(--release)
     bin_profile_dir="release"
     ;;
+  ci)
+    cargo_profile_args=(--profile ci)
+    bin_profile_dir="ci"
+    ;;
   dev|debug)
     cargo_profile_args=()
     bin_profile_dir="debug"
     ;;
   *)
-    echo "unsupported ANVIL_BUILD_PROFILE=${build_profile}; expected release or dev" >&2
+    echo "unsupported ANVIL_BUILD_PROFILE=${build_profile}; expected release, ci, or dev" >&2
     exit 2
     ;;
 esac
