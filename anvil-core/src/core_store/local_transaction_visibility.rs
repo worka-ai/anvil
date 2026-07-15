@@ -245,6 +245,7 @@ impl CoreStore {
         &self,
         transaction: &CoreTransaction,
     ) -> Result<()> {
+        let mut updates_by_stream = BTreeMap::<&str, Vec<(u64, &str)>>::new();
         for update in &transaction.visible_updates {
             let CoreTransactionUpdate::StreamAppend {
                 stream_id,
@@ -254,31 +255,53 @@ impl CoreStore {
             else {
                 continue;
             };
+            updates_by_stream
+                .entry(stream_id.as_str())
+                .or_default()
+                .push((*visible_sequence, prepared_record_hash.as_str()));
+        }
+
+        let mut predecessor_transactions = BTreeMap::<String, CoreTransaction>::new();
+        for (stream_id, updates) in updates_by_stream {
             let records = self.read_all_stream_records(stream_id).await?;
-            let Some(record) = records.iter().find(|record| {
-                record.sequence == *visible_sequence
-                    && record.event_hash == *prepared_record_hash
-                    && record.transaction_id.as_deref() == Some(transaction.transaction_id.as_str())
-            }) else {
-                bail!("TransactionConflict: transaction is missing a staged stream record");
-            };
-            for prior in records
+            let records_by_sequence = records
                 .iter()
-                .filter(|prior| prior.sequence < record.sequence)
-            {
+                .map(|record| (record.sequence, record))
+                .collect::<BTreeMap<_, _>>();
+            let mut last_staged_sequence = 0;
+            for (visible_sequence, prepared_record_hash) in updates {
+                let Some(record) = records_by_sequence.get(&visible_sequence) else {
+                    bail!("TransactionConflict: transaction is missing a staged stream record");
+                };
+                if record.event_hash != prepared_record_hash
+                    || record.transaction_id.as_deref() != Some(transaction.transaction_id.as_str())
+                {
+                    bail!("TransactionConflict: transaction is missing a staged stream record");
+                }
+                last_staged_sequence = last_staged_sequence.max(visible_sequence);
+            }
+
+            for prior in records.iter().filter(|prior| {
+                prior.sequence < last_staged_sequence
+                    && prior.transaction_id.as_deref() != Some(transaction.transaction_id.as_str())
+            }) {
                 let Some(prior_transaction_id) = prior.transaction_id.as_deref() else {
                     continue;
                 };
-                if prior_transaction_id == transaction.transaction_id {
-                    continue;
+                if !predecessor_transactions.contains_key(prior_transaction_id) {
+                    let Some(prior_transaction) =
+                        self.read_transaction_unlocked(prior_transaction_id).await?
+                    else {
+                        bail!(
+                            "TransactionConflict: transaction has a staged stream predecessor without transaction metadata"
+                        );
+                    };
+                    predecessor_transactions
+                        .insert(prior_transaction_id.to_string(), prior_transaction);
                 }
-                let Some(prior_transaction) =
-                    self.read_transaction_unlocked(prior_transaction_id).await?
-                else {
-                    bail!(
-                        "TransactionConflict: transaction has a staged stream predecessor without transaction metadata"
-                    );
-                };
+                let prior_transaction = predecessor_transactions
+                    .get(prior_transaction_id)
+                    .expect("predecessor transaction was inserted");
                 match prior_transaction.state {
                     CoreTransactionState::Committed => {
                         if !transaction_lists_stream_record(&prior_transaction, prior)? {
