@@ -17,7 +17,7 @@ permissions:
 jobs:
   build-image:
     name: Build Anvil image (${{ matrix.platform }})
-    runs-on: [self-hosted, worka-builder-1]
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -94,7 +94,7 @@ jobs:
 
   static:
     name: Static, docs, and packaging gates
-    runs-on: [self-hosted, worka-builder-1]
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 45
     steps:
       - name: Checkout repository
@@ -132,7 +132,7 @@ jobs:
 
   rust-unit:
     name: Rust unit and client tests
-    runs-on: [self-hosted, worka-builder-1]
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 45
     steps:
       - name: Checkout repository
@@ -164,7 +164,7 @@ jobs:
 
   server-core:
     name: Server core integration tests
-    runs-on: [self-hosted, worka-builder-1]
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 60
     steps:
       - name: Checkout repository
@@ -197,7 +197,7 @@ jobs:
   docker-integration:
     name: Docker integration tests (${{ matrix.group }})
     needs: build-image
-    runs-on: [self-hosted, worka-builder-1]
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 120
     strategy:
       fail-fast: false
