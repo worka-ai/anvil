@@ -24,7 +24,7 @@ concurrency:
 jobs:
   build-image:
     name: Build release image (${{ matrix.platform }})
-    runs-on: [self-hosted, worka-builder-1]
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -113,7 +113,7 @@ jobs:
 
   static-and-docs:
     name: Static gates and docs artifact
-    runs-on: [self-hosted, worka-builder-1]
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 45
     steps:
       - name: Checkout repository
@@ -165,7 +165,7 @@ jobs:
 
   rust-unit:
     name: Rust unit and client tests
-    runs-on: [self-hosted, worka-builder-1]
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 45
     env:
       CARGO_BUILD_JOBS: "2"
@@ -208,7 +208,7 @@ jobs:
 
   server-core:
     name: Server core integration tests
-    runs-on: [self-hosted, worka-builder-1]
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: "2"
@@ -255,7 +255,7 @@ jobs:
   docker-integration:
     name: Docker integration tests (${{ matrix.group }})
     needs: build-image
-    runs-on: [self-hosted, worka-builder-1]
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 120
     env:
       CARGO_BUILD_JOBS: "2"
@@ -319,7 +319,7 @@ jobs:
   publish:
     name: Publish release artifacts
     needs: [build-image, static-and-docs, rust-unit, server-core, docker-integration]
-    runs-on: [self-hosted, worka-builder-1]
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 45
     environment:
       name: github-pages
