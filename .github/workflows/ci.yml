@@ -157,6 +157,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-v2-
 
+      - name: Prebuild Rust unit test binaries
+        run: |
+          cargo test --no-run --all-targets \
+            -p anvil-storage-core \
+            -p anvil-server \
+            -p anvil-storage-cli \
+            -p anvil-storage \
+            -p anvil-storage-test-utils \
+            -p anvil-corestore-model \
+            -p anvil-documentation
+
       - name: Run Rust unit release gates
         run: ./scripts/release-gates.sh rust
 
@@ -194,6 +205,9 @@ jobs:
           key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-v2-
+
+      - name: Prebuild server integration test binaries
+        run: cargo test --no-run -p anvil-server --tests
 
       - name: Run server core integration gates
         run: ./scripts/release-gates.sh server-core
@@ -237,6 +251,9 @@ jobs:
           key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-v2-
+
+      - name: Prebuild Docker integration test binaries
+        run: cargo test --no-run -p anvil-server -p anvil-storage-cli --tests
 
       - name: Download amd64 Docker image artifact
         uses: actions/download-artifact@v4
