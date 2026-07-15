@@ -451,24 +451,40 @@ impl DockerTestCluster {
         resource: &str,
     ) {
         let started_at = Instant::now();
-        let mut client = AdminServiceClient::connect(self.admin_addrs[0].clone())
-            .await
-            .expect("connect Docker admin endpoint");
-        let mut request = tonic::Request::new(anvil::anvil_api::GrantApplicationPolicyRequest {
-            context: Some(test_admin_context(&format!("grant-{app_name}-{action}"), 0)),
-            tenant_id: tenant_id.to_string(),
-            app_name: app_name.to_string(),
-            action: action.to_string(),
-            resource: resource.to_string(),
-        });
-        add_docker_admin_bearer(&mut request, &self.admin_token);
-        client
-            .grant_application_policy(request)
-            .await
-            .expect("Docker admin GrantApplicationPolicy");
-        emit_test_timing(
-            format!("docker_actor grant_application_policy action={action}"),
-            started_at.elapsed(),
+        let mut last_error = None;
+        for attempt in 1..=5 {
+            let mut client = AdminServiceClient::connect(self.admin_addrs[0].clone())
+                .await
+                .expect("connect Docker admin endpoint");
+            let mut request =
+                tonic::Request::new(anvil::anvil_api::GrantApplicationPolicyRequest {
+                    context: Some(test_admin_context(
+                        &format!("grant-{app_name}-{action}-{attempt}"),
+                        0,
+                    )),
+                    tenant_id: tenant_id.to_string(),
+                    app_name: app_name.to_string(),
+                    action: action.to_string(),
+                    resource: resource.to_string(),
+                });
+            add_docker_admin_bearer(&mut request, &self.admin_token);
+            match client.grant_application_policy(request).await {
+                Ok(_) => {
+                    emit_test_timing(
+                        format!("docker_actor grant_application_policy action={action}"),
+                        started_at.elapsed(),
+                    );
+                    return;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    tokio::time::sleep(Duration::from_millis(100 * attempt)).await;
+                }
+            }
+        }
+        panic!(
+            "Docker admin GrantApplicationPolicy failed after retries: {:?}",
+            last_error
         );
     }
 
@@ -479,34 +495,49 @@ impl DockerTestCluster {
         policies: &[(String, String)],
     ) {
         let started_at = Instant::now();
-        let mut client = AdminServiceClient::connect(self.admin_addrs[0].clone())
-            .await
-            .expect("connect Docker admin endpoint");
-        let mut request = tonic::Request::new(anvil::anvil_api::ApplicationPoliciesRequest {
-            context: Some(test_admin_context(&format!("grant-batch-{app_name}"), 0)),
-            tenant_id: tenant_id.to_string(),
-            app_name: app_name.to_string(),
-            policies: policies
-                .iter()
-                .map(
-                    |(action, resource)| anvil::anvil_api::ApplicationPolicyMutation {
-                        action: action.clone(),
-                        resource: resource.clone(),
-                    },
-                )
-                .collect(),
-        });
-        add_docker_admin_bearer(&mut request, &self.admin_token);
-        client
-            .grant_application_policies(request)
-            .await
-            .expect("Docker admin GrantApplicationPolicies");
-        emit_test_timing(
-            format!(
-                "docker_actor grant_application_policies count={}",
-                policies.len()
-            ),
-            started_at.elapsed(),
+        let mut last_error = None;
+        for attempt in 1..=5 {
+            let mut client = AdminServiceClient::connect(self.admin_addrs[0].clone())
+                .await
+                .expect("connect Docker admin endpoint");
+            let mut request = tonic::Request::new(anvil::anvil_api::ApplicationPoliciesRequest {
+                context: Some(test_admin_context(
+                    &format!("grant-batch-{app_name}-{attempt}"),
+                    0,
+                )),
+                tenant_id: tenant_id.to_string(),
+                app_name: app_name.to_string(),
+                policies: policies
+                    .iter()
+                    .map(
+                        |(action, resource)| anvil::anvil_api::ApplicationPolicyMutation {
+                            action: action.clone(),
+                            resource: resource.clone(),
+                        },
+                    )
+                    .collect(),
+            });
+            add_docker_admin_bearer(&mut request, &self.admin_token);
+            match client.grant_application_policies(request).await {
+                Ok(_) => {
+                    emit_test_timing(
+                        format!(
+                            "docker_actor grant_application_policies count={}",
+                            policies.len()
+                        ),
+                        started_at.elapsed(),
+                    );
+                    return;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    tokio::time::sleep(Duration::from_millis(100 * attempt)).await;
+                }
+            }
+        }
+        panic!(
+            "Docker admin GrantApplicationPolicies failed after retries: {:?}",
+            last_error
         );
     }
 

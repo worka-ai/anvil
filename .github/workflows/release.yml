@@ -90,6 +90,7 @@ jobs:
         env:
           ANVIL_IMAGE: ${{ matrix.image }}
           ANVIL_DOCKER_PLATFORM: ${{ matrix.platform }}
+          ANVIL_BUILD_PROFILE: release
           CARGO_BUILD_JOBS: "2"
         run: ./scripts/build-image.sh
 

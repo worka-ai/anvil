@@ -102,13 +102,13 @@ Run these before changing core behaviour or opening a release PR:
 
 ```sh
 cargo fmt --all -- --check
-ANVIL_IMAGE=anvil:test ./scripts/build-image.sh
+ANVIL_BUILD_PROFILE=release ANVIL_IMAGE=anvil:test ./scripts/build-image.sh
 ./scripts/release-gates.sh
 ```
 
-`release-gates.sh` includes storage hardening checks, docs hardening, release-note rendering, the Fission documentation build, the Rust client publish dry run, Rust unit tests, server core integration tests, and Docker-backed integration groups. Each gate step prints start/finish timings and, where GNU `timeout` is available, is bounded by `ANVIL_GATE_STEP_TIMEOUT_SECONDS` (default `1800`). `build-image.sh` builds the release-shaped Docker image from host-built Linux binaries so CI and release jobs do not pay the Docker source-build cost. Security-sensitive changes should also include focused tests for the affected path before the full gate.
+`release-gates.sh` includes storage hardening checks, docs hardening, release-note rendering, the Fission documentation build, the Rust client publish dry run, Rust unit tests, server core integration tests, and Docker-backed integration groups. Each gate step prints start/finish timings and, where GNU `timeout` is available, is bounded by `ANVIL_GATE_STEP_TIMEOUT_SECONDS` (default `1800`). `build-image.sh` defaults to a dev-profile image for PR and local test turnaround; set `ANVIL_BUILD_PROFILE=release` when building release evidence. Security-sensitive changes should also include focused tests for the affected path before the full gate.
 
-CI and release builds run `build-image.sh` for both `linux/amd64` and `linux/arm64`. The script uses Zig/cargo-zigbuild by default so the Linux binaries are compatible with the runtime image instead of accidentally depending on the GitHub runner's newer glibc. Docker integration tests run against the `linux/amd64` artifact on GitHub's standard runner, while the `linux/arm64` artifact is still built and smoke-checked before release. The release workflow publishes architecture-specific GHCR tags and then creates the public multi-architecture tag from those tested artifacts.
+PR CI runs `build-image.sh` once for a fast `linux/amd64` dev-profile test image. Release builds run `build-image.sh` for both `linux/amd64` and `linux/arm64` with `ANVIL_BUILD_PROFILE=release`. The script uses Zig/cargo-zigbuild by default so the Linux binaries are compatible with the runtime image instead of accidentally depending on the GitHub runner's newer glibc. Docker integration tests run against the `linux/amd64` artifact, while the `linux/arm64` artifact is built and smoke-checked before publication. The release workflow publishes architecture-specific GHCR tags and then creates the public multi-architecture tag from those tested artifacts.
 
 ## Release Process
 

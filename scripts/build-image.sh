@@ -2,7 +2,7 @@
 set -euo pipefail
 
 image="${ANVIL_IMAGE:-anvil:test}"
-build_profile="${ANVIL_BUILD_PROFILE:-release}"
+build_profile="${ANVIL_BUILD_PROFILE:-dev}"
 
 case "${build_profile}" in
   release)

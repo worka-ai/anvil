@@ -34,7 +34,7 @@ Run fast, source-level checks before building a release image. Formatting is a m
 
 ```bash
 cargo fmt --all -- --check
-ANVIL_IMAGE=anvil:test ./scripts/build-image.sh
+ANVIL_BUILD_PROFILE=release ANVIL_IMAGE=anvil:test ./scripts/build-image.sh
 ./scripts/release-gates.sh
 ```
 
@@ -98,7 +98,7 @@ The release workflow builds Docker images with `scripts/build-image.sh` for `lin
 A local image check should use the same shape as CI where possible:
 
 ```bash
-ANVIL_IMAGE=anvil:test ./scripts/build-image.sh
+ANVIL_BUILD_PROFILE=release ANVIL_IMAGE=anvil:test ./scripts/build-image.sh
 
 docker run --rm anvil:test anvil-server --version
 docker run --rm anvil:test anvil --version

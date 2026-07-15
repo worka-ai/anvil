@@ -168,6 +168,10 @@ fn release_workflow_uses_shared_release_gates() {
         "release workflow must build the release image through scripts/build-image.sh"
     );
     assert!(
+        release.contains("ANVIL_BUILD_PROFILE: release"),
+        "release workflow must opt into release-profile image builds explicitly"
+    );
+    assert!(
         release.contains("linux/amd64") && release.contains("linux/arm64"),
         "release workflow must build both amd64 and arm64 images"
     );
