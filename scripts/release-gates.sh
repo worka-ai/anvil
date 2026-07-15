@@ -278,7 +278,10 @@ docker_index_gates() {
   run_docker_index_test_filter "vector hybrid build vector" "vector_hybrid::test_vector_index_builds_from_object_write_task"
   run_docker_index_test_filter "vector hybrid media modalities" "vector_hybrid::test_vector_index_builds_required_media_modalities_from_object_write_tasks"
 
-  run_docker_cargo_test "Docker CLI extended integration" -p anvil-storage-cli --test cli_extended
+  # CLI extended tests mutate the shared HF control stream and authz policy rows.
+  # Run them serially against the shared Docker cluster so the release gate
+  # validates public CLI behaviour without creating artificial cross-test races.
+  ANVIL_DOCKER_TEST_THREADS=1     run_docker_cargo_test "Docker CLI extended integration" -p anvil-storage-cli --test cli_extended
 }
 
 docker_mesh_gates() {
