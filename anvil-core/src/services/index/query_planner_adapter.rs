@@ -286,6 +286,9 @@ pub(super) async fn execute_corestore_query_plan(
     snapshot: &PlannerCandidateSnapshot,
     limit: usize,
 ) -> Result<crate::query_planner::QueryPlanResult, Status> {
+    if let Some(result) = empty_query_plan_result(snapshot) {
+        return Ok(result);
+    }
     let boundary_reader = PlannerBoundaryCandidateAdapter::new(snapshot.clone());
     let authz_reader = PlannerAuthzCandidateAdapter::new(
         storage.clone(),
@@ -311,6 +314,20 @@ pub(super) async fn execute_corestore_query_plan(
         .plan(request)
         .await
         .map_err(|e| Status::failed_precondition(e.to_string()))
+}
+
+fn empty_query_plan_result(
+    snapshot: &PlannerCandidateSnapshot,
+) -> Option<crate::query_planner::QueryPlanResult> {
+    snapshot
+        .index_candidates
+        .is_empty()
+        .then(|| crate::query_planner::QueryPlanResult {
+            candidates: snapshot.index_candidates.clone(),
+            ranges: Vec::new(),
+            final_authz: Vec::new(),
+            metrics: crate::query_planner::QueryPlanMetrics::default(),
+        })
 }
 
 impl PlannerCandidateSnapshot {
@@ -850,4 +867,43 @@ fn descending_score_tuple(score: f32, object_version_id: [u8; 16]) -> Vec<Vec<u8
         score_key = u32::MAX.to_be_bytes().to_vec();
     }
     vec![score_key, object_version_id.to_vec()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_index_candidates_produce_an_empty_plan() {
+        let scope = CandidateSetScope {
+            root_key_hash: "blake3:root".into(),
+            root_generation: 1,
+            index_id: "index-1".into(),
+            index_generation: 1,
+            authz_realm_id: "default".into(),
+            authz_scope_hash: "blake3:scope".into(),
+            authz_object_namespace: "objects".into(),
+            authz_relation: "read".into(),
+            authz_principal_hash: "blake3:principal".into(),
+            authz_revision: 1,
+            boundary_schema_generation_hash: "blake3:boundary".into(),
+            predicate_hash: "blake3:predicate".into(),
+            order_hash: "blake3:order".into(),
+        };
+        let snapshot = PlannerCandidateSnapshot {
+            index_candidates: CandidateSet::empty(scope.clone()),
+            boundary_candidates: CandidateSet::all_within_partition(scope.clone(), 7),
+            scope,
+            docs: Vec::new(),
+        };
+
+        let result = empty_query_plan_result(&snapshot).expect("empty plan");
+        assert!(result.candidates.is_empty());
+        assert!(result.ranges.is_empty());
+        assert!(result.final_authz.is_empty());
+        assert_eq!(
+            result.metrics,
+            crate::query_planner::QueryPlanMetrics::default()
+        );
+    }
 }
