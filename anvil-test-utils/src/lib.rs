@@ -291,6 +291,7 @@ impl DockerTestCluster {
     }
 
     async fn start_or_reuse() -> Self {
+        let _port_guard = docker_test_port_allocation_lock();
         let docker_image = require_docker_image();
         let compose_file = docker_compose_file();
         let project_name = docker_compose_project_name();
@@ -336,6 +337,7 @@ impl DockerTestCluster {
     }
 
     async fn start_isolated(label: &str, region: &str) -> Self {
+        let _port_guard = docker_test_port_allocation_lock();
         let docker_image = require_docker_image();
         let compose_file = docker_compose_file();
         let project_name = format!("anvil-test-{}-{}", label, uuid::Uuid::new_v4().simple());

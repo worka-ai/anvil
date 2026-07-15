@@ -88,11 +88,17 @@ fn read_numbered_ports_from_env(prefix: &str) -> Option<Vec<u16>> {
     Some(ports)
 }
 
+pub(super) fn docker_test_port_allocation_lock() -> DockerPortAllocationLock {
+    let dir = std::env::temp_dir().join("anvil-test-cluster-locks");
+    std::fs::create_dir_all(&dir).expect("create Docker test port state dir");
+    DockerPortAllocationLock::acquire(&dir)
+}
+
 fn docker_project_port_file(project_name: &str) -> DockerHostPorts {
     let dir = std::env::temp_dir().join("anvil-test-cluster-locks");
     std::fs::create_dir_all(&dir).expect("create Docker test port state dir");
     let port_file = dir.join(format!("{}.ports", sanitize_project_filename(project_name)));
-    let _guard = DockerPortAllocationLock::acquire(&dir);
+    let _guard = docker_test_port_allocation_lock();
     if let Some(ports) = read_project_port_file(&port_file) {
         return ports;
     }
@@ -168,7 +174,7 @@ fn sanitize_project_filename(project_name: &str) -> String {
     sanitized
 }
 
-struct DockerPortAllocationLock {
+pub(super) struct DockerPortAllocationLock {
     path: PathBuf,
 }
 
@@ -188,7 +194,8 @@ impl DockerPortAllocationLock {
                     return Self { path };
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if start.elapsed() > Duration::from_secs(30) {
+                    if port_lock_owner_is_dead(&path) || start.elapsed() > Duration::from_secs(300)
+                    {
                         let _ = std::fs::remove_file(&path);
                     }
                     std::thread::sleep(Duration::from_millis(100));
@@ -196,6 +203,34 @@ impl DockerPortAllocationLock {
                 Err(error) => panic!("acquire Docker test port allocation lock {path:?}: {error}"),
             }
         }
+    }
+}
+
+fn port_lock_owner_is_dead(path: &std::path::Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return true;
+    };
+    let Some(pid) = raw
+        .lines()
+        .find_map(|line| line.strip_prefix("pid="))
+        .and_then(|value| value.trim().parse::<u32>().ok())
+    else {
+        return true;
+    };
+
+    #[cfg(unix)]
+    {
+        !std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
     }
 }
 
