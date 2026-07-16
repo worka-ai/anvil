@@ -26,7 +26,7 @@ use anyhow::{Result as AnyhowResult, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{Stream, StreamExt};
 use serde_json::Value as JsonValue;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Mutex, OnceLock};
@@ -95,7 +95,8 @@ pub enum ObjectLinkReadMode {
     Metadata,
 }
 
-static DEFERRED_OBJECT_MAINTENANCE: OnceLock<Mutex<HashSet<(i64, i64)>>> = OnceLock::new();
+static DEFERRED_OBJECT_MAINTENANCE: OnceLock<Mutex<HashMap<(i64, i64), HashSet<String>>>> =
+    OnceLock::new();
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ObjectReadConsistency {
     #[default]
@@ -335,21 +336,37 @@ impl ObjectManager {
         .map_err(|error| Status::invalid_argument(error.to_string()))
     }
 
-    fn schedule_deferred_object_maintenance(&self, bucket: Bucket) {
+    fn schedule_deferred_object_maintenance(&self, bucket: Bucket, object_key: &str) {
         let key = (bucket.tenant_id, bucket.id);
-        let pending = DEFERRED_OBJECT_MAINTENANCE.get_or_init(|| Mutex::new(HashSet::new()));
-        {
+        let pending = DEFERRED_OBJECT_MAINTENANCE.get_or_init(|| Mutex::new(HashMap::new()));
+        let should_spawn = {
             let mut guard = pending.lock().expect("deferred maintenance lock poisoned");
-            if !guard.insert(key) {
-                return;
+            match guard.entry(key) {
+                Entry::Vacant(entry) => {
+                    entry.insert(HashSet::from([object_key.to_owned()]));
+                    true
+                }
+                Entry::Occupied(mut entry) => {
+                    entry.get_mut().insert(object_key.to_owned());
+                    false
+                }
             }
+        };
+        if !should_spawn {
+            return;
         }
 
         let persistence = self.persistence.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(250)).await;
+            let object_keys = DEFERRED_OBJECT_MAINTENANCE
+                .get()
+                .and_then(|pending| pending.lock().ok()?.remove(&key))
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<Vec<_>>();
             if let Err(error) = persistence
-                .enqueue_object_write_maintenance_if_due(&bucket, true, true)
+                .enqueue_object_write_maintenance_for_keys_if_due(&bucket, &object_keys, true, true)
                 .await
             {
                 tracing::warn!(
@@ -359,11 +376,6 @@ impl ObjectManager {
                     %error,
                     "deferred object write maintenance failed"
                 );
-            }
-            if let Some(pending) = DEFERRED_OBJECT_MAINTENANCE.get()
-                && let Ok(mut guard) = pending.lock()
-            {
-                guard.remove(&key);
             }
         });
     }
@@ -581,7 +593,7 @@ impl ObjectManager {
         );
         if transaction_id.is_none() {
             if options.visibility.defers_write_maintenance() {
-                self.schedule_deferred_object_maintenance(bucket.clone());
+                self.schedule_deferred_object_maintenance(bucket.clone(), object_key);
             }
             if options.visibility.requires_authz_materialization() {
                 let step_start = std::time::Instant::now();

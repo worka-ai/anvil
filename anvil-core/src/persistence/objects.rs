@@ -264,9 +264,10 @@ impl Persistence {
         if transaction_id.is_none() {
             if options.enqueue_index_maintenance {
                 let step_start = std::time::Instant::now();
-                self.enqueue_index_builds_for_bucket(&bucket).await?;
+                self.enqueue_index_builds_for_object_keys(&bucket, [object.key.as_str()])
+                    .await?;
                 crate::emit_test_timing(
-                    "persistence.create_object enqueue_index_builds_for_bucket",
+                    "persistence.create_object enqueue_index_builds_for_object_keys",
                     step_start.elapsed(),
                 );
             }
@@ -500,7 +501,8 @@ impl Persistence {
             )
             .await?;
             if options.enqueue_index_maintenance {
-                self.enqueue_index_builds_for_bucket(&bucket).await?;
+                self.enqueue_index_builds_for_object_keys(&bucket, [object.key.as_str()])
+                    .await?;
             }
             if options.enqueue_metadata_compaction {
                 self.enqueue_object_metadata_compaction_if_due(&bucket)
@@ -737,7 +739,8 @@ impl Persistence {
             )
             .await?;
             if options.enqueue_index_maintenance {
-                self.enqueue_index_builds_for_bucket(&bucket).await?;
+                self.enqueue_index_builds_for_object_keys(&bucket, [object.key.as_str()])
+                    .await?;
             }
             if options.enqueue_metadata_compaction {
                 self.enqueue_object_metadata_compaction_if_due(&bucket)
@@ -968,7 +971,8 @@ impl Persistence {
             )
             .await?;
             if options.enqueue_index_maintenance {
-                self.enqueue_index_builds_for_bucket(&bucket).await?;
+                self.enqueue_index_builds_for_object_keys(&bucket, [object.key.as_str()])
+                    .await?;
             }
             if options.enqueue_metadata_compaction {
                 self.enqueue_object_metadata_compaction_if_due(&bucket)
@@ -1066,7 +1070,8 @@ impl Persistence {
             )
             .await?;
             if options.enqueue_index_maintenance {
-                self.enqueue_index_builds_for_bucket(&bucket).await?;
+                self.enqueue_index_builds_for_object_keys(&bucket, [object.key.as_str()])
+                    .await?;
             }
             if options.enqueue_metadata_compaction {
                 self.enqueue_object_metadata_compaction_if_due(&bucket)
@@ -1167,16 +1172,22 @@ impl Persistence {
         Ok(())
     }
 
-    pub async fn enqueue_object_write_maintenance_if_due(
+    pub async fn enqueue_object_write_maintenance_for_keys_if_due(
         &self,
         bucket: &Bucket,
+        object_keys: &[String],
         enqueue_indexes: bool,
         enqueue_compaction: bool,
     ) -> Result<usize> {
         let mut scheduled = 0usize;
         if enqueue_indexes {
-            scheduled =
-                scheduled.saturating_add(self.enqueue_index_builds_for_bucket(bucket).await?);
+            scheduled = scheduled.saturating_add(
+                self.enqueue_index_builds_for_object_keys(
+                    bucket,
+                    object_keys.iter().map(String::as_str),
+                )
+                .await?,
+            );
         }
         if enqueue_compaction {
             self.enqueue_object_metadata_compaction_if_due(bucket)
