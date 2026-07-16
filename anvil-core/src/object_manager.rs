@@ -359,23 +359,48 @@ impl ObjectManager {
         let persistence = self.persistence.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(250)).await;
-            let object_keys = DEFERRED_OBJECT_MAINTENANCE
-                .get()
-                .and_then(|pending| pending.lock().ok()?.remove(&key))
-                .unwrap_or_default()
-                .into_iter()
-                .collect::<Vec<_>>();
-            if let Err(error) = persistence
-                .enqueue_object_write_maintenance_for_keys_if_due(&bucket, &object_keys, true, true)
-                .await
-            {
-                tracing::warn!(
-                    tenant_id = bucket.tenant_id,
-                    bucket_id = bucket.id,
-                    bucket_name = %bucket.name,
-                    %error,
-                    "deferred object write maintenance failed"
-                );
+            loop {
+                let object_keys = DEFERRED_OBJECT_MAINTENANCE
+                    .get()
+                    .and_then(|pending| {
+                        let mut pending = pending.lock().ok()?;
+                        pending.get_mut(&key).map(std::mem::take)
+                    })
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                if let Err(error) = persistence
+                    .enqueue_object_write_maintenance_for_keys_if_due(
+                        &bucket,
+                        &object_keys,
+                        true,
+                        true,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        tenant_id = bucket.tenant_id,
+                        bucket_id = bucket.id,
+                        bucket_name = %bucket.name,
+                        %error,
+                        "deferred object write maintenance failed"
+                    );
+                }
+
+                let has_more = DEFERRED_OBJECT_MAINTENANCE
+                    .get()
+                    .and_then(|pending| {
+                        let mut pending = pending.lock().ok()?;
+                        let has_more = pending.get(&key).is_some_and(|keys| !keys.is_empty());
+                        if !has_more {
+                            pending.remove(&key);
+                        }
+                        Some(has_more)
+                    })
+                    .unwrap_or(false);
+                if !has_more {
+                    break;
+                }
             }
         });
     }

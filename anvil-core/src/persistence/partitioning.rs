@@ -42,6 +42,7 @@ impl Persistence {
             core_store: Arc::new(OnceCell::new()),
             event_publisher,
             task_notify: Arc::new(Notify::new()),
+            task_queue_write_lock: Arc::new(TokioMutex::new(())),
             mesh_id: nonempty_or(&config.mesh_id, "default"),
             region: nonempty_or(&config.region, "default"),
             cell_id: nonempty_or(&config.cell_id, "default"),

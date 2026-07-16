@@ -1332,6 +1332,41 @@ async fn persistence_schedules_deduplicated_object_metadata_compaction_tasks() {
 }
 
 #[tokio::test]
+async fn persistence_serializes_concurrent_task_queue_writes() {
+    let temp = tempdir().unwrap();
+    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+
+    let writes = (0..12).map(|bucket_id| {
+        let persistence = persistence.clone();
+        async move {
+            persistence
+                .enqueue_task(
+                    crate::tasks::TaskType::DeleteBucket,
+                    json!({ "bucket_id": bucket_id }),
+                    100,
+                )
+                .await
+        }
+    });
+    let results = futures_util::future::join_all(writes).await;
+
+    for result in results {
+        result.unwrap();
+    }
+    let tasks = persistence.list_tasks().await.unwrap();
+    assert_eq!(tasks.len(), 12);
+    let ids = tasks.iter().map(|task| task.id).collect::<HashSet<_>>();
+    assert_eq!(ids.len(), 12);
+}
+
+#[test]
+fn task_queue_retries_coremeta_target_conflicts() {
+    assert!(is_retryable_partition_fence_error(&anyhow!(
+        "CoreMeta row cf_leases_fences/0x8904 target mismatch"
+    )));
+}
+
+#[tokio::test]
 async fn persistence_task_execution_lease_targets_object_metadata_partition() {
     let temp = tempdir().unwrap();
     let config = test_config(temp.path());

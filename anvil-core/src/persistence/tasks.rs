@@ -13,6 +13,7 @@ impl Persistence {
         payload: JsonValue,
         priority: i32,
     ) -> Result<()> {
+        let _write_guard = self.task_queue_write_lock.lock().await;
         let permit = self.task_queue_write_permit().await?;
         task_journal::enqueue_task_with_permit(
             &self.storage,
@@ -33,6 +34,7 @@ impl Persistence {
         payload: JsonValue,
         priority: i32,
     ) -> Result<bool> {
+        let _write_guard = self.task_queue_write_lock.lock().await;
         let permit = self.task_queue_write_permit().await?;
         let enqueued = task_journal::enqueue_task_if_absent_with_permit(
             &self.storage,
@@ -54,6 +56,7 @@ impl Persistence {
         payload: JsonValue,
         priority: i32,
     ) -> Result<bool> {
+        let _write_guard = self.task_queue_write_lock.lock().await;
         let mut last_error = None;
         for _ in 0..5 {
             let permit = match self.task_queue_write_permit().await {
@@ -274,6 +277,7 @@ impl Persistence {
     }
 
     pub async fn claim_pending_tasks(&self, limit: i64) -> Result<Vec<TaskRecord>> {
+        let _write_guard = self.task_queue_write_lock.lock().await;
         let mut last_error = None;
         for _ in 0..5 {
             let permit = match self.task_queue_write_permit().await {
@@ -317,6 +321,7 @@ impl Persistence {
         task_id: i64,
         status: crate::tasks::TaskStatus,
     ) -> Result<()> {
+        let _write_guard = self.task_queue_write_lock.lock().await;
         let mut last_error = None;
         for _ in 0..5 {
             let permit = match self.task_queue_write_permit().await {
@@ -349,6 +354,7 @@ impl Persistence {
     }
 
     pub async fn fail_task(&self, task_id: i64, error: &str) -> Result<()> {
+        let _write_guard = self.task_queue_write_lock.lock().await;
         let mut last_error = None;
         for _ in 0..5 {
             let permit = match self.task_queue_write_permit().await {

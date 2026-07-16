@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{Notify, OnceCell, mpsc::Sender};
+use tokio::sync::{Mutex, Notify, OnceCell, mpsc::Sender};
 
 use crate::{
     append_journal, authz_journal, authz_repair,
@@ -40,6 +40,7 @@ pub struct Persistence {
     core_store: Arc<OnceCell<CoreStore>>,
     event_publisher: Option<Sender<MetadataEvent>>,
     task_notify: Arc<Notify>,
+    task_queue_write_lock: Arc<Mutex<()>>,
     mesh_id: String,
     region: String,
     cell_id: String,
@@ -522,7 +523,12 @@ fn user_metadata_hash(user_meta: Option<&JsonValue>) -> String {
 
 fn is_retryable_partition_fence_error(error: &anyhow::Error) -> bool {
     let message = error.to_string();
-    message.contains("generation mismatch") || message.contains("stale")
+    message.contains("generation mismatch")
+        || message.contains("target mismatch")
+        || message.contains("must be absent")
+        || message.contains("must be present")
+        || message.contains("CAS lock was not acquired")
+        || message.contains("stale")
 }
 
 fn canonical_json_bytes(value: &JsonValue) -> Vec<u8> {
