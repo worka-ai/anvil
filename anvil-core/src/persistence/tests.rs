@@ -31,6 +31,68 @@ fn model_manifest() -> crate::anvil_api::ModelManifest {
 }
 
 #[tokio::test]
+async fn empty_bucket_index_build_materialises_an_empty_typed_json_segment() {
+    let temp = tempdir().unwrap();
+    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    let tenant = persistence
+        .create_tenant("empty-index-tenant", "empty-index-tenant")
+        .await
+        .unwrap();
+    let bucket = persistence
+        .create_bucket(tenant.id, "empty-index-bucket", "test-region")
+        .await
+        .unwrap();
+    let index = persistence
+        .create_index_definition(
+            tenant.id,
+            bucket.id,
+            "pending-items",
+            "typed_json",
+            json!({"prefix": "items/"}),
+            json!({}),
+            "inherit_object",
+            json!({
+                "source_kind": "object_current",
+                "fields": [
+                    {"name": "state", "extractor": "/state", "required": true}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+    persistence
+        .create_index_definition_event(tenant.id, bucket.id, &bucket.name, &index, "create")
+        .await
+        .unwrap();
+
+    assert!(
+        persistence
+            .enqueue_index_build_for_index(&bucket, &index)
+            .await
+            .unwrap(),
+        "an empty source still needs an initial materialised generation"
+    );
+    let outcome = persistence
+        .build_index_task(tenant.id, bucket.id, index.id, index.version, 0)
+        .await
+        .unwrap()
+        .expect("typed JSON index build outcome");
+
+    assert_eq!(outcome.item_count, 0);
+    assert_eq!(outcome.source_cursor, 0);
+    assert!(
+        crate::typed_field_segment::latest_typed_field_segment_ref(
+            &persistence.storage,
+            &outcome.index_storage_id,
+        )
+        .await
+        .unwrap()
+        .is_some(),
+        "empty typed JSON indexes must be queryable as empty results"
+    );
+}
+
+#[tokio::test]
 async fn tenant_and_bucket_creation_materialise_mesh_directory_locators() {
     let temp = tempdir().unwrap();
     let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
@@ -1329,6 +1391,41 @@ async fn persistence_schedules_deduplicated_object_metadata_compaction_tasks() {
         2,
         "new post-compaction journal frames should schedule a new task"
     );
+}
+
+#[tokio::test]
+async fn persistence_serializes_concurrent_task_queue_writes() {
+    let temp = tempdir().unwrap();
+    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+
+    let writes = (0..12).map(|bucket_id| {
+        let persistence = persistence.clone();
+        async move {
+            persistence
+                .enqueue_task(
+                    crate::tasks::TaskType::DeleteBucket,
+                    json!({ "bucket_id": bucket_id }),
+                    100,
+                )
+                .await
+        }
+    });
+    let results = futures_util::future::join_all(writes).await;
+
+    for result in results {
+        result.unwrap();
+    }
+    let tasks = persistence.list_tasks().await.unwrap();
+    assert_eq!(tasks.len(), 12);
+    let ids = tasks.iter().map(|task| task.id).collect::<HashSet<_>>();
+    assert_eq!(ids.len(), 12);
+}
+
+#[test]
+fn task_queue_retries_coremeta_target_conflicts() {
+    assert!(is_retryable_partition_fence_error(&anyhow!(
+        "CoreMeta row cf_leases_fences/0x8904 target mismatch"
+    )));
 }
 
 #[tokio::test]

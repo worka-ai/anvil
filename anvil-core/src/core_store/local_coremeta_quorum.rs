@@ -7,6 +7,7 @@ use crate::anvil_api::{
 };
 use crate::mesh_lifecycle::{self, LifecycleState, NodeCapability};
 use futures_util::StreamExt;
+use std::collections::VecDeque;
 
 #[derive(Debug, Clone)]
 pub(crate) struct CoreMetaQuorumCommitOutcome {
@@ -84,14 +85,17 @@ impl CoreStore {
     ) -> Result<Vec<CoreMetaQuorumCommitOutcome>> {
         validate_logical_id(transaction_id, "CoreMeta quorum transaction id")?;
         let mut local_rows = Vec::new();
-        let mut replicated_rows = BTreeMap::<(String, u64), Vec<CoreMetaEncodedOwnedRow>>::new();
+        let mut replicated_rows =
+            BTreeMap::<String, BTreeMap<u64, Vec<CoreMetaEncodedOwnedRow>>>::new();
 
         for row in self.meta.encode_batch_ops(ops)? {
             if row.root_key_hash.is_empty() {
                 local_rows.push(row);
             } else {
                 replicated_rows
-                    .entry((row.root_key_hash.clone(), row.root_generation))
+                    .entry(row.root_key_hash.clone())
+                    .or_default()
+                    .entry(row.root_generation)
                     .or_default()
                     .push(row);
             }
@@ -102,21 +106,38 @@ impl CoreStore {
             self.write_coremeta_encoded_rows(&borrowed)?;
         }
 
-        self.commit_coremeta_encoded_rows_for_roots(
-            replicated_rows
-                .into_iter()
-                .map(
-                    |((root_key_hash, post_root_generation), rows)| CoreMetaRootCommitInput {
-                        root_key_hash,
-                        expected_root_generation: post_root_generation.saturating_sub(1),
-                        post_root_generation,
-                        transaction_id: transaction_id.to_string(),
-                        rows,
-                    },
+        let mut generations_by_root = replicated_rows
+            .into_iter()
+            .map(|(root_key_hash, generations)| {
+                (
+                    root_key_hash,
+                    generations.into_iter().collect::<VecDeque<_>>(),
                 )
-                .collect(),
-        )
-        .await
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut outcomes = Vec::new();
+
+        loop {
+            let mut inputs = Vec::new();
+            for (root_key_hash, generations) in &mut generations_by_root {
+                let Some((post_root_generation, rows)) = generations.pop_front() else {
+                    continue;
+                };
+                inputs.push(CoreMetaRootCommitInput {
+                    root_key_hash: root_key_hash.clone(),
+                    expected_root_generation: post_root_generation.saturating_sub(1),
+                    post_root_generation,
+                    transaction_id: transaction_id.to_string(),
+                    rows,
+                });
+            }
+            if inputs.is_empty() {
+                break;
+            }
+            outcomes.extend(self.commit_coremeta_encoded_rows_for_roots(inputs).await?);
+        }
+
+        Ok(outcomes)
     }
 
     pub(crate) async fn commit_coremeta_encoded_rows_for_root(
