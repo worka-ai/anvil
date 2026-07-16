@@ -21,6 +21,12 @@ concurrency:
   group: anvil-release-${{ github.ref_name }}
   cancel-in-progress: false
 
+env:
+  # Self-hosted runners keep this directory between jobs. Sharing Cargo's
+  # target directory avoids rebuilding the same workspace dependencies in the
+  # image, unit, server-core and Docker-gate stages.
+  CARGO_TARGET_DIR: /home/github-runner/.cache/anvil/cargo-target
+
 jobs:
   build-image:
     name: Build release image (${{ matrix.platform }})
