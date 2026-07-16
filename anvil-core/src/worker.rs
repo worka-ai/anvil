@@ -21,6 +21,7 @@ use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tonic::Status;
 use tracing::{debug, error, info, warn};
 
@@ -158,10 +159,21 @@ pub async fn run(
     jwt_manager: Arc<JwtManager>,
     object_manager: ObjectManager,
     keyring: Arc<EncryptionKeyring>,
+    concurrency: usize,
 ) -> Result<()> {
     let task_notify = persistence.task_notify();
     let mut claim_backoff = WorkerClaimBackoff::default();
+    let task_slots = Arc::new(Semaphore::new(concurrency.max(1)));
     loop {
+        if task_slots.available_permits() == 0 {
+            let permit = task_slots
+                .acquire()
+                .await
+                .map_err(|_| anyhow!("background task semaphore closed"))?;
+            drop(permit);
+            continue;
+        }
+
         match persistence.has_due_task_work().await {
             Ok(true) => {}
             Ok(false) => {
@@ -176,7 +188,8 @@ pub async fn run(
             }
         }
 
-        let tasks = match persistence.claim_pending_tasks(10).await {
+        let claim_limit = task_slots.available_permits().min(10) as i64;
+        let tasks = match persistence.claim_pending_tasks(claim_limit).await {
             Ok(tasks) => {
                 claim_backoff.reset();
                 tasks
@@ -221,7 +234,13 @@ pub async fn run(
             let jm = jwt_manager.clone();
             let om = object_manager.clone();
             let keyring = keyring.clone();
+            let permit = task_slots
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| anyhow!("background task semaphore closed"))?;
             tokio::spawn(async move {
+                let _permit = permit;
                 let result = execute_task_with_lease(&p, &cs, &jm, &om, &task, &keyring).await;
 
                 if let Err(e) = result {
