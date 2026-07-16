@@ -48,16 +48,53 @@ const SHARED_CLUSTER_REGIONS: [&str; 6] = [
 
 async fn connect_docker_admin(addr: &str) -> AdminServiceClient<Channel> {
     let mut last_error = None;
-    for attempt in 1..=20 {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut attempt = 1_u64;
+    while Instant::now() < deadline {
         match AdminServiceClient::connect(addr.to_string()).await {
             Ok(client) => return client,
             Err(error) => {
                 last_error = Some(error);
-                tokio::time::sleep(Duration::from_millis(100 * attempt)).await;
+                tokio::time::sleep(Duration::from_millis((100 * attempt).min(1_000))).await;
+                attempt += 1;
             }
         }
     }
     panic!("connect Docker admin endpoint {addr}: {last_error:?}");
+}
+
+async fn wait_for_docker_admin_ready(addr: &str, token: &str, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if let Ok(mut client) = AdminServiceClient::connect(addr.to_string()).await {
+            let mut request =
+                tonic::Request::new(anvil::anvil_api::GetLocalNodeDescriptorRequest {});
+            add_docker_admin_bearer(&mut request, token);
+            if client.get_local_node_descriptor(request).await.is_ok() {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    false
+}
+
+fn dump_docker_cluster_diagnostics(
+    compose_file: &std::path::Path,
+    project_name: &str,
+    compose_env: &[(String, String)],
+) {
+    for (label, args) in [
+        ("ps", vec!["ps", "-a"]),
+        ("logs", vec!["logs", "--tail=160"]),
+    ] {
+        let output = docker_compose_output_with_env(compose_file, project_name, &args, compose_env);
+        eprintln!(
+            "[anvil-test] docker compose {label}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 fn test_cluster_limit() -> usize {
@@ -321,6 +358,17 @@ impl DockerTestCluster {
             .collect::<Vec<_>>();
 
         let admin_token = mint_docker_system_admin_token("docker-system-admin");
+        let wait_start = Instant::now();
+        for addr in &admin_addrs {
+            if !wait_for_docker_admin_ready(addr, &admin_token, Duration::from_secs(120)).await {
+                dump_docker_cluster_diagnostics(&compose_file, &project_name, &compose_env);
+                panic!("Docker Anvil admin endpoint did not become ready: {addr}");
+            }
+        }
+        emit_test_timing(
+            "docker_shared_cluster admin_ports_ready",
+            wait_start.elapsed(),
+        );
         ensure_docker_topology(&admin_addrs, &admin_token, &docker_test_region()).await;
 
         Self {
@@ -380,6 +428,17 @@ impl DockerTestCluster {
         emit_test_timing("docker_isolated_cluster ports_ready", wait_start.elapsed());
 
         let admin_token = mint_docker_system_admin_token("docker-system-admin");
+        let wait_start = Instant::now();
+        for addr in &admin_addrs {
+            if !wait_for_docker_admin_ready(addr, &admin_token, Duration::from_secs(120)).await {
+                dump_docker_cluster_diagnostics(&compose_file, &project_name, &compose_env);
+                panic!("isolated Docker Anvil admin endpoint did not become ready: {addr}");
+            }
+        }
+        emit_test_timing(
+            "docker_isolated_cluster admin_ports_ready",
+            wait_start.elapsed(),
+        );
         ensure_docker_topology(&admin_addrs, &admin_token, region).await;
 
         Self {
@@ -630,6 +689,8 @@ impl DockerTestCluster {
     pub async fn start_node(&self, node: u8) {
         let project_name = self.project_name.clone();
         let addr = self.grpc_addrs[(node - 1) as usize].clone();
+        let admin_addr = self.admin_addrs[(node - 1) as usize].clone();
+        let admin_token = self.admin_token.clone();
         tokio::task::spawn_blocking(move || {
             docker_container_command(&project_name, node, "start");
         })
@@ -638,6 +699,10 @@ impl DockerTestCluster {
         assert!(
             wait_for_http_ready(&addr, Duration::from_secs(90)).await,
             "Docker Anvil test endpoint did not become ready after restart: {addr}"
+        );
+        assert!(
+            wait_for_docker_admin_ready(&admin_addr, &admin_token, Duration::from_secs(90)).await,
+            "Docker Anvil admin endpoint did not become ready after restart: {admin_addr}"
         );
     }
 
