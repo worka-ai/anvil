@@ -614,8 +614,11 @@ fn page_token_scope_uses_authz_revision_fence_and_system_revision() {
     assert!(operations.contains("token.validate(&binding)?"));
     assert!(adapter.contains("system_revision: authz_scope.system_revision"));
     assert!(adapter.contains("authz_revision: authz_scope.revision_fence()"));
-    assert!(adapter.contains("if system_segment.header.generation != request.system_revision"));
-    assert!(adapter.contains("AuthzCandidateSetStale"));
+    assert!(adapter.contains("principal_has_bucket_wide_object_access("));
+    assert!(adapter.contains("principal_has_system_object_access("));
+    assert!(adapter.contains("system_realm_relationship_allows("));
+    assert!(adapter.matches("Some(system_revision)").count() >= 2);
+    assert!(adapter.contains("Invalid system authz revision"));
 }
 
 #[test]
