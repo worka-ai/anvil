@@ -132,7 +132,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       ANVIL_GATE_STEP_TIMEOUT_SECONDS: "5400"
-      ANVIL_RUST_TEST_THREADS: "4"
+      ANVIL_RUST_TEST_THREADS: "1"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -176,7 +176,7 @@ jobs:
       CARGO_BUILD_JOBS: "1"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-      ANVIL_RUST_TEST_THREADS: "4"
+      ANVIL_RUST_TEST_THREADS: "1"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
