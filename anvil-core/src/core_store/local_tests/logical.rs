@@ -137,6 +137,82 @@ async fn coremeta_quorum_commits_independent_roots_as_one_group() {
 }
 
 #[tokio::test]
+async fn coremeta_quorum_commits_successive_generations_of_one_root_in_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let store = CoreStore::new(storage).await.unwrap();
+    let root_key_hash = core_meta_root_key_hash("test/group/shared");
+    let first_key = core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("shared-first")]).unwrap();
+    let second_key = core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("shared-second")]).unwrap();
+    let first_payload = encode_core_meta_inline_payload_row(
+        b"first",
+        core_meta_committed_row_common(
+            "test/group",
+            root_key_hash.clone(),
+            1,
+            "successive-root-commit",
+            1,
+        ),
+    )
+    .unwrap();
+    let second_payload = encode_core_meta_inline_payload_row(
+        b"second",
+        core_meta_committed_row_common(
+            "test/group",
+            root_key_hash.clone(),
+            2,
+            "successive-root-commit",
+            2,
+        ),
+    )
+    .unwrap();
+    let operations = [
+        CoreMetaBatchOp {
+            cf: CF_INLINE_PAYLOADS,
+            table_id: TABLE_INLINE_PAYLOAD_ROW,
+            tuple_key: &first_key,
+            common: None,
+            kind: CoreMetaBatchOpKind::Put(&first_payload),
+        },
+        CoreMetaBatchOp {
+            cf: CF_INLINE_PAYLOADS,
+            table_id: TABLE_INLINE_PAYLOAD_ROW,
+            tuple_key: &second_key,
+            common: None,
+            kind: CoreMetaBatchOpKind::Put(&second_payload),
+        },
+    ];
+
+    let outcomes = store
+        .commit_coremeta_batch_by_embedded_roots("successive-root-commit", &operations)
+        .await
+        .unwrap();
+
+    assert_eq!(outcomes.len(), 2);
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| outcome.root_key_hash == root_key_hash)
+    );
+    assert_eq!(outcomes[0].post_root_generation, 1);
+    assert_eq!(outcomes[1].post_root_generation, 2);
+    assert!(
+        store
+            .meta
+            .get(CF_INLINE_PAYLOADS, TABLE_INLINE_PAYLOAD_ROW, &first_key)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .meta
+            .get(CF_INLINE_PAYLOADS, TABLE_INLINE_PAYLOAD_ROW, &second_key)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn core_store_put_get_blob_verifies_hash() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = Storage::new_at(tmp.path()).await.unwrap();
