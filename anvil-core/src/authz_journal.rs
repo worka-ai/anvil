@@ -726,6 +726,26 @@ pub async fn resolve_permission_at_revision(
                 );
             }
         }
+
+        // The current materialized rows are substantially cheaper than replaying the
+        // append journal. Double-check the revision around the read so an update racing
+        // this lookup falls back to the historical resolver instead of mixing revisions.
+        if latest_authz_revision(storage, tenant_id).await? == revision {
+            let allowed = resolve_current_permission(
+                storage,
+                tenant_id,
+                namespace,
+                object_id,
+                relation,
+                subject_kind,
+                subject_id,
+                caveat_hash,
+            )
+            .await?;
+            if latest_authz_revision(storage, tenant_id).await? == revision {
+                return Ok(allowed);
+            }
+        }
     }
 
     resolve_permission_from_current_view_at_revision(
