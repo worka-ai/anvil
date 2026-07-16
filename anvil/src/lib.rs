@@ -61,6 +61,7 @@ pub async fn start_node_with_admin_listener(
                 worker_state.jwt_manager.clone(),
                 worker_state.object_manager.clone(),
                 worker_state.secret_keyring.clone(),
+                worker_state.config.background_worker_concurrency,
             )
             .await
             {

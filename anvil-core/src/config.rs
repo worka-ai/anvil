@@ -155,10 +155,30 @@ pub struct Config {
     #[arg(long, env, default_value_t = true)]
     pub run_background_worker: bool,
 
+    /// Maximum number of background tasks executed concurrently by this node.
+    #[arg(
+        long,
+        env,
+        default_value_t = 4,
+        value_parser = parse_positive_usize
+    )]
+    pub background_worker_concurrency: usize,
+
     /// Seconds that an in-process background task lease remains valid without renewal.
     #[arg(long, env, default_value_t = 300)]
     pub task_lease_ttl_secs: u64,
 }
+
+fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| "value must be a positive integer".to_string())?;
+    if parsed == 0 {
+        return Err("value must be greater than zero".into());
+    }
+    Ok(parsed)
+}
+
 impl Config {
     #[allow(unused)]
     pub fn from_ref(args: &Self) -> Self {
@@ -256,6 +276,21 @@ mod tests {
             config.cross_region_routing_policy,
             CrossRegionRoutingPolicy::LocalOnly
         );
+    }
+
+    #[test]
+    fn background_worker_concurrency_defaults_and_parses() {
+        let default = Config::try_parse_from(required_args()).unwrap();
+        assert_eq!(default.background_worker_concurrency, 4);
+
+        let mut args = required_args().to_vec();
+        args.extend(["--background-worker-concurrency", "1"]);
+        let configured = Config::try_parse_from(args).unwrap();
+        assert_eq!(configured.background_worker_concurrency, 1);
+
+        let mut invalid_args = required_args().to_vec();
+        invalid_args.extend(["--background-worker-concurrency", "0"]);
+        assert!(Config::try_parse_from(invalid_args).is_err());
     }
 
     #[tokio::test]

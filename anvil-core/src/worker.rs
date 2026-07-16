@@ -21,6 +21,7 @@ use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tonic::Status;
 use tracing::{debug, error, info, warn};
 
@@ -158,10 +159,25 @@ pub async fn run(
     jwt_manager: Arc<JwtManager>,
     object_manager: ObjectManager,
     keyring: Arc<EncryptionKeyring>,
+    concurrency: usize,
 ) -> Result<()> {
+    while let Err(error) = recover_interrupted_tasks(&persistence).await {
+        warn!(%error, "Failed to recover interrupted background tasks; retrying");
+        tokio::time::sleep(CLAIM_FATAL_DELAY).await;
+    }
     let task_notify = persistence.task_notify();
     let mut claim_backoff = WorkerClaimBackoff::default();
+    let task_slots = Arc::new(Semaphore::new(concurrency.max(1)));
     loop {
+        if task_slots.available_permits() == 0 {
+            let permit = task_slots
+                .acquire()
+                .await
+                .map_err(|_| anyhow!("background task semaphore closed"))?;
+            drop(permit);
+            continue;
+        }
+
         match persistence.has_due_task_work().await {
             Ok(true) => {}
             Ok(false) => {
@@ -176,7 +192,8 @@ pub async fn run(
             }
         }
 
-        let tasks = match persistence.claim_pending_tasks(10).await {
+        let claim_limit = task_slots.available_permits().min(10) as i64;
+        let tasks = match persistence.claim_pending_tasks(claim_limit).await {
             Ok(tasks) => {
                 claim_backoff.reset();
                 tasks
@@ -221,7 +238,13 @@ pub async fn run(
             let jm = jwt_manager.clone();
             let om = object_manager.clone();
             let keyring = keyring.clone();
+            let permit = task_slots
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| anyhow!("background task semaphore closed"))?;
             tokio::spawn(async move {
+                let _permit = permit;
                 let result = execute_task_with_lease(&p, &cs, &jm, &om, &task, &keyring).await;
 
                 if let Err(e) = result {
@@ -242,6 +265,62 @@ pub async fn run(
             });
         }
     }
+}
+
+async fn recover_interrupted_tasks(persistence: &Persistence) -> Result<()> {
+    let node_id = persistence.owner_node_id();
+    let interrupted = persistence
+        .list_tasks()
+        .await?
+        .into_iter()
+        .filter(|task| task.status == TaskStatus::Running)
+        .collect::<Vec<_>>();
+    let mut recovered = 0_usize;
+
+    for task in interrupted {
+        let lease = match persistence.read_task_execution_lease(task.id).await {
+            Ok(lease) => lease,
+            Err(error) => {
+                warn!(
+                    task_id = task.id,
+                    %error,
+                    "Failed to inspect an interrupted background task lease"
+                );
+                continue;
+            }
+        };
+        if lease
+            .as_ref()
+            .is_some_and(|lease| lease.owner_node_id() != node_id)
+        {
+            continue;
+        }
+        if let Err(error) = persistence
+            .fail_task(
+                task.id,
+                "background worker restarted before task completion",
+            )
+            .await
+        {
+            warn!(
+                task_id = task.id,
+                %error,
+                "Failed to recover an interrupted background task"
+            );
+            continue;
+        }
+        recovered = recovered.saturating_add(1);
+        warn!(
+            task_id = task.id,
+            task_type = ?task.task_type,
+            "Recovered an interrupted background task"
+        );
+    }
+
+    if recovered > 0 {
+        info!(recovered, "Recovered interrupted background tasks");
+    }
+    Ok(())
 }
 
 async fn execute_task_with_lease(
@@ -778,6 +857,55 @@ mod tests {
                 .max(max_seen);
         }
         assert!(max_seen <= CLAIM_CONTENTION_MAX_DELAY + CLAIM_CONTENTION_MAX_DELAY / 2);
+    }
+
+    #[tokio::test]
+    async fn interrupted_claim_is_requeued_when_the_worker_restarts() {
+        let temp = tempdir().unwrap();
+        let config = test_config(temp.path());
+        let persistence = Persistence::new(&config, None).unwrap();
+
+        persistence
+            .enqueue_task(TaskType::DeleteObject, json!({ "object_id": 1 }), 0)
+            .await
+            .unwrap();
+        let claimed = persistence.claim_pending_tasks(1).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].status, TaskStatus::Running);
+
+        recover_interrupted_tasks(&persistence).await.unwrap();
+
+        let tasks = persistence.list_tasks().await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].status, TaskStatus::Failed);
+        assert_eq!(tasks[0].attempts, 1);
+        assert_eq!(
+            tasks[0].last_error.as_deref(),
+            Some("background worker restarted before task completion")
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_task_owned_by_the_restarting_node_is_requeued() {
+        let temp = tempdir().unwrap();
+        let config = test_config(temp.path());
+        let persistence = Persistence::new(&config, None).unwrap();
+
+        persistence
+            .enqueue_task(TaskType::DeleteObject, json!({ "object_id": 1 }), 0)
+            .await
+            .unwrap();
+        let claimed = persistence.claim_pending_tasks(1).await.unwrap();
+        persistence
+            .acquire_task_execution_lease(&claimed[0])
+            .await
+            .unwrap();
+
+        recover_interrupted_tasks(&persistence).await.unwrap();
+
+        let tasks = persistence.list_tasks().await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].status, TaskStatus::Failed);
     }
 
     #[tokio::test]
