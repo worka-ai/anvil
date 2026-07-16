@@ -45,7 +45,8 @@ run_step() {
 run_cargo_test() {
   local name="$1"
   shift
-  run_step "$name" cargo test --no-fail-fast "$@" -- --nocapture
+  local test_threads="${ANVIL_RUST_TEST_THREADS:-4}"
+  run_step "$name" cargo test --no-fail-fast "$@" -- --nocapture --test-threads="${test_threads}"
 }
 
 run_docker_cargo_test() {

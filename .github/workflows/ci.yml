@@ -124,11 +124,13 @@ jobs:
 
   rust-unit:
     name: Rust unit and client tests
+    needs: [build-image, static]
     runs-on: [self-hosted, linux, x64]
     timeout-minutes: 120
     env:
       CARGO_BUILD_JOBS: "2"
       ANVIL_GATE_STEP_TIMEOUT_SECONDS: "5400"
+      ANVIL_RUST_TEST_THREADS: "4"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -165,10 +167,12 @@ jobs:
 
   server-core:
     name: Server core integration tests
+    needs: rust-unit
     runs-on: [self-hosted, linux, x64]
     timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: "2"
+      ANVIL_RUST_TEST_THREADS: "4"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -208,13 +212,15 @@ jobs:
 
   docker-integration:
     name: Docker integration tests (${{ matrix.group }})
-    needs: build-image
+    needs: [build-image, server-core]
     runs-on: [self-hosted, linux, x64]
     timeout-minutes: 120
     env:
       CARGO_BUILD_JOBS: "2"
+      ANVIL_DOCKER_TEST_THREADS: "2"
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         group: [docker-auth, docker-storage, docker-index, docker-mesh]
     steps:
