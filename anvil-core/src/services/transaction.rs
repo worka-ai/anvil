@@ -424,6 +424,9 @@ fn transaction_state_name(state: CoreTransactionState) -> &'static str {
 
 fn core_store_status(error: anyhow::Error) -> Status {
     let message = error.to_string();
+    if message.contains("TransactionConflict") {
+        tracing::warn!(error = %message, "explicit transaction conflicted");
+    }
     if message.contains("TransactionNotFound") {
         Status::not_found("TransactionNotFound")
     } else if message.contains("TransactionPrincipalMismatch") {
@@ -1090,6 +1093,129 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(blocked.code(), tonic::Code::Aborted);
+    }
+
+    #[tokio::test]
+    async fn expired_open_predecessor_does_not_block_object_transaction_commit() {
+        let (_temp, state) = test_state().await;
+        let tenant = state
+            .persistence
+            .create_tenant("expired-predecessor", "expired-predecessor")
+            .await
+            .unwrap();
+        let claims = auth::Claims {
+            sub: "expired-predecessor-principal".to_string(),
+            exp: usize::MAX,
+            tenant_id: tenant.id,
+            jti: Some("expired-predecessor-jti".to_string()),
+        };
+        crate::access_control::grant_storage_tenant_owner(
+            &state.persistence,
+            tenant.id,
+            &claims.sub,
+            "expired predecessor test",
+            "seed transaction tenant owner",
+        )
+        .await
+        .unwrap();
+        let bucket = state
+            .bucket_manager
+            .create_bucket(&claims, "expired-predecessor", "local")
+            .await
+            .unwrap();
+        let root = hex::encode(metadata_journal::object_metadata_partition_id(
+            claims.tenant_id,
+            bucket.id,
+        ));
+
+        let predecessor_precondition = absent_objects(&bucket.name, &["abandoned.json"]);
+        let predecessor = state
+            .begin_transaction(with_exact_claims(
+                BeginTransactionRequest {
+                    idempotency_key: "expired-predecessor-open".to_string(),
+                    scope: Some(scope(&root)),
+                    preconditions: vec![predecessor_precondition.clone()],
+                    boundary_values: Vec::new(),
+                    ttl_ms: 250,
+                    purpose: "stage an abandoned predecessor".to_string(),
+                },
+                &claims,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut predecessor_request = Request::new(MutationBatchRequest {
+            bucket_name: bucket.name.clone(),
+            mutation_context: Some(mutation_context(
+                &claims,
+                bucket.id,
+                "expired-predecessor-open",
+                &predecessor.transaction_id,
+            )),
+            precondition: Some(predecessor_precondition),
+            operations: vec![put_json("abandoned.json", br#"{"value":1}"#)],
+        });
+        predecessor_request.extensions_mut().insert(claims.clone());
+        state.mutation_batch(predecessor_request).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let successor_precondition = absent_objects(&bucket.name, &["successor.json"]);
+        let successor = state
+            .begin_transaction(with_exact_claims(
+                BeginTransactionRequest {
+                    idempotency_key: "expired-predecessor-successor".to_string(),
+                    scope: Some(scope(&root)),
+                    preconditions: vec![successor_precondition.clone()],
+                    boundary_values: Vec::new(),
+                    ttl_ms: 60_000,
+                    purpose: "commit after an expired predecessor".to_string(),
+                },
+                &claims,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut successor_request = Request::new(MutationBatchRequest {
+            bucket_name: bucket.name.clone(),
+            mutation_context: Some(mutation_context(
+                &claims,
+                bucket.id,
+                "expired-predecessor-successor",
+                &successor.transaction_id,
+            )),
+            precondition: Some(successor_precondition),
+            operations: vec![put_json("successor.json", br#"{"value":2}"#)],
+        });
+        successor_request.extensions_mut().insert(claims.clone());
+        state.mutation_batch(successor_request).await.unwrap();
+
+        let committed = state
+            .commit_transaction(with_exact_claims(
+                CommitTransactionRequest {
+                    transaction_id: successor.transaction_id,
+                    consistency: ConsistencyMode::Committed as i32,
+                    wait_for_finalization: false,
+                    final_preconditions: Vec::new(),
+                },
+                &claims,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(committed.state, WriteState::Committed as i32);
+        assert_object_not_found(&state, &claims, &bucket.name, "abandoned.json").await;
+        state
+            .head_object(with_exact_claims(
+                HeadObjectRequest {
+                    bucket_name: bucket.name,
+                    object_key: "successor.json".to_string(),
+                    version_id: None,
+                    consistency: None,
+                },
+                &claims,
+            ))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

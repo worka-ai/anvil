@@ -310,6 +310,15 @@ impl CoreStore {
                             );
                         }
                     }
+                    CoreTransactionState::Open
+                        if prior_transaction.expires_at_unix_nanos != 0
+                            && current_unix_nanos_u64()?
+                                >= prior_transaction.expires_at_unix_nanos =>
+                    {
+                        // Expiry is authoritative even before a later read persists the
+                        // derived Expired state. A crashed writer must not poison the
+                        // stream indefinitely with an invisible staged predecessor.
+                    }
                     CoreTransactionState::Open | CoreTransactionState::Prepared => {
                         bail!(
                             "TransactionConflict: transaction would expose a stream record before an uncommitted predecessor"
