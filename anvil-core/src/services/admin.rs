@@ -1239,21 +1239,11 @@ impl AdminService for AppState {
             .map(str::to_owned)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-        if let Some(node) = self
-            .persistence
-            .list_node_descriptors(None, None)
-            .await
-            .map_err(lifecycle_status)?
-            .into_iter()
-            .find(|node| node.node_id == self.config.node_id)
-        {
-            return Ok(Response::new(NodeResponse {
-                request_id,
-                node: Some(node_descriptor_to_proto(node)),
-                audit_event_id: String::new(),
-            }));
-        }
-
+        // This RPC is used by the Docker topology bootstrap before lifecycle
+        // projections and control streams are initialised. Build the descriptor
+        // from local runtime state instead of reading mesh lifecycle storage,
+        // otherwise early boot can recurse through CoreStore/control-stream
+        // bootstrap while the node is still trying to join the mesh.
         let libp2p_peer_id = self
             .cluster
             .read()
