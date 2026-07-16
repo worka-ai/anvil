@@ -253,9 +253,6 @@ impl Persistence {
             .await?;
             index_repair::source_cursor_from_stats(stats)
         };
-        if source_cursor == 0 {
-            return Ok(false);
-        }
         let index_storage_id =
             index_journal::index_storage_id(bucket.tenant_id, bucket.id, index.id);
         let checkpoint = watch_checkpoint::read_watch_checkpoint(

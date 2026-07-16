@@ -31,6 +31,68 @@ fn model_manifest() -> crate::anvil_api::ModelManifest {
 }
 
 #[tokio::test]
+async fn empty_bucket_index_build_materialises_an_empty_typed_json_segment() {
+    let temp = tempdir().unwrap();
+    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    let tenant = persistence
+        .create_tenant("empty-index-tenant", "empty-index-tenant")
+        .await
+        .unwrap();
+    let bucket = persistence
+        .create_bucket(tenant.id, "empty-index-bucket", "test-region")
+        .await
+        .unwrap();
+    let index = persistence
+        .create_index_definition(
+            tenant.id,
+            bucket.id,
+            "pending-items",
+            "typed_json",
+            json!({"prefix": "items/"}),
+            json!({}),
+            "inherit_object",
+            json!({
+                "source_kind": "object_current",
+                "fields": [
+                    {"name": "state", "extractor": "/state", "required": true}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+    persistence
+        .create_index_definition_event(tenant.id, bucket.id, &bucket.name, &index, "create")
+        .await
+        .unwrap();
+
+    assert!(
+        persistence
+            .enqueue_index_build_for_index(&bucket, &index)
+            .await
+            .unwrap(),
+        "an empty source still needs an initial materialised generation"
+    );
+    let outcome = persistence
+        .build_index_task(tenant.id, bucket.id, index.id, index.version, 0)
+        .await
+        .unwrap()
+        .expect("typed JSON index build outcome");
+
+    assert_eq!(outcome.item_count, 0);
+    assert_eq!(outcome.source_cursor, 0);
+    assert!(
+        crate::typed_field_segment::latest_typed_field_segment_ref(
+            &persistence.storage,
+            &outcome.index_storage_id,
+        )
+        .await
+        .unwrap()
+        .is_some(),
+        "empty typed JSON indexes must be queryable as empty results"
+    );
+}
+
+#[tokio::test]
 async fn tenant_and_bucket_creation_materialise_mesh_directory_locators() {
     let temp = tempdir().unwrap();
     let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
