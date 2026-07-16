@@ -1,8 +1,7 @@
-use crate::admin_auth::AdminPrincipal;
 use crate::anvil_api::PageRequest;
+use crate::system_realm::AdminPrincipal;
 use base64::Engine;
 use hmac::{Hmac, Mac};
-use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tonic::{Code, Status};
 
@@ -21,7 +20,7 @@ pub(crate) struct AdminCursorBinding<'a> {
     pub sort: &'static str,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AdminListCursorToken {
     version: u8,
     scope: String,
@@ -31,6 +30,28 @@ struct AdminListCursorToken {
     limit: u32,
     revision: String,
     sort: String,
+    signature: String,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct AdminListCursorTokenProto {
+    #[prost(uint32, tag = "1")]
+    version: u32,
+    #[prost(string, tag = "2")]
+    scope: String,
+    #[prost(string, tag = "3")]
+    position: String,
+    #[prost(string, tag = "4")]
+    filter_hash: String,
+    #[prost(string, tag = "5")]
+    principal_hash: String,
+    #[prost(uint32, tag = "6")]
+    limit: u32,
+    #[prost(string, tag = "7")]
+    revision: String,
+    #[prost(string, tag = "8")]
+    sort: String,
+    #[prost(string, tag = "9")]
     signature: String,
 }
 
@@ -49,8 +70,13 @@ pub(crate) fn decode_page_cursor(
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(cursor)
         .map_err(|_| invalid_cursor())?;
-    let token: AdminListCursorToken =
-        serde_json::from_slice(&bytes).map_err(|_| invalid_cursor())?;
+    let token = admin_list_cursor_from_proto(
+        crate::core_store::decode_deterministic_proto::<AdminListCursorTokenProto>(
+            &bytes,
+            "admin list cursor",
+        )
+        .map_err(|_| invalid_cursor())?,
+    )?;
     if token.version != CURSOR_VERSION {
         return Err(invalid_cursor());
     }
@@ -121,9 +147,38 @@ pub(crate) fn encode_next_cursor(
         sort: binding.sort.to_string(),
         signature,
     };
-    let bytes = serde_json::to_vec(&token)
-        .map_err(|_| Status::internal("Failed to encode admin list cursor"))?;
+    let bytes = crate::core_store::encode_deterministic_proto(&admin_list_cursor_to_proto(&token));
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn admin_list_cursor_to_proto(token: &AdminListCursorToken) -> AdminListCursorTokenProto {
+    AdminListCursorTokenProto {
+        version: u32::from(token.version),
+        scope: token.scope.clone(),
+        position: token.position.clone(),
+        filter_hash: token.filter_hash.clone(),
+        principal_hash: token.principal_hash.clone(),
+        limit: token.limit,
+        revision: token.revision.clone(),
+        sort: token.sort.clone(),
+        signature: token.signature.clone(),
+    }
+}
+
+fn admin_list_cursor_from_proto(
+    proto: AdminListCursorTokenProto,
+) -> Result<AdminListCursorToken, Status> {
+    Ok(AdminListCursorToken {
+        version: u8::try_from(proto.version).map_err(|_| invalid_cursor())?,
+        scope: proto.scope,
+        position: proto.position,
+        filter_hash: proto.filter_hash,
+        principal_hash: proto.principal_hash,
+        limit: proto.limit,
+        revision: proto.revision,
+        sort: proto.sort,
+        signature: proto.signature,
+    })
 }
 
 pub(crate) fn collection_revision<'a>(records: impl IntoIterator<Item = (&'a str, u64)>) -> String {
@@ -234,6 +289,8 @@ mod tests {
             principal_id: id.to_string(),
             tenant_id: 7,
             authenticated_methods: vec!["bearer".to_string()],
+            checked_relation: None,
+            checked_object: None,
         }
     }
 
@@ -242,7 +299,7 @@ mod tests {
         let principal = test_principal("admin-a");
         let filters = [("tenant_id", "7"), ("bucket_name", "photos")];
         let binding = AdminCursorBinding {
-            scope: "admin.list_object_links.v1",
+            scope: "admin.list_host_aliases.v1",
             filters: &filters,
             principal: &principal,
             limit: 25,

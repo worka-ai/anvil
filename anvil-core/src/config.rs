@@ -1,5 +1,4 @@
 use clap::Parser;
-use std::path::{Path, PathBuf};
 
 use crate::routing::CrossRegionRoutingPolicy;
 use anyhow::Result;
@@ -12,10 +11,6 @@ pub struct Config {
     #[arg(long, env)]
     pub jwt_secret: String,
 
-    /// Optional fixed bearer token accepted for first administrative bootstrap.
-    #[arg(long, env)]
-    pub anvil_bootstrap_admin_token: Option<String>,
-
     /// Active hex-encoded 32-byte key used for server-side secret encryption.
     #[arg(long, env)]
     pub anvil_secret_encryption_key: String,
@@ -27,6 +22,12 @@ pub struct Config {
     /// Comma-delimited previous secret encryption keys as `key_id:hex`.
     #[arg(long, env, default_value = "")]
     pub anvil_secret_encryption_previous_keys: String,
+
+    /// Bearer token used by this node when it calls another node's internal
+    /// CoreStore services. Empty disables remote internal writes; a multi-node
+    /// placement will fail rather than silently degrading to local-only storage.
+    #[arg(long, env, default_value = "")]
+    pub corestore_internal_bearer_token: String,
 
     /// The address to bind the QUIC peer-to-peer endpoint to.
     #[arg(long, env, default_value = "/ip4/0.0.0.0/udp/7443/quic-v1")]
@@ -48,9 +49,34 @@ pub struct Config {
     #[arg(long, env, default_value = "127.0.0.1:50052")]
     pub admin_listen_addr: String,
 
+    /// Explicitly allow binding the private admin plane to a non-loopback address.
+    #[arg(long, env, default_value_t = false)]
+    pub allow_public_admin_listener: bool,
+
     /// Stable mesh identifier for administrative and lifecycle records.
     #[arg(long, env, default_value = "default")]
     pub mesh_id: String,
+
+    /// First-boot system-realm admin app name. Used only when the system realm is absent.
+    #[arg(long, env, default_value = "")]
+    pub bootstrap_system_admin_app_name: String,
+
+    /// File path where the first-boot admin app credential JSON is written.
+    #[arg(long, env, default_value = "")]
+    pub bootstrap_system_admin_credential_output_path: String,
+
+    /// Existing first-boot admin subject kind. Used instead of creating an app.
+    #[arg(long, env, default_value = "")]
+    pub bootstrap_system_admin_subject_kind: String,
+
+    /// Existing first-boot admin subject id. Used instead of creating an app.
+    #[arg(long, env, default_value = "")]
+    pub bootstrap_system_admin_subject_id: String,
+
+    /// Node principals admitted during mesh genesis. These principals receive
+    /// only the system-realm relation required for authenticated node RPCs.
+    #[arg(long, env, use_value_delimiter = true, value_delimiter = ',')]
+    pub bootstrap_node_ids: Vec<String>,
 
     /// The current region this node is operating in.
     #[arg(long, env)]
@@ -72,19 +98,10 @@ pub struct Config {
     #[arg(long, env, default_value_t = CrossRegionRoutingPolicy::RedirectPreferred)]
     pub cross_region_routing_policy: CrossRegionRoutingPolicy,
 
-    /// Path used by operators to persist this node's stable lifecycle identity.
-    /// Defaults to `<storage_path>/node-id` when left empty.
+    /// Stable node id. When supplied for a new volume, it becomes the persisted
+    /// identity; subsequent starts must supply the same value or omit it.
     #[arg(long, env, default_value = "")]
-    pub node_id_path: String,
-
-    /// Resolved stable node id loaded from `node_id_path` during startup.
-    #[arg(skip)]
     pub node_id: String,
-
-    /// Path used to persist the libp2p keypair backing the cluster identity.
-    /// Defaults to `<storage_path>/cluster-keypair.pb` when left empty.
-    #[arg(long, env, default_value = "")]
-    pub cluster_keypair_path: String,
 
     /// A list of bootstrap addresses for joining a cluster.
     #[arg(long, env, use_value_delimiter = true, value_delimiter = ',')]
@@ -134,6 +151,10 @@ pub struct Config {
     #[arg(long, env, default_value_t = 64 * 1024 * 1024)]
     pub object_metadata_compaction_bytes_threshold: u64,
 
+    /// Run the in-process background worker loop for tasks such as compaction and index builds.
+    #[arg(long, env, default_value_t = true)]
+    pub run_background_worker: bool,
+
     /// Seconds that an in-process background task lease remains valid without renewal.
     #[arg(long, env, default_value_t = 300)]
     pub task_lease_ttl_secs: u64,
@@ -146,28 +167,8 @@ impl Config {
         me
     }
 
-    pub fn resolved_node_id_path(&self) -> PathBuf {
-        resolve_identity_path(
-            &self.node_id_path,
-            &self.storage_path,
-            crate::cluster_identity::DEFAULT_NODE_ID_FILE,
-        )
-    }
-
-    pub fn resolved_cluster_keypair_path(&self) -> PathBuf {
-        resolve_identity_path(
-            &self.cluster_keypair_path,
-            &self.storage_path,
-            crate::cluster_identity::DEFAULT_CLUSTER_KEYPAIR_FILE,
-        )
-    }
-
     pub fn secret_keyring(&self) -> Result<crate::crypto::EncryptionKeyring> {
-        let active_key_id = if self.anvil_secret_encryption_key_id.trim().is_empty() {
-            "primary"
-        } else {
-            &self.anvil_secret_encryption_key_id
-        };
+        let active_key_id = self.active_encryption_key_id();
         crate::crypto::EncryptionKeyring::from_hex_config(
             active_key_id,
             &self.anvil_secret_encryption_key,
@@ -175,25 +176,45 @@ impl Config {
         )
     }
 
-    pub fn with_persisted_identity(mut self) -> Result<Self> {
-        let node_id_path = self.resolved_node_id_path();
-        let cluster_keypair_path = self.resolved_cluster_keypair_path();
+    pub fn core_pipeline_keyring(&self) -> Result<crate::core_store::CorePipelineKeyring> {
+        let active_key_id = self.active_encryption_key_id();
+        crate::core_store::CorePipelineKeyring::from_hex_config(
+            active_key_id,
+            &self.anvil_secret_encryption_key,
+            &self.anvil_secret_encryption_previous_keys,
+        )
+    }
 
-        self.node_id = crate::cluster_identity::load_or_create_node_id(&node_id_path)?;
-        crate::cluster_identity::load_or_create_cluster_keypair(&cluster_keypair_path)?;
-        self.node_id_path = node_id_path.to_string_lossy().into_owned();
-        self.cluster_keypair_path = cluster_keypair_path.to_string_lossy().into_owned();
+    fn active_encryption_key_id(&self) -> &str {
+        if self.anvil_secret_encryption_key_id.trim().is_empty() {
+            "primary"
+        } else {
+            &self.anvil_secret_encryption_key_id
+        }
+    }
+
+    pub fn validate_admin_listener_bind(&self) -> Result<()> {
+        let addr: std::net::SocketAddr = self.admin_listen_addr.parse()?;
+        if !self.allow_public_admin_listener && !addr.ip().is_loopback() {
+            anyhow::bail!(
+                "ADMIN_LISTEN_ADDR={} is not loopback; set ALLOW_PUBLIC_ADMIN_LISTENER=true only when the admin port is protected by private networking",
+                self.admin_listen_addr
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn with_persisted_identity(mut self) -> Result<Self> {
+        let requested_node_id = (!self.node_id.trim().is_empty()).then_some(self.node_id.as_str());
+        let identity = crate::cluster_identity::load_or_create_cluster_identity_with_node_id(
+            &self.storage_path,
+            requested_node_id,
+        )
+        .await?;
+        self.node_id = identity.node_id;
 
         Ok(self)
     }
-}
-
-fn resolve_identity_path(configured_path: &str, storage_path: &str, default_file: &str) -> PathBuf {
-    let configured_path = configured_path.trim();
-    if configured_path.is_empty() {
-        return Path::new(storage_path).join(default_file);
-    }
-    PathBuf::from(configured_path)
 }
 
 #[cfg(test)]
@@ -237,8 +258,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn persisted_identity_uses_storage_defaults_and_reloads() {
+    #[tokio::test]
+    async fn persisted_identity_is_coremeta_owned_and_reloads() {
         let temp = tempdir().unwrap();
         let storage_path = temp.path().join("storage");
         let config = Config {
@@ -246,24 +267,57 @@ mod tests {
             ..Config::default()
         };
 
-        let first = config.with_persisted_identity().unwrap();
+        let first = config.with_persisted_identity().await.unwrap();
         let restarted = Config {
             storage_path: storage_path.to_string_lossy().into_owned(),
             ..Config::default()
         }
         .with_persisted_identity()
+        .await
         .unwrap();
 
         assert_eq!(first.node_id, restarted.node_id);
-        assert_eq!(
-            PathBuf::from(&first.node_id_path),
-            storage_path.join("node-id")
+        assert!(!storage_path.join("node-id").exists());
+        assert!(!storage_path.join("cluster-keypair.pb").exists());
+        assert!(
+            storage_path
+                .join("corestore")
+                .join("meta")
+                .join("rocksdb")
+                .exists()
         );
-        assert_eq!(
-            PathBuf::from(&first.cluster_keypair_path),
-            storage_path.join("cluster-keypair.pb")
-        );
-        assert!(Path::new(&first.node_id_path).exists());
-        assert!(Path::new(&first.cluster_keypair_path).exists());
+    }
+
+    #[test]
+    fn admin_listener_rejects_public_bind_without_explicit_opt_in() {
+        for addr in ["0.0.0.0:50052", "[::]:50052", "192.168.1.10:50052"] {
+            let config = Config {
+                admin_listen_addr: addr.to_string(),
+                allow_public_admin_listener: false,
+                ..Config::default()
+            };
+
+            assert!(config.validate_admin_listener_bind().is_err(), "{addr}");
+        }
+    }
+
+    #[test]
+    fn admin_listener_allows_loopback_or_explicit_public_opt_in() {
+        for addr in ["127.0.0.1:50052", "[::1]:50052"] {
+            let config = Config {
+                admin_listen_addr: addr.to_string(),
+                allow_public_admin_listener: false,
+                ..Config::default()
+            };
+
+            config.validate_admin_listener_bind().unwrap();
+        }
+
+        let config = Config {
+            admin_listen_addr: "0.0.0.0:50052".to_string(),
+            allow_public_admin_listener: true,
+            ..Config::default()
+        };
+        config.validate_admin_listener_bind().unwrap();
     }
 }

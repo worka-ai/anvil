@@ -59,7 +59,9 @@ pub fn query_full_text_segment(
         let phrase_matches = evaluate_phrase_query(&borrowed, query.positions_enabled)?;
         let mut hits = phrase_matches
             .into_iter()
-            .filter(|matched| is_authorized(matched.authz_label_hash, query.authorized_labels))
+            .filter(|matched| {
+                matches_authorized_label_filter(matched.authz_label_hash, query.authorized_labels)
+            })
             .map(|matched| FullTextSearchHit {
                 document_id: matched.document_id,
                 field_id: matched.field_id,
@@ -95,7 +97,7 @@ pub fn query_full_text_segment(
             continue;
         };
         for posting in postings {
-            if !is_authorized(posting.authz_label_hash, query.authorized_labels) {
+            if !matches_authorized_label_filter(posting.authz_label_hash, query.authorized_labels) {
                 continue;
             }
             let key = document_key(posting);
@@ -175,7 +177,10 @@ fn average_matched_field_length(postings: &[Posting]) -> f32 {
     (total as f32 / postings.len() as f32).max(1.0)
 }
 
-fn is_authorized(label: Hash32, authorized_labels: Option<&BTreeSet<Hash32>>) -> bool {
+fn matches_authorized_label_filter(
+    label: Hash32,
+    authorized_labels: Option<&BTreeSet<Hash32>>,
+) -> bool {
     authorized_labels.is_none_or(|labels| labels.contains(&label))
 }
 
@@ -240,6 +245,7 @@ mod tests {
                 scorer: serde_json::json!({"kind": "bm25"}),
                 source_cursor: 1,
                 authz_revision: 1,
+                boundary_values: &[],
                 built_postings: &built,
                 document_table: b"",
             },
@@ -304,6 +310,7 @@ mod tests {
                 scorer: serde_json::json!({"kind": "bm25"}),
                 source_cursor: 1,
                 authz_revision: 1,
+                boundary_values: &[],
                 built_postings: &built,
                 document_table: b"",
             },
@@ -381,6 +388,7 @@ mod tests {
                 hnsw_ef_construction: 200,
                 source_cursor: 1,
                 authz_revision: 1,
+                boundary_values: &[],
                 entries: &entries,
                 deleted_bitset: &[0],
             },
@@ -443,6 +451,7 @@ mod tests {
                     hnsw_ef_construction: 200,
                     source_cursor: 1,
                     authz_revision: 1,
+                    boundary_values: &[],
                     entries: &entries,
                     deleted_bitset: &[0],
                 },

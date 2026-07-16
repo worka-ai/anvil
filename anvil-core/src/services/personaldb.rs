@@ -9,8 +9,8 @@ use crate::{
     error_codes::AnvilErrorCode,
     formats::{Hash32, hash32, personaldb::PersonalDbLogRecord as CorePersonalDbLogRecord},
     partition_fence::{
-        PartitionRecoveryAcquire, PartitionWritePermit, acquire_partition_recovery,
-        partition_write_ref_precondition, publish_partition_ready,
+        PartitionOwnerStatus, PartitionRecoveryAcquire, PartitionWritePermit,
+        acquire_partition_recovery, partition_write_precondition, publish_partition_ready,
     },
     permissions::AnvilAction,
     personaldb_catchup::{
@@ -23,7 +23,7 @@ use crate::{
     },
     personaldb_control::{PersonalDbCommitCertificate, PersonalDbGroupManifest},
     personaldb_envelope::{
-        PersonalDbEnvelopeDerivationInput, VerifiedMutationEnvelope,
+        PersonalDbEnvelopeDerivationInput, TableOperation, VerifiedMutationEnvelope,
         derive_verified_mutation_envelope,
     },
     personaldb_heads::{
@@ -74,7 +74,6 @@ use tonic::{Request, Response, Status};
 struct PersonalDbCommitActor {
     tenant_id: i64,
     principal: String,
-    scopes: Vec<String>,
     bearer_token: Option<String>,
     require_public_commit_authorization: bool,
 }
@@ -117,9 +116,14 @@ impl PersonalDbService for AppState {
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
 
         let resource = personaldb_resource(claims.tenant_id, &req.database_id);
-        if !auth::is_authorized(AnvilAction::PersonalDbCreate, &resource, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::PersonalDbCreate,
+            &resource,
+        )
+        .await?;
         let signing_key = self.personaldb_signing_key();
         if read_personaldb_group_manifest(
             &self.storage,
@@ -177,7 +181,7 @@ impl PersonalDbService for AppState {
             database_id: req.database_id,
             log_index: 0,
             log_hash: manifest.genesis_hash.clone(),
-            segment_path: String::new(),
+            segment_ref: String::new(),
             row_index_generation: 0,
             policy_epoch: manifest.active_policy_epoch,
             membership_epoch: manifest.active_membership_epoch,
@@ -195,6 +199,16 @@ impl PersonalDbService for AppState {
             &committed_head.database_id,
             &committed_head,
             signing_key,
+        )
+        .await
+        .map_err(internal_status)?;
+        access_control::grant_personaldb_group_defaults(
+            &self.persistence,
+            claims.tenant_id,
+            &committed_head.database_id,
+            &claims.sub,
+            &claims.sub,
+            "grant creator PersonalDB group owner",
         )
         .await
         .map_err(internal_status)?;
@@ -218,7 +232,6 @@ impl PersonalDbService for AppState {
             &claims,
             &req.database_id,
             AnvilAction::PersonalDbRead,
-            "reader",
         )
         .await?
         {
@@ -267,9 +280,14 @@ impl PersonalDbService for AppState {
             &req.database_id,
             &definition.projection_id,
         );
-        if !auth::is_authorized(AnvilAction::PersonalDbCreate, &resource, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::PersonalDbCreate,
+            &resource,
+        )
+        .await?;
         let signing_key = self.personaldb_signing_key();
         read_personaldb_group_manifest(
             &self.storage,
@@ -336,7 +354,6 @@ impl PersonalDbService for AppState {
             &req.database_id,
             &req.projection_id,
             AnvilAction::PersonalDbRead,
-            "reader",
         )
         .await?
         {
@@ -367,7 +384,6 @@ impl PersonalDbService for AppState {
         let actor = PersonalDbCommitActor {
             tenant_id: claims.tenant_id,
             principal: claims.sub.clone(),
-            scopes: claims.scopes.clone(),
             bearer_token: Some(bearer_token),
             require_public_commit_authorization: true,
         };
@@ -413,7 +429,6 @@ impl PersonalDbService for AppState {
             &claims,
             &req.database_id,
             AnvilAction::PersonalDbRead,
-            "reader",
         )
         .await?
         {
@@ -450,7 +465,6 @@ impl PersonalDbService for AppState {
             &claims,
             &req.database_id,
             AnvilAction::PersonalDbWatch,
-            "watcher",
         )
         .await?
         {
@@ -522,7 +536,6 @@ impl PersonalDbService for AppState {
             &req.database_id,
             &req.projection_id,
             AnvilAction::PersonalDbWatch,
-            "watcher",
         )
         .await?
         {
@@ -647,10 +660,15 @@ impl AppState {
                 recovered_manifest_hash: recovered_manifest_hash.to_string(),
                 now_nanos,
             },
-            self.personaldb_signing_key(),
+            self.persistence.partition_owner_signing_key(),
         )
         .await
         .map_err(internal_status)?;
+        if recovering.status == PartitionOwnerStatus::Ready {
+            return recovering.write_permit().map_err(|err| {
+                Status::failed_precondition(format!("PersonalDB partition is not writable: {err}"))
+            });
+        }
         let ready = publish_partition_ready(
             &self.storage,
             &partition_family,
@@ -660,7 +678,7 @@ impl AppState {
             recovered_through_sequence,
             recovered_manifest_hash,
             now_nanos.saturating_add(1),
-            self.personaldb_signing_key(),
+            self.persistence.partition_owner_signing_key(),
         )
         .await
         .map_err(internal_status)?;
@@ -673,13 +691,17 @@ impl AppState {
         &self,
         permit: &PartitionWritePermit,
     ) -> Result<CoreMutationPrecondition, Status> {
-        partition_write_ref_precondition(&self.storage, permit, self.personaldb_signing_key())
-            .await
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "PersonalDB partition write fence is not current: {err}"
-                ))
-            })
+        partition_write_precondition(
+            &self.storage,
+            permit,
+            self.persistence.partition_owner_signing_key(),
+        )
+        .await
+        .map_err(|err| {
+            Status::failed_precondition(format!(
+                "PersonalDB partition write fence is not current: {err}"
+            ))
+        })
     }
 
     async fn handle_personaldb_projection_writeback(
@@ -698,7 +720,6 @@ impl AppState {
             &actor,
             &request.database_id,
             AnvilAction::PersonalDbCommit,
-            "committer",
         )
         .await?
         {
@@ -868,7 +889,6 @@ impl AppState {
                 &actor,
                 &request.database_id,
                 AnvilAction::PersonalDbCommit,
-                "committer",
             )
             .await?
         {
@@ -1123,7 +1143,7 @@ impl AppState {
             database_id: validated.request.database_id.clone(),
             log_index: proposed_log_index,
             log_hash: hex::encode(record.entry_hash),
-            segment_path: segment_ref,
+            segment_ref: segment_ref,
             row_index_generation,
             policy_epoch: manifest.active_policy_epoch,
             membership_epoch: manifest.active_membership_epoch,
@@ -1180,6 +1200,10 @@ impl AppState {
         )
         .await
         .map_err(internal_status)?;
+
+        materialize_personaldb_row_owner_grants(&self.persistence, &envelope, &actor)
+            .await
+            .map_err(internal_status)?;
 
         append_personaldb_group_watch_record(
             &self.storage,
@@ -1366,7 +1390,6 @@ impl AppState {
                 PersonalDbCommitActor {
                     tenant_id,
                     principal: internal_actor,
-                    scopes: vec!["*|*".to_string()],
                     bearer_token: None,
                     require_public_commit_authorization: false,
                 },
@@ -1490,590 +1513,102 @@ async fn authorize_personaldb_row_effects(
     envelope: &VerifiedMutationEnvelope,
     actor: &PersonalDbCommitActor,
 ) -> Result<(), Status> {
+    if !actor.require_public_commit_authorization {
+        return Ok(());
+    }
+
     for effect in &envelope.table_effects {
         let binding = &effect.source_resource_binding;
-        let resource = format!(
-            "tenant-{}/{}/{}/{}",
-            actor.tenant_id, envelope.database_id, binding.resource_type, binding.resource_id
-        );
+        let resource = personaldb_row_resource_id(actor.tenant_id, &envelope.database_id, binding);
         for permission in &effect.required_permissions {
-            let action = permission
-                .parse::<AnvilAction>()
-                .map_err(|_| Status::internal("Invalid PersonalDB derived permission"))?;
-            let claims = auth::Claims {
-                sub: actor.principal.clone(),
-                exp: 0,
-                scopes: actor.scopes.clone(),
-                tenant_id: actor.tenant_id,
-                jti: None,
-            };
-            if !access_control::scope_or_relationship_allows(
+            let revision = i64::try_from(envelope.authz_revision)
+                .map_err(|_| Status::internal("Invalid PersonalDB authz revision"))?;
+            let allowed = authz_journal::resolve_permission_at_revision(
                 storage,
-                &claims,
-                action,
-                &resource,
-                "personaldb_row",
+                actor.tenant_id,
+                &encode_realm_namespace(DEFAULT_AUTHZ_REALM_ID, "personaldb_row"),
                 &resource,
                 permission,
-                Some(
-                    i64::try_from(envelope.authz_revision)
-                        .map_err(|_| Status::internal("Invalid PersonalDB authz revision"))?,
-                ),
+                access_control::APP_SUBJECT_KIND,
+                &actor.principal,
+                "",
+                revision,
             )
             .await
-            .map_err(internal_status)?
-            {
-                return Err(Status::permission_denied(
-                    "PersonalDB row/resource mutation is not authorized",
-                ));
+            .map_err(internal_status)?;
+            if allowed || insert_effect_creates_owned_row(effect, actor) {
+                continue;
             }
+            return Err(Status::permission_denied(
+                "PersonalDB row/resource mutation is not authorized",
+            ));
         }
     }
     Ok(())
 }
 
-fn core_submit_request(
-    req: SubmitPersonalDbChangesetRequest,
-) -> Result<CoreSubmitChangeset, Status> {
-    let client_debug_metadata = if req.client_debug_metadata_json.trim().is_empty() {
-        None
-    } else {
-        Some(
-            serde_json::from_str(&req.client_debug_metadata_json)
-                .map_err(|err| Status::invalid_argument(err.to_string()))?,
-        )
-    };
-    Ok(CoreSubmitChangeset {
-        tenant_id: req.tenant_id,
-        database_id: req.database_id,
-        principal: req.principal,
-        session_token: req.session_token,
-        request_id: req.request_id,
-        idempotency_key: req.idempotency_key,
-        base_log_index: req.base_log_index,
-        base_log_hash: req.base_log_hash,
-        client_log_epoch: req.client_log_epoch,
-        membership_epoch: req.membership_epoch,
-        policy_epoch: req.policy_epoch,
-        leader_replica_id: req.leader_replica_id,
-        voter_acks: req
-            .voter_acks
-            .into_iter()
-            .map(|ack| crate::personaldb_submit::PersonalDbVoterAck {
-                replica_id: ack.replica_id,
-                log_index: ack.log_index,
-                log_hash: ack.log_hash,
-                signature: ack.signature,
-            })
-            .collect(),
-        changeset_payload_hash: req.changeset_payload_hash,
-        changeset_bytes: req.changeset_bytes,
-        client_debug_metadata,
-    })
-}
-
-fn group_manifest_record(manifest: PersonalDbGroupManifest) -> PersonalDbGroupManifestRecord {
-    PersonalDbGroupManifestRecord {
-        format_version: manifest.format_version.into(),
-        tenant_id: manifest.tenant_id,
-        database_id: manifest.database_id,
-        schema_hash: manifest.schema_hash,
-        genesis_hash: manifest.genesis_hash,
-        created_at: manifest.created_at,
-        created_by: manifest.created_by,
-        consistency_policy: manifest.consistency_policy,
-        object_layout_version: manifest.object_layout_version.into(),
-        active_membership_epoch: manifest.active_membership_epoch,
-        active_policy_epoch: manifest.active_policy_epoch,
-        current_row_index_generation: manifest.current_row_index_generation,
-        current_projection_generation: manifest.current_projection_generation,
-        manifest_hash: manifest.manifest_hash.unwrap_or_default(),
-        manifest_signature: manifest.manifest_signature.unwrap_or_default(),
-    }
-}
-
-fn committed_head_record(head: PersonalDbCommittedHead) -> PersonalDbCommittedHeadRecord {
-    PersonalDbCommittedHeadRecord {
-        format_version: head.format_version.into(),
-        tenant_id: head.tenant_id,
-        database_id: head.database_id,
-        log_index: head.log_index,
-        log_hash: head.log_hash,
-        segment_path: head.segment_path,
-        row_index_generation: head.row_index_generation,
-        policy_epoch: head.policy_epoch,
-        membership_epoch: head.membership_epoch,
-        schema_hash: head.schema_hash,
-        updated_at: head.updated_at,
-        updated_by_node: head.updated_by_node,
-        head_hash: head.head_hash.unwrap_or_default(),
-        head_signature: head.head_signature.unwrap_or_default(),
-    }
-}
-
-fn snapshots_head_record(head: PersonalDbSnapshotsHead) -> PersonalDbSnapshotsHeadRecord {
-    PersonalDbSnapshotsHeadRecord {
-        format_version: head.format_version.into(),
-        tenant_id: head.tenant_id,
-        database_id: head.database_id,
-        latest_snapshot_log_index: head.latest_snapshot_log_index,
-        latest_snapshot_log_hash: head.latest_snapshot_log_hash,
-        latest_snapshot_manifest_path: head.latest_snapshot_manifest_path,
-        retained_snapshot_count: head.retained_snapshot_count,
-        updated_at: head.updated_at,
-        updated_by_node: head.updated_by_node,
-        head_hash: head.head_hash.unwrap_or_default(),
-        head_signature: head.head_signature.unwrap_or_default(),
-    }
-}
-
-fn certificate_record(
-    certificate: crate::personaldb_control::PersonalDbCommitCertificate,
-) -> PersonalDbCommitCertificateRecord {
-    PersonalDbCommitCertificateRecord {
-        format_version: certificate.format_version.into(),
-        tenant_id: certificate.tenant_id,
-        database_id: certificate.database_id,
-        log_index: certificate.log_index,
-        previous_log_hash: certificate.previous_log_hash,
-        entry_hash: certificate.entry_hash,
-        changeset_payload_hash: certificate.changeset_payload_hash,
-        verified_envelope_hash: certificate.verified_envelope_hash,
-        client_log_epoch: certificate.client_log_epoch,
-        membership_epoch: certificate.membership_epoch,
-        policy_epoch: certificate.policy_epoch,
-        leader_replica_id: certificate.leader_replica_id,
-        voter_acks_hash: certificate.voter_acks_hash,
-        authz_revision: certificate.authz_revision,
-        witness_node_id: certificate.witness_node_id,
-        witnessed_at: certificate.witnessed_at,
-        certificate_hash: certificate.certificate_hash.unwrap_or_default(),
-        witness_signature: certificate.witness_signature.unwrap_or_default(),
-    }
-}
-
-fn log_record(record: crate::formats::personaldb::PersonalDbLogRecord) -> PersonalDbLogRecord {
-    PersonalDbLogRecord {
-        log_index: record.log_index,
-        client_log_epoch: record.client_log_epoch,
-        membership_epoch: record.membership_epoch,
-        policy_epoch: record.policy_epoch,
-        previous_log_hash: hex::encode(record.previous_log_hash),
-        changeset_payload_hash: hex::encode(record.changeset_payload_hash),
-        verified_envelope_hash: hex::encode(record.verified_envelope_hash),
-        certificate_hash: hex::encode(record.certificate_hash),
-        payload_ref: String::from_utf8_lossy(&record.payload_ref).into_owned(),
-        certificate_ref: String::from_utf8_lossy(&record.certificate_ref).into_owned(),
-        inline_certificate_json: record.inline_certificate_json,
-        entry_hash: hex::encode(record.entry_hash),
-    }
-}
-
-fn catch_up_response(response: CoreCatchUpResponse) -> PersonalDbCatchUpResponse {
-    match response {
-        CoreCatchUpResponse::Entries(entries) => PersonalDbCatchUpResponse {
-            snapshot_required: false,
-            snapshot_reason: String::new(),
-            committed_head: Some(committed_head_record(entries.committed_head)),
-            snapshots_head: None,
-            entries: entries
-                .entries
-                .into_iter()
-                .map(|entry| PersonalDbCatchUpEntry {
-                    log_record: Some(log_record(entry.record)),
-                    changeset_bytes: entry.changeset_bytes,
-                    certificate: Some(certificate_record(entry.certificate)),
-                    certificate_json: entry.certificate_json,
-                })
-                .collect(),
-            has_more: entries.has_more,
-        },
-        CoreCatchUpResponse::SnapshotRequired(snapshot) => PersonalDbCatchUpResponse {
-            snapshot_required: true,
-            snapshot_reason: snapshot_reason(snapshot.reason).to_string(),
-            committed_head: snapshot.committed_head.map(committed_head_record),
-            snapshots_head: snapshot.snapshots_head.map(snapshots_head_record),
-            entries: Vec::new(),
-            has_more: false,
-        },
-    }
-}
-
-fn watch_response(event: PersonalDbGroupWatchEvent) -> WatchPersonalDbGroupResponse {
-    let (low, high) = split_u128(event.cursor);
-    let payload = event.payload;
-    let emitted_at = payload.emitted_at.clone();
-    let database_id = payload.database_id.clone();
-    let log_index = payload.log_index;
-    let payload_hash = watch_envelope::payload_hash(&payload);
-    WatchPersonalDbGroupResponse {
-        cursor_low: low,
-        cursor_high: high,
-        database_id: database_id.clone(),
-        event_type: payload.event_type,
-        log_index,
-        log_hash: payload.log_hash,
-        changeset_payload_hash: payload.changeset_payload_hash,
-        certificate_hash: payload.certificate_hash,
-        committed_head_hash: payload.committed_head_hash,
-        authz_revision: event.authz_revision,
-        emitted_at: emitted_at.clone(),
-        envelope: Some(watch_envelope::envelope(WatchEnvelopeParts {
-            watch_stream_id: "personaldb_group",
-            partition_family: "personaldb_group",
-            partition_id: database_id.clone(),
-            cursor: event.cursor,
-            mutation_id: watch_envelope::uuid_from_bytes(event.mutation_id),
-            record_kind: "personaldb_group".to_string(),
-            object_ref: database_id,
-            authz_revision: event.authz_revision,
-            index_generation: 0,
-            personaldb_log_index: log_index,
-            payload_hash,
-            emitted_at,
-        })),
-    }
-}
-
-fn snapshot_reason(reason: PersonalDbSnapshotRestoreReason) -> &'static str {
-    match reason {
-        PersonalDbSnapshotRestoreReason::MissingCommittedHead => "missing_committed_head",
-        PersonalDbSnapshotRestoreReason::DivergentReplica => "divergent_replica",
-    }
-}
-
-fn validate_claim_tenant(claim_tenant_id: i64, request_tenant_id: i64) -> Result<(), Status> {
-    if request_tenant_id != claim_tenant_id {
-        return Err(Status::permission_denied("Tenant scope mismatch"));
-    }
-    Ok(())
-}
-
-fn validate_database_id(database_id: &str) -> Result<(), Status> {
-    if database_id.is_empty() {
-        return Err(Status::invalid_argument("database_id must not be empty"));
-    }
-    if database_id.contains('/') || database_id.contains("..") {
-        return Err(Status::invalid_argument(
-            "database_id contains unsafe characters",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_projection_id(projection_id: &str) -> Result<(), Status> {
-    if projection_id.is_empty() {
-        return Err(Status::invalid_argument("projection_id must not be empty"));
-    }
-    if projection_id.contains('/') || projection_id.contains("..") {
-        return Err(Status::invalid_argument(
-            "projection_id contains unsafe characters",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_projection_definition_scope(
-    tenant_id: i64,
-    database_id: &str,
-    definition: &ProjectionDefinition,
-) -> Result<(), Status> {
-    if definition.tenant_id != tenant_id.to_string()
-        || definition.database_id != database_id
-        || definition.target_database_id != database_id
-    {
-        return Err(Status::invalid_argument(
-            "PersonalDB projection definition scope mismatch",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_hex32(value: &str, field: &'static str) -> Result<(), Status> {
-    if value.len() != 64 || !value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(Status::invalid_argument(format!("{field} must be hex32")));
-    }
-    Ok(())
-}
-
-fn hex32_status(value: &str, field: &'static str) -> Result<Hash32, Status> {
-    validate_hex32(value, field)?;
-    hex::decode(value)
-        .map_err(|_| Status::invalid_argument(format!("{field} must be hex32")))?
-        .try_into()
-        .map_err(|_| Status::invalid_argument(format!("{field} must be hex32")))
-}
-
-fn personaldb_resource(tenant_id: i64, database_id: &str) -> String {
-    format!("tenant-{tenant_id}/{database_id}")
-}
-
-async fn personaldb_access_allowed(
-    storage: &crate::storage::Storage,
-    claims: &auth::Claims,
-    database_id: &str,
-    action: AnvilAction,
-    relation: &str,
-) -> Result<bool, Status> {
-    let resource = personaldb_resource(claims.tenant_id, database_id);
-    access_control::scope_or_relationship_allows(
-        storage,
-        claims,
-        action,
-        &resource,
-        "personaldb",
-        &resource,
-        relation,
-        None,
-    )
-    .await
-    .map_err(internal_status)
-}
-
-async fn personaldb_actor_access_allowed(
-    storage: &crate::storage::Storage,
+async fn materialize_personaldb_row_owner_grants(
+    persistence: &crate::persistence::Persistence,
+    envelope: &VerifiedMutationEnvelope,
     actor: &PersonalDbCommitActor,
-    database_id: &str,
-    action: AnvilAction,
-    relation: &str,
-) -> Result<bool, Status> {
-    let claims = auth::Claims {
-        sub: actor.principal.clone(),
-        exp: 0,
-        scopes: actor.scopes.clone(),
-        tenant_id: actor.tenant_id,
-        jti: None,
-    };
-    personaldb_access_allowed(storage, &claims, database_id, action, relation).await
+) -> anyhow::Result<()> {
+    let mut mutations = Vec::new();
+    for row in &envelope.row_metadata_delta.upserts {
+        if row.owner_principal.as_deref() != Some(actor.principal.as_str()) {
+            continue;
+        }
+        let resource = format!(
+            "tenant-{}/{}/{}/{}",
+            actor.tenant_id, envelope.database_id, row.resource_type, row.resource_id
+        );
+        for relation in [
+            "personaldb:insert",
+            "personaldb:update",
+            "personaldb:delete",
+        ] {
+            mutations.push(crate::persistence::AuthzTupleBatchMutation {
+                namespace: encode_realm_namespace(DEFAULT_AUTHZ_REALM_ID, "personaldb_row"),
+                object_id: resource.clone(),
+                relation: relation.to_string(),
+                subject_kind: access_control::APP_SUBJECT_KIND.to_string(),
+                subject_id: actor.principal.clone(),
+                caveat_hash: String::new(),
+                operation: "add".to_string(),
+                reason: "PersonalDB row owner grant".to_string(),
+            });
+        }
+    }
+    if mutations.is_empty() {
+        return Ok(());
+    }
+    persistence
+        .write_authz_tuple_batch(actor.tenant_id, mutations, &actor.principal)
+        .await?;
+    Ok(())
 }
 
-fn personaldb_group_partition_family() -> &'static str {
-    "personaldb_group"
+fn insert_effect_creates_owned_row(
+    effect: &crate::personaldb_envelope::TableEffect,
+    actor: &PersonalDbCommitActor,
+) -> bool {
+    effect.operation == TableOperation::Insert
+        && effect.source_resource_binding.owner_principal.as_deref()
+            == Some(actor.principal.as_str())
 }
 
-fn personaldb_group_partition_id(tenant_id: i64, database_id: &str) -> String {
-    hex::encode(hash32(
-        format!("personaldb_group\0{tenant_id}\0{database_id}").as_bytes(),
-    ))
-}
-
-fn personaldb_projection_resource(
+fn personaldb_row_resource_id(
     tenant_id: i64,
     database_id: &str,
-    projection_id: &str,
+    binding: &crate::personaldb_envelope::ResourceBinding,
 ) -> String {
-    format!("tenant-{tenant_id}/{database_id}/projections/{projection_id}")
-}
-
-async fn personaldb_projection_access_allowed(
-    storage: &crate::storage::Storage,
-    claims: &auth::Claims,
-    database_id: &str,
-    projection_id: &str,
-    action: AnvilAction,
-    relation: &str,
-) -> Result<bool, Status> {
-    let resource = personaldb_projection_resource(claims.tenant_id, database_id, projection_id);
-    access_control::scope_or_relationship_allows(
-        storage,
-        claims,
-        action,
-        &resource,
-        "personaldb_projection",
-        &resource,
-        relation,
-        None,
+    format!(
+        "tenant-{}/{}/{}/{}",
+        tenant_id, database_id, binding.resource_type, binding.resource_id
     )
-    .await
-    .map_err(internal_status)
 }
 
-fn configured_personaldb_snapshot_policy(
-    config: &crate::config::Config,
-) -> PersonalDbSnapshotPolicy {
-    let default = PersonalDbSnapshotPolicy::default();
-    PersonalDbSnapshotPolicy {
-        entry_threshold: if config.personaldb_snapshot_entry_threshold == 0 {
-            default.entry_threshold
-        } else {
-            config.personaldb_snapshot_entry_threshold
-        },
-        payload_bytes_threshold: if config.personaldb_snapshot_payload_bytes_threshold == 0 {
-            default.payload_bytes_threshold
-        } else {
-            config.personaldb_snapshot_payload_bytes_threshold
-        },
-    }
-}
-
-fn nonzero_limit(limit: u32) -> usize {
-    if limit == 0 { 100 } else { limit as usize }
-}
-
-fn split_u128(value: u128) -> (u64, u64) {
-    (value as u64, (value >> 64) as u64)
-}
-
-fn join_u128(low: u64, high: u64) -> u128 {
-    (u128::from(high) << 64) | u128::from(low)
-}
-
-fn now_rfc3339() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
-}
-
-fn internal_status(err: impl std::fmt::Display) -> Status {
-    Status::internal(err.to_string())
-}
-
-fn personaldb_ownership_status(err: impl std::fmt::Display) -> Status {
-    Status::failed_precondition(format!(
-        "PersonalDB group ownership fence is not current: {err}"
-    ))
-}
-
-fn projection_writeback_rejected(reason: &'static str) -> Status {
-    Status::failed_precondition(format!(
-        "{}: {reason}",
-        AnvilErrorCode::PersonalDbProjectionWriteBackRejected
-    ))
-}
-
-fn projection_writeback_rejected_owned(reason: String) -> Status {
-    Status::failed_precondition(format!(
-        "{}: {reason}",
-        AnvilErrorCode::PersonalDbProjectionWriteBackRejected
-    ))
-}
-
-fn single_projection_writeback_source(definition: &ProjectionDefinition) -> Result<String, Status> {
-    let sources = definition
-        .table_mappings
-        .iter()
-        .map(|mapping| mapping.source_database_id.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    if sources.len() != 1 {
-        return Err(projection_writeback_rejected(
-            "projection write-back has ambiguous source database bindings",
-        ));
-    }
-    Ok(sources.into_iter().next().expect("one source database"))
-}
-
-fn submit_changeset_response(
-    committed: CommittedPersonalDbChangeset,
-) -> Response<SubmitPersonalDbChangesetResponse> {
-    let (watch_cursor_low, watch_cursor_high) = split_u128(committed.watch_cursor);
-    Response::new(SubmitPersonalDbChangesetResponse {
-        log_index: committed.log_index,
-        log_hash: committed.log_hash,
-        changeset_payload_hash: committed.changeset_payload_hash,
-        verified_envelope_hash: committed.verified_envelope_hash,
-        certificate_hash: committed.certificate_hash,
-        certificate: Some(certificate_record(committed.certificate)),
-        committed_head: Some(committed_head_record(committed.committed_head)),
-        watch_cursor_low,
-        watch_cursor_high,
-    })
-}
-
-fn projection_response(
-    definition: ProjectionDefinition,
-) -> Result<PersonalDbProjectionResponse, Status> {
-    Ok(PersonalDbProjectionResponse {
-        projection_definition_json: serde_json::to_string(&definition).map_err(internal_status)?,
-    })
-}
-
-fn projection_watch_response(
-    event: PersonalDbProjectionWatchEvent,
-) -> WatchPersonalDbProjectionResponse {
-    let (low, high) = split_u128(event.cursor);
-    let payload = event.payload;
-    let emitted_at = payload.emitted_at.clone();
-    let database_id = payload.database_id.clone();
-    let projection_id = payload.projection_id.clone();
-    let projection_log_index = payload.projection_log_index;
-    let payload_hash = watch_envelope::payload_hash(&payload);
-    WatchPersonalDbProjectionResponse {
-        cursor_low: low,
-        cursor_high: high,
-        database_id: database_id.clone(),
-        projection_id: projection_id.clone(),
-        event_type: payload.event_type,
-        source_database_id: payload.source_database_id,
-        source_log_index: payload.source_log_index,
-        source_log_hash: payload.source_log_hash,
-        projection_log_index,
-        projection_log_hash: payload.projection_log_hash,
-        definition_hash: payload.definition_hash,
-        authz_revision: event.authz_revision,
-        emitted_at: emitted_at.clone(),
-        envelope: Some(watch_envelope::envelope(WatchEnvelopeParts {
-            watch_stream_id: "personaldb_projection",
-            partition_family: "personaldb_projection",
-            partition_id: format!("{database_id}/{projection_id}"),
-            cursor: event.cursor,
-            mutation_id: watch_envelope::uuid_from_bytes(event.mutation_id),
-            record_kind: "personaldb_projection".to_string(),
-            object_ref: format!("{database_id}/{projection_id}"),
-            authz_revision: event.authz_revision,
-            index_generation: 0,
-            personaldb_log_index: projection_log_index,
-            payload_hash,
-            emitted_at,
-        })),
-    }
-}
+mod helpers;
+use helpers::*;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::formats::hash32;
-
-    #[test]
-    fn watch_cursor_split_round_trips() {
-        let value = (37u128 << 64) | 99;
-        let (low, high) = split_u128(value);
-        assert_eq!(join_u128(low, high), value);
-    }
-
-    #[test]
-    fn database_id_validation_rejects_path_escape() {
-        assert!(validate_database_id("db-alpha").is_ok());
-        assert!(validate_database_id("../db").is_err());
-        assert!(validate_database_id("tenant/db").is_err());
-    }
-
-    #[test]
-    fn log_record_hex_encodes_hashes() {
-        let record = crate::formats::personaldb::PersonalDbLogRecord::new(
-            1,
-            1,
-            1,
-            1,
-            [1; 32],
-            [2; 32],
-            [3; 32],
-            [4; 32],
-            b"payload".to_vec(),
-            b"certificate".to_vec(),
-            Vec::new(),
-        );
-        let encoded = log_record(record);
-        assert_eq!(encoded.previous_log_hash, hex::encode([1; 32]));
-        assert_eq!(encoded.changeset_payload_hash, hex::encode([2; 32]));
-    }
-
-    #[test]
-    fn genesis_hash_uses_blake3_hash_format() {
-        assert!(validate_hex32(&hex::encode(hash32(b"genesis")), "genesis_hash").is_ok());
-    }
-
-    #[test]
-    fn snapshot_policy_uses_spec_defaults_for_zero_config_values() {
-        let config = crate::config::Config::default();
-        let policy = configured_personaldb_snapshot_policy(&config);
-        assert_eq!(policy, PersonalDbSnapshotPolicy::default());
-    }
-}
+mod tests;

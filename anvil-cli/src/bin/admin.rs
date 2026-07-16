@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
-#[path = "../cli/mod.rs"]
-mod cli;
+#[path = "../cli/admin.rs"]
+mod admin_cli;
 #[path = "../config.rs"]
 mod config;
 #[path = "../context.rs"]
@@ -31,7 +31,7 @@ enum Commands {
         command: KeyCommands,
     },
     #[clap(flatten)]
-    Admin(cli::admin::AdminCommands),
+    Admin(admin_cli::AdminCommands),
 }
 
 #[derive(Subcommand)]
@@ -53,11 +53,8 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         Commands::Admin(command) => {
-            let ctx = match cli.host {
-                Some(host) => Context::from_host(host),
-                None => Context::new(cli.profile, cli.config)?,
-            };
-            cli::admin::handle_admin_command(command, &ctx).await?;
+            let ctx = Context::admin(cli.profile, cli.config, cli.host)?;
+            admin_cli::handle_admin_command(command, &ctx).await?;
         }
     }
     Ok(())

@@ -29,10 +29,22 @@ pub enum AnvilErrorCode {
     StaleFence,
     LeaseOwnerMismatch,
     LeaseCasConflict,
+    ResourceExhaustedMetadataBacklog,
+    BoundaryRequiredMissing,
+    BoundaryBlockLimitUnsatisfied,
+    BoundaryRequiredSingleValueViolation,
+    BoundaryTypeMismatch,
+    BoundaryExtractorUnsupportedContentType,
+    BoundaryExtractorBodyTooLarge,
+    BoundarySchemaGenerationConflict,
+    BoundarySchemaIncompatibleChange,
+    BoundaryMigrationRequired,
+    BoundaryMigrationInProgress,
+    BoundaryMigrationFailed,
 }
 
 impl AnvilErrorCode {
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 41] = [
         Self::Unauthorized,
         Self::UnauthorizedReservedNamespace,
         Self::ForbiddenByPolicy,
@@ -62,6 +74,18 @@ impl AnvilErrorCode {
         Self::StaleFence,
         Self::LeaseOwnerMismatch,
         Self::LeaseCasConflict,
+        Self::ResourceExhaustedMetadataBacklog,
+        Self::BoundaryRequiredMissing,
+        Self::BoundaryBlockLimitUnsatisfied,
+        Self::BoundaryRequiredSingleValueViolation,
+        Self::BoundaryTypeMismatch,
+        Self::BoundaryExtractorUnsupportedContentType,
+        Self::BoundaryExtractorBodyTooLarge,
+        Self::BoundarySchemaGenerationConflict,
+        Self::BoundarySchemaIncompatibleChange,
+        Self::BoundaryMigrationRequired,
+        Self::BoundaryMigrationInProgress,
+        Self::BoundaryMigrationFailed,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -97,6 +121,20 @@ impl AnvilErrorCode {
             Self::StaleFence => "StaleFence",
             Self::LeaseOwnerMismatch => "LeaseOwnerMismatch",
             Self::LeaseCasConflict => "LeaseCasConflict",
+            Self::ResourceExhaustedMetadataBacklog => "ResourceExhaustedMetadataBacklog",
+            Self::BoundaryRequiredMissing => "BoundaryRequiredMissing",
+            Self::BoundaryBlockLimitUnsatisfied => "BoundaryBlockLimitUnsatisfied",
+            Self::BoundaryRequiredSingleValueViolation => "BoundaryRequiredSingleValueViolation",
+            Self::BoundaryTypeMismatch => "BoundaryTypeMismatch",
+            Self::BoundaryExtractorUnsupportedContentType => {
+                "BoundaryExtractorUnsupportedContentType"
+            }
+            Self::BoundaryExtractorBodyTooLarge => "BoundaryExtractorBodyTooLarge",
+            Self::BoundarySchemaGenerationConflict => "BoundarySchemaGenerationConflict",
+            Self::BoundarySchemaIncompatibleChange => "BoundarySchemaIncompatibleChange",
+            Self::BoundaryMigrationRequired => "BoundaryMigrationRequired",
+            Self::BoundaryMigrationInProgress => "BoundaryMigrationInProgress",
+            Self::BoundaryMigrationFailed => "BoundaryMigrationFailed",
         }
     }
 }
@@ -161,6 +199,18 @@ mod tests {
                 "StaleFence",
                 "LeaseOwnerMismatch",
                 "LeaseCasConflict",
+                "ResourceExhaustedMetadataBacklog",
+                "BoundaryRequiredMissing",
+                "BoundaryBlockLimitUnsatisfied",
+                "BoundaryRequiredSingleValueViolation",
+                "BoundaryTypeMismatch",
+                "BoundaryExtractorUnsupportedContentType",
+                "BoundaryExtractorBodyTooLarge",
+                "BoundarySchemaGenerationConflict",
+                "BoundarySchemaIncompatibleChange",
+                "BoundaryMigrationRequired",
+                "BoundaryMigrationInProgress",
+                "BoundaryMigrationFailed",
             ]
         );
     }

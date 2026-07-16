@@ -12,7 +12,7 @@ services:
       - REGION=DOCKER_TEST
       - JWT_SECRET=docker-test-secret
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      - ANVIL_CLUSTER_SECRET=docker-cluster-secret
+      - CLUSTER_SECRET=docker-cluster-secret
       - API_LISTEN_ADDR=0.0.0.0:50051
       - CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/7443/quic-v1
       - PUBLIC_CLUSTER_ADDRS=/dns4/anvil1/udp/7443/quic-v1
@@ -42,7 +42,7 @@ services:
       - REGION=DOCKER_TEST
       - JWT_SECRET=docker-test-secret
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      - ANVIL_CLUSTER_SECRET=docker-cluster-secret
+      - CLUSTER_SECRET=docker-cluster-secret
       - API_LISTEN_ADDR=0.0.0.0:50051
       - CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/7444/quic-v1
       - PUBLIC_CLUSTER_ADDRS=/dns4/anvil2/udp/7444/quic-v1
@@ -67,7 +67,7 @@ services:
       - REGION=DOCKER_TEST
       - JWT_SECRET=docker-test-secret
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      - ANVIL_CLUSTER_SECRET=docker-cluster-secret
+      - CLUSTER_SECRET=docker-cluster-secret
       - API_LISTEN_ADDR=0.0.0.0:50051
       - CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/7445/quic-v1
       - PUBLIC_CLUSTER_ADDRS=/dns4/anvil3/udp/7445/quic-v1

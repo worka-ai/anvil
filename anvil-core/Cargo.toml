@@ -94,7 +94,6 @@ globset = "0.4"
 local-ip-address = "0.6.5"
 reqwest = { version = "0.12.23", default-features = false, features = ["rustls-tls"] }
 trust-dns-resolver = "0.23.2"
-async-trait = "0.1.89"
 libp2p = { version = "0.56.0", features = ["gossipsub", "mdns", "tcp", "tokio", "macros", "noise", "yamux", "quic"] }
 reed-solomon-erasure = "6.0.0"
 ahash = "0.8.12"
@@ -127,11 +126,13 @@ aws-credential-types = "1"   # for Credentials
 aws-smithy-runtime-api = "1" # for Identity
 
 aes-gcm = "0.10.3"
+aes-gcm-siv = "0.11.1"
 constant_time_eq = "0.4.2"
 http-body-util = "0.1.1"
 subtle = "2.6.1"
 moka = { version = "0.12.11", features = ["future"] }
 hnsw_rs = "0.3.4"
+rocksdb = { version = "0.24.0", default-features = false, features = ["bindgen-runtime", "lz4", "zstd"] }
 
 [build-dependencies]
 tonic-prost-build = { version = "0.14.2" }

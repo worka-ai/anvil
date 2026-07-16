@@ -2,7 +2,7 @@
 
 This folder contains the Fission static documentation site for Anvil.
 
-The site is intentionally structured as a learning path, not a command dump. The home page explains why Anvil exists. The Learn section teaches object storage, key design, indexing, search, authorisation, watches, and PersonalDB from first principles. The Developer section then applies those concepts to application code. The Operator section explains deployment, identity, indexing operations, backup, and release work. The Reference section is for exact settings, command families, package outputs, and errors after the concepts are clear.
+The site is intentionally structured as a learning path, not a command dump. The home page explains why Anvil exists. Learn teaches the core concepts from first principles. Architecture explains the implementation model and release status. Tutorials turn those concepts into complete workflows. Operators is the production runbook. CLIs is the exact command reference for the public and admin command lines.
 
 ## Build
 
@@ -29,8 +29,8 @@ fission site serve --project-dir documentation
 
 - `src/app.rs` - custom Fission marketing home page.
 - `content/learn/` - progressive conceptual guide.
+- `content/architecture/` - CoreStore, RocksDB, byte-pipeline, index, stream, mesh, release-status, and contributor architecture pages.
 - `content/tutorials/` - operation tutorials using the Rust client shipped in this release.
-- `content/developers/` - application development guide.
-- `content/operators/` - deployment, operations, and release guide.
-- `content/reference/` - configuration, CLI, security errors, and packages.
+- `content/operators/` - operator book for deployment, operations, repair, security, and release readiness.
+- `content/reference/` - public and administrative CLI references.
 - `site/*-sidebar.toml` - navigation order for documentation sections.

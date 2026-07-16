@@ -1,12 +1,17 @@
 use crate::{
-    core_store::{AppendStreamRecord, CoreStore, ReadStream},
+    core_store::{
+        AppendStreamRecord, CoreStore, ReadStream, decode_deterministic_proto,
+        encode_deterministic_proto, sha256_hex,
+    },
     storage::Storage,
 };
 use anyhow::Result;
+use prost::Message;
 use serde::{Deserialize, Serialize};
 
 pub const ADMIN_AUDIT_EVENT_SCHEMA: &str = "anvil.admin.audit_event.v1";
-const ADMIN_AUDIT_STREAM_ID: &str = "admin_audit:global";
+const ADMIN_AUDIT_STREAM_PREFIX: &str = "admin_audit:shard";
+const ADMIN_AUDIT_SHARD_COUNT: u16 = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AdminAuditEvent {
@@ -21,6 +26,28 @@ pub struct AdminAuditEvent {
     pub details_json: String,
 }
 
+#[derive(Clone, PartialEq, Message)]
+struct AdminAuditEventProto {
+    #[prost(string, tag = "1")]
+    schema: String,
+    #[prost(string, tag = "2")]
+    audit_event_id: String,
+    #[prost(string, tag = "3")]
+    request_id: String,
+    #[prost(string, tag = "4")]
+    principal_id: String,
+    #[prost(string, tag = "5")]
+    resource_id: String,
+    #[prost(string, tag = "6")]
+    action: String,
+    #[prost(string, tag = "7")]
+    audit_reason: String,
+    #[prost(string, tag = "8")]
+    created_at: String,
+    #[prost(string, tag = "9")]
+    details_json: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuditEventFilter<'a> {
     pub principal_id: Option<&'a str>,
@@ -32,10 +59,12 @@ pub async fn append_audit_event(storage: &Storage, event: &AdminAuditEvent) -> R
     CoreStore::new(storage.clone())
         .await?
         .append_stream(AppendStreamRecord {
-            stream_id: ADMIN_AUDIT_STREAM_ID.to_string(),
+            stream_id: audit_stream_id(&event.audit_event_id),
             partition_id: "global".to_string(),
             record_kind: "admin_audit_event".to_string(),
-            payload: serde_json::to_vec(event)?,
+            payload: encode_audit_event(event),
+            content_type: None,
+            user_metadata_json: "{}".to_string(),
             fence: None,
             transaction_id: None,
             idempotency_key: Some(event.audit_event_id.clone()),
@@ -49,18 +78,20 @@ pub async fn list_audit_events(
     filter: AuditEventFilter<'_>,
 ) -> Result<Vec<AdminAuditEvent>> {
     let mut out = Vec::new();
-    for record in CoreStore::new(storage.clone())
-        .await?
-        .read_stream(ReadStream {
-            stream_id: ADMIN_AUDIT_STREAM_ID.to_string(),
-            after_sequence: 0,
-            limit: 0,
-        })
-        .await?
-    {
-        let event: AdminAuditEvent = serde_json::from_slice(&record.payload)?;
-        if matches_filter(&event, &filter) {
-            out.push(event);
+    let core_store = CoreStore::new(storage.clone()).await?;
+    for shard in 0..ADMIN_AUDIT_SHARD_COUNT {
+        for record in core_store
+            .read_stream(ReadStream {
+                stream_id: audit_stream_id_for_shard(shard),
+                after_sequence: 0,
+                limit: 0,
+            })
+            .await?
+        {
+            let event = decode_audit_event(&record.payload)?;
+            if matches_filter(&event, &filter) {
+                out.push(event);
+            }
         }
     }
     out.sort_by(|left, right| {
@@ -69,6 +100,47 @@ pub async fn list_audit_events(
             .then(left.audit_event_id.cmp(&right.audit_event_id))
     });
     Ok(out)
+}
+
+fn audit_stream_id(audit_event_id: &str) -> String {
+    let digest = sha256_hex(audit_event_id.as_bytes());
+    let shard = u16::from_str_radix(&digest[0..2], 16).expect("sha256 hex prefix is valid");
+    audit_stream_id_for_shard(shard)
+}
+
+fn audit_stream_id_for_shard(shard: u16) -> String {
+    debug_assert!(shard < ADMIN_AUDIT_SHARD_COUNT);
+    format!("{ADMIN_AUDIT_STREAM_PREFIX}:{shard:02x}")
+}
+
+fn encode_audit_event(event: &AdminAuditEvent) -> Vec<u8> {
+    encode_deterministic_proto(&AdminAuditEventProto {
+        schema: event.schema.clone(),
+        audit_event_id: event.audit_event_id.clone(),
+        request_id: event.request_id.clone(),
+        principal_id: event.principal_id.clone(),
+        resource_id: event.resource_id.clone(),
+        action: event.action.clone(),
+        audit_reason: event.audit_reason.clone(),
+        created_at: event.created_at.clone(),
+        details_json: event.details_json.clone(),
+    })
+}
+
+fn decode_audit_event(bytes: &[u8]) -> Result<AdminAuditEvent> {
+    let proto =
+        decode_deterministic_proto::<AdminAuditEventProto>(bytes, "admin audit event payload")?;
+    Ok(AdminAuditEvent {
+        schema: proto.schema,
+        audit_event_id: proto.audit_event_id,
+        request_id: proto.request_id,
+        principal_id: proto.principal_id,
+        resource_id: proto.resource_id,
+        action: proto.action,
+        audit_reason: proto.audit_reason,
+        created_at: proto.created_at,
+        details_json: proto.details_json,
+    })
 }
 
 pub fn audit_event_position(event: &AdminAuditEvent) -> String {
@@ -136,6 +208,19 @@ mod tests {
         append_audit_event(&storage, &event("audit-b", "admin-b", "bucket-b", "delete"))
             .await
             .unwrap();
+
+        let raw = CoreStore::new(storage.clone())
+            .await
+            .unwrap()
+            .read_stream(ReadStream {
+                stream_id: audit_stream_id("audit-a"),
+                after_sequence: 0,
+                limit: 1,
+            })
+            .await
+            .unwrap();
+        assert_ne!(raw[0].payload.first().copied(), Some(b'{'));
+        assert!(decode_audit_event(&raw[0].payload).is_ok());
 
         let all = list_audit_events(&storage, AuditEventFilter::default())
             .await

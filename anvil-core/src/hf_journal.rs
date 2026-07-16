@@ -1,14 +1,16 @@
 use crate::core_store::{
     CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreStore, ReadStream,
 };
-use crate::formats::{Hash32, JournalFrame, JournalRecordKind, hash32, validate_journal_chain};
-use crate::partition_fence::{PartitionWritePermit, partition_write_ref_precondition};
+use crate::formats::{Hash32, hash32};
+use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
 use crate::persistence::{HfIngestion, HfIngestionItem, HfIngestionJob, HfKey};
 use crate::storage::Storage;
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use prost::{Message, Oneof};
 use std::collections::{BTreeMap, HashSet};
+
+const HF_METADATA_BODY_SCHEMA: &str = "anvil.core.hf_metadata.v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HfMutationKind {
@@ -29,14 +31,161 @@ impl HfMutationKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct HfBody {
-    event: String,
-    key: Option<HfKey>,
-    key_name: Option<String>,
-    ingestion: Option<HfIngestion>,
-    item: Option<HfIngestionItem>,
+#[derive(Debug, Clone)]
+enum HfBody {
+    KeyUpsert {
+        key: HfKey,
+        emitted_at: DateTime<Utc>,
+    },
+    KeyDelete {
+        tenant_id: i64,
+        key_name: String,
+        emitted_at: DateTime<Utc>,
+    },
+    IngestionUpsert {
+        ingestion: HfIngestion,
+        emitted_at: DateTime<Utc>,
+    },
+    ItemUpsert {
+        item: HfIngestionItem,
+        emitted_at: DateTime<Utc>,
+    },
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct HfJournalBodyProto {
+    #[prost(string, tag = "1")]
+    schema: String,
+    #[prost(string, tag = "2")]
     emitted_at: String,
+    #[prost(uint64, tag = "3")]
+    fence_token: u64,
+    #[prost(string, tag = "4")]
+    mutation_id: String,
+    #[prost(oneof = "hf_journal_body_proto::Event", tags = "10, 11, 12, 13")]
+    event: Option<hf_journal_body_proto::Event>,
+}
+
+mod hf_journal_body_proto {
+    use super::*;
+
+    #[derive(Clone, PartialEq, Oneof)]
+    pub(super) enum Event {
+        #[prost(message, tag = "10")]
+        KeyUpsert(super::HfKeyProto),
+        #[prost(message, tag = "11")]
+        KeyDelete(super::HfKeyDeleteProto),
+        #[prost(message, tag = "12")]
+        IngestionUpsert(super::HfIngestionProto),
+        #[prost(message, tag = "13")]
+        ItemUpsert(super::HfIngestionItemProto),
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct HfKeyProto {
+    #[prost(int64, tag = "1")]
+    id: i64,
+    #[prost(string, tag = "2")]
+    name: String,
+    #[prost(bytes, tag = "3")]
+    token_encrypted: Vec<u8>,
+    #[prost(string, optional, tag = "4")]
+    note: Option<String>,
+    #[prost(string, tag = "5")]
+    created_at: String,
+    #[prost(string, tag = "6")]
+    updated_at: String,
+    #[prost(int64, tag = "7")]
+    tenant_id: i64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct HfKeyDeleteProto {
+    #[prost(int64, tag = "1")]
+    tenant_id: i64,
+    #[prost(string, tag = "2")]
+    key_name: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct HfIngestionProto {
+    #[prost(int64, tag = "1")]
+    id: i64,
+    #[prost(int64, tag = "2")]
+    key_id: i64,
+    #[prost(int64, tag = "3")]
+    tenant_id: i64,
+    #[prost(int64, tag = "4")]
+    requester_app_id: i64,
+    #[prost(string, tag = "5")]
+    repo: String,
+    #[prost(string, tag = "6")]
+    revision: String,
+    #[prost(string, tag = "7")]
+    target_bucket: String,
+    #[prost(string, tag = "8")]
+    target_region: String,
+    #[prost(string, tag = "9")]
+    target_prefix: String,
+    #[prost(string, repeated, tag = "10")]
+    include_globs: Vec<String>,
+    #[prost(string, repeated, tag = "11")]
+    exclude_globs: Vec<String>,
+    #[prost(enumeration = "HfIngestionStateProto", tag = "12")]
+    state: i32,
+    #[prost(string, optional, tag = "13")]
+    error: Option<String>,
+    #[prost(string, tag = "14")]
+    created_at: String,
+    #[prost(string, optional, tag = "15")]
+    started_at: Option<String>,
+    #[prost(string, optional, tag = "16")]
+    finished_at: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct HfIngestionItemProto {
+    #[prost(int64, tag = "1")]
+    id: i64,
+    #[prost(int64, tag = "2")]
+    ingestion_id: i64,
+    #[prost(string, tag = "3")]
+    path: String,
+    #[prost(int64, optional, tag = "4")]
+    size: Option<i64>,
+    #[prost(string, optional, tag = "5")]
+    etag: Option<String>,
+    #[prost(enumeration = "HfIngestionItemStateProto", tag = "6")]
+    state: i32,
+    #[prost(string, optional, tag = "7")]
+    error: Option<String>,
+    #[prost(string, tag = "8")]
+    created_at: String,
+    #[prost(string, optional, tag = "9")]
+    started_at: Option<String>,
+    #[prost(string, optional, tag = "10")]
+    finished_at: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+enum HfIngestionStateProto {
+    Unspecified = 0,
+    Queued = 1,
+    Running = 2,
+    Completed = 3,
+    Failed = 4,
+    Canceled = 5,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+enum HfIngestionItemStateProto {
+    Unspecified = 0,
+    Queued = 1,
+    Downloading = 2,
+    Stored = 3,
+    Failed = 4,
+    Skipped = 5,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -55,12 +204,14 @@ struct HfWriteGuard {
 #[cfg(test)]
 async fn create_key(
     storage: &Storage,
+    tenant_id: i64,
     name: &str,
     token_encrypted: &[u8],
     note: Option<&str>,
 ) -> Result<()> {
     create_key_inner(
         storage,
+        tenant_id,
         name,
         token_encrypted,
         note,
@@ -71,6 +222,7 @@ async fn create_key(
 
 pub(crate) async fn create_key_with_permit(
     storage: &Storage,
+    tenant_id: i64,
     name: &str,
     token_encrypted: &[u8],
     note: Option<&str>,
@@ -78,18 +230,23 @@ pub(crate) async fn create_key_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
     let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
-    create_key_inner(storage, name, token_encrypted, note, guard).await
+    create_key_inner(storage, tenant_id, name, token_encrypted, note, guard).await
 }
 
 async fn create_key_inner(
     storage: &Storage,
+    tenant_id: i64,
     name: &str,
     token_encrypted: &[u8],
     note: Option<&str>,
     guard: HfWriteGuard,
 ) -> Result<()> {
     let state = read_state(storage).await?;
-    if state.keys.values().any(|key| key.name == name) {
+    if state
+        .keys
+        .values()
+        .any(|key| key.tenant_id == tenant_id && key.name == name)
+    {
         return Err(anyhow!("hugging face key already exists"));
     }
     let now = Utc::now();
@@ -98,6 +255,7 @@ async fn create_key_inner(
         HfMutationKind::KeyUpsert,
         Some(HfKey {
             id: next_key_id(&state)?,
+            tenant_id,
             name: name.to_string(),
             token_encrypted: token_encrypted.to_vec(),
             note: note.map(ToOwned::to_owned),
@@ -113,29 +271,38 @@ async fn create_key_inner(
 }
 
 #[cfg(test)]
-async fn delete_key(storage: &Storage, name: &str) -> Result<u64> {
-    delete_key_inner(storage, name, HfWriteGuard::default()).await
+async fn delete_key(storage: &Storage, tenant_id: i64, name: &str) -> Result<u64> {
+    delete_key_inner(storage, tenant_id, name, HfWriteGuard::default()).await
 }
 
 pub(crate) async fn delete_key_with_permit(
     storage: &Storage,
+    tenant_id: i64,
     name: &str,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<u64> {
     let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
-    delete_key_inner(storage, name, guard).await
+    delete_key_inner(storage, tenant_id, name, guard).await
 }
 
-async fn delete_key_inner(storage: &Storage, name: &str, guard: HfWriteGuard) -> Result<u64> {
+async fn delete_key_inner(
+    storage: &Storage,
+    tenant_id: i64,
+    name: &str,
+    guard: HfWriteGuard,
+) -> Result<u64> {
     let state = read_state(storage).await?;
-    let deleted = state.keys.values().any(|key| key.name == name);
+    let deleted = state
+        .keys
+        .values()
+        .any(|key| key.tenant_id == tenant_id && key.name == name);
     if deleted {
         append_body(
             storage,
             HfMutationKind::KeyDelete,
             None,
-            Some(name.to_string()),
+            Some((tenant_id, name.to_string())),
             None,
             None,
             guard,
@@ -145,20 +312,29 @@ async fn delete_key_inner(storage: &Storage, name: &str, guard: HfWriteGuard) ->
     Ok(u64::from(deleted))
 }
 
-pub async fn get_key_encrypted(storage: &Storage, name: &str) -> Result<Option<(i64, Vec<u8>)>> {
+pub async fn get_key_encrypted(
+    storage: &Storage,
+    tenant_id: i64,
+    name: &str,
+) -> Result<Option<(i64, Vec<u8>)>> {
     Ok(read_state(storage)
         .await?
         .keys
         .into_values()
-        .find(|key| key.name == name)
+        .find(|key| key.tenant_id == tenant_id && key.name == name)
         .map(|key| (key.id, key.token_encrypted)))
 }
 
-pub async fn get_key_encrypted_by_id(storage: &Storage, id: i64) -> Result<Option<Vec<u8>>> {
+pub async fn get_key_encrypted_by_id(
+    storage: &Storage,
+    tenant_id: i64,
+    id: i64,
+) -> Result<Option<Vec<u8>>> {
     Ok(read_state(storage)
         .await?
         .keys
         .remove(&id)
+        .filter(|key| key.tenant_id == tenant_id)
         .map(|key| key.token_encrypted))
 }
 
@@ -202,11 +378,13 @@ pub(crate) async fn update_key_encrypted_with_permit(
 
 pub async fn list_keys(
     storage: &Storage,
+    tenant_id: i64,
 ) -> Result<Vec<(String, Option<String>, DateTime<Utc>, DateTime<Utc>)>> {
     let mut keys = read_state(storage)
         .await?
         .keys
         .into_values()
+        .filter(|key| key.tenant_id == tenant_id)
         .map(|key| (key.name, key.note, key.created_at, key.updated_at))
         .collect::<Vec<_>>();
     keys.sort_by(|left, right| left.0.cmp(&right.0));
@@ -691,35 +869,28 @@ fn count_items(state: &HfState, id: i64, item_state: crate::tasks::HFIngestionIt
 }
 
 async fn read_state(storage: &Storage) -> Result<HfState> {
-    let frames = read_hf_journal_frames(storage).await?;
+    let bodies = read_hf_bodies(storage).await?;
     let mut state = HfState::default();
-    for frame in frames {
-        if frame.record_kind != JournalRecordKind::HfMetadata {
-            continue;
-        }
-        let body: HfBody = serde_json::from_slice(&frame.body)?;
-        match body.event.as_str() {
-            "key_upsert" => {
-                if let Some(key) = body.key {
-                    state.keys.insert(key.id, key);
-                }
+    for body in bodies {
+        match body {
+            HfBody::KeyUpsert { key, .. } => {
+                state.keys.insert(key.id, key);
             }
-            "key_delete" => {
-                if let Some(name) = body.key_name {
-                    state.keys.retain(|_, key| key.name != name);
-                }
+            HfBody::KeyDelete {
+                tenant_id,
+                key_name,
+                ..
+            } => {
+                state
+                    .keys
+                    .retain(|_, key| key.tenant_id != tenant_id || key.name != key_name);
             }
-            "ingestion_upsert" => {
-                if let Some(ingestion) = body.ingestion {
-                    state.ingestions.insert(ingestion.id, ingestion);
-                }
+            HfBody::IngestionUpsert { ingestion, .. } => {
+                state.ingestions.insert(ingestion.id, ingestion);
             }
-            "item_upsert" => {
-                if let Some(item) = body.item {
-                    state.items.insert(item.id, item);
-                }
+            HfBody::ItemUpsert { item, .. } => {
+                state.items.insert(item.id, item);
             }
-            _ => {}
         }
     }
     Ok(state)
@@ -729,28 +900,21 @@ async fn append_body(
     storage: &Storage,
     event: HfMutationKind,
     key: Option<HfKey>,
-    key_name: Option<String>,
+    key_delete: Option<(i64, String)>,
     ingestion: Option<HfIngestion>,
     item: Option<HfIngestionItem>,
     guard: HfWriteGuard,
 ) -> Result<()> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    let previous = read_hf_journal_frames_from_store(&core_store)
-        .await
-        .unwrap_or_default();
-    let sequence = previous
-        .last()
-        .map(|frame| frame.partition_sequence + 1)
-        .unwrap_or(1);
-    let previous_hash = previous
-        .last()
-        .map(|frame| frame.record_hash)
-        .unwrap_or([0; 32]);
     let mutation_id = uuid::Uuid::new_v4();
     let key_text = key
         .as_ref()
-        .map(|key| format!("key/{}", key.id))
-        .or_else(|| key_name.as_ref().map(|name| format!("key-name/{name}")))
+        .map(|key| format!("tenant/{}/key/{}", key.tenant_id, key.id))
+        .or_else(|| {
+            key_delete
+                .as_ref()
+                .map(|(tenant_id, name)| format!("tenant/{tenant_id}/key-name/{name}"))
+        })
         .or_else(|| {
             ingestion
                 .as_ref()
@@ -758,26 +922,12 @@ async fn append_body(
         })
         .or_else(|| item.as_ref().map(|item| format!("item/{}", item.id)))
         .unwrap_or_else(|| event.as_str().to_string());
-    let frame = JournalFrame::new(
-        JournalRecordKind::HfMetadata,
-        sequence,
-        guard.fence_token,
-        *mutation_id.as_bytes(),
-        hash32(format!("hf/{key_text}").as_bytes()),
-        previous_hash,
-        serde_json::to_vec(&HfBody {
-            event: event.as_str().to_string(),
-            key,
-            key_name,
-            ingestion,
-            item,
-            emitted_at: Utc::now().to_rfc3339(),
-        })?,
-    );
+    let body = hf_body_from_parts(event, key, key_delete, ingestion, item, Utc::now())?;
+    let payload = encode_hf_body(&body, guard.fence_token, mutation_id)?;
     let partition_id = hex::encode(hf_partition_id());
     core_store
         .commit_mutation_batch(CoreMutationBatch {
-            transaction_id: format!("hf-metadata:{mutation_id}"),
+            transaction_id: format!("hf-metadata:{key_text}:{mutation_id}"),
             scope_partition: partition_id.clone(),
             committed_by_principal: hf_partition_principal(),
             preconditions: guard.partition_precondition.into_iter().collect(),
@@ -785,20 +935,16 @@ async fn append_body(
                 partition_id,
                 stream_id: hf_metadata_stream_id(),
                 record_kind: "hf_metadata".to_string(),
-                payload: frame.encode(),
-                idempotency_key: Some(format!("hf-metadata:{mutation_id}")),
+                payload,
+                idempotency_key: Some(format!("hf-metadata:{key_text}:{mutation_id}")),
             }],
         })
         .await?;
     Ok(())
 }
 
-async fn read_hf_journal_frames(storage: &Storage) -> Result<Vec<JournalFrame>> {
+async fn read_hf_bodies(storage: &Storage) -> Result<Vec<HfBody>> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    read_hf_journal_frames_from_store(&core_store).await
-}
-
-async fn read_hf_journal_frames_from_store(core_store: &CoreStore) -> Result<Vec<JournalFrame>> {
     let records = core_store
         .read_stream(ReadStream {
             stream_id: hf_metadata_stream_id(),
@@ -806,15 +952,329 @@ async fn read_hf_journal_frames_from_store(core_store: &CoreStore) -> Result<Vec
             limit: 0,
         })
         .await?;
-    let mut frames = Vec::new();
-    for record in records {
-        if record.record_kind != "hf_metadata" {
-            continue;
+    records
+        .into_iter()
+        .filter(|record| record.record_kind == "hf_metadata")
+        .map(|record| decode_hf_body(&record.payload))
+        .collect()
+}
+
+fn hf_body_from_parts(
+    event: HfMutationKind,
+    key: Option<HfKey>,
+    key_delete: Option<(i64, String)>,
+    ingestion: Option<HfIngestion>,
+    item: Option<HfIngestionItem>,
+    emitted_at: DateTime<Utc>,
+) -> Result<HfBody> {
+    match event {
+        HfMutationKind::KeyUpsert => Ok(HfBody::KeyUpsert {
+            key: key.ok_or_else(|| anyhow!("hf key upsert body is missing key"))?,
+            emitted_at,
+        }),
+        HfMutationKind::KeyDelete => {
+            let (tenant_id, key_name) = key_delete
+                .ok_or_else(|| anyhow!("hf key delete body is missing tenant and key name"))?;
+            Ok(HfBody::KeyDelete {
+                tenant_id,
+                key_name,
+                emitted_at,
+            })
         }
-        frames.push(JournalFrame::decode(&record.payload)?);
+        HfMutationKind::IngestionUpsert => Ok(HfBody::IngestionUpsert {
+            ingestion: ingestion
+                .ok_or_else(|| anyhow!("hf ingestion upsert body is missing ingestion"))?,
+            emitted_at,
+        }),
+        HfMutationKind::ItemUpsert => Ok(HfBody::ItemUpsert {
+            item: item.ok_or_else(|| anyhow!("hf item upsert body is missing item"))?,
+            emitted_at,
+        }),
     }
-    validate_journal_chain(&frames)?;
-    Ok(frames)
+}
+
+fn encode_hf_body(body: &HfBody, fence_token: u64, mutation_id: uuid::Uuid) -> Result<Vec<u8>> {
+    encode_deterministic_proto(&hf_body_to_proto(body, fence_token, mutation_id)?)
+}
+
+fn decode_hf_body(bytes: &[u8]) -> Result<HfBody> {
+    let proto = HfJournalBodyProto::decode(bytes)?;
+    ensure_deterministic_proto(&proto, bytes, "hf metadata body")?;
+    hf_body_from_proto(proto)
+}
+
+fn hf_body_to_proto(
+    body: &HfBody,
+    fence_token: u64,
+    mutation_id: uuid::Uuid,
+) -> Result<HfJournalBodyProto> {
+    Ok(match body {
+        HfBody::KeyUpsert { key, emitted_at } => HfJournalBodyProto {
+            schema: HF_METADATA_BODY_SCHEMA.to_string(),
+            emitted_at: emitted_at.to_rfc3339(),
+            fence_token,
+            mutation_id: mutation_id.to_string(),
+            event: Some(hf_journal_body_proto::Event::KeyUpsert(hf_key_to_proto(
+                key,
+            ))),
+        },
+        HfBody::KeyDelete {
+            tenant_id,
+            key_name,
+            emitted_at,
+        } => HfJournalBodyProto {
+            schema: HF_METADATA_BODY_SCHEMA.to_string(),
+            emitted_at: emitted_at.to_rfc3339(),
+            fence_token,
+            mutation_id: mutation_id.to_string(),
+            event: Some(hf_journal_body_proto::Event::KeyDelete(HfKeyDeleteProto {
+                tenant_id: *tenant_id,
+                key_name: key_name.clone(),
+            })),
+        },
+        HfBody::IngestionUpsert {
+            ingestion,
+            emitted_at,
+        } => HfJournalBodyProto {
+            schema: HF_METADATA_BODY_SCHEMA.to_string(),
+            emitted_at: emitted_at.to_rfc3339(),
+            fence_token,
+            mutation_id: mutation_id.to_string(),
+            event: Some(hf_journal_body_proto::Event::IngestionUpsert(
+                hf_ingestion_to_proto(ingestion),
+            )),
+        },
+        HfBody::ItemUpsert { item, emitted_at } => HfJournalBodyProto {
+            schema: HF_METADATA_BODY_SCHEMA.to_string(),
+            emitted_at: emitted_at.to_rfc3339(),
+            fence_token,
+            mutation_id: mutation_id.to_string(),
+            event: Some(hf_journal_body_proto::Event::ItemUpsert(
+                hf_ingestion_item_to_proto(item),
+            )),
+        },
+    })
+}
+
+fn hf_body_from_proto(proto: HfJournalBodyProto) -> Result<HfBody> {
+    if proto.schema != HF_METADATA_BODY_SCHEMA {
+        return Err(anyhow!("hf metadata body has invalid schema"));
+    }
+    let _mutation_id = uuid::Uuid::parse_str(&proto.mutation_id)
+        .map_err(|_| anyhow!("hf metadata body has invalid mutation id"))?;
+    let emitted_at = parse_required_hf_time(&proto.emitted_at, "emitted_at")?;
+    match proto
+        .event
+        .ok_or_else(|| anyhow!("hf metadata body is missing event"))?
+    {
+        hf_journal_body_proto::Event::KeyUpsert(key) => Ok(HfBody::KeyUpsert {
+            key: hf_key_from_proto(key)?,
+            emitted_at,
+        }),
+        hf_journal_body_proto::Event::KeyDelete(key) => Ok(HfBody::KeyDelete {
+            tenant_id: key.tenant_id,
+            key_name: key.key_name,
+            emitted_at,
+        }),
+        hf_journal_body_proto::Event::IngestionUpsert(ingestion) => Ok(HfBody::IngestionUpsert {
+            ingestion: hf_ingestion_from_proto(ingestion)?,
+            emitted_at,
+        }),
+        hf_journal_body_proto::Event::ItemUpsert(item) => Ok(HfBody::ItemUpsert {
+            item: hf_ingestion_item_from_proto(item)?,
+            emitted_at,
+        }),
+    }
+}
+
+#[cfg(test)]
+fn decode_hf_body_fence(bytes: &[u8]) -> Result<u64> {
+    let proto = HfJournalBodyProto::decode(bytes)?;
+    ensure_deterministic_proto(&proto, bytes, "hf metadata body")?;
+    if proto.schema != HF_METADATA_BODY_SCHEMA {
+        return Err(anyhow!("hf metadata body has invalid schema"));
+    }
+    Ok(proto.fence_token)
+}
+
+fn hf_key_to_proto(key: &HfKey) -> HfKeyProto {
+    HfKeyProto {
+        id: key.id,
+        tenant_id: key.tenant_id,
+        name: key.name.clone(),
+        token_encrypted: key.token_encrypted.clone(),
+        note: key.note.clone(),
+        created_at: key.created_at.to_rfc3339(),
+        updated_at: key.updated_at.to_rfc3339(),
+    }
+}
+
+fn hf_key_from_proto(proto: HfKeyProto) -> Result<HfKey> {
+    Ok(HfKey {
+        id: proto.id,
+        tenant_id: proto.tenant_id,
+        name: proto.name,
+        token_encrypted: proto.token_encrypted,
+        note: proto.note,
+        created_at: parse_required_hf_time(&proto.created_at, "key.created_at")?,
+        updated_at: parse_required_hf_time(&proto.updated_at, "key.updated_at")?,
+    })
+}
+
+fn hf_ingestion_to_proto(ingestion: &HfIngestion) -> HfIngestionProto {
+    HfIngestionProto {
+        id: ingestion.id,
+        key_id: ingestion.key_id,
+        tenant_id: ingestion.tenant_id,
+        requester_app_id: ingestion.requester_app_id,
+        repo: ingestion.repo.clone(),
+        revision: ingestion.revision.clone(),
+        target_bucket: ingestion.target_bucket.clone(),
+        target_region: ingestion.target_region.clone(),
+        target_prefix: ingestion.target_prefix.clone(),
+        include_globs: ingestion.include_globs.clone(),
+        exclude_globs: ingestion.exclude_globs.clone(),
+        state: hf_ingestion_state_to_proto(ingestion.state) as i32,
+        error: ingestion.error.clone(),
+        created_at: ingestion.created_at.to_rfc3339(),
+        started_at: ingestion.started_at.as_ref().map(DateTime::to_rfc3339),
+        finished_at: ingestion.finished_at.as_ref().map(DateTime::to_rfc3339),
+    }
+}
+
+fn hf_ingestion_from_proto(proto: HfIngestionProto) -> Result<HfIngestion> {
+    Ok(HfIngestion {
+        id: proto.id,
+        key_id: proto.key_id,
+        tenant_id: proto.tenant_id,
+        requester_app_id: proto.requester_app_id,
+        repo: proto.repo,
+        revision: proto.revision,
+        target_bucket: proto.target_bucket,
+        target_region: proto.target_region,
+        target_prefix: proto.target_prefix,
+        include_globs: proto.include_globs,
+        exclude_globs: proto.exclude_globs,
+        state: hf_ingestion_state_from_proto(proto.state)?,
+        error: proto.error,
+        created_at: parse_required_hf_time(&proto.created_at, "ingestion.created_at")?,
+        started_at: parse_optional_hf_time(proto.started_at, "ingestion.started_at")?,
+        finished_at: parse_optional_hf_time(proto.finished_at, "ingestion.finished_at")?,
+    })
+}
+
+fn hf_ingestion_item_to_proto(item: &HfIngestionItem) -> HfIngestionItemProto {
+    HfIngestionItemProto {
+        id: item.id,
+        ingestion_id: item.ingestion_id,
+        path: item.path.clone(),
+        size: item.size,
+        etag: item.etag.clone(),
+        state: hf_ingestion_item_state_to_proto(item.state) as i32,
+        error: item.error.clone(),
+        created_at: item.created_at.to_rfc3339(),
+        started_at: item.started_at.as_ref().map(DateTime::to_rfc3339),
+        finished_at: item.finished_at.as_ref().map(DateTime::to_rfc3339),
+    }
+}
+
+fn hf_ingestion_item_from_proto(proto: HfIngestionItemProto) -> Result<HfIngestionItem> {
+    Ok(HfIngestionItem {
+        id: proto.id,
+        ingestion_id: proto.ingestion_id,
+        path: proto.path,
+        size: proto.size,
+        etag: proto.etag,
+        state: hf_ingestion_item_state_from_proto(proto.state)?,
+        error: proto.error,
+        created_at: parse_required_hf_time(&proto.created_at, "item.created_at")?,
+        started_at: parse_optional_hf_time(proto.started_at, "item.started_at")?,
+        finished_at: parse_optional_hf_time(proto.finished_at, "item.finished_at")?,
+    })
+}
+
+fn hf_ingestion_state_to_proto(state: crate::tasks::HFIngestionState) -> HfIngestionStateProto {
+    match state {
+        crate::tasks::HFIngestionState::Queued => HfIngestionStateProto::Queued,
+        crate::tasks::HFIngestionState::Running => HfIngestionStateProto::Running,
+        crate::tasks::HFIngestionState::Completed => HfIngestionStateProto::Completed,
+        crate::tasks::HFIngestionState::Failed => HfIngestionStateProto::Failed,
+        crate::tasks::HFIngestionState::Canceled => HfIngestionStateProto::Canceled,
+    }
+}
+
+fn hf_ingestion_state_from_proto(value: i32) -> Result<crate::tasks::HFIngestionState> {
+    Ok(
+        match HfIngestionStateProto::try_from(value)
+            .map_err(|_| anyhow!("hf ingestion body has invalid state"))?
+        {
+            HfIngestionStateProto::Unspecified => {
+                return Err(anyhow!("hf ingestion body has unspecified state"));
+            }
+            HfIngestionStateProto::Queued => crate::tasks::HFIngestionState::Queued,
+            HfIngestionStateProto::Running => crate::tasks::HFIngestionState::Running,
+            HfIngestionStateProto::Completed => crate::tasks::HFIngestionState::Completed,
+            HfIngestionStateProto::Failed => crate::tasks::HFIngestionState::Failed,
+            HfIngestionStateProto::Canceled => crate::tasks::HFIngestionState::Canceled,
+        },
+    )
+}
+
+fn hf_ingestion_item_state_to_proto(
+    state: crate::tasks::HFIngestionItemState,
+) -> HfIngestionItemStateProto {
+    match state {
+        crate::tasks::HFIngestionItemState::Queued => HfIngestionItemStateProto::Queued,
+        crate::tasks::HFIngestionItemState::Downloading => HfIngestionItemStateProto::Downloading,
+        crate::tasks::HFIngestionItemState::Stored => HfIngestionItemStateProto::Stored,
+        crate::tasks::HFIngestionItemState::Failed => HfIngestionItemStateProto::Failed,
+        crate::tasks::HFIngestionItemState::Skipped => HfIngestionItemStateProto::Skipped,
+    }
+}
+
+fn hf_ingestion_item_state_from_proto(value: i32) -> Result<crate::tasks::HFIngestionItemState> {
+    Ok(
+        match HfIngestionItemStateProto::try_from(value)
+            .map_err(|_| anyhow!("hf ingestion item body has invalid state"))?
+        {
+            HfIngestionItemStateProto::Unspecified => {
+                return Err(anyhow!("hf ingestion item body has unspecified state"));
+            }
+            HfIngestionItemStateProto::Queued => crate::tasks::HFIngestionItemState::Queued,
+            HfIngestionItemStateProto::Downloading => {
+                crate::tasks::HFIngestionItemState::Downloading
+            }
+            HfIngestionItemStateProto::Stored => crate::tasks::HFIngestionItemState::Stored,
+            HfIngestionItemStateProto::Failed => crate::tasks::HFIngestionItemState::Failed,
+            HfIngestionItemStateProto::Skipped => crate::tasks::HFIngestionItemState::Skipped,
+        },
+    )
+}
+
+fn parse_required_hf_time(value: &str, field: &str) -> Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|time| time.with_timezone(&Utc))
+        .map_err(|err| anyhow!("hf metadata body has invalid {field}: {err}"))
+}
+
+fn parse_optional_hf_time(value: Option<String>, field: &str) -> Result<Option<DateTime<Utc>>> {
+    value
+        .map(|time| parse_required_hf_time(&time, field))
+        .transpose()
+}
+
+fn encode_deterministic_proto(message: &impl Message) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(message.encoded_len());
+    message.encode(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn ensure_deterministic_proto(message: &impl Message, bytes: &[u8], label: &str) -> Result<()> {
+    let encoded = encode_deterministic_proto(message)?;
+    if encoded != bytes {
+        return Err(anyhow!("{label} is not deterministically encoded"));
+    }
+    Ok(())
 }
 
 fn next_key_id(state: &HfState) -> Result<i64> {
@@ -864,11 +1324,18 @@ fn hf_partition_principal() -> String {
 
 #[cfg(test)]
 pub(crate) async fn read_hf_frame_fences_for_test(storage: &Storage) -> Result<Vec<u64>> {
-    Ok(read_hf_journal_frames(storage)
+    let core_store = CoreStore::new(storage.clone()).await?;
+    Ok(core_store
+        .read_stream(ReadStream {
+            stream_id: hf_metadata_stream_id(),
+            after_sequence: 0,
+            limit: 0,
+        })
         .await?
         .into_iter()
-        .map(|frame| frame.fence_token)
-        .collect())
+        .filter(|record| record.record_kind == "hf_metadata")
+        .map(|record| decode_hf_body_fence(&record.payload))
+        .collect::<Result<Vec<_>>>()?)
 }
 
 async fn hf_write_guard(
@@ -880,7 +1347,7 @@ async fn hf_write_guard(
     Ok(HfWriteGuard {
         fence_token: permit.fence_token,
         partition_precondition: Some(
-            partition_write_ref_precondition(storage, permit, partition_owner_signing_key).await?,
+            partition_write_precondition(storage, permit, partition_owner_signing_key).await?,
         ),
     })
 }
@@ -898,7 +1365,8 @@ fn require_hf_permit(permit: &PartitionWritePermit) -> Result<()> {
 mod tests {
     use super::*;
     use crate::partition_fence::{
-        PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
+        PartitionRecoveryAcquire, acquire_partition_recovery,
+        force_expire_partition_owner_for_node, publish_partition_ready,
     };
     use tempfile::tempdir;
 
@@ -908,10 +1376,10 @@ mod tests {
     async fn hf_journal_replays_keys_ingestions_and_items() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        create_key(&storage, "primary", b"secret", Some("note"))
+        create_key(&storage, 1, "primary", b"secret", Some("note"))
             .await
             .unwrap();
-        let (key_id, secret) = get_key_encrypted(&storage, "primary")
+        let (key_id, secret) = get_key_encrypted(&storage, 1, "primary")
             .await
             .unwrap()
             .unwrap();
@@ -954,12 +1422,179 @@ mod tests {
         );
         let summary = status_summary(&storage, ingestion_id).await.unwrap();
         assert_eq!(summary.3, 1);
-        assert_eq!(delete_key(&storage, "primary").await.unwrap(), 1);
+        assert_eq!(delete_key(&storage, 1, "primary").await.unwrap(), 1);
         assert!(
-            get_key_encrypted_by_id(&storage, key_id)
+            get_key_encrypted_by_id(&storage, 1, key_id)
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn hf_keys_are_isolated_by_tenant() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+
+        create_key(&storage, 11, "shared-name", b"tenant-11", None)
+            .await
+            .unwrap();
+        create_key(&storage, 12, "shared-name", b"tenant-12", None)
+            .await
+            .unwrap();
+
+        let (tenant_11_key_id, tenant_11_secret) = get_key_encrypted(&storage, 11, "shared-name")
+            .await
+            .unwrap()
+            .unwrap();
+        let (tenant_12_key_id, tenant_12_secret) = get_key_encrypted(&storage, 12, "shared-name")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(tenant_11_key_id, tenant_12_key_id);
+        assert_eq!(tenant_11_secret, b"tenant-11");
+        assert_eq!(tenant_12_secret, b"tenant-12");
+        assert_eq!(list_keys(&storage, 11).await.unwrap().len(), 1);
+        assert_eq!(list_keys(&storage, 12).await.unwrap().len(), 1);
+
+        assert_eq!(delete_key(&storage, 11, "shared-name").await.unwrap(), 1);
+        assert!(
+            get_key_encrypted(&storage, 11, "shared-name")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            get_key_encrypted(&storage, 12, "shared-name")
+                .await
+                .unwrap()
+                .unwrap()
+                .1,
+            b"tenant-12"
+        );
+    }
+
+    #[tokio::test]
+    async fn hf_metadata_frame_bodies_are_deterministic_protobuf() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+
+        create_key(&storage, 1, "primary", b"secret", Some("note"))
+            .await
+            .unwrap();
+        let (key_id, _) = get_key_encrypted(&storage, 1, "primary")
+            .await
+            .unwrap()
+            .unwrap();
+        let ingestion_id = create_ingestion(
+            &storage,
+            key_id,
+            1,
+            2,
+            "owner/repo",
+            None,
+            "bucket",
+            "region",
+            Some("prefix"),
+            &["*.safetensors".to_string()],
+            &["tmp/*".to_string()],
+        )
+        .await
+        .unwrap();
+        let item_id = add_item(&storage, ingestion_id, "a.txt", Some(10), Some("etag"))
+            .await
+            .unwrap();
+        update_item_success(&storage, item_id, 10, "etag")
+            .await
+            .unwrap();
+        delete_key(&storage, 1, "primary").await.unwrap();
+
+        let core_store = CoreStore::new(storage.clone()).await.unwrap();
+        let records = core_store
+            .read_stream(ReadStream {
+                stream_id: hf_metadata_stream_id(),
+                after_sequence: 0,
+                limit: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 5);
+
+        let mut saw_key_upsert = false;
+        let mut saw_key_delete = false;
+        let mut saw_ingestion = false;
+        let mut saw_item = false;
+        for record in records {
+            assert_eq!(record.record_kind, "hf_metadata");
+            assert_eq!(record.payload.first().copied(), Some(0x0a));
+
+            let proto = HfJournalBodyProto::decode(record.payload.as_slice()).unwrap();
+            assert_eq!(proto.schema, HF_METADATA_BODY_SCHEMA);
+
+            let body = decode_hf_body(&record.payload).unwrap();
+            let reencoded = encode_deterministic_proto(&proto).unwrap();
+            assert_eq!(reencoded, record.payload);
+
+            match body {
+                HfBody::KeyUpsert { key, .. } => {
+                    saw_key_upsert = true;
+                    assert_eq!(key.id, key_id);
+                    assert_eq!(key.tenant_id, 1);
+                    assert_eq!(key.name, "primary");
+                    assert_eq!(key.token_encrypted, b"secret");
+                }
+                HfBody::KeyDelete {
+                    tenant_id,
+                    key_name,
+                    ..
+                } => {
+                    saw_key_delete = true;
+                    assert_eq!(tenant_id, 1);
+                    assert_eq!(key_name, "primary");
+                }
+                HfBody::IngestionUpsert { ingestion, .. } => {
+                    saw_ingestion = true;
+                    assert_eq!(ingestion.id, ingestion_id);
+                    assert_eq!(ingestion.include_globs, vec!["*.safetensors".to_string()]);
+                    assert_eq!(ingestion.exclude_globs, vec!["tmp/*".to_string()]);
+                }
+                HfBody::ItemUpsert { item, .. } => {
+                    saw_item = true;
+                    assert_eq!(item.ingestion_id, ingestion_id);
+                    assert_eq!(item.path, "a.txt");
+                }
+            }
+        }
+        assert!(saw_key_upsert);
+        assert!(saw_key_delete);
+        assert!(saw_ingestion);
+        assert!(saw_item);
+    }
+
+    #[test]
+    fn hf_metadata_body_rejects_invalid_schema_and_unknown_fields() {
+        let body = HfBody::KeyDelete {
+            tenant_id: 1,
+            key_name: "primary".to_string(),
+            emitted_at: fixed_hf_time(),
+        };
+
+        let mutation_id = uuid::Uuid::from_u128(0x1234_5678_1234_5678_1234_5678_1234_5678);
+        let mut invalid_schema = hf_body_to_proto(&body, 0, mutation_id).unwrap();
+        invalid_schema.schema = "anvil.core.hf_metadata.v0".to_string();
+        let invalid_schema_bytes = encode_deterministic_proto(&invalid_schema).unwrap();
+        let err = decode_hf_body(&invalid_schema_bytes).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid schema"),
+            "unexpected invalid schema error: {err}"
+        );
+
+        let mut unknown_field = encode_hf_body(&body, 0, mutation_id).unwrap();
+        unknown_field.extend_from_slice(&[0xf8, 0x07, 0x01]);
+        let err = decode_hf_body(&unknown_field).unwrap_err();
+        assert!(
+            err.to_string().contains("not deterministically encoded"),
+            "unexpected unknown field error: {err}"
         );
     }
 
@@ -970,10 +1605,18 @@ mod tests {
         let owner = ready_owner(&storage, "node-a").await;
         let permit = owner.write_permit().unwrap();
 
-        create_key_with_permit(&storage, "primary", b"secret", Some("note"), &permit, KEY)
-            .await
-            .unwrap();
-        let (key_id, _) = get_key_encrypted(&storage, "primary")
+        create_key_with_permit(
+            &storage,
+            1,
+            "primary",
+            b"secret",
+            Some("note"),
+            &permit,
+            KEY,
+        )
+        .await
+        .unwrap();
+        let (key_id, _) = get_key_encrypted(&storage, 1, "primary")
             .await
             .unwrap()
             .unwrap();
@@ -1021,17 +1664,13 @@ mod tests {
         update_item_success_with_permit(&storage, item_id, 10, "etag", &permit, KEY)
             .await
             .unwrap();
-        delete_key_with_permit(&storage, "primary", &permit, KEY)
+        delete_key_with_permit(&storage, 1, "primary", &permit, KEY)
             .await
             .unwrap();
 
-        let frames = read_hf_journal_frames(&storage).await.unwrap();
-        assert_eq!(frames.len(), 7);
-        assert!(
-            frames
-                .iter()
-                .all(|frame| frame.fence_token == permit.fence_token)
-        );
+        let fences = read_hf_frame_fences_for_test(&storage).await.unwrap();
+        assert_eq!(fences.len(), 7);
+        assert!(fences.iter().all(|fence| *fence == permit.fence_token));
     }
 
     #[tokio::test]
@@ -1040,11 +1679,23 @@ mod tests {
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = ready_owner(&storage, "node-a").await;
         let stale_permit = owner.write_permit().unwrap();
+        force_expire_partition_owner_for_node(
+            &storage,
+            &owner.partition_family,
+            &owner.partition_id,
+            "node-a",
+            250,
+            KEY,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let newer = ready_owner(&storage, "node-b").await;
         assert!(newer.fence_token > stale_permit.fence_token);
 
         let err = create_key_with_permit(
             &storage,
+            1,
             "primary",
             b"secret",
             Some("note"),
@@ -1065,14 +1716,26 @@ mod tests {
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = ready_owner(&storage, "node-a").await;
         let stale_permit = owner.write_permit().unwrap();
-        let stale_precondition = partition_write_ref_precondition(&storage, &stale_permit, KEY)
+        let stale_precondition = partition_write_precondition(&storage, &stale_permit, KEY)
             .await
             .unwrap();
+        force_expire_partition_owner_for_node(
+            &storage,
+            &owner.partition_family,
+            &owner.partition_id,
+            "node-a",
+            250,
+            KEY,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let newer = ready_owner(&storage, "node-b").await;
         assert!(newer.fence_token > stale_permit.fence_token);
 
         let err = create_key_inner(
             &storage,
+            1,
             "primary",
             b"secret",
             Some("note"),
@@ -1091,6 +1754,7 @@ mod tests {
 
         create_key_with_permit(
             &storage,
+            1,
             "primary",
             b"secret",
             Some("note"),
@@ -1134,5 +1798,11 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    fn fixed_hf_time() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&Utc)
     }
 }

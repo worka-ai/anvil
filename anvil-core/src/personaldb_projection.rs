@@ -1,15 +1,19 @@
 use crate::{
-    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    core_store::{decode_deterministic_proto, encode_deterministic_proto},
     formats::hash32,
+    personaldb_coremeta::{
+        list_personaldb_data_locator_rows, list_personaldb_data_locator_rows_for_tenant,
+        personaldb_payload_hash, read_personaldb_data_locator_bytes,
+        read_personaldb_data_locator_row, write_personaldb_bytes_as_data_locator,
+    },
     storage::Storage,
 };
 use anyhow::{Result, anyhow};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use prost::Message;
 use serde::{Deserialize, Serialize};
 
-const PERSONALDB_PROJECTION_DEFINITION_REF_PREFIX: &str = "personaldb_projection_definition:";
-const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
+const PERSONALDB_PROJECTION_DEFINITION_PREFIX: &str = "personaldb_projection_definition:";
+const PERSONALDB_PROJECTION_DEFINITION_KIND: &str = "projection_definition";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectionDefinition {
@@ -91,6 +95,121 @@ pub enum WriteBackPolicy {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+enum RowFilterKindProto {
+    Unspecified = 0,
+    FieldEqualsLiteral = 1,
+    FieldInAuthorizedResourceSet = 2,
+    ResourceRelationAllows = 3,
+    ParentRelationAllows = 4,
+    NotDeleted = 5,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+enum WriteBackPolicyKindProto {
+    Unspecified = 0,
+    Deny = 1,
+    AllowMappedColumns = 2,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ProjectionDefinitionProto {
+    #[prost(uint32, tag = "1")]
+    format_version: u32,
+    #[prost(string, tag = "2")]
+    tenant_id: String,
+    #[prost(string, tag = "3")]
+    database_id: String,
+    #[prost(string, tag = "4")]
+    projection_id: String,
+    #[prost(string, repeated, tag = "5")]
+    source_database_ids: Vec<String>,
+    #[prost(string, tag = "6")]
+    target_database_id: String,
+    #[prost(string, tag = "7")]
+    target_actor_or_scope: String,
+    #[prost(message, repeated, tag = "8")]
+    table_mappings: Vec<TableMappingProto>,
+    #[prost(message, repeated, tag = "9")]
+    column_mappings: Vec<ColumnMappingProto>,
+    #[prost(message, repeated, tag = "10")]
+    row_filters: Vec<RowFilterProto>,
+    #[prost(message, repeated, tag = "11")]
+    resource_bindings: Vec<ProjectionResourceBindingProto>,
+    #[prost(message, optional, tag = "12")]
+    writeback_policy: Option<WriteBackPolicyProto>,
+    #[prost(string, optional, tag = "13")]
+    definition_hash: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct TableMappingProto {
+    #[prost(string, tag = "1")]
+    source_database_id: String,
+    #[prost(string, tag = "2")]
+    source_table: String,
+    #[prost(string, tag = "3")]
+    target_table: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ColumnMappingProto {
+    #[prost(string, tag = "1")]
+    source_table: String,
+    #[prost(string, tag = "2")]
+    source_column: String,
+    #[prost(string, tag = "3")]
+    target_table: String,
+    #[prost(string, tag = "4")]
+    target_column: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct RowFilterProto {
+    #[prost(enumeration = "RowFilterKindProto", tag = "1")]
+    kind: i32,
+    #[prost(string, tag = "2")]
+    table: String,
+    #[prost(string, tag = "3")]
+    field: String,
+    #[prost(string, tag = "4")]
+    literal: String,
+    #[prost(string, tag = "5")]
+    resource_set: String,
+    #[prost(string, tag = "6")]
+    resource_id_field: String,
+    #[prost(string, tag = "7")]
+    relation: String,
+    #[prost(string, tag = "8")]
+    parent_resource_id_field: String,
+    #[prost(string, tag = "9")]
+    deleted_field: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ProjectionResourceBindingProto {
+    #[prost(string, tag = "1")]
+    source_table: String,
+    #[prost(string, tag = "2")]
+    primary_key_column: String,
+    #[prost(string, tag = "3")]
+    resource_type: String,
+    #[prost(string, tag = "4")]
+    resource_id_column: String,
+    #[prost(string, optional, tag = "5")]
+    parent_resource_id_column: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct WriteBackPolicyProto {
+    #[prost(enumeration = "WriteBackPolicyKindProto", tag = "1")]
+    kind: i32,
+    #[prost(string, repeated, tag = "2")]
+    protected_columns: Vec<String>,
+    #[prost(string, repeated, tag = "3")]
+    allowed_columns: Vec<String>,
+}
+
 impl ProjectionDefinition {
     pub fn seal(mut self) -> Result<Self> {
         canonicalize_projection_definition(&mut self);
@@ -117,7 +236,9 @@ impl ProjectionDefinition {
 pub fn hash_projection_definition(definition: &ProjectionDefinition) -> Result<String> {
     let mut unsigned = definition.clone();
     unsigned.definition_hash = None;
-    Ok(hex::encode(hash32(&serde_json::to_vec(&unsigned)?)))
+    Ok(hex::encode(hash32(&encode_projection_definition(
+        &unsigned,
+    )?)))
 }
 
 pub async fn write_projection_definition(
@@ -128,37 +249,27 @@ pub async fn write_projection_definition(
 ) -> Result<()> {
     definition.verify()?;
     ensure_scope(tenant_id, database_id, definition)?;
-    let ref_name =
-        projection_definition_ref_name(tenant_id, database_id, &definition.projection_id)?;
-    let bytes = serde_json::to_vec_pretty(definition)?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.clone(),
-            bytes,
-            region_id: "local".to_string(),
-            mutation_id: format!(
-                "personaldb-projection-definition:{tenant_id}:{database_id}:{}",
-                definition.projection_id
-            ),
-        })
-        .await?;
-    let new_target = encode_core_object_ref_target(&object_ref)?;
-    let current = store.read_ref(&ref_name).await?;
-    store
-        .compare_and_swap_ref(CompareAndSwapRef {
-            ref_name,
-            expected_generation: current.as_ref().map(|value| value.generation),
-            expected_target: current.map(|value| value.target),
-            require_absent: false,
-            require_present: false,
-            fence: None,
-            authz_revision: None,
-            source_watch_cursor: None,
-            new_target,
-            transaction_id: None,
-        })
-        .await?;
+    let data_id = projection_definition_data_id(tenant_id, database_id, &definition.projection_id)?;
+    let bytes = encode_projection_definition(definition)?;
+    let generation = read_personaldb_data_locator_row(storage, tenant_id, database_id, &data_id)?
+        .map(|row| row.generation.saturating_add(1))
+        .unwrap_or(1);
+    write_personaldb_bytes_as_data_locator(
+        storage,
+        tenant_id,
+        database_id,
+        &data_id,
+        PERSONALDB_PROJECTION_DEFINITION_KIND,
+        generation,
+        bytes.clone(),
+        personaldb_payload_hash(&bytes),
+        definition.source_database_ids.clone(),
+        format!(
+            "personaldb-projection-definition:{tenant_id}:{database_id}:{}",
+            definition.projection_id
+        ),
+    )
+    .await?;
     Ok(())
 }
 
@@ -168,13 +279,15 @@ pub async fn read_projection_definition(
     database_id: &str,
     projection_id: &str,
 ) -> Result<Option<ProjectionDefinition>> {
-    let ref_name = projection_definition_ref_name(tenant_id, database_id, projection_id)?;
-    let Some(definition) = read_projection_definition_ref(storage, &ref_name).await? else {
+    let data_id = projection_definition_data_id(tenant_id, database_id, projection_id)?;
+    let Some(definition) =
+        read_projection_definition_row(storage, tenant_id, database_id, &data_id).await?
+    else {
         return Ok(None);
     };
     ensure_scope(tenant_id, database_id, &definition)?;
     if definition.projection_id != projection_id {
-        return Err(anyhow!("projection definition ref scope mismatch"));
+        return Err(anyhow!("projection definition data scope mismatch"));
     }
     Ok(Some(definition))
 }
@@ -184,13 +297,14 @@ pub async fn list_projection_definitions_for_source(
     tenant_id: i64,
     source_database_id: &str,
 ) -> Result<Vec<ProjectionDefinition>> {
-    let store = CoreStore::new(storage.clone()).await?;
     let mut definitions = Vec::new();
-    for ref_name in store
-        .list_ref_names(&projection_definition_tenant_ref_prefix(tenant_id)?)
-        .await?
-    {
-        let Some(definition) = read_projection_definition_ref(storage, &ref_name).await? else {
+    for row in list_personaldb_data_locator_rows_for_tenant(storage, tenant_id)? {
+        if row.data_kind != PERSONALDB_PROJECTION_DEFINITION_KIND {
+            continue;
+        }
+        let Some(definition) =
+            read_projection_definition_row(storage, tenant_id, &row.group_id, &row.data_id).await?
+        else {
             continue;
         };
         if definition
@@ -214,39 +328,326 @@ pub async fn list_projection_definitions_for_database(
     tenant_id: i64,
     database_id: &str,
 ) -> Result<Vec<ProjectionDefinition>> {
-    let store = CoreStore::new(storage.clone()).await?;
     let mut definitions = Vec::new();
-    for ref_name in store
-        .list_ref_names(&projection_definition_database_ref_prefix(
-            tenant_id,
-            database_id,
-        )?)
-        .await?
-    {
-        if let Some(definition) = read_projection_definition_ref(storage, &ref_name).await? {
-            definitions.push(definition);
+    for row in list_personaldb_data_locator_rows(storage, tenant_id, database_id)? {
+        if row.data_kind != PERSONALDB_PROJECTION_DEFINITION_KIND {
+            continue;
         }
+        if let Some(definition) =
+            read_projection_definition_row(storage, tenant_id, database_id, &row.data_id).await?
+        {
+            definitions.push(definition);
+        };
     }
     definitions.sort_by(|left, right| left.projection_id.cmp(&right.projection_id));
     Ok(definitions)
 }
 
-async fn read_projection_definition_ref(
+async fn read_projection_definition_row(
     storage: &Storage,
-    ref_name: &str,
+    tenant_id: i64,
+    database_id: &str,
+    data_id: &str,
 ) -> Result<Option<ProjectionDefinition>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store.read_ref(ref_name).await? else {
+    let Some(row) = read_personaldb_data_locator_row(storage, tenant_id, database_id, data_id)?
+    else {
         return Ok(None);
     };
-    let bytes = store
-        .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
-        })
-        .await?;
-    let definition: ProjectionDefinition = serde_json::from_slice(&bytes)?;
+    if row.data_kind != PERSONALDB_PROJECTION_DEFINITION_KIND {
+        return Err(anyhow!("projection definition CoreMeta row kind mismatch"));
+    }
+    let bytes = read_personaldb_data_locator_bytes(storage, &row).await?;
+    let definition = decode_projection_definition(&bytes)?;
     definition.verify()?;
     Ok(Some(definition))
+}
+
+fn encode_projection_definition(definition: &ProjectionDefinition) -> Result<Vec<u8>> {
+    Ok(encode_deterministic_proto(&projection_to_proto(definition)))
+}
+
+fn decode_projection_definition(bytes: &[u8]) -> Result<ProjectionDefinition> {
+    projection_from_proto(decode_deterministic_proto::<ProjectionDefinitionProto>(
+        bytes,
+        "personaldb projection definition",
+    )?)
+}
+
+fn projection_to_proto(definition: &ProjectionDefinition) -> ProjectionDefinitionProto {
+    ProjectionDefinitionProto {
+        format_version: u32::from(definition.format_version),
+        tenant_id: definition.tenant_id.clone(),
+        database_id: definition.database_id.clone(),
+        projection_id: definition.projection_id.clone(),
+        source_database_ids: definition.source_database_ids.clone(),
+        target_database_id: definition.target_database_id.clone(),
+        target_actor_or_scope: definition.target_actor_or_scope.clone(),
+        table_mappings: definition
+            .table_mappings
+            .iter()
+            .map(table_mapping_to_proto)
+            .collect(),
+        column_mappings: definition
+            .column_mappings
+            .iter()
+            .map(column_mapping_to_proto)
+            .collect(),
+        row_filters: definition
+            .row_filters
+            .iter()
+            .map(row_filter_to_proto)
+            .collect(),
+        resource_bindings: definition
+            .resource_bindings
+            .iter()
+            .map(resource_binding_to_proto)
+            .collect(),
+        writeback_policy: Some(writeback_policy_to_proto(&definition.writeback_policy)),
+        definition_hash: definition.definition_hash.clone(),
+    }
+}
+
+fn projection_from_proto(proto: ProjectionDefinitionProto) -> Result<ProjectionDefinition> {
+    Ok(ProjectionDefinition {
+        format_version: u16::try_from(proto.format_version)
+            .map_err(|_| anyhow!("projection definition version exceeds u16"))?,
+        tenant_id: proto.tenant_id,
+        database_id: proto.database_id,
+        projection_id: proto.projection_id,
+        source_database_ids: proto.source_database_ids,
+        target_database_id: proto.target_database_id,
+        target_actor_or_scope: proto.target_actor_or_scope,
+        table_mappings: proto
+            .table_mappings
+            .into_iter()
+            .map(table_mapping_from_proto)
+            .collect(),
+        column_mappings: proto
+            .column_mappings
+            .into_iter()
+            .map(column_mapping_from_proto)
+            .collect(),
+        row_filters: proto
+            .row_filters
+            .into_iter()
+            .map(row_filter_from_proto)
+            .collect::<Result<Vec<_>>>()?,
+        resource_bindings: proto
+            .resource_bindings
+            .into_iter()
+            .map(resource_binding_from_proto)
+            .collect(),
+        writeback_policy: writeback_policy_from_proto(
+            proto
+                .writeback_policy
+                .ok_or_else(|| anyhow!("projection definition missing writeback policy"))?,
+        )?,
+        definition_hash: proto.definition_hash,
+    })
+}
+
+fn table_mapping_to_proto(mapping: &TableMapping) -> TableMappingProto {
+    TableMappingProto {
+        source_database_id: mapping.source_database_id.clone(),
+        source_table: mapping.source_table.clone(),
+        target_table: mapping.target_table.clone(),
+    }
+}
+
+fn table_mapping_from_proto(proto: TableMappingProto) -> TableMapping {
+    TableMapping {
+        source_database_id: proto.source_database_id,
+        source_table: proto.source_table,
+        target_table: proto.target_table,
+    }
+}
+
+fn column_mapping_to_proto(mapping: &ColumnMapping) -> ColumnMappingProto {
+    ColumnMappingProto {
+        source_table: mapping.source_table.clone(),
+        source_column: mapping.source_column.clone(),
+        target_table: mapping.target_table.clone(),
+        target_column: mapping.target_column.clone(),
+    }
+}
+
+fn column_mapping_from_proto(proto: ColumnMappingProto) -> ColumnMapping {
+    ColumnMapping {
+        source_table: proto.source_table,
+        source_column: proto.source_column,
+        target_table: proto.target_table,
+        target_column: proto.target_column,
+    }
+}
+
+fn row_filter_to_proto(filter: &RowFilter) -> RowFilterProto {
+    match filter {
+        RowFilter::FieldEqualsLiteral {
+            table,
+            field,
+            literal,
+        } => RowFilterProto {
+            kind: RowFilterKindProto::FieldEqualsLiteral as i32,
+            table: table.clone(),
+            field: field.clone(),
+            literal: literal.clone(),
+            resource_set: String::new(),
+            resource_id_field: String::new(),
+            relation: String::new(),
+            parent_resource_id_field: String::new(),
+            deleted_field: String::new(),
+        },
+        RowFilter::FieldInAuthorizedResourceSet {
+            table,
+            field,
+            resource_set,
+        } => RowFilterProto {
+            kind: RowFilterKindProto::FieldInAuthorizedResourceSet as i32,
+            table: table.clone(),
+            field: field.clone(),
+            resource_set: resource_set.clone(),
+            literal: String::new(),
+            resource_id_field: String::new(),
+            relation: String::new(),
+            parent_resource_id_field: String::new(),
+            deleted_field: String::new(),
+        },
+        RowFilter::ResourceRelationAllows {
+            table,
+            resource_id_field,
+            relation,
+        } => RowFilterProto {
+            kind: RowFilterKindProto::ResourceRelationAllows as i32,
+            table: table.clone(),
+            resource_id_field: resource_id_field.clone(),
+            relation: relation.clone(),
+            field: String::new(),
+            literal: String::new(),
+            resource_set: String::new(),
+            parent_resource_id_field: String::new(),
+            deleted_field: String::new(),
+        },
+        RowFilter::ParentRelationAllows {
+            table,
+            parent_resource_id_field,
+            relation,
+        } => RowFilterProto {
+            kind: RowFilterKindProto::ParentRelationAllows as i32,
+            table: table.clone(),
+            parent_resource_id_field: parent_resource_id_field.clone(),
+            relation: relation.clone(),
+            field: String::new(),
+            literal: String::new(),
+            resource_set: String::new(),
+            resource_id_field: String::new(),
+            deleted_field: String::new(),
+        },
+        RowFilter::NotDeleted {
+            table,
+            deleted_field,
+        } => RowFilterProto {
+            kind: RowFilterKindProto::NotDeleted as i32,
+            table: table.clone(),
+            deleted_field: deleted_field.clone(),
+            field: String::new(),
+            literal: String::new(),
+            resource_set: String::new(),
+            resource_id_field: String::new(),
+            relation: String::new(),
+            parent_resource_id_field: String::new(),
+        },
+    }
+}
+
+fn row_filter_from_proto(proto: RowFilterProto) -> Result<RowFilter> {
+    match RowFilterKindProto::try_from(proto.kind)
+        .map_err(|_| anyhow!("projection row filter kind is invalid"))?
+    {
+        RowFilterKindProto::FieldEqualsLiteral => Ok(RowFilter::FieldEqualsLiteral {
+            table: proto.table,
+            field: proto.field,
+            literal: proto.literal,
+        }),
+        RowFilterKindProto::FieldInAuthorizedResourceSet => {
+            Ok(RowFilter::FieldInAuthorizedResourceSet {
+                table: proto.table,
+                field: proto.field,
+                resource_set: proto.resource_set,
+            })
+        }
+        RowFilterKindProto::ResourceRelationAllows => Ok(RowFilter::ResourceRelationAllows {
+            table: proto.table,
+            resource_id_field: proto.resource_id_field,
+            relation: proto.relation,
+        }),
+        RowFilterKindProto::ParentRelationAllows => Ok(RowFilter::ParentRelationAllows {
+            table: proto.table,
+            parent_resource_id_field: proto.parent_resource_id_field,
+            relation: proto.relation,
+        }),
+        RowFilterKindProto::NotDeleted => Ok(RowFilter::NotDeleted {
+            table: proto.table,
+            deleted_field: proto.deleted_field,
+        }),
+        RowFilterKindProto::Unspecified => {
+            Err(anyhow!("projection row filter kind is unspecified"))
+        }
+    }
+}
+
+fn resource_binding_to_proto(
+    binding: &ProjectionResourceBinding,
+) -> ProjectionResourceBindingProto {
+    ProjectionResourceBindingProto {
+        source_table: binding.source_table.clone(),
+        primary_key_column: binding.primary_key_column.clone(),
+        resource_type: binding.resource_type.clone(),
+        resource_id_column: binding.resource_id_column.clone(),
+        parent_resource_id_column: binding.parent_resource_id_column.clone(),
+    }
+}
+
+fn resource_binding_from_proto(proto: ProjectionResourceBindingProto) -> ProjectionResourceBinding {
+    ProjectionResourceBinding {
+        source_table: proto.source_table,
+        primary_key_column: proto.primary_key_column,
+        resource_type: proto.resource_type,
+        resource_id_column: proto.resource_id_column,
+        parent_resource_id_column: proto.parent_resource_id_column,
+    }
+}
+
+fn writeback_policy_to_proto(policy: &WriteBackPolicy) -> WriteBackPolicyProto {
+    match policy {
+        WriteBackPolicy::Deny => WriteBackPolicyProto {
+            kind: WriteBackPolicyKindProto::Deny as i32,
+            protected_columns: Vec::new(),
+            allowed_columns: Vec::new(),
+        },
+        WriteBackPolicy::AllowMappedColumns {
+            protected_columns,
+            allowed_columns,
+        } => WriteBackPolicyProto {
+            kind: WriteBackPolicyKindProto::AllowMappedColumns as i32,
+            protected_columns: protected_columns.clone(),
+            allowed_columns: allowed_columns.clone(),
+        },
+    }
+}
+
+fn writeback_policy_from_proto(proto: WriteBackPolicyProto) -> Result<WriteBackPolicy> {
+    match WriteBackPolicyKindProto::try_from(proto.kind)
+        .map_err(|_| anyhow!("projection writeback policy kind is invalid"))?
+    {
+        WriteBackPolicyKindProto::Deny => Ok(WriteBackPolicy::Deny),
+        WriteBackPolicyKindProto::AllowMappedColumns => Ok(WriteBackPolicy::AllowMappedColumns {
+            protected_columns: proto.protected_columns,
+            allowed_columns: proto.allowed_columns,
+        }),
+        WriteBackPolicyKindProto::Unspecified => {
+            Err(anyhow!("projection writeback policy kind is unspecified"))
+        }
+    }
 }
 
 fn canonicalize_projection_definition(definition: &mut ProjectionDefinition) {
@@ -453,26 +854,19 @@ fn ensure_scope(
     Ok(())
 }
 
-fn projection_definition_tenant_ref_prefix(tenant_id: i64) -> Result<String> {
+fn projection_definition_data_prefix(tenant_id: i64, database_id: &str) -> Result<String> {
     if tenant_id < 0 {
         return Err(anyhow!(
             "projection definition tenant id must be nonnegative"
         ));
     }
-    Ok(format!(
-        "{PERSONALDB_PROJECTION_DEFINITION_REF_PREFIX}tenant:{tenant_id}:"
-    ))
-}
-
-fn projection_definition_database_ref_prefix(tenant_id: i64, database_id: &str) -> Result<String> {
     require_safe_component(database_id, "database_id")?;
     Ok(format!(
-        "{}database:{database_id}:",
-        projection_definition_tenant_ref_prefix(tenant_id)?
+        "{PERSONALDB_PROJECTION_DEFINITION_PREFIX}tenant:{tenant_id}:database:{database_id}:"
     ))
 }
 
-fn projection_definition_ref_name(
+fn projection_definition_data_id(
     tenant_id: i64,
     database_id: &str,
     projection_id: &str,
@@ -480,7 +874,7 @@ fn projection_definition_ref_name(
     require_safe_component(projection_id, "projection_id")?;
     Ok(format!(
         "{}projection:{projection_id}",
-        projection_definition_database_ref_prefix(tenant_id, database_id)?
+        projection_definition_data_prefix(tenant_id, database_id)?
     ))
 }
 
@@ -496,20 +890,6 @@ fn require_safe_component(value: &str, field: &'static str) -> Result<()> {
         return Err(anyhow!("{field} is not a safe component"));
     }
     Ok(())
-}
-
-fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
-    Ok(format!(
-        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
-    ))
-}
-
-fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
-    let encoded = target
-        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
-        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
-    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
 }
 
 fn require_nonempty(value: &str, field: &'static str) -> Result<()> {
@@ -572,9 +952,9 @@ mod tests {
         write_projection_definition(&storage, 7, "projection-db", &definition)
             .await
             .unwrap();
-        let ref_name = projection_definition_ref_name(7, "projection-db", "projection-a").unwrap();
+        let data_id = projection_definition_data_id(7, "projection-db", "projection-a").unwrap();
         assert!(
-            ref_name
+            data_id
                 .starts_with("personaldb_projection_definition:tenant:7:database:projection-db:")
         );
 
@@ -625,7 +1005,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(projection_definition_ref_name(7, "projection-db", "../escape").is_err());
+        assert!(projection_definition_data_id(7, "projection-db", "../escape").is_err());
     }
 
     fn sample_definition() -> ProjectionDefinition {

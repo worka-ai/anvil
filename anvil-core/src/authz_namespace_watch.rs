@@ -1,13 +1,33 @@
 use crate::{
-    core_store::{AppendStreamRecord, CoreStore, ReadStream},
+    core_store::{
+        AppendStreamRecord, CoreStore, ReadStream, decode_deterministic_proto,
+        encode_deterministic_proto,
+    },
     formats::{Hash32, hash32, watch::WatchRecord},
     storage::Storage,
 };
 use anyhow::{Result, anyhow};
+use prost::Message;
 use serde::{Deserialize, Serialize};
 
 const AUTHZ_NAMESPACE_PARTITION_FAMILY: u16 = 9;
 const AUTHZ_NAMESPACE_RECORD_KIND: u16 = 1;
+
+#[derive(Clone, PartialEq, Message)]
+struct AuthzNamespaceWatchPayloadProto {
+    #[prost(string, tag = "1")]
+    namespace: String,
+    #[prost(string, tag = "2")]
+    event_type: String,
+    #[prost(uint64, tag = "3")]
+    authz_revision: u64,
+    #[prost(string, tag = "4")]
+    schema_hash: String,
+    #[prost(bool, tag = "5")]
+    invalidates_derived_usersets: bool,
+    #[prost(string, tag = "6")]
+    emitted_at: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuthzNamespaceWatchPayload {
@@ -48,7 +68,7 @@ pub async fn append_authz_namespace_watch_record(
         payload.authz_revision,
         0,
         0,
-        serde_json::to_vec(&payload)?,
+        encode_authz_namespace_watch_payload(&payload)?,
     );
     core_store
         .append_stream(AppendStreamRecord {
@@ -56,6 +76,8 @@ pub async fn append_authz_namespace_watch_record(
             partition_id: hex::encode(partition_id(tenant_id, &payload.namespace)),
             record_kind: "authz_namespace_watch".to_string(),
             payload: record.encode(),
+            content_type: None,
+            user_metadata_json: "{}".to_string(),
             fence: None,
             transaction_id: None,
             idempotency_key: Some(format!(
@@ -92,7 +114,8 @@ pub async fn list_authz_namespace_watch_events(
         {
             continue;
         }
-        let payload: AuthzNamespaceWatchPayload = serde_json::from_slice(&record.payload)?;
+        let payload: AuthzNamespaceWatchPayload =
+            decode_authz_namespace_watch_payload(&record.payload)?;
         if payload.namespace != namespace {
             return Err(anyhow!(
                 "authorization namespace watch payload scope mismatch"
@@ -124,6 +147,34 @@ pub async fn latest_authz_namespace_watch_cursor(
             .map(|event| event.cursor)
             .max(),
     )
+}
+
+fn encode_authz_namespace_watch_payload(payload: &AuthzNamespaceWatchPayload) -> Result<Vec<u8>> {
+    Ok(encode_deterministic_proto(
+        &AuthzNamespaceWatchPayloadProto {
+            namespace: payload.namespace.clone(),
+            event_type: payload.event_type.clone(),
+            authz_revision: payload.authz_revision,
+            schema_hash: payload.schema_hash.clone(),
+            invalidates_derived_usersets: payload.invalidates_derived_usersets,
+            emitted_at: payload.emitted_at.clone(),
+        },
+    ))
+}
+
+fn decode_authz_namespace_watch_payload(bytes: &[u8]) -> Result<AuthzNamespaceWatchPayload> {
+    let proto = decode_deterministic_proto::<AuthzNamespaceWatchPayloadProto>(
+        bytes,
+        "AuthzNamespaceWatchPayload payload",
+    )?;
+    Ok(AuthzNamespaceWatchPayload {
+        namespace: proto.namespace,
+        event_type: proto.event_type,
+        authz_revision: proto.authz_revision,
+        schema_hash: proto.schema_hash,
+        invalidates_derived_usersets: proto.invalidates_derived_usersets,
+        emitted_at: proto.emitted_at,
+    })
 }
 
 async fn ensure_cursor_is_monotonic(

@@ -5,11 +5,21 @@ use tracing::info;
 
 use anvil::config::Config;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+const ANVIL_TOKIO_WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(ANVIL_TOKIO_WORKER_STACK_BYTES)
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let config = Config::parse();
+    config.validate_admin_listener_bind()?;
 
     let addr = config
         .api_listen_addr

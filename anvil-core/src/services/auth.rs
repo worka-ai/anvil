@@ -1,24 +1,173 @@
 use crate::anvil_api::auth_service_server::AuthService;
 use crate::anvil_api::*;
 use crate::{
-    AppState, auth, authz_derived_lag_watch, authz_journal, authz_namespace_watch,
+    AppState, access_control, auth, authz_derived_lag_watch, authz_journal, authz_namespace_watch,
     authz_realm_schema, authz_schema,
     authz_scope::{
         DEFAULT_AUTHZ_REALM_ID, decode_realm_namespace, decode_userset_subject_realm,
         encode_optional_realm_namespace, encode_realm_namespace, encode_userset_subject_realm,
     },
-    authz_userset_index,
+    authz_userset_index, bucket_journal,
     formats::hash32,
     permissions::AnvilAction,
     services::watch_envelope::{self, WatchEnvelopeParts},
+    system_realm::{SYSTEM_REALM_ID, SYSTEM_STORAGE_TENANT_ID},
 };
-use base64::Engine;
 use hmac::{Hmac, Mac};
-use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+
+async fn public_access_grant_record(
+    state: &AppState,
+    app: &crate::persistence::App,
+    grant: crate::persistence::AuthzTupleRecord,
+) -> Result<AccessGrantRecord, Status> {
+    let (action, resource) = public_action_resource_for_system_tuple(state, &grant)
+        .await
+        .unwrap_or_else(|| {
+            (
+                grant.relation.clone(),
+                format!("{}:{}", grant.namespace, grant.object_id),
+            )
+        });
+    Ok(AccessGrantRecord {
+        app_id: app.id.to_string(),
+        app_name: app.name.clone(),
+        action,
+        resource,
+    })
+}
+
+async fn public_action_resource_for_system_tuple(
+    state: &AppState,
+    grant: &crate::persistence::AuthzTupleRecord,
+) -> Option<(String, String)> {
+    let namespace = decode_realm_namespace(SYSTEM_REALM_ID, &grant.namespace)?;
+    match namespace {
+        crate::system_realm::SYSTEM_STORAGE_TENANT_NAMESPACE => {
+            let action = match grant.relation.as_str() {
+                "create_bucket" => "bucket:create",
+                "list_buckets" => "bucket:list",
+                "read_tenant" => "app:read",
+                "grant_access" => "policy:grant",
+                "revoke_access" => "policy:revoke",
+                "read_access_grants" => "policy:read",
+                "lease_read" => "coordination:lease_read",
+                "lease_write" => "coordination:lease_write",
+                "lease_admin" => "coordination:lease_admin",
+                "manage_tenant" | "owner" | "admin" => "tenant:manage",
+                _ => return None,
+            };
+            Some((action.to_string(), format!("tenant:{}", grant.object_id)))
+        }
+        crate::system_realm::SYSTEM_BUCKET_NAMESPACE => {
+            let bucket_id = grant.object_id.parse::<i64>().ok()?;
+            let bucket = bucket_journal::read_current_bucket_by_id(&state.storage, bucket_id)
+                .await
+                .ok()
+                .flatten()?;
+            let action = match grant.relation.as_str() {
+                "list_objects" | "reader" => "bucket:read",
+                "manage_bucket" | "owner" | "admin" => "bucket:write",
+                "get_object" => "object:read",
+                "put_object" | "writer" => "object:write",
+                "delete_object" => "object:delete",
+                "manage_links" => "object:write",
+                "manage_indexes" => "index:create",
+                "query_indexes" => "index:read",
+                _ => return None,
+            };
+            Some((action.to_string(), bucket.name))
+        }
+        crate::system_realm::SYSTEM_OBJECT_NAMESPACE => {
+            let (bucket_id, key) = grant.object_id.split_once('/')?;
+            let bucket = bucket_journal::read_current_bucket_by_id(
+                &state.storage,
+                bucket_id.parse::<i64>().ok()?,
+            )
+            .await
+            .ok()
+            .flatten()?;
+            let action = match grant.relation.as_str() {
+                "get" | "reader" => "object:read",
+                "put" | "writer" => "object:write",
+                "delete" => "object:delete",
+                "link" => "object:write",
+                _ => return None,
+            };
+            Some((action.to_string(), format!("{}/{}", bucket.name, key)))
+        }
+        crate::system_realm::SYSTEM_INDEX_NAMESPACE => {
+            let (bucket_id, index) = grant.object_id.split_once('/')?;
+            let bucket = bucket_journal::read_current_bucket_by_id(
+                &state.storage,
+                bucket_id.parse::<i64>().ok()?,
+            )
+            .await
+            .ok()
+            .flatten()?;
+            let action = match grant.relation.as_str() {
+                "define" | "owner" | "writer" => "index:create",
+                "query" | "reader" => "index:read",
+                "repair" => "index:update",
+                _ => return None,
+            };
+            Some((action.to_string(), format!("{}/{}", bucket.name, index)))
+        }
+        crate::system_realm::SYSTEM_STREAM_NAMESPACE => {
+            let (bucket_id, stream_key) = grant.object_id.split_once('/')?;
+            let bucket = bucket_journal::read_current_bucket_by_id(
+                &state.storage,
+                bucket_id.parse::<i64>().ok()?,
+            )
+            .await
+            .ok()
+            .flatten()?;
+            let action = match grant.relation.as_str() {
+                "append" | "producer" => "stream:append",
+                "read" | "consumer" => "stream:read",
+                "seal_segment" => "stream:seal_segment",
+                "owner" => "stream:create",
+                _ => return None,
+            };
+            Some((
+                action.to_string(),
+                format!("{}/{}", bucket.name, stream_key),
+            ))
+        }
+        crate::system_realm::SYSTEM_AUTHZ_REALM_NAMESPACE => {
+            let action = match grant.relation.as_str() {
+                "tuple_writer" | "write_tuples" => "authz:tuple_write",
+                "checker" | "check" => "authz:check",
+                "auditor" | "list" => "authz:tuple_read",
+                "schema_admin" | "put_schema" | "bind_schema" => "authz:schema_write",
+                _ => return None,
+            };
+            Some((action.to_string(), grant.object_id.clone()))
+        }
+        crate::system_realm::SYSTEM_PERSONALDB_GROUP_NAMESPACE => {
+            let action = match grant.relation.as_str() {
+                "get_snapshot" => "personaldb:read",
+                "watch" => "personaldb:watch",
+                "apply_changeset" => "personaldb:commit",
+                "owner" => "personaldb:create",
+                _ => return None,
+            };
+            Some((action.to_string(), grant.object_id.clone()))
+        }
+        crate::system_realm::SYSTEM_REGISTRY_NAMESPACE => {
+            let action = match grant.relation.as_str() {
+                "publish" => "registry:version_write",
+                "read" => "registry:read",
+                _ => return None,
+            };
+            Some((action.to_string(), grant.object_id.clone()))
+        }
+        _ => None,
+    }
+}
 
 #[tonic::async_trait]
 impl AuthService for AppState {
@@ -58,43 +207,11 @@ impl AuthService for AppState {
             return Err(Status::unauthenticated("Invalid client secret"));
         }
 
-        let allowed_scopes = self
-            .persistence
-            .get_policies_for_app(app_details.id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        let approved_scopes = if req.scopes.is_empty() || req.scopes == vec!["*"] {
-            allowed_scopes
-        } else {
-            req.scopes
-                .into_iter()
-                .filter(|requested_scope| {
-                    let parts: Vec<&str> = requested_scope.splitn(2, '|').collect();
-                    if parts.len() != 2 {
-                        return false;
-                    }
-                    if let Ok(action) = parts[0].parse::<AnvilAction>() {
-                        auth::is_authorized(action, parts[1], &allowed_scopes)
-                    } else {
-                        false
-                    }
-                })
-                .collect()
-        };
-
-        if approved_scopes.is_empty() {
-            return Err(Status::permission_denied("App has no assigned policies"));
-        }
-
-        // 3. Mint token
+        // Tokens identify the principal and Anvil storage tenant. Authorisation
+        // is resolved from Zanzibar relations at request time, not token scopes.
         let token = self
             .jwt_manager
-            .mint_token(
-                app_details.id.to_string(),
-                approved_scopes,
-                app_details.tenant_id,
-            )
+            .mint_token(app_details.id.to_string(), app_details.tenant_id)
             .map_err(|e| Status::internal(e.to_string()))?;
         tracing::info!(
             "[AuthService] Returning access token for app_id={}",
@@ -104,6 +221,161 @@ impl AuthService for AppState {
             access_token: token,
             expires_in: 3600,
         }))
+    }
+
+    async fn create_application_credential(
+        &self,
+        request: Request<CreateApplicationCredentialRequest>,
+    ) -> Result<Response<ApplicationSecretResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        require_app_management_permission(self, &claims, AnvilAction::AppCreate).await?;
+        validate_public_app_request(&req.app_name, &req.request_id, &req.idempotency_key)?;
+
+        let client_id = format!("app_{}", uuid::Uuid::new_v4().simple());
+        let client_secret = format!("secret_{}", uuid::Uuid::new_v4().simple());
+        let encrypted_secret = self
+            .secret_keyring
+            .encrypt(client_secret.as_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let app = self
+            .persistence
+            .create_app(
+                claims.tenant_id,
+                &req.app_name,
+                &client_id,
+                &encrypted_secret,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let audit_event_id = crate::services::audit::record_tenant_audit_event(
+            self,
+            &claims,
+            &req.request_id,
+            format!("app:{}", app.name),
+            "app.create",
+            serde_json::json!({ "app_id": app.id, "client_id": client_id }),
+        )
+        .await?;
+
+        Ok(Response::new(ApplicationSecretResponse {
+            request_id: req.request_id,
+            tenant_id: claims.tenant_id.to_string(),
+            app_name: app.name,
+            client_id,
+            client_secret,
+            audit_event_id,
+            app_id: app.id.to_string(),
+        }))
+    }
+
+    async fn rotate_application_credential_secret(
+        &self,
+        request: Request<RotateApplicationCredentialSecretRequest>,
+    ) -> Result<Response<ApplicationSecretResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        require_app_management_permission(self, &claims, AnvilAction::AppRotateSecret).await?;
+        validate_public_app_request(&req.app_name, &req.request_id, &req.idempotency_key)?;
+        let app = app_in_claims_tenant(self, claims.tenant_id, &req.app_name).await?;
+
+        let client_secret = format!("secret_{}", uuid::Uuid::new_v4().simple());
+        let encrypted_secret = self
+            .secret_keyring
+            .encrypt(client_secret.as_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        self.persistence
+            .update_app_secret(app.id, &encrypted_secret)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let audit_event_id = crate::services::audit::record_tenant_audit_event(
+            self,
+            &claims,
+            &req.request_id,
+            format!("app:{}", app.name),
+            "app.rotate_secret",
+            serde_json::json!({ "app_id": app.id, "client_id": app.client_id }),
+        )
+        .await?;
+
+        Ok(Response::new(ApplicationSecretResponse {
+            request_id: req.request_id,
+            tenant_id: claims.tenant_id.to_string(),
+            app_name: app.name,
+            client_id: app.client_id,
+            client_secret,
+            audit_event_id,
+            app_id: app.id.to_string(),
+        }))
+    }
+
+    async fn delete_application_credential(
+        &self,
+        request: Request<DeleteApplicationCredentialRequest>,
+    ) -> Result<Response<DeleteApplicationCredentialResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        require_app_management_permission(self, &claims, AnvilAction::AppDelete).await?;
+        validate_public_app_request(&req.app_name, &req.request_id, &req.idempotency_key)?;
+        let app = app_in_claims_tenant(self, claims.tenant_id, &req.app_name).await?;
+
+        self.persistence
+            .delete_app(app.id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        crate::services::audit::record_tenant_audit_event(
+            self,
+            &claims,
+            &req.request_id,
+            format!("app:{}", app.name),
+            "app.delete",
+            serde_json::json!({ "app_id": app.id }),
+        )
+        .await?;
+
+        Ok(Response::new(DeleteApplicationCredentialResponse {
+            request_id: req.request_id,
+            app_id: app.id.to_string(),
+        }))
+    }
+
+    async fn list_applications(
+        &self,
+        request: Request<ListApplicationsRequest>,
+    ) -> Result<Response<ListApplicationsResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let _ = request.into_inner();
+        require_app_management_permission(self, &claims, AnvilAction::AppRead).await?;
+        let applications = self
+            .persistence
+            .list_apps_for_tenant(claims.tenant_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .into_iter()
+            .map(|app| ApplicationDescriptor {
+                tenant_id: claims.tenant_id.to_string(),
+                app_id: app.id.to_string(),
+                app_name: app.name,
+                client_id: app.client_id,
+            })
+            .collect();
+        Ok(Response::new(ListApplicationsResponse { applications }))
     }
 
     async fn grant_access(
@@ -116,22 +388,58 @@ impl AuthService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.get_ref();
 
-        if !auth::is_authorized(AnvilAction::PolicyGrant, &req.resource, &claims.scopes) {
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            claims,
+            AnvilAction::PolicyGrant,
+            &req.resource,
+        )
+        .await?;
+        validate_public_delegation_resource(claims, &req.resource)?;
+        if req.action.trim() == "*"
+            || req.action.trim().ends_with(":*")
+            || req.resource.trim() == "*"
+        {
             return Err(Status::permission_denied(
-                "Permission denied to grant access to this resource",
+                "Public policy delegation cannot grant wildcard authority",
             ));
         }
+        let delegated_action = req
+            .action
+            .parse::<AnvilAction>()
+            .map_err(|_| Status::invalid_argument("Invalid delegated action"))?;
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            claims,
+            delegated_action.clone(),
+            &req.resource,
+        )
+        .await?;
 
-        let app = self
-            .persistence
-            .get_app_by_name(&req.grantee_app_id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Grantee app not found"))?;
-        self.persistence
-            .grant_policy(app.id, &req.resource, &req.action)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let app = app_in_claims_tenant(self, claims.tenant_id, &req.grantee_app_id).await?;
+        access_control::write_delegated_action_tuple(
+            &self.storage,
+            &self.persistence,
+            claims.tenant_id,
+            &app.id.to_string(),
+            delegated_action,
+            &req.resource,
+            "add",
+            &claims.sub,
+            "tenant access grant",
+        )
+        .await?;
+        crate::services::audit::record_tenant_audit_event(
+            self,
+            claims,
+            "policy-grant",
+            &req.resource,
+            "policy.grant",
+            serde_json::json!({ "grantee_app_id": app.id, "action": req.action }),
+        )
+        .await?;
 
         Ok(Response::new(GrantAccessResponse {}))
     }
@@ -146,25 +454,84 @@ impl AuthService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.get_ref();
 
-        if !auth::is_authorized(AnvilAction::PolicyRevoke, &req.resource, &claims.scopes) {
-            return Err(Status::permission_denied(
-                "Permission denied to revoke access to this resource",
-            ));
-        }
+        validate_public_delegation_resource(claims, &req.resource)?;
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            claims,
+            AnvilAction::PolicyRevoke,
+            &req.resource,
+        )
+        .await?;
 
-        let app = self
-            .persistence
-            .get_app_by_name(&req.grantee_app_id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Grantee app not found"))?;
+        let app = app_in_claims_tenant(self, claims.tenant_id, &req.grantee_app_id).await?;
 
-        self.persistence
-            .revoke_policy(app.id, &req.resource, &req.action)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let delegated_action = req
+            .action
+            .parse::<AnvilAction>()
+            .map_err(|_| Status::invalid_argument("Invalid delegated action"))?;
+        access_control::write_delegated_action_tuple(
+            &self.storage,
+            &self.persistence,
+            claims.tenant_id,
+            &app.id.to_string(),
+            delegated_action,
+            &req.resource,
+            "remove",
+            &claims.sub,
+            "tenant access revoke",
+        )
+        .await?;
+        crate::services::audit::record_tenant_audit_event(
+            self,
+            claims,
+            "policy-revoke",
+            &req.resource,
+            "policy.revoke",
+            serde_json::json!({ "grantee_app_id": app.id, "action": req.action }),
+        )
+        .await?;
 
         Ok(Response::new(RevokeAccessResponse {}))
+    }
+
+    async fn list_access_grants(
+        &self,
+        request: Request<ListAccessGrantsRequest>,
+    ) -> Result<Response<ListAccessGrantsResponse>, Status> {
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        require_app_management_permission(self, &claims, AnvilAction::PolicyRead).await?;
+        let app = app_in_claims_tenant(self, claims.tenant_id, &req.app).await?;
+        let revision = authz_journal::latest_authz_revision(
+            &self.storage,
+            crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+        let grant_rows = authz_journal::read_current_authz_tuples_at_revision(
+            &self.storage,
+            SYSTEM_STORAGE_TENANT_ID,
+            authz_journal::AuthzTupleFilter {
+                subject_kind: Some(access_control::APP_SUBJECT_KIND.to_string()),
+                subject_id: Some(app.id.to_string()),
+                caveat_hash: Some(String::new()),
+                ..authz_journal::AuthzTupleFilter::default()
+            },
+            revision,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+        let mut grants = Vec::with_capacity(grant_rows.len());
+        for grant in grant_rows {
+            grants.push(public_access_grant_record(self, &app, grant).await?);
+        }
+
+        Ok(Response::new(ListAccessGrantsResponse { grants }))
     }
 
     async fn set_public_access(
@@ -177,17 +544,29 @@ impl AuthService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.get_ref();
 
-        let resource = format!("bucket:{}", req.bucket);
-        if !auth::is_authorized(AnvilAction::PolicyGrant, &resource, &claims.scopes) {
-            return Err(Status::permission_denied(
-                "Permission denied to modify public access on this bucket",
-            ));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            claims,
+            AnvilAction::BucketWrite,
+            &req.bucket,
+        )
+        .await?;
 
-        self.persistence
+        let bucket = self
+            .persistence
             .set_bucket_public_access(claims.tenant_id, &req.bucket, req.allow_public_read)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        access_control::write_bucket_public_read_tuple(
+            &self.persistence,
+            &bucket,
+            req.allow_public_read,
+            &claims.sub,
+            "bucket public-read policy update",
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(SetPublicAccessResponse {}))
     }
@@ -243,7 +622,7 @@ impl AuthService for AppState {
             ));
         }
         for mutation in &req.mutations {
-            validate_authz_tuple_mutation(&claims, mutation)?;
+            validate_authz_tuple_mutation(self, &claims, mutation).await?;
         }
         let scope = resolve_batch_scope(&claims, req.scope.as_ref(), &req.mutations)?;
 
@@ -297,7 +676,7 @@ impl AuthService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
-        validate_optional_tuple_component("namespace", &req.namespace)?;
+        validate_optional_public_authz_namespace(&req.namespace)?;
         validate_optional_tuple_field("object_id", &req.object_id)?;
         validate_optional_tuple_component("relation", &req.relation)?;
         validate_optional_tuple_component("subject_kind", &req.subject_kind)?;
@@ -305,10 +684,14 @@ impl AuthService for AppState {
         validate_caveat_hash(&req.caveat_hash)?;
         let scope = resolve_authz_scope(&claims, req.scope.as_ref())?;
 
-        let resource = authz_filter_resource(&req.namespace, &req.object_id, &req.relation);
-        if !auth::is_authorized(AnvilAction::AuthzTupleRead, &resource, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::AuthzTupleRead,
+            &scope.authz_realm_id,
+        )
+        .await?;
         let filter_hash = authz_page_filter_hash(
             "read_tuples",
             &[
@@ -436,16 +819,20 @@ impl AuthService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
-        validate_tuple_component("namespace", &req.namespace)?;
+        validate_public_authz_namespace(&req.namespace)?;
         validate_tuple_component("relation", &req.relation)?;
         validate_tuple_component("subject_kind", &req.subject_kind)?;
         validate_tuple_field("subject_id", &req.subject_id)?;
         validate_caveat_hash(&req.caveat_hash)?;
         let scope = resolve_authz_scope(&claims, req.scope.as_ref())?;
-        let resource = authz_filter_resource(&req.namespace, "", &req.relation);
-        if !auth::is_authorized(AnvilAction::AuthzTupleRead, &resource, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::AuthzTupleRead,
+            &scope.authz_realm_id,
+        )
+        .await?;
         let filter_hash = authz_page_filter_hash(
             "list_objects",
             &[
@@ -511,15 +898,19 @@ impl AuthService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
-        validate_tuple_component("namespace", &req.namespace)?;
+        validate_public_authz_namespace(&req.namespace)?;
         validate_tuple_field("object_id", &req.object_id)?;
         validate_tuple_component("relation", &req.relation)?;
         validate_optional_tuple_component("subject_kind", &req.subject_kind)?;
         let scope = resolve_authz_scope(&claims, req.scope.as_ref())?;
-        let resource = authz_resource(&req.namespace, &req.object_id, &req.relation);
-        if !auth::is_authorized(AnvilAction::AuthzTupleRead, &resource, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::AuthzTupleRead,
+            &scope.authz_realm_id,
+        )
+        .await?;
         let filter_hash = authz_page_filter_hash(
             "list_subjects",
             &[
@@ -602,15 +993,16 @@ impl AuthService for AppState {
             ));
         }
         for namespace in &req.namespaces {
-            validate_tuple_component("namespace", &namespace.namespace)?;
-            if !auth::is_authorized(
-                AnvilAction::AuthzSchemaWrite,
-                &namespace.namespace,
-                &claims.scopes,
-            ) {
-                return Err(Status::permission_denied("Permission denied"));
-            }
+            validate_public_authz_namespace(&namespace.namespace)?;
         }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::AuthzSchemaWrite,
+            &format!("schema:{}", req.schema_id),
+        )
+        .await?;
         let authz_revision = authz_journal::latest_authz_revision(&self.storage, claims.tenant_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))
@@ -649,18 +1041,35 @@ impl AuthService for AppState {
             .schema_ref
             .ok_or_else(|| Status::invalid_argument("schema_ref is required"))?;
         validate_tuple_component("schema_id", &schema_ref.schema_id)?;
-        if !auth::is_authorized(
-            AnvilAction::AuthzSchemaWrite,
-            &scope.authz_realm_id,
-            &claims.scopes,
-        ) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        // Creating or rebinding a tenant authz realm is controlled by the
+        // owning storage-tenant relation first. The realm row may not exist yet,
+        // so checking the realm relation before seeding its parent_tenant tuple
+        // would make first bind impossible without a non-Zanzibar bypass.
+        access_control::require_storage_tenant_permission(&self.storage, &claims, "manage_tenant")
+            .await?;
         let authz_revision = authz_journal::latest_authz_revision(&self.storage, claims.tenant_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))
             .and_then(revision_to_u64)?
             .saturating_add(1);
+        access_control::grant_authz_realm_defaults(
+            &self.persistence,
+            claims.tenant_id,
+            &scope.authz_realm_id,
+            &claims.sub,
+            &claims.sub,
+            "grant creator authz realm owner",
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+        access_control::require_system_realm_permission(
+            &self.storage,
+            &claims,
+            crate::system_realm::SYSTEM_AUTHZ_REALM_NAMESPACE,
+            &access_control::authz_realm_object_id(claims.tenant_id, &scope.authz_realm_id),
+            "bind_schema",
+        )
+        .await?;
         let binding = authz_realm_schema::bind_schema(
             &self.storage,
             claims.tenant_id,
@@ -697,13 +1106,14 @@ impl AuthService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
         let scope = resolve_authz_scope(&claims, req.scope.as_ref())?;
-        if !auth::is_authorized(
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
             AnvilAction::AuthzSchemaRead,
             &scope.authz_realm_id,
-            &claims.scopes,
-        ) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        )
+        .await?;
         let binding = authz_realm_schema::read_schema_binding(
             &self.storage,
             claims.tenant_id,
@@ -740,6 +1150,25 @@ impl AuthService for AppState {
             ));
         }
 
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::AuthzSchemaWrite,
+            DEFAULT_AUTHZ_REALM_ID,
+        )
+        .await?;
+
+        access_control::grant_authz_realm_defaults(
+            &self.persistence,
+            claims.tenant_id,
+            DEFAULT_AUTHZ_REALM_ID,
+            &claims.sub,
+            &claims.sub,
+            "grant default authz realm owner",
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
         let mut records = Vec::with_capacity(req.namespaces.len());
         let authz_revision = authz_journal::latest_authz_revision(&self.storage, claims.tenant_id)
             .await
@@ -747,14 +1176,7 @@ impl AuthService for AppState {
             .and_then(revision_to_u64)?
             .max(1);
         for namespace in req.namespaces {
-            validate_tuple_component("namespace", &namespace.namespace)?;
-            if !auth::is_authorized(
-                AnvilAction::AuthzSchemaWrite,
-                &namespace.namespace,
-                &claims.scopes,
-            ) {
-                return Err(Status::permission_denied("Permission denied"));
-            }
+            validate_public_authz_namespace(&namespace.namespace)?;
             let record = authz_schema::write_authz_namespace_schema(
                 &self.storage,
                 claims.tenant_id,
@@ -807,9 +1229,14 @@ impl AuthService for AppState {
         if !req.schema_id.is_empty() {
             validate_storage_tenant(&claims, &req.anvil_storage_tenant_id)?;
             validate_tuple_component("schema_id", &req.schema_id)?;
-            if !auth::is_authorized(AnvilAction::AuthzSchemaRead, &req.schema_id, &claims.scopes) {
-                return Err(Status::permission_denied("Permission denied"));
-            }
+            access_control::require_action(
+                &self.storage,
+                &self.persistence,
+                &claims,
+                AnvilAction::AuthzSchemaRead,
+                &format!("schema:{}", req.schema_id),
+            )
+            .await?;
             let record = authz_realm_schema::read_schema_revision(
                 &self.storage,
                 claims.tenant_id,
@@ -826,16 +1253,16 @@ impl AuthService for AppState {
             }));
         }
         if !req.namespace.is_empty() {
-            validate_tuple_component("namespace", &req.namespace)?;
+            validate_public_authz_namespace(&req.namespace)?;
         }
-        let resource = if req.namespace.is_empty() {
-            "*".to_string()
-        } else {
-            req.namespace.clone()
-        };
-        if !auth::is_authorized(AnvilAction::AuthzSchemaRead, &resource, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::AuthzSchemaRead,
+            DEFAULT_AUTHZ_REALM_ID,
+        )
+        .await?;
         let records = if req.namespace.is_empty() {
             authz_schema::list_authz_namespace_schemas(&self.storage, claims.tenant_id).await
         } else {
@@ -871,14 +1298,14 @@ impl AuthService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
         let scope = resolve_authz_scope(&claims, req.scope.as_ref())?;
-        let resource = if req.namespace.is_empty() {
-            "*".to_string()
-        } else {
-            req.namespace.clone()
-        };
-        if !auth::is_authorized(AnvilAction::AuthzWatch, &resource, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::AuthzWatch,
+            &scope.authz_realm_id,
+        )
+        .await?;
         let after_revision = i64::try_from(req.after_revision)
             .map_err(|_| Status::invalid_argument("after_revision exceeds supported range"))?;
         let mut live = self.authz_watch_tx.subscribe();
@@ -964,10 +1391,15 @@ impl AuthService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
-        validate_watch_component("namespace", &req.namespace)?;
-        if !auth::is_authorized(AnvilAction::AuthzWatch, &req.namespace, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        validate_public_authz_namespace(&req.namespace)?;
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::AuthzWatch,
+            DEFAULT_AUTHZ_REALM_ID,
+        )
+        .await?;
 
         let after_cursor = join_u128(req.after_cursor_low, req.after_cursor_high);
         let snapshot = authz_namespace_watch::list_authz_namespace_watch_events(
@@ -1043,13 +1475,14 @@ impl AuthService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
         validate_watch_component("derived_index_id", &req.derived_index_id)?;
-        if !auth::is_authorized(
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
             AnvilAction::AuthzWatch,
-            &req.derived_index_id,
-            &claims.scopes,
-        ) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+            DEFAULT_AUTHZ_REALM_ID,
+        )
+        .await?;
 
         let after_cursor = join_u128(req.after_cursor_low, req.after_cursor_high);
         let snapshot = authz_derived_lag_watch::list_authz_derived_lag_watch_events(
@@ -1115,748 +1548,8 @@ impl AuthService for AppState {
     }
 }
 
-fn authz_resource(namespace: &str, object_id: &str, relation: &str) -> String {
-    format!("{}/{}#{}", namespace, object_id, relation)
-}
-
-fn authz_filter_resource(namespace: &str, object_id: &str, relation: &str) -> String {
-    match (
-        namespace.is_empty(),
-        object_id.is_empty(),
-        relation.is_empty(),
-    ) {
-        (true, _, _) => "*".to_string(),
-        (false, true, true) => namespace.to_string(),
-        (false, true, false) => format!("{namespace}/*#{relation}"),
-        (false, false, true) => format!("{namespace}/{object_id}#*"),
-        (false, false, false) => authz_resource(namespace, object_id, relation),
-    }
-}
-
-fn validate_storage_tenant(
-    claims: &auth::Claims,
-    anvil_storage_tenant_id: &str,
-) -> Result<(), Status> {
-    if anvil_storage_tenant_id.is_empty() || anvil_storage_tenant_id == claims.tenant_id.to_string()
-    {
-        Ok(())
-    } else {
-        Err(Status::permission_denied(
-            "authz scope storage tenant does not match authenticated tenant",
-        ))
-    }
-}
-
-fn resolve_authz_scope(
-    claims: &auth::Claims,
-    scope: Option<&AuthzScope>,
-) -> Result<AuthzScope, Status> {
-    let mut resolved = scope.cloned().unwrap_or_else(|| AuthzScope {
-        anvil_storage_tenant_id: claims.tenant_id.to_string(),
-        authz_realm_id: DEFAULT_AUTHZ_REALM_ID.to_string(),
-    });
-    if resolved.anvil_storage_tenant_id.is_empty() {
-        resolved.anvil_storage_tenant_id = claims.tenant_id.to_string();
-    }
-    validate_storage_tenant(claims, &resolved.anvil_storage_tenant_id)?;
-    validate_tuple_component("authz_realm_id", &resolved.authz_realm_id)?;
-    Ok(resolved)
-}
-
-fn resolve_batch_scope(
-    claims: &auth::Claims,
-    request_scope: Option<&AuthzScope>,
-    mutations: &[AuthzTupleMutation],
-) -> Result<AuthzScope, Status> {
-    let scope = resolve_authz_scope(
-        claims,
-        request_scope.or_else(|| {
-            mutations
-                .first()
-                .and_then(|mutation| mutation.scope.as_ref())
-        }),
-    )?;
-    for mutation in mutations {
-        if let Some(mutation_scope) = mutation.scope.as_ref() {
-            let mutation_scope = resolve_authz_scope(claims, Some(mutation_scope))?;
-            if mutation_scope != scope {
-                return Err(Status::invalid_argument(
-                    "authz tuple batch must target one authz scope",
-                ));
-            }
-        }
-    }
-    Ok(scope)
-}
-
-fn record_belongs_to_realm(record: &crate::persistence::AuthzTupleRecord, realm_id: &str) -> bool {
-    decode_realm_namespace(realm_id, &record.namespace).is_some()
-}
-
-fn filter_records_for_realm(
-    records: Vec<crate::persistence::AuthzTupleRecord>,
-    realm_id: &str,
-) -> Vec<crate::persistence::AuthzTupleRecord> {
-    records
-        .into_iter()
-        .filter(|record| record_belongs_to_realm(record, realm_id))
-        .collect()
-}
-
-fn validate_tuple_field(name: &str, value: &str) -> Result<(), Status> {
-    if value.is_empty() {
-        return Err(Status::invalid_argument(format!(
-            "{name} must not be empty"
-        )));
-    }
-    if value.chars().any(char::is_control) {
-        return Err(Status::invalid_argument(format!(
-            "{name} must not contain control characters"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_optional_tuple_field(name: &str, value: &str) -> Result<(), Status> {
-    if value.is_empty() {
-        return Ok(());
-    }
-    validate_tuple_field(name, value)
-}
-
-fn validate_tuple_component(name: &str, value: &str) -> Result<(), Status> {
-    validate_tuple_field(name, value)?;
-    if value == "." || value == ".." || value.contains('/') {
-        return Err(Status::invalid_argument(format!(
-            "{name} must be a safe authz component"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_optional_tuple_component(name: &str, value: &str) -> Result<(), Status> {
-    if value.is_empty() {
-        return Ok(());
-    }
-    validate_tuple_component(name, value)
-}
-
-fn validate_caveat_hash(value: &str) -> Result<(), Status> {
-    authz_journal::validate_optional_caveat_hash(value)
-        .map_err(|err| Status::invalid_argument(err.to_string()))
-}
-
-fn validate_watch_component(name: &str, value: &str) -> Result<(), Status> {
-    validate_tuple_field(name, value)?;
-    if value == "." || value == ".." || value.contains('/') {
-        return Err(Status::invalid_argument(format!(
-            "{name} must be a safe path component"
-        )));
-    }
-    Ok(())
-}
-
-async fn write_authz_tuple_record(
-    state: &AppState,
-    claims: &auth::Claims,
-    req: AuthzTupleMutation,
-) -> Result<crate::persistence::AuthzTupleRecord, Status> {
-    let operation = validate_authz_tuple_mutation(claims, &req)?;
-    let scope = resolve_authz_scope(claims, req.scope.as_ref())?;
-    let record = state
-        .persistence
-        .write_authz_tuple(
-            claims.tenant_id,
-            &encode_realm_namespace(&scope.authz_realm_id, &req.namespace),
-            &req.object_id,
-            &req.relation,
-            &req.subject_kind,
-            &encode_userset_subject_realm(
-                &scope.authz_realm_id,
-                &req.subject_kind,
-                &req.subject_id,
-            ),
-            &req.caveat_hash,
-            operation,
-            &claims.sub,
-            &req.reason,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-    emit_authz_tuple_write_side_effects(state, claims.tenant_id, &record).await?;
-    Ok(record)
-}
-
-fn validate_authz_tuple_mutation<'a>(
-    claims: &auth::Claims,
-    req: &'a AuthzTupleMutation,
-) -> Result<&'a str, Status> {
-    validate_tuple_component("namespace", &req.namespace)?;
-    validate_tuple_field("object_id", &req.object_id)?;
-    validate_tuple_component("relation", &req.relation)?;
-    validate_tuple_component("subject_kind", &req.subject_kind)?;
-    validate_tuple_field("subject_id", &req.subject_id)?;
-    validate_caveat_hash(&req.caveat_hash)?;
-    let operation = match req.operation.as_str() {
-        "add" | "remove" => req.operation.as_str(),
-        _ => return Err(Status::invalid_argument("operation must be add or remove")),
-    };
-    let resource = authz_resource(&req.namespace, &req.object_id, &req.relation);
-    if !auth::is_authorized(AnvilAction::AuthzTupleWrite, &resource, &claims.scopes) {
-        return Err(Status::permission_denied("Permission denied"));
-    }
-    Ok(operation)
-}
-
-async fn emit_authz_tuple_write_side_effects(
-    state: &AppState,
-    tenant_id: i64,
-    record: &crate::persistence::AuthzTupleRecord,
-) -> Result<(), Status> {
-    emit_authz_tuple_batch_side_effects(state, tenant_id, std::slice::from_ref(record)).await
-}
-
-async fn emit_authz_tuple_batch_side_effects(
-    state: &AppState,
-    tenant_id: i64,
-    records: &[crate::persistence::AuthzTupleRecord],
-) -> Result<(), Status> {
-    let Some(last_record) = records
-        .iter()
-        .max_by_key(|record| (record.revision, record.revision_ordinal))
-    else {
-        return Ok(());
-    };
-    for record in records {
-        let _ = state.authz_watch_tx.send(record.clone());
-    }
-    let derived = authz_userset_index::advance_derived_userset_index_from_batch(
-        &state.storage,
-        tenant_id,
-        authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID,
-        records,
-    )
-    .await
-    .map_err(|e| Status::internal(e.to_string()))?;
-    let processed_revision = revision_to_u64(last_record.revision)?;
-    authz_derived_lag_watch::append_authz_derived_lag_watch_record(
-        &state.storage,
-        tenant_id,
-        u128::from(processed_revision),
-        mutation_id_from_record_hash(&last_record.record_hash),
-        authz_derived_lag_watch::AuthzDerivedLagWatchPayload {
-            derived_index_id: authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID.to_string(),
-            derived_index_kind: "userset".to_string(),
-            processed_revision: derived.processed_revision,
-            latest_revision: processed_revision,
-            source_cursor: u128::from(processed_revision),
-            source_manifest_hash: derived.source_records_hash,
-            generation: derived.generation,
-            emitted_at: chrono::Utc::now().to_rfc3339(),
-        },
-    )
-    .await
-    .map_err(|e| Status::internal(e.to_string()))?;
-    Ok(())
-}
-
-async fn check_permission_response(
-    state: &AppState,
-    claims: &auth::Claims,
-    req: CheckPermissionRequest,
-) -> Result<CheckPermissionResponse, Status> {
-    validate_tuple_component("namespace", &req.namespace)?;
-    validate_tuple_field("object_id", &req.object_id)?;
-    validate_tuple_component("relation", &req.relation)?;
-    validate_tuple_component("subject_kind", &req.subject_kind)?;
-    validate_tuple_field("subject_id", &req.subject_id)?;
-    validate_caveat_hash(&req.caveat_hash)?;
-    let scope = resolve_authz_scope(claims, req.scope.as_ref())?;
-    let resource = authz_resource(&req.namespace, &req.object_id, &req.relation);
-    if !auth::is_authorized(AnvilAction::AuthzCheck, &resource, &claims.scopes) {
-        return Err(Status::permission_denied("Permission denied"));
-    }
-    let consistency = AuthzConsistency::from_request(&req.consistency, &req.zookie)?;
-    let response_revision =
-        resolve_authz_response_revision(&state.storage, claims.tenant_id, consistency).await?;
-    let allowed = authz_journal::resolve_permission_at_revision(
-        &state.storage,
-        claims.tenant_id,
-        &encode_realm_namespace(&scope.authz_realm_id, &req.namespace),
-        &req.object_id,
-        &req.relation,
-        &req.subject_kind,
-        &req.subject_id,
-        &req.caveat_hash,
-        response_revision,
-    )
-    .await
-    .map_err(|e| Status::internal(e.to_string()))?;
-
-    Ok(CheckPermissionResponse {
-        allowed,
-        revision: revision_to_u64(response_revision)?,
-        zookie: zookie(response_revision),
-        explanation_ref: if allowed {
-            "tuple_or_userset_match".to_string()
-        } else {
-            "no_current_tuple_or_userset".to_string()
-        },
-    })
-}
-
-async fn resolve_authz_response_revision(
-    storage: &crate::storage::Storage,
-    tenant_id: i64,
-    consistency: AuthzConsistency,
-) -> Result<i64, Status> {
-    let latest_revision = authz_journal::latest_authz_revision(storage, tenant_id)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-    if let Some(required_revision) = consistency.required_revision()
-        && latest_revision < required_revision
-    {
-        return Err(Status::failed_precondition("AuthzRevisionUnavailable"));
-    }
-
-    Ok(match consistency {
-        AuthzConsistency::Exact(revision) => revision,
-        AuthzConsistency::Latest | AuthzConsistency::AtLeast(_) => latest_revision,
-    })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuthzConsistency {
-    Latest,
-    AtLeast(i64),
-    Exact(i64),
-}
-
-impl AuthzConsistency {
-    fn from_request(consistency: &str, zookie: &str) -> Result<Self, Status> {
-        match consistency {
-            "" | "latest" => Ok(Self::Latest),
-            "at_least" => Ok(Self::AtLeast(parse_authz_zookie(zookie)?)),
-            "exact" => Ok(Self::Exact(parse_authz_zookie(zookie)?)),
-            _ => Err(Status::invalid_argument(
-                "consistency must be latest, at_least, exact, or empty",
-            )),
-        }
-    }
-
-    fn required_revision(self) -> Option<i64> {
-        match self {
-            Self::Latest => None,
-            Self::AtLeast(revision) | Self::Exact(revision) => Some(revision),
-        }
-    }
-}
-
-fn parse_authz_zookie(value: &str) -> Result<i64, Status> {
-    let Some(revision) = value.strip_prefix("authz:") else {
-        return Err(Status::invalid_argument(
-            "zookie must use authz:<revision> format",
-        ));
-    };
-    let revision = revision
-        .parse::<i64>()
-        .map_err(|_| Status::invalid_argument("zookie revision must be an integer"))?;
-    if revision < 0 {
-        return Err(Status::invalid_argument(
-            "zookie revision must not be negative",
-        ));
-    }
-    Ok(revision)
-}
-
-fn revision_to_u64(revision: i64) -> Result<u64, Status> {
-    u64::try_from(revision).map_err(|_| Status::internal("Invalid authz revision"))
-}
-
-fn u64_to_i64(revision: u64) -> Result<i64, Status> {
-    i64::try_from(revision).map_err(|_| Status::internal("Invalid authz revision"))
-}
-
-fn zookie(revision: i64) -> String {
-    format!("authz:{}", revision.max(0))
-}
-
-fn schema_ref_response(record: &authz_realm_schema::StoredSchemaRef) -> AuthzSchemaRef {
-    AuthzSchemaRef {
-        schema_id: record.schema_id.clone(),
-        schema_revision: record.schema_revision,
-        schema_digest: record.schema_digest.clone(),
-    }
-}
-
-fn write_authz_tuple_response(
-    record: &crate::persistence::AuthzTupleRecord,
-) -> Result<WriteAuthzTupleResponse, Status> {
-    Ok(WriteAuthzTupleResponse {
-        revision: revision_to_u64(record.revision)?,
-        zookie: zookie(record.revision),
-        record_hash: record.record_hash.clone(),
-    })
-}
-
-fn authz_tuple_response_for_realm(
-    record: &crate::persistence::AuthzTupleRecord,
-    realm_id: &str,
-) -> Result<AuthzTuple, Status> {
-    let namespace = decode_realm_namespace(realm_id, &record.namespace)
-        .ok_or_else(|| Status::internal("authz tuple namespace is outside requested realm"))?;
-    Ok(AuthzTuple {
-        namespace: namespace.to_string(),
-        object_id: record.object_id.clone(),
-        relation: record.relation.clone(),
-        subject_kind: record.subject_kind.clone(),
-        subject_id: decode_userset_subject_realm(
-            realm_id,
-            &record.subject_kind,
-            &record.subject_id,
-        ),
-        caveat_hash: record.caveat_hash.clone(),
-        revision: revision_to_u64(record.revision)?,
-        zookie: zookie(record.revision),
-    })
-}
-
-fn optional_filter_value(value: String) -> Option<String> {
-    if value.is_empty() { None } else { Some(value) }
-}
-
-fn optional_str(value: &str) -> Option<&str> {
-    if value.is_empty() { None } else { Some(value) }
-}
-
-fn paginate_authz<T>(
-    values: Vec<T>,
-    page_size: u32,
-    offset: usize,
-    tenant_id: i64,
-    revision: i64,
-    filter_hash: &str,
-    signing_key: &[u8],
-) -> Result<(Vec<T>, String), Status> {
-    let limit = normalize_page_size(page_size);
-    if offset >= values.len() {
-        return Ok((Vec::new(), String::new()));
-    }
-    let next_offset = offset.saturating_add(limit);
-    let next_page_token = if next_offset < values.len() {
-        encode_authz_page_token(
-            AuthzPageTokenClaims {
-                tenant_id,
-                revision,
-                filter_hash,
-                offset: next_offset,
-            },
-            signing_key,
-        )?
-    } else {
-        String::new()
-    };
-    Ok((
-        values.into_iter().skip(offset).take(limit).collect(),
-        next_page_token,
-    ))
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct AuthzPageToken {
-    version: u8,
-    tenant_id: i64,
-    revision: i64,
-    filter_hash: String,
-    offset: usize,
-    signature: String,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AuthzPageTokenClaims<'a> {
-    tenant_id: i64,
-    revision: i64,
-    filter_hash: &'a str,
-    offset: usize,
-}
-
-fn parse_authz_page_token(
-    value: &str,
-    expected_tenant_id: i64,
-    expected_filter_hash: &str,
-    signing_key: &[u8],
-) -> Result<Option<AuthzPageToken>, Status> {
-    if value.is_empty() {
-        return Ok(None);
-    }
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(value)
-        .map_err(|_| Status::invalid_argument("Invalid authz page token"))?;
-    let token: AuthzPageToken = serde_json::from_slice(&bytes)
-        .map_err(|_| Status::invalid_argument("Invalid authz page token"))?;
-    if token.version != 1
-        || token.tenant_id != expected_tenant_id
-        || token.filter_hash != expected_filter_hash
-    {
-        return Err(Status::invalid_argument(
-            "Authz page token does not match this request",
-        ));
-    }
-    let expected = sign_authz_page_token(
-        AuthzPageTokenClaims {
-            tenant_id: token.tenant_id,
-            revision: token.revision,
-            filter_hash: &token.filter_hash,
-            offset: token.offset,
-        },
-        signing_key,
-    )?;
-    if token.signature != expected {
-        return Err(Status::invalid_argument("Invalid authz page token"));
-    }
-    Ok(Some(token))
-}
-
-fn encode_authz_page_token(
-    claims: AuthzPageTokenClaims<'_>,
-    signing_key: &[u8],
-) -> Result<String, Status> {
-    let token = AuthzPageToken {
-        version: 1,
-        tenant_id: claims.tenant_id,
-        revision: claims.revision,
-        filter_hash: claims.filter_hash.to_string(),
-        offset: claims.offset,
-        signature: sign_authz_page_token(claims, signing_key)?,
-    };
-    let bytes = serde_json::to_vec(&token)
-        .map_err(|_| Status::internal("Failed to encode authz page token"))?;
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
-}
-
-fn sign_authz_page_token(
-    claims: AuthzPageTokenClaims<'_>,
-    signing_key: &[u8],
-) -> Result<String, Status> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(signing_key)
-        .map_err(|_| Status::internal("Invalid authz page token signing key"))?;
-    mac.update(b"authz-page-token-v1");
-    mac.update(&claims.tenant_id.to_le_bytes());
-    mac.update(&claims.revision.to_le_bytes());
-    mac.update(&(claims.filter_hash.len() as u64).to_le_bytes());
-    mac.update(claims.filter_hash.as_bytes());
-    mac.update(&(claims.offset as u64).to_le_bytes());
-    Ok(base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
-}
-
-fn authz_page_filter_hash(kind: &str, values: &[&str]) -> String {
-    let mut input = Vec::new();
-    input.extend_from_slice(&(kind.len() as u64).to_le_bytes());
-    input.extend_from_slice(kind.as_bytes());
-    for value in values {
-        input.extend_from_slice(&(value.len() as u64).to_le_bytes());
-        input.extend_from_slice(value.as_bytes());
-    }
-    hex::encode(hash32(&input))
-}
-
-fn normalize_page_size(value: u32) -> usize {
-    if value == 0 {
-        1000
-    } else {
-        usize::try_from(value.min(1000)).unwrap_or(1000)
-    }
-}
-
-fn authz_tuple_log_response(
-    record: &crate::persistence::AuthzTupleRecord,
-) -> WatchAuthzTupleLogResponse {
-    let revision = revision_to_u64(record.revision).unwrap_or_default();
-    let written_at = record.written_at.to_string();
-    WatchAuthzTupleLogResponse {
-        revision,
-        namespace: record.namespace.clone(),
-        object_id: record.object_id.clone(),
-        relation: record.relation.clone(),
-        subject_kind: record.subject_kind.clone(),
-        subject_id: record.subject_id.clone(),
-        caveat_hash: record.caveat_hash.clone(),
-        operation: record.operation.clone(),
-        written_by: record.written_by.clone(),
-        reason: record.reason.clone(),
-        record_hash: record.record_hash.clone(),
-        written_at: written_at.clone(),
-        envelope: Some(watch_envelope::envelope(WatchEnvelopeParts {
-            watch_stream_id: "authz_tuple_log",
-            partition_family: "authz_tuple",
-            partition_id: record.namespace.clone(),
-            cursor: revision.into(),
-            mutation_id: record.mutation_id.to_string(),
-            record_kind: "authz_tuple".to_string(),
-            object_ref: format!(
-                "{}:{}#{}",
-                record.namespace, record.object_id, record.relation
-            ),
-            authz_revision: revision,
-            index_generation: 0,
-            personaldb_log_index: 0,
-            payload_hash: record.record_hash.clone(),
-            emitted_at: written_at,
-        })),
-    }
-}
-
-fn authz_tuple_log_response_for_realm(
-    record: &crate::persistence::AuthzTupleRecord,
-    realm_id: &str,
-) -> WatchAuthzTupleLogResponse {
-    let mut response = authz_tuple_log_response(record);
-    if let Some(namespace) = decode_realm_namespace(realm_id, &response.namespace) {
-        response.namespace = namespace.to_string();
-    }
-    response.subject_id =
-        decode_userset_subject_realm(realm_id, &response.subject_kind, &response.subject_id);
-    response
-}
-
-fn authz_namespace_watch_response(
-    event: authz_namespace_watch::AuthzNamespaceWatchEvent,
-) -> WatchAuthzNamespaceResponse {
-    let (cursor_low, cursor_high) = split_u128(event.cursor);
-    let payload = event.payload;
-    let emitted_at = payload.emitted_at.clone();
-    let namespace = payload.namespace.clone();
-    let payload_hash = watch_envelope::payload_hash(&payload);
-    WatchAuthzNamespaceResponse {
-        cursor_low,
-        cursor_high,
-        namespace: namespace.clone(),
-        event_type: payload.event_type,
-        authz_revision: event.authz_revision,
-        schema_hash: payload.schema_hash,
-        invalidates_derived_usersets: payload.invalidates_derived_usersets,
-        emitted_at: emitted_at.clone(),
-        envelope: Some(watch_envelope::envelope(WatchEnvelopeParts {
-            watch_stream_id: "authz_namespace",
-            partition_family: "authz_namespace",
-            partition_id: namespace.clone(),
-            cursor: event.cursor,
-            mutation_id: watch_envelope::uuid_from_bytes(event.mutation_id),
-            record_kind: "authz_namespace".to_string(),
-            object_ref: namespace,
-            authz_revision: event.authz_revision,
-            index_generation: 0,
-            personaldb_log_index: 0,
-            payload_hash,
-            emitted_at,
-        })),
-    }
-}
-
-fn authz_derived_lag_watch_response(
-    event: authz_derived_lag_watch::AuthzDerivedLagWatchEvent,
-) -> WatchAuthzDerivedLagResponse {
-    let (cursor_low, cursor_high) = split_u128(event.cursor);
-    let (source_cursor_low, source_cursor_high) = split_u128(event.payload.source_cursor);
-    let revision_lag = event.payload.revision_lag();
-    let payload = event.payload;
-    let emitted_at = payload.emitted_at.clone();
-    let derived_index_id = payload.derived_index_id.clone();
-    let generation = payload.generation;
-    let latest_revision = payload.latest_revision;
-    let payload_hash = watch_envelope::payload_hash(&payload);
-    WatchAuthzDerivedLagResponse {
-        cursor_low,
-        cursor_high,
-        derived_index_id: derived_index_id.clone(),
-        derived_index_kind: payload.derived_index_kind,
-        processed_revision: payload.processed_revision,
-        latest_revision,
-        revision_lag,
-        source_cursor_low,
-        source_cursor_high,
-        source_manifest_hash: payload.source_manifest_hash,
-        generation,
-        authz_revision: event.authz_revision,
-        emitted_at: emitted_at.clone(),
-        envelope: Some(watch_envelope::envelope(WatchEnvelopeParts {
-            watch_stream_id: "authz_derived_lag",
-            partition_family: "authz_derived_lag",
-            partition_id: derived_index_id.clone(),
-            cursor: event.cursor,
-            mutation_id: watch_envelope::uuid_from_bytes(event.mutation_id),
-            record_kind: "authz_derived_lag".to_string(),
-            object_ref: derived_index_id,
-            authz_revision: event.authz_revision,
-            index_generation: generation,
-            personaldb_log_index: 0,
-            payload_hash,
-            emitted_at,
-        })),
-    }
-}
-
-fn split_u128(value: u128) -> (u64, u64) {
-    (value as u64, (value >> 64) as u64)
-}
-
-fn join_u128(low: u64, high: u64) -> u128 {
-    u128::from(low) | (u128::from(high) << 64)
-}
-
-fn mutation_id_from_record_hash(record_hash: &str) -> [u8; 16] {
-    let mut mutation_id = [0; 16];
-    if let Ok(bytes) = hex::decode(record_hash) {
-        let len = bytes.len().min(mutation_id.len());
-        mutation_id[..len].copy_from_slice(&bytes[..len]);
-    }
-    mutation_id
-}
+mod helpers;
+use helpers::*;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn authz_consistency_parses_latest_without_zookie() {
-        assert_eq!(
-            AuthzConsistency::from_request("", "").unwrap(),
-            AuthzConsistency::Latest
-        );
-        assert_eq!(
-            AuthzConsistency::from_request("latest", "").unwrap(),
-            AuthzConsistency::Latest
-        );
-    }
-
-    #[test]
-    fn authz_consistency_requires_zookie_for_at_least_and_exact() {
-        assert_eq!(
-            AuthzConsistency::from_request("at_least", "authz:42").unwrap(),
-            AuthzConsistency::AtLeast(42)
-        );
-        assert_eq!(
-            AuthzConsistency::from_request("exact", "authz:7").unwrap(),
-            AuthzConsistency::Exact(7)
-        );
-        assert_eq!(
-            AuthzConsistency::from_request("exact", "")
-                .unwrap_err()
-                .code(),
-            tonic::Code::InvalidArgument
-        );
-        assert_eq!(
-            AuthzConsistency::from_request("at_least", "authz:-1")
-                .unwrap_err()
-                .code(),
-            tonic::Code::InvalidArgument
-        );
-    }
-
-    #[test]
-    fn authz_watch_cursor_split_round_trips() {
-        let cursor = (u128::from(99_u64) << 64) | u128::from(42_u64);
-        let (low, high) = split_u128(cursor);
-        assert_eq!(join_u128(low, high), cursor);
-    }
-}
+mod tests;

@@ -1,24 +1,29 @@
-#[cfg(test)]
-use crate::core_store::CompareAndSwapRef;
 use crate::{
     core_store::{
-        CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreObjectRef,
-        CoreStore, GetBlob, PutBlob,
+        CoreMutationBatch, CoreMutationPrecondition, CoreStore, decode_deterministic_proto,
+        encode_deterministic_proto,
     },
     formats::hash32,
     personaldb_control::PersonalDbGroupManifest,
+    personaldb_coremeta::{
+        PersonalDbDataLocatorCoreMetaRow, PersonalDbGroupCoreMetaRow,
+        personaldb_group_coremeta_put_operation, personaldb_partition_id, personaldb_payload_hash,
+        read_personaldb_data_locator_bytes, read_personaldb_data_locator_row,
+        write_personaldb_bytes_as_data_locator_with_preconditions,
+    },
     storage::Storage,
 };
 use anyhow::{Result, anyhow};
 use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hmac::{Hmac, Mac};
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
-const PERSONALDB_HEAD_REF_PREFIX: &str = "personaldb_head:";
-const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
+const PERSONALDB_HEAD_DATA_PREFIX: &str = "personaldb_head:";
+const PERSONALDB_LOG_SEGMENT_REF_PREFIX: &str = "personaldb_log_segment:";
+const PERSONALDB_SNAPSHOT_MANIFEST_REF_PREFIX: &str = "personaldb_snapshot_manifest:";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersonalDbCommittedHead {
@@ -27,7 +32,7 @@ pub struct PersonalDbCommittedHead {
     pub database_id: String,
     pub log_index: u64,
     pub log_hash: String,
-    pub segment_path: String,
+    pub segment_ref: String,
     pub row_index_generation: u64,
     pub policy_epoch: u64,
     pub membership_epoch: u64,
@@ -45,12 +50,104 @@ pub struct PersonalDbSnapshotsHead {
     pub database_id: String,
     pub latest_snapshot_log_index: u64,
     pub latest_snapshot_log_hash: String,
-    pub latest_snapshot_manifest_path: String,
+    pub latest_snapshot_manifest_ref: String,
     pub retained_snapshot_count: u32,
     pub updated_at: String,
     pub updated_by_node: String,
     pub head_hash: Option<String>,
     pub head_signature: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct PersonalDbCommittedHeadProto {
+    #[prost(uint32, tag = "1")]
+    format_version: u32,
+    #[prost(string, tag = "2")]
+    tenant_id: String,
+    #[prost(string, tag = "3")]
+    database_id: String,
+    #[prost(uint64, tag = "4")]
+    log_index: u64,
+    #[prost(string, tag = "5")]
+    log_hash: String,
+    #[prost(string, tag = "6")]
+    segment_ref: String,
+    #[prost(uint64, tag = "7")]
+    row_index_generation: u64,
+    #[prost(uint64, tag = "8")]
+    policy_epoch: u64,
+    #[prost(uint64, tag = "9")]
+    membership_epoch: u64,
+    #[prost(string, tag = "10")]
+    schema_hash: String,
+    #[prost(string, tag = "11")]
+    updated_at: String,
+    #[prost(string, tag = "12")]
+    updated_by_node: String,
+    #[prost(string, optional, tag = "13")]
+    head_hash: Option<String>,
+    #[prost(string, optional, tag = "14")]
+    head_signature: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct PersonalDbSnapshotsHeadProto {
+    #[prost(uint32, tag = "1")]
+    format_version: u32,
+    #[prost(string, tag = "2")]
+    tenant_id: String,
+    #[prost(string, tag = "3")]
+    database_id: String,
+    #[prost(uint64, tag = "4")]
+    latest_snapshot_log_index: u64,
+    #[prost(string, tag = "5")]
+    latest_snapshot_log_hash: String,
+    #[prost(string, tag = "6")]
+    latest_snapshot_manifest_ref: String,
+    #[prost(uint32, tag = "7")]
+    retained_snapshot_count: u32,
+    #[prost(string, tag = "8")]
+    updated_at: String,
+    #[prost(string, tag = "9")]
+    updated_by_node: String,
+    #[prost(string, optional, tag = "10")]
+    head_hash: Option<String>,
+    #[prost(string, optional, tag = "11")]
+    head_signature: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct PersonalDbGroupManifestProto {
+    #[prost(uint32, tag = "1")]
+    format_version: u32,
+    #[prost(string, tag = "2")]
+    tenant_id: String,
+    #[prost(string, tag = "3")]
+    database_id: String,
+    #[prost(string, tag = "4")]
+    schema_hash: String,
+    #[prost(string, tag = "5")]
+    genesis_hash: String,
+    #[prost(string, tag = "6")]
+    created_at: String,
+    #[prost(string, tag = "7")]
+    created_by: String,
+    #[prost(string, tag = "8")]
+    consistency_policy: String,
+    #[prost(uint32, tag = "9")]
+    object_layout_version: u32,
+    #[prost(uint64, tag = "10")]
+    active_membership_epoch: u64,
+    #[prost(uint64, tag = "11")]
+    active_policy_epoch: u64,
+    #[prost(uint64, tag = "12")]
+    current_row_index_generation: u64,
+    #[prost(uint64, tag = "13")]
+    current_projection_generation: u64,
+    #[prost(string, optional, tag = "14")]
+    manifest_hash: Option<String>,
+    #[prost(string, optional, tag = "15")]
+    manifest_signature: Option<String>,
 }
 
 impl PersonalDbCommittedHead {
@@ -141,14 +238,14 @@ pub fn hash_committed_head(head: &PersonalDbCommittedHead) -> Result<String> {
     let mut unsigned = head.clone();
     unsigned.head_hash = None;
     unsigned.head_signature = None;
-    Ok(hex::encode(hash32(&serde_json::to_vec(&unsigned)?)))
+    Ok(hex::encode(hash32(&unsigned.encode_record()?)))
 }
 
 pub fn hash_snapshots_head(head: &PersonalDbSnapshotsHead) -> Result<String> {
     let mut unsigned = head.clone();
     unsigned.head_hash = None;
     unsigned.head_signature = None;
-    Ok(hex::encode(hash32(&serde_json::to_vec(&unsigned)?)))
+    Ok(hex::encode(hash32(&unsigned.encode_record()?)))
 }
 
 pub async fn write_personaldb_group_manifest(
@@ -164,9 +261,9 @@ pub async fn write_personaldb_group_manifest(
         &manifest.tenant_id,
         &manifest.database_id,
     )?;
-    write_json_ref(
+    write_head_record(
         storage,
-        &personaldb_ref_name(tenant_id, &manifest.database_id, "group_manifest")?,
+        &personaldb_head_data_id(tenant_id, &manifest.database_id, "group_manifest")?,
         manifest,
     )
     .await
@@ -178,9 +275,9 @@ pub async fn read_personaldb_group_manifest(
     database_id: &str,
     signing_key: &[u8],
 ) -> Result<Option<PersonalDbGroupManifest>> {
-    let Some(manifest) = read_json_ref::<PersonalDbGroupManifest>(
+    let Some(manifest) = read_head_record::<PersonalDbGroupManifest>(
         storage,
-        &personaldb_ref_name(tenant_id, database_id, "group_manifest")?,
+        &personaldb_head_data_id(tenant_id, database_id, "group_manifest")?,
     )
     .await?
     else {
@@ -205,9 +302,9 @@ pub async fn write_personaldb_committed_head(
 ) -> Result<()> {
     head.verify(signing_key)?;
     ensure_head_scope(tenant_id, database_id, &head.tenant_id, &head.database_id)?;
-    write_json_ref(
+    write_head_record(
         storage,
-        &personaldb_ref_name(tenant_id, database_id, "committed_head")?,
+        &personaldb_head_data_id(tenant_id, database_id, "committed_head")?,
         head,
     )
     .await
@@ -223,9 +320,9 @@ pub async fn write_personaldb_committed_head_with_preconditions(
 ) -> Result<()> {
     head.verify(signing_key)?;
     ensure_head_scope(tenant_id, database_id, &head.tenant_id, &head.database_id)?;
-    write_json_ref_with_preconditions(
+    write_head_record_with_preconditions(
         storage,
-        &personaldb_ref_name(tenant_id, database_id, "committed_head")?,
+        &personaldb_head_data_id(tenant_id, database_id, "committed_head")?,
         head,
         preconditions,
     )
@@ -238,9 +335,9 @@ pub async fn read_personaldb_committed_head(
     database_id: &str,
     signing_key: &[u8],
 ) -> Result<Option<PersonalDbCommittedHead>> {
-    let Some(head) = read_json_ref::<PersonalDbCommittedHead>(
+    let Some(head) = read_head_record::<PersonalDbCommittedHead>(
         storage,
-        &personaldb_ref_name(tenant_id, database_id, "committed_head")?,
+        &personaldb_head_data_id(tenant_id, database_id, "committed_head")?,
     )
     .await?
     else {
@@ -260,9 +357,9 @@ pub async fn write_personaldb_snapshots_head(
 ) -> Result<()> {
     head.verify(signing_key)?;
     ensure_head_scope(tenant_id, database_id, &head.tenant_id, &head.database_id)?;
-    write_json_ref(
+    write_head_record(
         storage,
-        &personaldb_ref_name(tenant_id, database_id, "snapshots_head")?,
+        &personaldb_head_data_id(tenant_id, database_id, "snapshots_head")?,
         head,
     )
     .await
@@ -274,9 +371,9 @@ pub async fn read_personaldb_snapshots_head(
     database_id: &str,
     signing_key: &[u8],
 ) -> Result<Option<PersonalDbSnapshotsHead>> {
-    let Some(head) = read_json_ref::<PersonalDbSnapshotsHead>(
+    let Some(head) = read_head_record::<PersonalDbSnapshotsHead>(
         storage,
-        &personaldb_ref_name(tenant_id, database_id, "snapshots_head")?,
+        &personaldb_head_data_id(tenant_id, database_id, "snapshots_head")?,
     )
     .await?
     else {
@@ -296,13 +393,17 @@ fn validate_committed_head_unsigned(head: &PersonalDbCommittedHead) -> Result<()
     require_nonempty(&head.tenant_id, "tenant_id")?;
     require_nonempty(&head.database_id, "database_id")?;
     if head.log_index == 0 {
-        if !head.segment_path.is_empty() {
+        if !head.segment_ref.is_empty() {
             return Err(anyhow!(
-                "personaldb genesis committed head segment path must be empty"
+                "personaldb genesis committed head segment ref must be empty"
             ));
         }
     } else {
-        require_nonempty(&head.segment_path, "segment_path")?;
+        require_corestore_ref(
+            &head.segment_ref,
+            "segment_ref",
+            PERSONALDB_LOG_SEGMENT_REF_PREFIX,
+        )?;
     }
     require_nonempty(&head.updated_at, "updated_at")?;
     require_nonempty(&head.updated_by_node, "updated_by_node")?;
@@ -316,9 +417,10 @@ fn validate_snapshots_head_unsigned(head: &PersonalDbSnapshotsHead) -> Result<()
     validate_hex32(&head.latest_snapshot_log_hash, "latest_snapshot_log_hash")?;
     require_nonempty(&head.tenant_id, "tenant_id")?;
     require_nonempty(&head.database_id, "database_id")?;
-    require_nonempty(
-        &head.latest_snapshot_manifest_path,
-        "latest_snapshot_manifest_path",
+    require_corestore_ref(
+        &head.latest_snapshot_manifest_ref,
+        "latest_snapshot_manifest_ref",
+        PERSONALDB_SNAPSHOT_MANIFEST_REF_PREFIX,
     )?;
     require_nonempty(&head.updated_at, "updated_at")?;
     require_nonempty(&head.updated_by_node, "updated_by_node")?;
@@ -374,83 +476,332 @@ fn require_nonempty(value: &str, field: &'static str) -> Result<()> {
     Ok(())
 }
 
-async fn write_json_ref<T: Serialize>(storage: &Storage, ref_name: &str, value: &T) -> Result<()> {
-    write_json_ref_with_preconditions(storage, ref_name, value, Vec::new()).await
-}
-
-async fn write_json_ref_with_preconditions<T: Serialize>(
-    storage: &Storage,
-    ref_name: &str,
-    value: &T,
-    mut preconditions: Vec<CoreMutationPrecondition>,
-) -> Result<()> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let current = store.read_ref(ref_name).await?;
-    let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.to_string(),
-            bytes: serde_json::to_vec_pretty(value)?,
-            region_id: "local".to_string(),
-            mutation_id: format!("personaldb-head:{}", uuid::Uuid::new_v4().simple()),
-        })
-        .await?;
-    preconditions.push(CoreMutationPrecondition::Ref {
-        ref_name: ref_name.to_string(),
-        expected_generation: current.as_ref().map(|value| value.generation),
-        expected_target: current.as_ref().map(|value| value.target.clone()),
-        require_absent: current.is_none(),
-        require_present: current.is_some(),
-        fence: None,
-        authz_revision: None,
-        source_watch_cursor: None,
-    });
-    let partition_id = json_ref_partition_id(ref_name);
-    store
-        .commit_mutation_batch(CoreMutationBatch {
-            transaction_id: format!(
-                "personaldb-json-ref:{}:{}",
-                hex::encode(hash32(ref_name.as_bytes())),
-                uuid::Uuid::new_v4().simple()
-            ),
-            scope_partition: partition_id.clone(),
-            committed_by_principal: "personaldb-head-writer".to_string(),
-            preconditions,
-            operations: vec![CoreMutationOperation::RefUpdate {
-                partition_id,
-                ref_name: ref_name.to_string(),
-                new_target: encode_core_object_ref_target(&object_ref)?,
-            }],
-        })
-        .await?;
+fn require_corestore_ref(value: &str, field: &'static str, prefix: &str) -> Result<()> {
+    require_nonempty(value, field)?;
+    if !value.starts_with(prefix) {
+        return Err(anyhow!("{field} must be a CoreStore/CoreMeta ref"));
+    }
+    if value.contains('/') || value.contains('\\') || value.chars().any(char::is_control) {
+        return Err(anyhow!("{field} must not be a storage path"));
+    }
     Ok(())
 }
 
-fn json_ref_partition_id(ref_name: &str) -> String {
-    format!("json-ref:{}", hex::encode(hash32(ref_name.as_bytes())))
+async fn write_head_record<T: PersonalDbHeadRecordCodec>(
+    storage: &Storage,
+    data_id: &str,
+    value: &T,
+) -> Result<()> {
+    write_head_record_with_preconditions(storage, data_id, value, Vec::new()).await
 }
 
-async fn read_json_ref<T: for<'de> Deserialize<'de>>(
+async fn write_head_record_with_preconditions<T: PersonalDbHeadRecordCodec>(
     storage: &Storage,
-    ref_name: &str,
+    data_id: &str,
+    value: &T,
+    preconditions: Vec<CoreMutationPrecondition>,
+) -> Result<()> {
+    let (tenant_id, database_id) = personaldb_head_scope(data_id)?;
+    let encoded = value.encode_record()?;
+    let payload_hash = personaldb_payload_hash(&encoded);
+    let row = write_personaldb_bytes_as_data_locator_with_preconditions(
+        storage,
+        tenant_id,
+        &database_id,
+        data_id,
+        value.data_kind(),
+        value.writer_generation().max(1),
+        encoded,
+        payload_hash,
+        vec![format!("kind:{}", value.data_kind())],
+        format!("personaldb-head:{}", uuid::Uuid::new_v4().simple()),
+        &preconditions,
+    )
+    .await?;
+    if let Some(group_row) = value.group_coremeta_row(tenant_id, &database_id, &row)? {
+        CoreStore::new(storage.clone())
+            .await?
+            .commit_mutation_batch(CoreMutationBatch {
+                transaction_id: format!(
+                    "personaldb-head-group:{}:{}",
+                    group_row.group_id, group_row.generation
+                ),
+                scope_partition: personaldb_partition_id(tenant_id, &database_id),
+                committed_by_principal: "system:personaldb".to_string(),
+                preconditions,
+                operations: vec![personaldb_group_coremeta_put_operation(&group_row)?],
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+async fn read_head_record<T: PersonalDbHeadRecordCodec>(
+    storage: &Storage,
+    data_id: &str,
 ) -> Result<Option<T>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store.read_ref(ref_name).await? else {
+    let (tenant_id, database_id) = personaldb_head_scope(data_id)?;
+    let Some(row) = read_personaldb_data_locator_row(storage, tenant_id, &database_id, data_id)?
+    else {
         return Ok(None);
     };
-    let object_ref = decode_core_object_ref_target(&ref_value.target)?;
-    let bytes = store.get_blob(GetBlob { object_ref }).await?;
-    Ok(Some(serde_json::from_slice(&bytes)?))
+    if row.data_kind != T::data_kind_static() {
+        return Err(anyhow!("personaldb CoreMeta row has wrong record kind"));
+    }
+    let bytes = read_personaldb_data_locator_bytes(storage, &row).await?;
+    Ok(Some(T::decode_record(&bytes)?))
 }
 
-fn personaldb_ref_name(tenant_id: i64, database_id: &str, kind: &str) -> Result<String> {
+trait PersonalDbHeadRecordCodec: Sized {
+    fn data_kind_static() -> &'static str;
+    fn data_kind(&self) -> &'static str {
+        Self::data_kind_static()
+    }
+    fn writer_generation(&self) -> u64;
+    fn encode_record(&self) -> Result<Vec<u8>>;
+    fn decode_record(bytes: &[u8]) -> Result<Self>;
+    fn group_coremeta_row(
+        &self,
+        _tenant_id: i64,
+        _database_id: &str,
+        _locator: &PersonalDbDataLocatorCoreMetaRow,
+    ) -> Result<Option<PersonalDbGroupCoreMetaRow>> {
+        Ok(None)
+    }
+}
+
+impl PersonalDbHeadRecordCodec for PersonalDbCommittedHead {
+    fn data_kind_static() -> &'static str {
+        "committed_head"
+    }
+
+    fn writer_generation(&self) -> u64 {
+        self.log_index
+    }
+
+    fn encode_record(&self) -> Result<Vec<u8>> {
+        Ok(encode_deterministic_proto(&committed_head_to_proto(self)))
+    }
+
+    fn decode_record(bytes: &[u8]) -> Result<Self> {
+        committed_head_from_proto(decode_deterministic_proto::<PersonalDbCommittedHeadProto>(
+            bytes,
+            "personaldb committed head",
+        )?)
+    }
+}
+
+impl PersonalDbHeadRecordCodec for PersonalDbSnapshotsHead {
+    fn data_kind_static() -> &'static str {
+        "snapshots_head"
+    }
+
+    fn writer_generation(&self) -> u64 {
+        self.latest_snapshot_log_index
+    }
+
+    fn encode_record(&self) -> Result<Vec<u8>> {
+        Ok(encode_deterministic_proto(&snapshots_head_to_proto(self)))
+    }
+
+    fn decode_record(bytes: &[u8]) -> Result<Self> {
+        snapshots_head_from_proto(decode_deterministic_proto::<PersonalDbSnapshotsHeadProto>(
+            bytes,
+            "personaldb snapshots head",
+        )?)
+    }
+}
+
+impl PersonalDbHeadRecordCodec for PersonalDbGroupManifest {
+    fn data_kind_static() -> &'static str {
+        "group_manifest"
+    }
+
+    fn writer_generation(&self) -> u64 {
+        self.active_policy_epoch
+            .max(self.current_row_index_generation)
+    }
+
+    fn encode_record(&self) -> Result<Vec<u8>> {
+        Ok(encode_deterministic_proto(&group_manifest_to_proto(self)))
+    }
+
+    fn decode_record(bytes: &[u8]) -> Result<Self> {
+        group_manifest_from_proto(decode_deterministic_proto::<PersonalDbGroupManifestProto>(
+            bytes,
+            "personaldb group manifest",
+        )?)
+    }
+
+    fn group_coremeta_row(
+        &self,
+        tenant_id: i64,
+        database_id: &str,
+        locator: &PersonalDbDataLocatorCoreMetaRow,
+    ) -> Result<Option<PersonalDbGroupCoreMetaRow>> {
+        Ok(Some(PersonalDbGroupCoreMetaRow {
+            tenant_id,
+            group_id: database_id.to_string(),
+            generation: locator.generation,
+            replica_set_hash: personaldb_payload_hash(self.created_by.as_bytes()),
+            witness_policy_hash: personaldb_payload_hash(self.consistency_policy.as_bytes()),
+            latest_commit: self.genesis_hash.clone(),
+            snapshot_locator: None,
+            transaction_id: locator.transaction_id.clone(),
+            created_at_unix_nanos: locator.created_at_unix_nanos,
+        }))
+    }
+}
+
+fn committed_head_to_proto(head: &PersonalDbCommittedHead) -> PersonalDbCommittedHeadProto {
+    PersonalDbCommittedHeadProto {
+        format_version: u32::from(head.format_version),
+        tenant_id: head.tenant_id.clone(),
+        database_id: head.database_id.clone(),
+        log_index: head.log_index,
+        log_hash: head.log_hash.clone(),
+        segment_ref: head.segment_ref.clone(),
+        row_index_generation: head.row_index_generation,
+        policy_epoch: head.policy_epoch,
+        membership_epoch: head.membership_epoch,
+        schema_hash: head.schema_hash.clone(),
+        updated_at: head.updated_at.clone(),
+        updated_by_node: head.updated_by_node.clone(),
+        head_hash: head.head_hash.clone(),
+        head_signature: head.head_signature.clone(),
+    }
+}
+
+fn committed_head_from_proto(
+    proto: PersonalDbCommittedHeadProto,
+) -> Result<PersonalDbCommittedHead> {
+    Ok(PersonalDbCommittedHead {
+        format_version: u16::try_from(proto.format_version)
+            .map_err(|_| anyhow!("personaldb committed head version exceeds u16"))?,
+        tenant_id: proto.tenant_id,
+        database_id: proto.database_id,
+        log_index: proto.log_index,
+        log_hash: proto.log_hash,
+        segment_ref: proto.segment_ref,
+        row_index_generation: proto.row_index_generation,
+        policy_epoch: proto.policy_epoch,
+        membership_epoch: proto.membership_epoch,
+        schema_hash: proto.schema_hash,
+        updated_at: proto.updated_at,
+        updated_by_node: proto.updated_by_node,
+        head_hash: proto.head_hash,
+        head_signature: proto.head_signature,
+    })
+}
+
+fn snapshots_head_to_proto(head: &PersonalDbSnapshotsHead) -> PersonalDbSnapshotsHeadProto {
+    PersonalDbSnapshotsHeadProto {
+        format_version: u32::from(head.format_version),
+        tenant_id: head.tenant_id.clone(),
+        database_id: head.database_id.clone(),
+        latest_snapshot_log_index: head.latest_snapshot_log_index,
+        latest_snapshot_log_hash: head.latest_snapshot_log_hash.clone(),
+        latest_snapshot_manifest_ref: head.latest_snapshot_manifest_ref.clone(),
+        retained_snapshot_count: head.retained_snapshot_count,
+        updated_at: head.updated_at.clone(),
+        updated_by_node: head.updated_by_node.clone(),
+        head_hash: head.head_hash.clone(),
+        head_signature: head.head_signature.clone(),
+    }
+}
+
+fn snapshots_head_from_proto(
+    proto: PersonalDbSnapshotsHeadProto,
+) -> Result<PersonalDbSnapshotsHead> {
+    Ok(PersonalDbSnapshotsHead {
+        format_version: u16::try_from(proto.format_version)
+            .map_err(|_| anyhow!("personaldb snapshots head version exceeds u16"))?,
+        tenant_id: proto.tenant_id,
+        database_id: proto.database_id,
+        latest_snapshot_log_index: proto.latest_snapshot_log_index,
+        latest_snapshot_log_hash: proto.latest_snapshot_log_hash,
+        latest_snapshot_manifest_ref: proto.latest_snapshot_manifest_ref,
+        retained_snapshot_count: proto.retained_snapshot_count,
+        updated_at: proto.updated_at,
+        updated_by_node: proto.updated_by_node,
+        head_hash: proto.head_hash,
+        head_signature: proto.head_signature,
+    })
+}
+
+fn group_manifest_to_proto(manifest: &PersonalDbGroupManifest) -> PersonalDbGroupManifestProto {
+    PersonalDbGroupManifestProto {
+        format_version: u32::from(manifest.format_version),
+        tenant_id: manifest.tenant_id.clone(),
+        database_id: manifest.database_id.clone(),
+        schema_hash: manifest.schema_hash.clone(),
+        genesis_hash: manifest.genesis_hash.clone(),
+        created_at: manifest.created_at.clone(),
+        created_by: manifest.created_by.clone(),
+        consistency_policy: manifest.consistency_policy.clone(),
+        object_layout_version: u32::from(manifest.object_layout_version),
+        active_membership_epoch: manifest.active_membership_epoch,
+        active_policy_epoch: manifest.active_policy_epoch,
+        current_row_index_generation: manifest.current_row_index_generation,
+        current_projection_generation: manifest.current_projection_generation,
+        manifest_hash: manifest.manifest_hash.clone(),
+        manifest_signature: manifest.manifest_signature.clone(),
+    }
+}
+
+fn group_manifest_from_proto(
+    proto: PersonalDbGroupManifestProto,
+) -> Result<PersonalDbGroupManifest> {
+    Ok(PersonalDbGroupManifest {
+        format_version: u16::try_from(proto.format_version)
+            .map_err(|_| anyhow!("personaldb group manifest version exceeds u16"))?,
+        tenant_id: proto.tenant_id,
+        database_id: proto.database_id,
+        schema_hash: proto.schema_hash,
+        genesis_hash: proto.genesis_hash,
+        created_at: proto.created_at,
+        created_by: proto.created_by,
+        consistency_policy: proto.consistency_policy,
+        object_layout_version: u16::try_from(proto.object_layout_version)
+            .map_err(|_| anyhow!("personaldb group manifest layout version exceeds u16"))?,
+        active_membership_epoch: proto.active_membership_epoch,
+        active_policy_epoch: proto.active_policy_epoch,
+        current_row_index_generation: proto.current_row_index_generation,
+        current_projection_generation: proto.current_projection_generation,
+        manifest_hash: proto.manifest_hash,
+        manifest_signature: proto.manifest_signature,
+    })
+}
+
+fn personaldb_head_data_id(tenant_id: i64, database_id: &str, kind: &str) -> Result<String> {
+    validate_head_scope_component(tenant_id, database_id)?;
+    require_safe_component(kind, "personaldb head kind")?;
+    Ok(format!(
+        "{PERSONALDB_HEAD_DATA_PREFIX}tenant:{tenant_id}:database:{database_id}:{kind}"
+    ))
+}
+
+fn personaldb_head_scope(data_id: &str) -> Result<(i64, String)> {
+    let rest = data_id
+        .strip_prefix(PERSONALDB_HEAD_DATA_PREFIX)
+        .ok_or_else(|| anyhow!("personaldb CoreMeta head id has invalid prefix"))?;
+    let parts = rest.split(':').collect::<Vec<_>>();
+    if parts.len() != 5 || parts[0] != "tenant" || parts[2] != "database" {
+        return Err(anyhow!("personaldb CoreMeta head id has invalid shape"));
+    }
+    let tenant_id = parts[1]
+        .parse::<i64>()
+        .map_err(|_| anyhow!("personaldb CoreMeta head id tenant is invalid"))?;
+    validate_head_scope_component(tenant_id, parts[3])?;
+    require_safe_component(parts[4], "personaldb head kind")?;
+    Ok((tenant_id, parts[3].to_string()))
+}
+
+fn validate_head_scope_component(tenant_id: i64, database_id: &str) -> Result<()> {
     if tenant_id < 0 {
         return Err(anyhow!("personaldb tenant id must be nonnegative"));
     }
-    require_safe_component(database_id, "database_id")?;
-    require_safe_component(kind, "personaldb ref kind")?;
-    Ok(format!(
-        "{PERSONALDB_HEAD_REF_PREFIX}tenant:{tenant_id}:database:{database_id}:{kind}"
-    ))
+    require_safe_component(database_id, "database_id")
 }
 
 fn require_safe_component(value: &str, field: &'static str) -> Result<()> {
@@ -467,20 +818,6 @@ fn require_safe_component(value: &str, field: &'static str) -> Result<()> {
     Ok(())
 }
 
-fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
-    Ok(format!(
-        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
-    ))
-}
-
-fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
-    let encoded = target
-        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
-        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
-    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,7 +826,7 @@ mod tests {
     const KEY: &[u8] = b"personaldb head signing key";
 
     #[tokio::test]
-    async fn committed_head_round_trips_via_core_store_ref() {
+    async fn committed_head_round_trips_via_coremeta_data_locator() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let head = sample_committed_head().seal(KEY).unwrap();
@@ -498,13 +835,17 @@ mod tests {
             .await
             .unwrap();
 
-        let store = CoreStore::new(storage.clone()).await.unwrap();
+        let data_id = personaldb_head_data_id(7, "db-alpha", "committed_head").unwrap();
+        let row = read_personaldb_data_locator_row(&storage, 7, "db-alpha", &data_id)
+            .unwrap()
+            .expect("committed head CoreMeta locator row exists");
+        assert_eq!(row.data_kind, "committed_head");
+        assert_eq!(row.generation, head.log_index);
         assert!(
-            store
-                .read_ref(&personaldb_ref_name(7, "db-alpha", "committed_head").unwrap())
+            !read_personaldb_data_locator_bytes(&storage, &row)
                 .await
                 .unwrap()
-                .is_some()
+                .is_empty()
         );
 
         let read = read_personaldb_committed_head(&storage, 7, "db-alpha", KEY)
@@ -516,7 +857,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshots_head_round_trips_via_core_store_ref() {
+    async fn snapshots_head_round_trips_via_coremeta_data_locator() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let head = sample_snapshots_head().seal(KEY).unwrap();
@@ -525,14 +866,12 @@ mod tests {
             .await
             .unwrap();
 
-        let store = CoreStore::new(storage.clone()).await.unwrap();
-        assert!(
-            store
-                .read_ref(&personaldb_ref_name(7, "db-alpha", "snapshots_head").unwrap())
-                .await
-                .unwrap()
-                .is_some()
-        );
+        let data_id = personaldb_head_data_id(7, "db-alpha", "snapshots_head").unwrap();
+        let row = read_personaldb_data_locator_row(&storage, 7, "db-alpha", &data_id)
+            .unwrap()
+            .expect("snapshots head CoreMeta locator row exists");
+        assert_eq!(row.data_kind, "snapshots_head");
+        assert_eq!(row.generation, head.latest_snapshot_log_index);
 
         let read = read_personaldb_snapshots_head(&storage, 7, "db-alpha", KEY)
             .await
@@ -543,7 +882,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn group_manifest_round_trips_via_core_store_ref() {
+    async fn group_manifest_round_trips_via_coremeta_data_locator() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let manifest = sample_group_manifest().seal(KEY).unwrap();
@@ -552,14 +891,11 @@ mod tests {
             .await
             .unwrap();
 
-        let store = CoreStore::new(storage.clone()).await.unwrap();
-        assert!(
-            store
-                .read_ref(&personaldb_ref_name(7, "db-alpha", "group_manifest").unwrap())
-                .await
-                .unwrap()
-                .is_some()
-        );
+        let data_id = personaldb_head_data_id(7, "db-alpha", "group_manifest").unwrap();
+        let row = read_personaldb_data_locator_row(&storage, 7, "db-alpha", &data_id)
+            .unwrap()
+            .expect("group manifest CoreMeta locator row exists");
+        assert_eq!(row.data_kind, "group_manifest");
 
         let read = read_personaldb_group_manifest(&storage, 7, "db-alpha", KEY)
             .await
@@ -596,40 +932,28 @@ mod tests {
             .await
             .unwrap();
 
-        let store = CoreStore::new(storage.clone()).await.unwrap();
-        let ref_value = store
-            .read_ref(&personaldb_ref_name(7, "db-alpha", "committed_head").unwrap())
-            .await
+        let data_id = personaldb_head_data_id(7, "db-alpha", "committed_head").unwrap();
+        let row = read_personaldb_data_locator_row(&storage, 7, "db-alpha", &data_id)
             .unwrap()
-            .unwrap();
-        let object_ref = decode_core_object_ref_target(&ref_value.target).unwrap();
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&store.get_blob(GetBlob { object_ref }).await.unwrap()).unwrap();
-        value["log_index"] = serde_json::json!(head.log_index + 1);
-        let tampered = store
-            .put_blob(PutBlob {
-                logical_name: "personaldb-head-tamper".to_string(),
-                bytes: serde_json::to_vec_pretty(&value).unwrap(),
-                region_id: "local".to_string(),
-                mutation_id: "personaldb-head-tamper".to_string(),
-            })
+            .expect("committed head CoreMeta locator row exists");
+        let mut value = read_personaldb_data_locator_bytes(&storage, &row)
             .await
             .unwrap();
-        store
-            .compare_and_swap_ref(CompareAndSwapRef {
-                ref_name: personaldb_ref_name(7, "db-alpha", "committed_head").unwrap(),
-                expected_generation: Some(ref_value.generation),
-                expected_target: Some(ref_value.target),
-                require_absent: false,
-                require_present: true,
-                fence: None,
-                authz_revision: None,
-                source_watch_cursor: None,
-                new_target: encode_core_object_ref_target(&tampered).unwrap(),
-                transaction_id: None,
-            })
-            .await
-            .unwrap();
+        *value.last_mut().expect("stored head bytes are not empty") ^= 0x01;
+        crate::personaldb_coremeta::write_personaldb_bytes_as_data_locator(
+            &storage,
+            7,
+            "db-alpha",
+            &data_id,
+            "committed_head",
+            row.generation + 1,
+            value.clone(),
+            personaldb_payload_hash(&value),
+            vec!["kind:committed_head".to_string()],
+            "personaldb-head-tamper".to_string(),
+        )
+        .await
+        .unwrap();
 
         assert!(
             read_personaldb_committed_head(&storage, 7, "db-alpha", KEY)
@@ -659,7 +983,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(personaldb_ref_name(7, "../escape", "committed_head").is_err());
+        assert!(personaldb_head_data_id(7, "../escape", "committed_head").is_err());
     }
 
     fn sample_committed_head() -> PersonalDbCommittedHead {
@@ -669,7 +993,12 @@ mod tests {
             database_id: "db-alpha".to_string(),
             log_index: 42,
             log_hash: hex::encode([1; 32]),
-            segment_path: "_anvil/personaldb/tenants/tenant-7/groups/db-alpha/log/segments/00000000000000000001-00000000000000000042-segment.pdbseg".to_string(),
+            segment_ref: concat!(
+                "personaldb_log_segment:tenant:7:database:db-alpha:",
+                "start:00000000000000000001:end:00000000000000000042:",
+                "hash:0000000000000000000000000000000000000000000000000000000000000001"
+            )
+            .to_string(),
             row_index_generation: 3,
             policy_epoch: 5,
             membership_epoch: 8,
@@ -688,7 +1017,7 @@ mod tests {
             database_id: "db-alpha".to_string(),
             latest_snapshot_log_index: 1024,
             latest_snapshot_log_hash: hex::encode([3; 32]),
-            latest_snapshot_manifest_path: "_anvil/personaldb/tenants/tenant-7/groups/db-alpha/snapshots/manifests/00000000000000001024-state.json".to_string(),
+            latest_snapshot_manifest_ref: "personaldb_snapshot_manifest:tenant:7:database:db-alpha:log:00000000000000001024:state:0000000000000000000000000000000000000000000000000000000000000003".to_string(),
             retained_snapshot_count: 2,
             updated_at: "2026-06-27T00:00:00.000000000Z".to_string(),
             updated_by_node: "node-a".to_string(),

@@ -3,11 +3,15 @@ use anvil::anvil_api::{
     GetGitBlobByPathRequest, GetGitObjectRequest, GitPackMetadata, ListGitTreeRequest,
     PutGitPackRequest, WatchGitSourceRequest, put_git_pack_request,
 };
-use anvil::core_store::CoreStore;
+use anvil::core_store::{
+    CF_MATERIALISATION, CoreMetaStore, CoreMetaTuplePart, TABLE_WRITER_SEGMENT_ROW,
+    core_meta_tuple_key,
+};
 use anvil::formats::git::{GitHashAlgorithm, GitSourceRecord};
 use anvil::git_source_index::{GitSourceIndexWrite, write_git_source_index};
 use anvil::git_source_watch::{GitSourceWatchPayload, append_git_source_watch_record};
-use anvil_test_utils::TestCluster;
+use anvil::writer_segment_catalog::read_writer_segment_catalog_record;
+use anvil_test_utils::{shared_default_test_cluster, unique_test_name};
 use flate2::{Compression, write::ZlibEncoder};
 use futures_util::StreamExt;
 use sha1::{Digest, Sha1};
@@ -15,19 +19,30 @@ use std::io::Write;
 use std::time::Duration;
 use tonic::Request;
 
+fn writer_segment_catalog_tuple_key(family: &str, scope: &str, segment_ref: &str) -> Vec<u8> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("writer-segment"),
+        CoreMetaTuplePart::Utf8(family),
+        CoreMetaTuplePart::Utf8(scope),
+        CoreMetaTuplePart::Utf8(segment_ref),
+    ])
+    .unwrap()
+}
+
 #[tokio::test]
+// Internal-only: seeds Git source watch records directly through local storage.
 async fn test_git_source_watch_streams_snapshot_and_new_events() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
+    let repository_id = unique_test_name("repo-alpha");
 
     append_git_source_watch_record(
         &cluster.states[0].storage,
         1,
-        "repo-alpha",
+        &repository_id,
         1,
         [1; 16],
         5,
-        git_watch_payload(1),
+        git_watch_payload(&repository_id, 1),
     )
     .await
     .unwrap();
@@ -36,7 +51,7 @@ async fn test_git_source_watch_streams_snapshot_and_new_events() {
         .await
         .unwrap();
     let mut watch_req = Request::new(WatchGitSourceRequest {
-        repository_id: "repo-alpha".to_string(),
+        repository_id: repository_id.clone(),
         after_cursor_low: 0,
         after_cursor_high: 0,
     });
@@ -57,7 +72,7 @@ async fn test_git_source_watch_streams_snapshot_and_new_events() {
         .unwrap();
     assert_eq!(snapshot.cursor_low, 1);
     assert_eq!(snapshot.cursor_high, 0);
-    assert_eq!(snapshot.repository_id, "repo-alpha");
+    assert_eq!(snapshot.repository_id, repository_id);
     assert_eq!(snapshot.event_type, "index_published");
     assert_eq!(snapshot.generation, 1);
     assert_eq!(snapshot.source_hash, hex::encode([1; 32]));
@@ -81,11 +96,11 @@ async fn test_git_source_watch_streams_snapshot_and_new_events() {
     append_git_source_watch_record(
         &cluster.states[0].storage,
         1,
-        "repo-alpha",
+        &repository_id,
         2,
         [2; 16],
         6,
-        git_watch_payload(2),
+        git_watch_payload(&repository_id, 2),
     )
     .await
     .unwrap();
@@ -100,23 +115,24 @@ async fn test_git_source_watch_streams_snapshot_and_new_events() {
 }
 
 #[tokio::test]
+// Internal-only: writes the Git source index directly and mints a custom JWT.
 async fn test_git_source_query_apis_use_latest_index_and_enforce_read_authz() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    let cluster = shared_default_test_cluster().await;
+    let repository_id = unique_test_name("repo-alpha");
 
     write_git_source_index(
         &cluster.states[0].storage,
         GitSourceIndexWrite {
             tenant_id: 1,
-            repository_id: "repo-alpha",
+            repository_id: &repository_id,
             generation: 1,
             source_hash: [7; 32],
             hash_algorithm: GitHashAlgorithm::Sha1,
             records: &[
-                git_record(1, 10, "src/lib.rs", 100, 44),
-                git_record(1, 11, "src/main.rs", 200, 55),
-                git_record(1, 12, "README.md", 300, 66),
-                git_record(2, 13, "src/lib.rs", 400, 77),
+                git_record(&repository_id, 1, 10, "src/lib.rs", 100, 44),
+                git_record(&repository_id, 1, 11, "src/main.rs", 200, 55),
+                git_record(&repository_id, 1, 12, "README.md", 300, 66),
+                git_record(&repository_id, 2, 13, "src/lib.rs", 400, 77),
             ],
         },
     )
@@ -129,7 +145,7 @@ async fn test_git_source_query_apis_use_latest_index_and_enforce_read_authz() {
     let blob = client
         .get_git_blob_by_path(authorized(
             GetGitBlobByPathRequest {
-                repository_id: "repo-alpha".to_string(),
+                repository_id: repository_id.clone(),
                 commit_id: hex::encode([1_u8; 20]),
                 tree_path: "/src/lib.rs".to_string(),
             },
@@ -152,7 +168,7 @@ async fn test_git_source_query_apis_use_latest_index_and_enforce_read_authz() {
     let tree = client
         .list_git_tree(authorized(
             ListGitTreeRequest {
-                repository_id: "repo-alpha".to_string(),
+                repository_id: repository_id.clone(),
                 commit_id: hex::encode([1_u8; 20]),
                 prefix: "src".to_string(),
                 limit: 10,
@@ -173,7 +189,7 @@ async fn test_git_source_query_apis_use_latest_index_and_enforce_read_authz() {
     let object_locations = client
         .get_git_object(authorized(
             GetGitObjectRequest {
-                repository_id: "repo-alpha".to_string(),
+                repository_id: repository_id.clone(),
                 object_id: hex::encode([10_u8; 20]),
             },
             &cluster.token,
@@ -187,16 +203,12 @@ async fn test_git_source_query_apis_use_latest_index_and_enforce_read_authz() {
 
     let read_denied_token = cluster.states[0]
         .jwt_manager
-        .mint_token(
-            "watch-only".to_string(),
-            vec!["git_source:watch|repository:repo-alpha".to_string()],
-            1,
-        )
+        .mint_token("watch-only".to_string(), 1)
         .unwrap();
     let denied = client
         .get_git_object(authorized(
             GetGitObjectRequest {
-                repository_id: "repo-alpha".to_string(),
+                repository_id: repository_id.clone(),
                 object_id: hex::encode([10_u8; 20]),
             },
             &read_denied_token,
@@ -207,12 +219,13 @@ async fn test_git_source_query_apis_use_latest_index_and_enforce_read_authz() {
 }
 
 #[tokio::test]
+// Internal-only: verifies and deletes CoreMeta/catalog rows through direct
+// storage paths to assert derived index rebuild behavior.
 async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable() {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
-    cluster
-        .create_bucket("git-source-packs", "test-region-1")
-        .await;
+    let cluster = shared_default_test_cluster().await;
+    let repository_id = unique_test_name("repo-alpha");
+    let bucket_name = unique_test_name("git-source-packs");
+    cluster.create_bucket(&bucket_name, "test-region-1").await;
 
     let pack = minimal_git_pack();
     let mut client = GitSourceServiceClient::connect(cluster.grpc_addrs[0].clone())
@@ -221,8 +234,8 @@ async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable(
     let mut request = Request::new(tokio_stream::iter(vec![
         PutGitPackRequest {
             data: Some(put_git_pack_request::Data::Metadata(GitPackMetadata {
-                repository_id: "repo-alpha".to_string(),
-                bucket_name: "git-source-packs".to_string(),
+                repository_id: repository_id.clone(),
+                bucket_name: bucket_name.clone(),
             })),
         },
         PutGitPackRequest {
@@ -234,12 +247,12 @@ async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable(
         format!("Bearer {}", cluster.token).parse().unwrap(),
     );
     let response = client.put_git_pack(request).await.unwrap().into_inner();
-    assert_eq!(response.repository_id, "repo-alpha");
-    assert_eq!(response.bucket_name, "git-source-packs");
+    assert_eq!(response.repository_id, repository_id);
+    assert_eq!(response.bucket_name, bucket_name);
     assert!(
         response
             .object_key
-            .starts_with("git-source/repo-alpha/packs/")
+            .starts_with(&format!("git-source/{repository_id}/packs/"))
     );
     assert_eq!(response.generation, 1);
     assert_eq!(
@@ -250,32 +263,44 @@ async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable(
     assert_eq!(response.watch_cursor_low, 1);
     assert_eq!(response.watch_cursor_high, 0);
     assert!(response.index_path.starts_with("git_source_index:"));
-    let core_store = CoreStore::new(cluster.states[0].storage.clone())
-        .await
-        .unwrap();
+    let index_scope = format!("tenant/1/repository/{repository_id}");
     assert!(
-        core_store
-            .read_ref(&response.index_path)
-            .await
-            .unwrap()
-            .is_some()
+        read_writer_segment_catalog_record(
+            &cluster.states[0].storage,
+            "git_source_index",
+            &index_scope,
+            &response.index_path,
+        )
+        .unwrap()
+        .is_some()
     );
-    core_store
-        .delete_ref(&response.index_path, None, None, true)
-        .await
+    CoreMetaStore::open(cluster.states[0].storage.core_store_meta_path())
+        .unwrap()
+        .delete(
+            CF_MATERIALISATION,
+            TABLE_WRITER_SEGMENT_ROW,
+            &writer_segment_catalog_tuple_key(
+                "git_source_index",
+                &index_scope,
+                &response.index_path,
+            ),
+        )
         .unwrap();
     assert!(
-        core_store
-            .read_ref(&response.index_path)
-            .await
-            .unwrap()
-            .is_none()
+        read_writer_segment_catalog_record(
+            &cluster.states[0].storage,
+            "git_source_index",
+            &index_scope,
+            &response.index_path,
+        )
+        .unwrap()
+        .is_none()
     );
 
     let blob = client
         .get_git_blob_by_path(authorized(
             GetGitBlobByPathRequest {
-                repository_id: "repo-alpha".to_string(),
+                repository_id: repository_id.clone(),
                 commit_id: minimal_pack_commit_id_hex(),
                 tree_path: "README.md".to_string(),
             },
@@ -289,12 +314,15 @@ async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable(
     assert_eq!(blob.tree_path, "README.md");
     assert_eq!(blob.pack_object_version_id, response.version_id);
     assert!(
-        core_store
-            .read_ref(&response.index_path)
-            .await
-            .unwrap()
-            .is_some(),
-        "git source query must rebuild a missing derived index ref from stored pack bytes"
+        read_writer_segment_catalog_record(
+            &cluster.states[0].storage,
+            "git_source_index",
+            &index_scope,
+            &response.index_path,
+        )
+        .unwrap()
+        .is_some(),
+        "git source query must rebuild a missing derived index catalog row from stored pack bytes"
     );
 
     let s3 = cluster
@@ -302,7 +330,7 @@ async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable(
         .await;
     let got = s3
         .get_object()
-        .bucket("git-source-packs")
+        .bucket(&bucket_name)
         .key(&response.object_key)
         .send()
         .await
@@ -418,10 +446,17 @@ fn test_git_object_id(kind: TestGitKind, data: &[u8]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-fn git_record(commit: u8, object: u8, path: &str, start: u64, len: u64) -> GitSourceRecord {
+fn git_record(
+    repository_id: &str,
+    commit: u8,
+    object: u8,
+    path: &str,
+    start: u64,
+    len: u64,
+) -> GitSourceRecord {
     GitSourceRecord::new(
         GitHashAlgorithm::Sha1,
-        b"repo-alpha".to_vec(),
+        repository_id.as_bytes().to_vec(),
         vec![commit; 20],
         vec![object; 20],
         path.as_bytes().to_vec(),
@@ -432,14 +467,14 @@ fn git_record(commit: u8, object: u8, path: &str, start: u64, len: u64) -> GitSo
     .unwrap()
 }
 
-fn git_watch_payload(generation: u64) -> GitSourceWatchPayload {
+fn git_watch_payload(repository_id: &str, generation: u64) -> GitSourceWatchPayload {
     GitSourceWatchPayload {
-        repository_id: "repo-alpha".to_string(),
+        repository_id: repository_id.to_string(),
         event_type: "index_published".to_string(),
         generation,
         source_hash: hex::encode([generation as u8; 32]),
         index_path: format!(
-            "_anvil/git/tenants/tenant-1/repositories/repo-alpha/indexes/generation-{generation:020}-source.angit"
+            "_anvil/git/tenants/tenant-1/repositories/{repository_id}/indexes/generation-{generation:020}-source.angit"
         ),
         pack_object_version_id: Some("00000000-0000-0000-0000-000000000001".to_string()),
         emitted_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),

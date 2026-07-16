@@ -1,10 +1,16 @@
 use crate::{
     core_store::{
-        AppendStreamRecord, AuthzScopeRef, CompareAndSwapRef, CoreMutationBatch,
-        CoreMutationOperation, CoreMutationPrecondition, CoreObjectRef, CoreRefValue, CoreStore,
-        GetBlob, PutBlob, ReadStream, StreamAppendReceipt, StreamRecord,
+        AppendStreamRecord, AuthzScopeRef, CF_REGISTRY, CoreLogicalFileWrite, CoreMetaBatchOp,
+        CoreMetaBatchOpKind, CoreMetaStore, CoreMetaTuplePart, CoreObjectRef, CorePipelinePolicy,
+        CoreStore, CoreTraceContext, GetBlob, ReadStream, StreamAppendReceipt, StreamRecord,
+        TABLE_GATEWAY_METADATA_ROW, WriteLogicalFileRequest, core_meta_committed_row_common,
+        core_meta_root_key_hash, core_meta_tuple_key, core_object_ref_from_logical_file_write,
+        decode_deterministic_proto, encode_deterministic_proto,
     },
-    formats::hash32,
+    formats::{
+        hash32,
+        writer::{WriterFamily, canonical_logical_file_id},
+    },
     storage::Storage,
 };
 use anyhow::{Result, anyhow, bail};
@@ -12,16 +18,14 @@ use argon2::Argon2;
 use argon2::password_hash::{
     PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng,
 };
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
-const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 const GATEWAY_REPOSITORY_SCHEMA: &str = "anvil.gateway.repository.v1";
 const GATEWAY_BLOB_SCHEMA: &str = "anvil.gateway.blob.v1";
 const GATEWAY_TAG_SCHEMA: &str = "anvil.gateway.tag.v1";
@@ -30,6 +34,14 @@ const GATEWAY_CREDENTIAL_SCHEMA: &str = "anvil.gateway.credential.v1";
 const GATEWAY_MOUNT_SCHEMA: &str = "anvil.gateway.mount.v1";
 const GATEWAY_AUDIT_SCHEMA: &str = "anvil.gateway.audit.v1";
 const GATEWAY_ACCESS_TOKEN_KIND: &str = "anvil.gateway.access_token.v1";
+const GATEWAY_METADATA_ROW_SCHEMA: &str = "anvil.gateway.coremeta_record.v1";
+const GATEWAY_ROW_REPOSITORY: &str = "repository";
+const GATEWAY_ROW_BLOB: &str = "blob";
+const GATEWAY_ROW_TAG: &str = "tag";
+const GATEWAY_ROW_UPLOAD_SESSION: &str = "upload_session";
+const GATEWAY_ROW_UPLOAD_IDEMPOTENCY: &str = "upload_idempotency";
+const GATEWAY_ROW_CREDENTIAL: &str = "credential";
+const GATEWAY_ROW_MOUNT: &str = "mount";
 pub const GATEWAY_CREDENTIAL_CACHE_TTL_SECONDS: i64 = 60;
 pub const GATEWAY_ACCESS_TOKEN_MAX_TTL_SECONDS: i64 = 900;
 const REGIONAL_GATEWAY_SUFFIX: &str = ".anvil-storage.com";
@@ -171,7 +183,7 @@ pub enum GatewayMountMatchKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayMountResolution {
     pub record: GatewayMountRecord,
-    pub ref_generation: u64,
+    pub row_generation: u64,
     pub matched_host: String,
     pub matched_path_prefix: String,
     pub match_kind: GatewayMountMatchKind,
@@ -278,7 +290,8 @@ pub fn normalize_gateway_identifier(input: &str, label: &str) -> Result<String> 
         if matches!(
             lower.as_str(),
             "_anvil"
-                | "_core"
+                | "corestore"
+                | "admission"
                 | "_system"
                 | "_authz"
                 | "_credentials"
@@ -326,8 +339,9 @@ pub async fn create_gateway_repository(
         record_hash: String::new(),
     };
     record.record_hash = hash_record(&record)?;
-    put_record_ref(
+    put_record_row(
         storage,
+        GATEWAY_ROW_REPOSITORY,
         &gateway_repository_ref_name(&record)?,
         &record,
         true,
@@ -345,12 +359,17 @@ pub async fn read_gateway_repository(
     repository: &str,
 ) -> Result<Option<GatewayRepositoryRecord>> {
     let key = GatewayRepositoryKey::new(tenant_id, gateway, registry_instance_id, repository)?;
-    let Some(record) = read_record_ref::<GatewayRepositoryRecord>(storage, &key.ref_name()).await?
+    let Some(row) = read_record_row::<GatewayRepositoryRecord>(
+        storage,
+        GATEWAY_ROW_REPOSITORY,
+        &key.ref_name(),
+    )
+    .await?
     else {
         return Ok(None);
     };
-    validate_repository_record(&record, &key)?;
-    Ok(Some(record))
+    validate_repository_record(&row.record, &key)?;
+    Ok(Some(row.record))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -383,29 +402,31 @@ pub async fn put_gateway_blob(
         &repository,
         digest,
     )?;
-    if let Some(existing) = read_record_ref::<GatewayBlobRecord>(storage, &ref_name).await? {
+    if let Some(existing) =
+        read_record_row::<GatewayBlobRecord>(storage, GATEWAY_ROW_BLOB, &ref_name).await?
+    {
         validate_blob_record(
-            &existing,
+            &existing.record,
             tenant_id,
             &gateway,
             &registry_instance_id,
             &repository,
             digest,
         )?;
-        return Ok(existing);
+        return Ok(existing.record);
     }
 
     let store = CoreStore::new(storage.clone()).await?;
-    let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.clone(),
-            bytes: bytes.to_vec(),
-            region_id: "local".to_string(),
-            mutation_id: format!(
-                "gateway-blob:{tenant_id}:{gateway}:{registry_instance_id}:{repository}:{digest}"
-            ),
-        })
-        .await?;
+    let payload_write = write_gateway_logical_file_with_locator(
+        &store,
+        WriterFamily::Registry.as_str(),
+        1,
+        ref_name.clone(),
+        bytes.to_vec(),
+        format!("gateway-blob:{tenant_id}:{gateway}:{registry_instance_id}:{repository}:{digest}"),
+    )
+    .await?;
+    let object_ref = core_object_ref_from_logical_file_write(&payload_write);
     let mut record = GatewayBlobRecord {
         schema: GATEWAY_BLOB_SCHEMA.to_string(),
         tenant_id,
@@ -421,7 +442,8 @@ pub async fn put_gateway_blob(
         record_hash: String::new(),
     };
     record.record_hash = hash_record(&record)?;
-    put_record_ref(storage, &ref_name, &record, true, None).await?;
+    coremeta::write_registry_blob_locator_row(storage, &record, &payload_write.locator).await?;
+    put_record_row(storage, GATEWAY_ROW_BLOB, &ref_name, &record, true, None).await?;
     Ok(record)
 }
 
@@ -444,9 +466,12 @@ pub async fn read_gateway_blob(
         &repository,
         digest,
     )?;
-    let Some(record) = read_record_ref::<GatewayBlobRecord>(storage, &ref_name).await? else {
+    let Some(row) =
+        read_record_row::<GatewayBlobRecord>(storage, GATEWAY_ROW_BLOB, &ref_name).await?
+    else {
         return Ok(None);
     };
+    let record = row.record;
     validate_blob_record(
         &record,
         tenant_id,
@@ -500,10 +525,27 @@ pub async fn update_gateway_tag(
     };
     record.record_hash = hash_record(&record)?;
     let ref_name = gateway_tag_ref_name(&record)?;
-    let receipt = put_record_ref(storage, &ref_name, &record, false, expected_generation).await?;
+    let blob = coremeta::read_registry_blob_locator_row(
+        storage,
+        tenant_id,
+        &record.gateway,
+        &record.registry_instance_id,
+        &record.target_digest,
+    )?
+    .ok_or_else(|| anyhow!("registry tag target blob is missing CoreMeta locator row"))?;
+    let row = put_record_row(
+        storage,
+        GATEWAY_ROW_TAG,
+        &ref_name,
+        &record,
+        false,
+        expected_generation,
+    )
+    .await?;
+    coremeta::write_registry_version_row_for_tag(storage, &record, &blob, row.generation).await?;
     Ok(GatewayTagUpdateReceipt {
         record,
-        generation: receipt.generation,
+        generation: row.generation,
     })
 }
 
@@ -514,7 +556,7 @@ pub async fn read_gateway_tag(
     registry_instance_id: &str,
     repository: &str,
     tag: &str,
-) -> Result<Option<(GatewayTagRecord, CoreRefValue)>> {
+) -> Result<Option<(GatewayTagRecord, GatewayStoredHandle)>> {
     let gateway = normalize_gateway_identifier(gateway, "gateway")?;
     let registry_instance_id = normalize_gateway_identifier(registry_instance_id, "registry")?;
     let repository = normalize_gateway_identifier(repository, "repository")?;
@@ -526,16 +568,13 @@ pub async fn read_gateway_tag(
         &repository,
         &tag,
     )?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store.read_ref(&ref_name).await? else {
+    let Some(row) =
+        read_record_row::<GatewayTagRecord>(storage, GATEWAY_ROW_TAG, &ref_name).await?
+    else {
         return Ok(None);
     };
-    let bytes = store
-        .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
-        })
-        .await?;
-    let record: GatewayTagRecord = serde_json::from_slice(&bytes)?;
+    let stored_handle = row.stored_handle();
+    let record = row.record;
     validate_tag_record(
         &record,
         tenant_id,
@@ -544,7 +583,7 @@ pub async fn read_gateway_tag(
         &repository,
         &tag,
     )?;
-    Ok(Some((record, ref_value)))
+    Ok(Some((record, stored_handle)))
 }
 
 pub async fn create_gateway_upload_session(
@@ -577,21 +616,25 @@ pub async fn create_gateway_upload_session(
         &repository,
         &idempotency_key_hash,
     )?;
-    let store = CoreStore::new(storage.clone()).await?;
-    if let Some(ref_value) = store.read_ref(&idempotency_ref_name).await? {
-        let record = read_upload_session_from_ref_value(&store, &ref_value).await?;
+    if let Some(existing) = read_record_row::<GatewayUploadSessionRecord>(
+        storage,
+        GATEWAY_ROW_UPLOAD_IDEMPOTENCY,
+        &idempotency_ref_name,
+    )
+    .await?
+    {
         validate_upload_session_record(
-            &record,
+            &existing.record,
             tenant_id,
             &gateway,
             &registry_instance_id,
             &repository,
-            &record.upload_id,
+            &existing.record.upload_id,
         )?;
-        if record.expected_digest.as_deref() != expected_digest {
+        if existing.record.expected_digest.as_deref() != expected_digest {
             bail!("gateway upload session idempotency target mismatch");
         }
-        return Ok(record);
+        return Ok(existing.record);
     }
 
     let upload_id = Uuid::new_v4().simple().to_string();
@@ -616,84 +659,24 @@ pub async fn create_gateway_upload_session(
         record_hash: String::new(),
     };
     record.record_hash = hash_record(&record)?;
-    let session_ref_name = gateway_upload_ref_name(&record)?;
-    let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: session_ref_name.clone(),
-            bytes: serde_json::to_vec_pretty(&record)?,
-            region_id: "local".to_string(),
-            mutation_id: format!(
-                "gateway-upload-start:{}:{}",
-                session_ref_name,
-                Uuid::new_v4().simple()
-            ),
-        })
-        .await?;
-    let receipt = store
-        .commit_mutation_batch(CoreMutationBatch {
-            transaction_id: format!(
-                "gateway-upload-start:{}:{}",
-                session_ref_name,
-                Uuid::new_v4().simple()
-            ),
-            scope_partition: gateway_partition_id(
-                record.tenant_id,
-                &record.gateway,
-                &record.registry_instance_id,
-                &record.repository,
-            ),
-            committed_by_principal: record.started_by_principal.clone(),
-            preconditions: vec![
-                CoreMutationPrecondition::Ref {
-                    ref_name: session_ref_name.clone(),
-                    expected_generation: None,
-                    expected_target: None,
-                    require_absent: true,
-                    require_present: false,
-                    fence: None,
-                    authz_revision: None,
-                    source_watch_cursor: None,
-                },
-                CoreMutationPrecondition::Ref {
-                    ref_name: idempotency_ref_name.clone(),
-                    expected_generation: None,
-                    expected_target: None,
-                    require_absent: true,
-                    require_present: false,
-                    fence: None,
-                    authz_revision: None,
-                    source_watch_cursor: None,
-                },
-            ],
-            operations: vec![
-                CoreMutationOperation::RefUpdate {
-                    partition_id: gateway_partition_id(
-                        record.tenant_id,
-                        &record.gateway,
-                        &record.registry_instance_id,
-                        &record.repository,
-                    ),
-                    ref_name: session_ref_name,
-                    new_target: encode_core_object_ref_target(&object_ref)?,
-                },
-                CoreMutationOperation::RefUpdate {
-                    partition_id: gateway_partition_id(
-                        record.tenant_id,
-                        &record.gateway,
-                        &record.registry_instance_id,
-                        &record.repository,
-                    ),
-                    ref_name: idempotency_ref_name.clone(),
-                    new_target: encode_core_object_ref_target(&object_ref)?,
-                },
-            ],
-        })
-        .await;
-    if let Err(error) = receipt {
-        if let Some(ref_value) = store.read_ref(&idempotency_ref_name).await? {
-            let existing = read_upload_session_from_ref_value(&store, &ref_value).await?;
-            if existing.expected_digest.as_deref() == expected_digest {
-                return Ok(existing);
+    let session_handle_name = gateway_upload_ref_name(&record)?;
+    if let Err(error) = put_upload_session_start_rows(
+        storage,
+        &session_handle_name,
+        &idempotency_ref_name,
+        &record,
+    )
+    .await
+    {
+        if let Some(existing) = read_record_row::<GatewayUploadSessionRecord>(
+            storage,
+            GATEWAY_ROW_UPLOAD_IDEMPOTENCY,
+            &idempotency_ref_name,
+        )
+        .await?
+        {
+            if existing.record.expected_digest.as_deref() == expected_digest {
+                return Ok(existing.record);
             }
         }
         return Err(error);
@@ -709,7 +692,7 @@ pub async fn read_gateway_upload_session(
     registry_instance_id: &str,
     repository: &str,
     upload_id: &str,
-) -> Result<Option<(GatewayUploadSessionRecord, CoreRefValue)>> {
+) -> Result<Option<(GatewayUploadSessionRecord, GatewayStoredHandle)>> {
     let gateway = normalize_gateway_identifier(gateway, "gateway")?;
     let registry_instance_id = normalize_gateway_identifier(registry_instance_id, "registry")?;
     let repository = normalize_gateway_identifier(repository, "repository")?;
@@ -721,16 +704,17 @@ pub async fn read_gateway_upload_session(
         &repository,
         &upload_id,
     )?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store.read_ref(&ref_name).await? else {
+    let Some(row) = read_record_row::<GatewayUploadSessionRecord>(
+        storage,
+        GATEWAY_ROW_UPLOAD_SESSION,
+        &ref_name,
+    )
+    .await?
+    else {
         return Ok(None);
     };
-    let bytes = store
-        .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
-        })
-        .await?;
-    let record: GatewayUploadSessionRecord = serde_json::from_slice(&bytes)?;
+    let stored_handle = row.stored_handle();
+    let record = row.record;
     validate_upload_session_record(
         &record,
         tenant_id,
@@ -739,7 +723,7 @@ pub async fn read_gateway_upload_session(
         &repository,
         &upload_id,
     )?;
-    Ok(Some((record, ref_value)))
+    Ok(Some((record, stored_handle)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -751,7 +735,7 @@ pub async fn abort_gateway_upload_session(
     repository: &str,
     upload_id: &str,
 ) -> Result<GatewayUploadSessionReceipt> {
-    let Some((mut record, ref_value)) = read_gateway_upload_session(
+    let Some((mut record, stored_handle)) = read_gateway_upload_session(
         storage,
         tenant_id,
         gateway,
@@ -768,22 +752,23 @@ pub async fn abort_gateway_upload_session(
             record.state = GatewayUploadSessionState::Aborted;
             record.record_hash.clear();
             record.record_hash = hash_record(&record)?;
-            let receipt = put_record_ref(
+            let row = put_record_row(
                 storage,
+                GATEWAY_ROW_UPLOAD_SESSION,
                 &gateway_upload_ref_name(&record)?,
                 &record,
                 false,
-                Some(ref_value.generation),
+                Some(stored_handle.generation),
             )
             .await?;
             Ok(GatewayUploadSessionReceipt {
                 record,
-                generation: receipt.generation,
+                generation: row.generation,
             })
         }
         GatewayUploadSessionState::Aborted => Ok(GatewayUploadSessionReceipt {
             record,
-            generation: ref_value.generation,
+            generation: stored_handle.generation,
         }),
         GatewayUploadSessionState::Committed
         | GatewayUploadSessionState::Expired
@@ -802,7 +787,7 @@ pub async fn expire_gateway_upload_session(
     repository: &str,
     upload_id: &str,
 ) -> Result<GatewayUploadSessionReceipt> {
-    let Some((mut record, ref_value)) = read_gateway_upload_session(
+    let Some((mut record, stored_handle)) = read_gateway_upload_session(
         storage,
         tenant_id,
         gateway,
@@ -817,7 +802,7 @@ pub async fn expire_gateway_upload_session(
     match record.state {
         GatewayUploadSessionState::Expired => Ok(GatewayUploadSessionReceipt {
             record,
-            generation: ref_value.generation,
+            generation: stored_handle.generation,
         }),
         GatewayUploadSessionState::Open | GatewayUploadSessionState::Receiving
             if is_upload_session_expired(&record)? =>
@@ -825,17 +810,18 @@ pub async fn expire_gateway_upload_session(
             record.state = GatewayUploadSessionState::Expired;
             record.record_hash.clear();
             record.record_hash = hash_record(&record)?;
-            let receipt = put_record_ref(
+            let row = put_record_row(
                 storage,
+                GATEWAY_ROW_UPLOAD_SESSION,
                 &gateway_upload_ref_name(&record)?,
                 &record,
                 false,
-                Some(ref_value.generation),
+                Some(stored_handle.generation),
             )
             .await?;
             Ok(GatewayUploadSessionReceipt {
                 record,
-                generation: receipt.generation,
+                generation: row.generation,
             })
         }
         GatewayUploadSessionState::Open | GatewayUploadSessionState::Receiving => {
@@ -862,7 +848,7 @@ pub async fn append_gateway_upload_part(
     bytes: &[u8],
     idempotency_key: &str,
 ) -> Result<GatewayUploadSessionReceipt> {
-    let Some((mut record, ref_value)) = read_gateway_upload_session(
+    let Some((mut record, stored_handle)) = read_gateway_upload_session(
         storage,
         tenant_id,
         gateway,
@@ -878,17 +864,18 @@ pub async fn append_gateway_upload_part(
         record.state = GatewayUploadSessionState::Expired;
         record.record_hash.clear();
         record.record_hash = hash_record(&record)?;
-        let receipt = put_record_ref(
+        let row = put_record_row(
             storage,
+            GATEWAY_ROW_UPLOAD_SESSION,
             &gateway_upload_ref_name(&record)?,
             &record,
             false,
-            Some(ref_value.generation),
+            Some(stored_handle.generation),
         )
         .await?;
         return Ok(GatewayUploadSessionReceipt {
             record,
-            generation: receipt.generation,
+            generation: row.generation,
         });
     }
     if !matches!(
@@ -915,7 +902,7 @@ pub async fn append_gateway_upload_part(
         {
             return Ok(GatewayUploadSessionReceipt {
                 record,
-                generation: ref_value.generation,
+                generation: stored_handle.generation,
             });
         }
         bail!("gateway upload part idempotency conflict");
@@ -935,20 +922,21 @@ pub async fn append_gateway_upload_part(
     }
 
     let store = CoreStore::new(storage.clone()).await?;
-    let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: format!(
-                "gateway_upload_part:tenant:{tenant_id}:gateway:{}:registry:{}:repository:{}:upload:{}:part:{part_id}",
-                record.gateway, record.registry_instance_id, record.repository, record.upload_id
-            ),
-            bytes: bytes.to_vec(),
-            region_id: "local".to_string(),
-            mutation_id: format!(
-                "gateway-upload-part:{tenant_id}:{}:{}:{}:{}:{part_id}:{idempotency_key_hash}",
-                record.gateway, record.registry_instance_id, record.repository, record.upload_id
-            ),
-        })
-        .await?;
+    let object_ref = write_gateway_logical_file(
+        &store,
+        WriterFamily::Registry.as_str(),
+        record.staged_parts.len() as u64 + 1,
+        format!(
+            "gateway_upload_part:tenant:{tenant_id}:gateway:{}:registry:{}:repository:{}:upload:{}:part:{part_id}",
+            record.gateway, record.registry_instance_id, record.repository, record.upload_id
+        ),
+        bytes.to_vec(),
+        format!(
+            "gateway-upload-part:{tenant_id}:{}:{}:{}:{}:{part_id}:{idempotency_key_hash}",
+            record.gateway, record.registry_instance_id, record.repository, record.upload_id
+        ),
+    )
+    .await?;
     record.staged_parts.push(GatewayUploadPartRecord {
         schema: "anvil.gateway.upload_part.v1".to_string(),
         session_id: record.upload_id.clone(),
@@ -966,17 +954,18 @@ pub async fn append_gateway_upload_part(
     record.state = GatewayUploadSessionState::Receiving;
     record.record_hash.clear();
     record.record_hash = hash_record(&record)?;
-    let receipt = put_record_ref(
+    let row = put_record_row(
         storage,
+        GATEWAY_ROW_UPLOAD_SESSION,
         &gateway_upload_ref_name(&record)?,
         &record,
         false,
-        Some(ref_value.generation),
+        Some(stored_handle.generation),
     )
     .await?;
     Ok(GatewayUploadSessionReceipt {
         record,
-        generation: receipt.generation,
+        generation: row.generation,
     })
 }
 
@@ -992,7 +981,7 @@ pub async fn finalise_gateway_upload_session(
     media_type: &str,
     committed_by_principal: &str,
 ) -> Result<GatewayBlobRecord> {
-    let Some((session, session_ref)) = read_gateway_upload_session(
+    let Some((session, session_handle)) = read_gateway_upload_session(
         storage,
         tenant_id,
         gateway,
@@ -1081,30 +1070,40 @@ pub async fn finalise_gateway_upload_session(
         &repository,
         &target_digest,
     )?;
-    if let Some(existing) = read_record_ref::<GatewayBlobRecord>(storage, &blob_ref_name).await? {
+    if let Some(existing) =
+        read_record_row::<GatewayBlobRecord>(storage, GATEWAY_ROW_BLOB, &blob_ref_name).await?
+    {
         validate_blob_record(
-            &existing,
+            &existing.record,
             tenant_id,
             &gateway,
             &registry_instance_id,
             &repository,
             &target_digest,
         )?;
-        return commit_upload_session_record(store, session, session_ref, &target_digest, None)
-            .await
-            .map(|_| existing);
+        return commit_upload_session_record(
+            storage,
+            session,
+            session_handle,
+            &target_digest,
+            None,
+        )
+        .await
+        .map(|_| existing.record);
     }
 
-    let payload_ref = store
-        .put_blob(PutBlob {
-            logical_name: blob_ref_name.clone(),
-            bytes: payload,
-            region_id: "local".to_string(),
-            mutation_id: format!(
-                "gateway-upload-finalise:{tenant_id}:{gateway}:{registry_instance_id}:{repository}:{target_digest}"
-            ),
-        })
-        .await?;
+    let payload_write = write_gateway_logical_file_with_locator(
+        &store,
+        WriterFamily::Registry.as_str(),
+        1,
+        blob_ref_name.clone(),
+        payload,
+        format!(
+            "gateway-upload-finalise:{tenant_id}:{gateway}:{registry_instance_id}:{repository}:{target_digest}"
+        ),
+    )
+    .await?;
+    let payload_ref = core_object_ref_from_logical_file_write(&payload_write);
     let mut blob_record = GatewayBlobRecord {
         schema: GATEWAY_BLOB_SCHEMA.to_string(),
         tenant_id,
@@ -1120,23 +1119,14 @@ pub async fn finalise_gateway_upload_session(
         record_hash: String::new(),
     };
     blob_record.record_hash = hash_record(&blob_record)?;
-    let blob_record_ref = store
-        .put_blob(PutBlob {
-            logical_name: blob_ref_name.clone(),
-            bytes: serde_json::to_vec_pretty(&blob_record)?,
-            region_id: "local".to_string(),
-            mutation_id: format!(
-                "gateway-blob-record:{blob_ref_name}:{}",
-                Uuid::new_v4().simple()
-            ),
-        })
+    coremeta::write_registry_blob_locator_row(storage, &blob_record, &payload_write.locator)
         .await?;
     commit_upload_session_record(
-        store,
+        storage,
         session,
-        session_ref,
+        session_handle,
         &target_digest,
-        Some((blob_ref_name, blob_record_ref)),
+        Some((blob_ref_name, blob_record.clone())),
     )
     .await?;
     Ok(blob_record)
@@ -1151,8 +1141,16 @@ pub async fn put_gateway_credential_record(
     validate_credential_record_shape(&record)?;
     record.record_hash = hash_record(&record)?;
     let ref_name = gateway_credential_ref_name(&record)?;
-    let receipt = put_record_ref(storage, &ref_name, &record, false, expected_generation).await?;
-    Ok(receipt.generation)
+    let row = put_record_row(
+        storage,
+        GATEWAY_ROW_CREDENTIAL,
+        &ref_name,
+        &record,
+        false,
+        expected_generation,
+    )
+    .await?;
+    Ok(row.generation)
 }
 
 pub async fn read_gateway_credential_record(
@@ -1160,20 +1158,18 @@ pub async fn read_gateway_credential_record(
     tenant_id: i64,
     gateway: &str,
     credential_id: &str,
-) -> Result<Option<(GatewayCredentialRecord, CoreRefValue)>> {
+) -> Result<Option<(GatewayCredentialRecord, GatewayStoredHandle)>> {
     let gateway = normalize_gateway_identifier(gateway, "gateway")?;
     let credential_id = normalize_gateway_identifier(credential_id, "credential id")?;
     let ref_name = gateway_credential_ref_name_parts(tenant_id, &gateway, &credential_id)?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store.read_ref(&ref_name).await? else {
+    let Some(row) =
+        read_record_row::<GatewayCredentialRecord>(storage, GATEWAY_ROW_CREDENTIAL, &ref_name)
+            .await?
+    else {
         return Ok(None);
     };
-    let bytes = store
-        .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
-        })
-        .await?;
-    let record: GatewayCredentialRecord = serde_json::from_slice(&bytes)?;
+    let stored_handle = row.stored_handle();
+    let record = row.record;
     if record.tenant_id != tenant_id
         || record.gateway != gateway
         || record.credential_id != credential_id
@@ -1181,7 +1177,7 @@ pub async fn read_gateway_credential_record(
         bail!("gateway credential record scope mismatch");
     }
     validate_credential_record_shape(&record)?;
-    Ok(Some((record, ref_value)))
+    Ok(Some((record, stored_handle)))
 }
 
 pub async fn revoke_gateway_credential_record(
@@ -1191,7 +1187,7 @@ pub async fn revoke_gateway_credential_record(
     credential_id: &str,
     expected_generation: u64,
 ) -> Result<u64> {
-    let Some((mut record, _ref_value)) =
+    let Some((mut record, _stored_handle)) =
         read_gateway_credential_record(storage, tenant_id, gateway, credential_id).await?
     else {
         bail!("gateway credential record not found");
@@ -1238,7 +1234,7 @@ pub async fn issue_gateway_access_token(
     if actions.is_empty() {
         bail!("gateway token requires at least one action");
     }
-    let Some((credential, ref_value)) =
+    let Some((credential, stored_handle)) =
         read_gateway_credential_record(storage, tenant_id, &gateway, &credential_id).await?
     else {
         bail!("gateway credential not found");
@@ -1259,7 +1255,7 @@ pub async fn issue_gateway_access_token(
         actions,
         subject_principal: credential.subject_principal,
         credential_id,
-        credential_generation: ref_value.generation,
+        credential_generation: stored_handle.generation,
         iat: now,
         exp: (now + ttl) as usize,
         jti: Uuid::new_v4().to_string(),
@@ -1309,7 +1305,7 @@ pub async fn validate_gateway_access_token(
         }
     }
 
-    let Some((credential, ref_value)) = read_gateway_credential_record(
+    let Some((credential, stored_handle)) = read_gateway_credential_record(
         storage,
         claims.tenant_id,
         &claims.gateway,
@@ -1319,7 +1315,7 @@ pub async fn validate_gateway_access_token(
     else {
         bail!("gateway credential not found");
     };
-    if ref_value.generation != claims.credential_generation
+    if stored_handle.generation != claims.credential_generation
         || credential.subject_principal != claims.subject_principal
     {
         bail!("gateway credential changed after token issue");
@@ -1340,31 +1336,36 @@ pub async fn put_gateway_mount_record(
     validate_mount_record_shape(&record)?;
     record.record_hash = hash_record(&record)?;
     let ref_name = gateway_mount_ref_name(&record)?;
-    let receipt = put_record_ref(storage, &ref_name, &record, false, expected_generation).await?;
-    Ok(receipt.generation)
+    let row = put_record_row(
+        storage,
+        GATEWAY_ROW_MOUNT,
+        &ref_name,
+        &record,
+        false,
+        expected_generation,
+    )
+    .await?;
+    Ok(row.generation)
 }
 
 pub async fn read_gateway_mount_record(
     storage: &Storage,
     mount_id: &str,
-) -> Result<Option<(GatewayMountRecord, CoreRefValue)>> {
+) -> Result<Option<(GatewayMountRecord, GatewayStoredHandle)>> {
     let mount_id = normalize_gateway_identifier(mount_id, "mount id")?;
     let ref_name = gateway_mount_ref_name_parts(&mount_id)?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store.read_ref(&ref_name).await? else {
+    let Some(row) =
+        read_record_row::<GatewayMountRecord>(storage, GATEWAY_ROW_MOUNT, &ref_name).await?
+    else {
         return Ok(None);
     };
-    let bytes = store
-        .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
-        })
-        .await?;
-    let record: GatewayMountRecord = serde_json::from_slice(&bytes)?;
+    let stored_handle = row.stored_handle();
+    let record = row.record;
     if record.mount_id != mount_id {
         bail!("gateway mount record scope mismatch");
     }
     validate_mount_record_shape(&record)?;
-    Ok(Some((record, ref_value)))
+    Ok(Some((record, stored_handle)))
 }
 
 pub async fn resolve_gateway_mount(
@@ -1429,7 +1430,7 @@ pub async fn append_gateway_audit_record(
             if stream.idempotency_key_hash.as_deref() != Some(idempotency_key_hash.as_str()) {
                 continue;
             }
-            let existing: GatewayAuditRecord = serde_json::from_slice(&stream.payload)?;
+            let existing: GatewayAuditRecord = decode_gateway_record(&stream.payload)?;
             validate_gateway_audit_record(&existing)?;
             if record.created_at.is_empty() {
                 record.created_at = existing.created_at.clone();
@@ -1462,7 +1463,9 @@ pub async fn append_gateway_audit_record(
             stream_id,
             partition_id,
             record_kind: GATEWAY_AUDIT_SCHEMA.to_string(),
-            payload: serde_json::to_vec(&record)?,
+            payload: encode_gateway_record(&record)?,
+            content_type: None,
+            user_metadata_json: "{}".to_string(),
             fence: None,
             transaction_id: None,
             idempotency_key: idempotency_key.map(str::to_string),
@@ -1495,7 +1498,7 @@ pub async fn read_gateway_audit_records(
         if stream.record_kind != GATEWAY_AUDIT_SCHEMA {
             bail!("gateway audit stream contains unexpected record kind");
         }
-        let audit: GatewayAuditRecord = serde_json::from_slice(&stream.payload)?;
+        let audit: GatewayAuditRecord = decode_gateway_record(&stream.payload)?;
         if audit.tenant_id != tenant_id
             || audit.gateway != gateway
             || audit.registry_instance_id != registry_instance_id
@@ -1510,34 +1513,25 @@ pub async fn read_gateway_audit_records(
 
 async fn list_gateway_mount_records(
     storage: &Storage,
-) -> Result<Vec<(GatewayMountRecord, CoreRefValue)>> {
-    let store = CoreStore::new(storage.clone()).await?;
+) -> Result<Vec<(GatewayMountRecord, GatewayStoredHandle)>> {
     let mut mounts = Vec::new();
-    for ref_name in store.list_ref_names("gateway_mount:mount:").await? {
-        let Some(ref_value) = store.read_ref(&ref_name).await? else {
-            continue;
-        };
-        let bytes = store
-            .get_blob(GetBlob {
-                object_ref: decode_core_object_ref_target(&ref_value.target)?,
-            })
-            .await?;
-        let record: GatewayMountRecord = serde_json::from_slice(&bytes)?;
-        validate_mount_record_shape(&record)?;
-        mounts.push((record, ref_value));
+    for row in list_record_rows::<GatewayMountRecord>(storage, GATEWAY_ROW_MOUNT).await? {
+        validate_mount_record_shape(&row.record)?;
+        let stored_handle = row.stored_handle();
+        mounts.push((row.record, stored_handle));
     }
     Ok(mounts)
 }
 
 fn best_gateway_mount_match(
-    mounts: &[(GatewayMountRecord, CoreRefValue)],
+    mounts: &[(GatewayMountRecord, GatewayStoredHandle)],
     host: &str,
     path: &str,
     match_kind: GatewayMountMatchKind,
 ) -> Option<GatewayMountResolution> {
     mounts
         .iter()
-        .filter_map(|(record, ref_value)| {
+        .filter_map(|(record, stored_handle)| {
             if record.state != GatewayMountState::Active {
                 return None;
             }
@@ -1567,7 +1561,7 @@ fn best_gateway_mount_match(
             };
             Some(GatewayMountResolution {
                 record: record.clone(),
-                ref_generation: ref_value.generation,
+                row_generation: stored_handle.generation,
                 matched_host: host.to_string(),
                 matched_path_prefix: matched_prefix,
                 match_kind,
@@ -1604,1497 +1598,106 @@ fn path_style_gateway_prefix(record: &GatewayMountRecord) -> String {
 }
 
 async fn commit_upload_session_record(
-    store: CoreStore,
+    storage: &Storage,
     mut session: GatewayUploadSessionRecord,
-    session_ref: CoreRefValue,
+    session_handle: GatewayStoredHandle,
     committed_digest: &str,
-    blob_record_ref: Option<(String, CoreObjectRef)>,
+    blob_record: Option<(String, GatewayBlobRecord)>,
 ) -> Result<GatewayUploadSessionReceipt> {
     session.state = GatewayUploadSessionState::Committed;
     session.committed_digest = Some(committed_digest.to_string());
     session.completed_at = Some(now_rfc3339());
     session.record_hash.clear();
     session.record_hash = hash_record(&session)?;
-    let session_ref_name = gateway_upload_ref_name(&session)?;
-    let session_object_ref = store
-        .put_blob(PutBlob {
-            logical_name: session_ref_name.clone(),
-            bytes: serde_json::to_vec_pretty(&session)?,
-            region_id: "local".to_string(),
-            mutation_id: format!(
-                "gateway-upload-commit:{}:{}",
-                session_ref_name,
-                Uuid::new_v4().simple()
-            ),
-        })
+    let session_handle_name = gateway_upload_ref_name(&session)?;
+    if let Some((blob_key, blob_record)) = blob_record {
+        put_record_row(
+            storage,
+            GATEWAY_ROW_BLOB,
+            &blob_key,
+            &blob_record,
+            true,
+            None,
+        )
         .await?;
-    let mut preconditions = vec![CoreMutationPrecondition::Ref {
-        ref_name: session_ref_name.clone(),
-        expected_generation: Some(session_ref.generation),
-        expected_target: Some(session_ref.target),
-        require_absent: false,
-        require_present: true,
-        fence: None,
-        authz_revision: None,
-        source_watch_cursor: None,
-    }];
-    let mut operations = vec![CoreMutationOperation::RefUpdate {
-        partition_id: gateway_partition_id(
-            session.tenant_id,
-            &session.gateway,
-            &session.registry_instance_id,
-            &session.repository,
-        ),
-        ref_name: session_ref_name.clone(),
-        new_target: encode_core_object_ref_target(&session_object_ref)?,
-    }];
-    if let Some((blob_ref_name, object_ref)) = blob_record_ref {
-        preconditions.push(CoreMutationPrecondition::Ref {
-            ref_name: blob_ref_name.clone(),
-            expected_generation: None,
-            expected_target: None,
-            require_absent: true,
-            require_present: false,
-            fence: None,
-            authz_revision: None,
-            source_watch_cursor: None,
-        });
-        operations.push(CoreMutationOperation::RefUpdate {
-            partition_id: gateway_partition_id(
-                session.tenant_id,
-                &session.gateway,
-                &session.registry_instance_id,
-                &session.repository,
-            ),
-            ref_name: blob_ref_name,
-            new_target: encode_core_object_ref_target(&object_ref)?,
-        });
     }
-    let receipt = store
-        .commit_mutation_batch(CoreMutationBatch {
-            transaction_id: format!(
-                "gateway-upload-commit:{}:{}",
-                session.upload_id,
-                Uuid::new_v4().simple()
-            ),
-            scope_partition: gateway_partition_id(
-                session.tenant_id,
-                &session.gateway,
-                &session.registry_instance_id,
-                &session.repository,
-            ),
-            committed_by_principal: session.started_by_principal.clone(),
-            preconditions,
-            operations,
-        })
-        .await?;
-    let generation = receipt
-        .visible_updates
-        .iter()
-        .find_map(|update| match update {
-            crate::core_store::CoreTransactionUpdate::CoreRefUpdate {
-                ref_name,
-                new_generation,
-            } if ref_name == &session_ref_name => Some(*new_generation),
-            _ => None,
-        })
-        .ok_or_else(|| anyhow!("gateway upload commit did not update session ref"))?;
+    let row = put_record_row(
+        storage,
+        GATEWAY_ROW_UPLOAD_SESSION,
+        &session_handle_name,
+        &session,
+        false,
+        Some(session_handle.generation),
+    )
+    .await?;
     Ok(GatewayUploadSessionReceipt {
         record: session,
-        generation,
+        generation: row.generation,
     })
 }
 
-async fn put_record_ref<T: Serialize>(
-    storage: &Storage,
-    ref_name: &str,
-    record: &T,
-    require_absent: bool,
-    expected_generation: Option<u64>,
-) -> Result<crate::core_store::CasRefReceipt> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let current = store.read_ref(ref_name).await?;
-    if require_absent && current.is_some() {
-        bail!("CoreStore gateway ref {ref_name} already exists");
-    }
-    if let Some(expected_generation) = expected_generation {
-        let actual = current.as_ref().map(|value| value.generation);
-        if actual != Some(expected_generation) {
-            bail!("CoreStore gateway ref {ref_name} generation mismatch");
-        }
-    }
-    let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.to_string(),
-            bytes: serde_json::to_vec_pretty(record)?,
-            region_id: "local".to_string(),
-            mutation_id: format!("gateway-record:{ref_name}:{}", Uuid::new_v4().simple()),
-        })
-        .await?;
+async fn write_gateway_logical_file(
+    store: &CoreStore,
+    writer_family: &str,
+    generation: u64,
+    logical_file_id: String,
+    source: Vec<u8>,
+    mutation_id: String,
+) -> Result<CoreObjectRef> {
+    let write = write_gateway_logical_file_with_locator(
+        store,
+        writer_family,
+        generation,
+        logical_file_id,
+        source,
+        mutation_id,
+    )
+    .await?;
+    Ok(core_object_ref_from_logical_file_write(&write))
+}
+
+async fn write_gateway_logical_file_with_locator(
+    store: &CoreStore,
+    writer_family: &str,
+    generation: u64,
+    logical_file_id: String,
+    source: Vec<u8>,
+    mutation_id: String,
+) -> Result<CoreLogicalFileWrite> {
+    let family = WriterFamily::from_name(writer_family)
+        .ok_or_else(|| anyhow!("unsupported gateway writer family {writer_family}"))?;
+    let logical_file_id =
+        canonical_logical_file_id(family, generation, &logical_file_id, &hash32(&source));
     store
-        .compare_and_swap_ref(CompareAndSwapRef {
-            ref_name: ref_name.to_string(),
-            expected_generation: current.as_ref().map(|value| value.generation),
-            expected_target: current.as_ref().map(|value| value.target.clone()),
-            require_absent: current.is_none(),
-            require_present: current.is_some(),
-            fence: None,
-            authz_revision: None,
-            source_watch_cursor: None,
-            new_target: encode_core_object_ref_target(&object_ref)?,
-            transaction_id: None,
+        .write_logical_file_with_locator(WriteLogicalFileRequest {
+            writer_family: writer_family.to_string(),
+            generation,
+            logical_file_id,
+            source,
+            range_hints: Vec::new(),
+            pipeline_policy: CorePipelinePolicy::default(),
+            trace_context: CoreTraceContext::default(),
+            boundary_values: Vec::new(),
+            mutation_id,
+            region_id: "local".to_string(),
         })
         .await
 }
 
-async fn read_record_ref<T: for<'de> Deserialize<'de>>(
-    storage: &Storage,
-    ref_name: &str,
-) -> Result<Option<T>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store.read_ref(ref_name).await? else {
-        return Ok(None);
-    };
-    let bytes = store
-        .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
-        })
-        .await?;
-    Ok(Some(serde_json::from_slice(&bytes)?))
-}
-
-async fn read_upload_session_from_ref_value(
-    store: &CoreStore,
-    ref_value: &CoreRefValue,
-) -> Result<GatewayUploadSessionRecord> {
-    let bytes = store
-        .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
-        })
-        .await?;
-    Ok(serde_json::from_slice(&bytes)?)
-}
-
-struct GatewayRepositoryKey {
-    tenant_id: i64,
-    gateway: String,
-    registry_instance_id: String,
-    repository: String,
-}
-
-impl GatewayRepositoryKey {
-    fn new(
-        tenant_id: i64,
-        gateway: &str,
-        registry_instance_id: &str,
-        repository: &str,
-    ) -> Result<Self> {
-        validate_tenant(tenant_id)?;
-        Ok(Self {
-            tenant_id,
-            gateway: normalize_gateway_identifier(gateway, "gateway")?,
-            registry_instance_id: normalize_gateway_identifier(registry_instance_id, "registry")?,
-            repository: normalize_gateway_identifier(repository, "repository")?,
-        })
-    }
-
-    fn ref_name(&self) -> String {
-        format!(
-            "gateway_repository:tenant:{}:gateway:{}:registry:{}:repository:{}",
-            self.tenant_id, self.gateway, self.registry_instance_id, self.repository
-        )
-    }
-}
-
-fn gateway_repository_ref_name(record: &GatewayRepositoryRecord) -> Result<String> {
-    Ok(GatewayRepositoryKey::new(
-        record.tenant_id,
-        &record.gateway,
-        &record.registry_instance_id,
-        &record.repository,
-    )?
-    .ref_name())
-}
-
-fn gateway_blob_ref_name(
-    tenant_id: i64,
-    gateway: &str,
-    registry_instance_id: &str,
-    repository: &str,
-    digest: &str,
-) -> Result<String> {
-    validate_tenant(tenant_id)?;
-    validate_gateway_digest(digest)?;
-    Ok(format!(
-        "gateway_blob:tenant:{tenant_id}:gateway:{gateway}:registry:{registry_instance_id}:repository:{repository}:digest:{digest}"
-    ))
-}
-
-fn gateway_tag_ref_name(record: &GatewayTagRecord) -> Result<String> {
-    gateway_tag_ref_name_parts(
-        record.tenant_id,
-        &record.gateway,
-        &record.registry_instance_id,
-        &record.repository,
-        &record.tag,
-    )
-}
-
-fn gateway_tag_ref_name_parts(
-    tenant_id: i64,
-    gateway: &str,
-    registry_instance_id: &str,
-    repository: &str,
-    tag: &str,
-) -> Result<String> {
-    validate_tenant(tenant_id)?;
-    Ok(format!(
-        "gateway_tag:tenant:{tenant_id}:gateway:{gateway}:registry:{registry_instance_id}:repository:{repository}:tag:{tag}"
-    ))
-}
-
-fn gateway_upload_ref_name(record: &GatewayUploadSessionRecord) -> Result<String> {
-    validate_tenant(record.tenant_id)?;
-    gateway_upload_ref_name_parts(
-        record.tenant_id,
-        &record.gateway,
-        &record.registry_instance_id,
-        &record.repository,
-        &record.upload_id,
-    )
-}
-
-fn gateway_upload_ref_name_parts(
-    tenant_id: i64,
-    gateway: &str,
-    registry_instance_id: &str,
-    repository: &str,
-    upload_id: &str,
-) -> Result<String> {
-    validate_tenant(tenant_id)?;
-    Ok(format!(
-        "gateway_upload_session:tenant:{tenant_id}:gateway:{gateway}:registry:{registry_instance_id}:repository:{repository}:upload:{upload_id}"
-    ))
-}
-
-fn gateway_upload_idempotency_ref_name(
-    tenant_id: i64,
-    gateway: &str,
-    registry_instance_id: &str,
-    repository: &str,
-    idempotency_key_hash: &str,
-) -> Result<String> {
-    validate_tenant(tenant_id)?;
-    validate_gateway_digest(idempotency_key_hash)?;
-    Ok(format!(
-        "gateway_upload_idempotency:tenant:{tenant_id}:gateway:{gateway}:registry:{registry_instance_id}:repository:{repository}:idempotency:{idempotency_key_hash}"
-    ))
-}
-
-fn gateway_credential_ref_name(record: &GatewayCredentialRecord) -> Result<String> {
-    validate_tenant(record.tenant_id)?;
-    gateway_credential_ref_name_parts(record.tenant_id, &record.gateway, &record.credential_id)
-}
-
-fn gateway_credential_ref_name_parts(
-    tenant_id: i64,
-    gateway: &str,
-    credential_id: &str,
-) -> Result<String> {
-    validate_tenant(tenant_id)?;
-    Ok(format!(
-        "gateway_credential:tenant:{tenant_id}:gateway:{gateway}:credential:{credential_id}"
-    ))
-}
-
-fn gateway_mount_ref_name(record: &GatewayMountRecord) -> Result<String> {
-    gateway_mount_ref_name_parts(&record.mount_id)
-}
-
-fn gateway_mount_ref_name_parts(mount_id: &str) -> Result<String> {
-    let mount_id = normalize_gateway_identifier(mount_id, "mount id")?;
-    Ok(format!("gateway_mount:mount:{mount_id}"))
-}
-
-fn gateway_partition_id(
-    tenant_id: i64,
-    gateway: &str,
-    registry_instance_id: &str,
-    repository: &str,
-) -> String {
-    format!(
-        "gateway:tenant:{tenant_id}:gateway:{gateway}:registry:{registry_instance_id}:repository:{repository}"
-    )
-}
-
-fn gateway_audit_partition_id(
-    tenant_id: i64,
-    gateway: &str,
-    registry_instance_id: &str,
-) -> Result<String> {
-    validate_tenant(tenant_id)?;
-    Ok(format!(
-        "gateway_audit:tenant:{tenant_id}:gateway:{gateway}:registry:{registry_instance_id}"
-    ))
-}
-
-fn gateway_audit_stream_id(
-    tenant_id: i64,
-    gateway: &str,
-    registry_instance_id: &str,
-) -> Result<String> {
-    validate_tenant(tenant_id)?;
-    Ok(format!(
-        "gateway_audit:tenant:{tenant_id}:gateway:{gateway}:registry:{registry_instance_id}"
-    ))
-}
-
-fn validate_repository_record(
-    record: &GatewayRepositoryRecord,
-    key: &GatewayRepositoryKey,
-) -> Result<()> {
-    if record.schema != GATEWAY_REPOSITORY_SCHEMA
-        || record.tenant_id != key.tenant_id
-        || record.gateway != key.gateway
-        || record.registry_instance_id != key.registry_instance_id
-        || record.repository != key.repository
-    {
-        bail!("gateway repository record scope mismatch");
-    }
-    validate_hash(record, &record.record_hash)
-}
-
-fn validate_blob_record(
-    record: &GatewayBlobRecord,
-    tenant_id: i64,
-    gateway: &str,
-    registry_instance_id: &str,
-    repository: &str,
-    digest: &str,
-) -> Result<()> {
-    if record.schema != GATEWAY_BLOB_SCHEMA
-        || record.tenant_id != tenant_id
-        || record.gateway != gateway
-        || record.registry_instance_id != registry_instance_id
-        || record.repository != repository
-        || record.digest != digest
-    {
-        bail!("gateway blob record scope mismatch");
-    }
-    validate_gateway_digest(&record.digest)?;
-    validate_media_type(&record.media_type)?;
-    validate_hash(record, &record.record_hash)
-}
-
-fn validate_tag_record(
-    record: &GatewayTagRecord,
-    tenant_id: i64,
-    gateway: &str,
-    registry_instance_id: &str,
-    repository: &str,
-    tag: &str,
-) -> Result<()> {
-    if record.schema != GATEWAY_TAG_SCHEMA
-        || record.tenant_id != tenant_id
-        || record.gateway != gateway
-        || record.registry_instance_id != registry_instance_id
-        || record.repository != repository
-        || record.tag != tag
-    {
-        bail!("gateway tag record scope mismatch");
-    }
-    validate_gateway_digest(&record.target_digest)?;
-    validate_hash(record, &record.record_hash)
-}
-
-fn validate_upload_session_record(
-    record: &GatewayUploadSessionRecord,
-    tenant_id: i64,
-    gateway: &str,
-    registry_instance_id: &str,
-    repository: &str,
-    upload_id: &str,
-) -> Result<()> {
-    if record.schema != GATEWAY_UPLOAD_SESSION_SCHEMA
-        || record.tenant_id != tenant_id
-        || record.gateway != gateway
-        || record.registry_instance_id != registry_instance_id
-        || record.repository != repository
-        || record.upload_id != upload_id
-    {
-        bail!("gateway upload session record scope mismatch");
-    }
-    if let Some(digest) = record.expected_digest.as_deref() {
-        validate_gateway_digest(digest)?;
-    }
-    if let Some(digest) = record.committed_digest.as_deref() {
-        validate_gateway_digest(digest)?;
-    }
-    validate_gateway_digest(&record.idempotency_key_hash)?;
-    let mut next_offset = 0_u64;
-    for part in &record.staged_parts {
-        if part.schema != "anvil.gateway.upload_part.v1" || part.session_id != record.upload_id {
-            bail!("gateway upload part scope mismatch");
-        }
-        normalize_gateway_identifier(&part.part_id, "part id")?;
-        validate_gateway_digest(&part.payload_hash)?;
-        validate_gateway_digest(&part.idempotency_key_hash)?;
-        if part.offset != next_offset {
-            bail!("gateway upload part offsets must be contiguous");
-        }
-        next_offset = next_offset
-            .checked_add(part.length)
-            .ok_or_else(|| anyhow!("gateway upload part offset overflow"))?;
-    }
-    if next_offset != record.received_bytes {
-        bail!("gateway upload session received_bytes mismatch");
-    }
-    DateTime::parse_from_rfc3339(&record.started_at)
-        .map_err(|error| anyhow!("gateway upload session started_at is invalid: {error}"))?;
-    DateTime::parse_from_rfc3339(&record.expires_at)
-        .map_err(|error| anyhow!("gateway upload session expires_at is invalid: {error}"))?;
-    if let Some(completed_at) = record.completed_at.as_deref() {
-        DateTime::parse_from_rfc3339(completed_at)
-            .map_err(|error| anyhow!("gateway upload session completed_at is invalid: {error}"))?;
-    }
-    validate_hash(record, &record.record_hash)
-}
-
-fn is_upload_session_expired(record: &GatewayUploadSessionRecord) -> Result<bool> {
-    if matches!(
-        record.state,
-        GatewayUploadSessionState::Committed
-            | GatewayUploadSessionState::Aborted
-            | GatewayUploadSessionState::Expired
-    ) {
-        return Ok(false);
-    }
-    let expires_at = DateTime::parse_from_rfc3339(&record.expires_at)
-        .map_err(|error| anyhow!("gateway upload session expires_at is invalid: {error}"))?
-        .with_timezone(&Utc);
-    Ok(expires_at <= Utc::now())
-}
-
-fn validate_credential_record_shape(record: &GatewayCredentialRecord) -> Result<()> {
-    if record.schema != GATEWAY_CREDENTIAL_SCHEMA {
-        bail!("gateway credential record schema mismatch");
-    }
-    validate_tenant(record.tenant_id)?;
-    normalize_gateway_identifier(&record.credential_id, "credential id")?;
-    normalize_gateway_identifier(&record.gateway, "gateway")?;
-    normalize_gateway_identifier(&record.subject_principal, "principal")?;
-    if record.secret_hash.is_empty() || record.secret_hash.contains(char::is_control) {
-        bail!("gateway credential secret_hash must be non-empty and safe");
-    }
-    if !record.record_hash.is_empty() {
-        validate_hash(record, &record.record_hash)?;
-    }
-    Ok(())
-}
-
-fn validate_mount_record_shape(record: &GatewayMountRecord) -> Result<()> {
-    if record.schema != GATEWAY_MOUNT_SCHEMA {
-        bail!("gateway mount record schema mismatch");
-    }
-    normalize_gateway_identifier(&record.mount_id, "mount id")?;
-    normalize_gateway_identifier(&record.gateway, "gateway")?;
-    validate_gateway_slug(&record.mesh_id, "mesh id")?;
-    validate_gateway_slug(&record.region, "region")?;
-    validate_gateway_slug(&record.anvil_storage_tenant_id, "anvil storage tenant id")?;
-    validate_gateway_slug(
-        &record.authz_scope.anvil_storage_tenant_id,
-        "authz tenant id",
-    )?;
-    validate_gateway_slug(&record.authz_scope.authz_realm_id, "authz realm id")?;
-    if record.authz_scope.anvil_storage_tenant_id != record.anvil_storage_tenant_id {
-        bail!("gateway mount authz scope tenant mismatch");
-    }
-    validate_gateway_slug(&record.tenant_id, "tenant id")?;
-    normalize_gateway_identifier(&record.registry_instance_id, "registry")?;
-    normalize_gateway_identifier(&record.default_bucket, "default bucket")?;
-    validate_gateway_repository_prefix(&record.repository_prefix)?;
-    if record.generation == 0 {
-        bail!("gateway mount generation must be positive");
-    }
-    if record.hosts.is_empty() && record.path_prefixes.is_empty() {
-        bail!("gateway mount must define at least one host or path prefix");
-    }
-    for host in &record.hosts {
-        if normalize_gateway_host(host)? != *host {
-            bail!("gateway mount host must be canonical");
-        }
-    }
-    for prefix in &record.path_prefixes {
-        validate_gateway_path_prefix(prefix)?;
-    }
-    if !record.record_hash.is_empty() {
-        validate_hash(record, &record.record_hash)?;
-    }
-    Ok(())
-}
-
-fn normalise_gateway_audit_record(record: &mut GatewayAuditRecord) -> Result<()> {
-    record.schema = GATEWAY_AUDIT_SCHEMA.to_string();
-    validate_tenant(record.tenant_id)?;
-    record.gateway = normalize_gateway_identifier(&record.gateway, "gateway")?;
-    record.registry_instance_id =
-        normalize_gateway_identifier(&record.registry_instance_id, "registry")?;
-    record.operation = normalize_gateway_identifier(&record.operation, "operation")?;
-    record.repository = normalize_gateway_identifier(&record.repository, "repository")?;
-    record.package = record
-        .package
-        .as_deref()
-        .map(|package| normalize_gateway_identifier(package, "package"))
-        .transpose()?;
-    record.version_or_reference = record
-        .version_or_reference
-        .as_deref()
-        .map(|reference| normalize_gateway_identifier(reference, "version or reference"))
-        .transpose()?;
-    record.subject_principal =
-        normalize_gateway_identifier(&record.subject_principal, "principal")?;
-    record.credential_id = record
-        .credential_id
-        .as_deref()
-        .map(|credential_id| normalize_gateway_identifier(credential_id, "credential id"))
-        .transpose()?;
-    record.request_id = normalize_gateway_identifier(&record.request_id, "request id")?;
-    record.result = normalize_gateway_identifier(&record.result, "result")?;
-    Ok(())
-}
-
-fn validate_gateway_audit_record(record: &GatewayAuditRecord) -> Result<()> {
-    if record.schema != GATEWAY_AUDIT_SCHEMA {
-        bail!("gateway audit record schema mismatch");
-    }
-    validate_tenant(record.tenant_id)?;
-    normalize_gateway_identifier(&record.gateway, "gateway")?;
-    normalize_gateway_identifier(&record.registry_instance_id, "registry")?;
-    normalize_gateway_identifier(&record.operation, "operation")?;
-    normalize_gateway_identifier(&record.repository, "repository")?;
-    if let Some(package) = record.package.as_deref() {
-        normalize_gateway_identifier(package, "package")?;
-    }
-    if let Some(reference) = record.version_or_reference.as_deref() {
-        normalize_gateway_identifier(reference, "version or reference")?;
-    }
-    if let Some(digest) = record.digest.as_deref() {
-        validate_gateway_digest(digest)?;
-    }
-    normalize_gateway_identifier(&record.subject_principal, "principal")?;
-    if let Some(credential_id) = record.credential_id.as_deref() {
-        normalize_gateway_identifier(credential_id, "credential id")?;
-    }
-    normalize_gateway_identifier(&record.request_id, "request id")?;
-    normalize_gateway_identifier(&record.result, "result")?;
-    DateTime::parse_from_rfc3339(&record.created_at)
-        .map_err(|error| anyhow!("gateway audit created_at is invalid: {error}"))?;
-    validate_hash(record, &record.record_hash)
-}
-
-fn normalize_gateway_actions(actions: &[String]) -> Result<Vec<String>> {
-    let mut normalized = Vec::with_capacity(actions.len());
-    for action in actions {
-        let action = normalize_gateway_identifier(action, "action")?;
-        if !normalized.iter().any(|existing| existing == &action) {
-            normalized.push(action);
-        }
-    }
-    normalized.sort();
-    Ok(normalized)
-}
-
-fn validate_gateway_token_claim_shape(claims: &GatewayAccessTokenClaims) -> Result<()> {
-    validate_tenant(claims.tenant_id)?;
-    normalize_gateway_identifier(&claims.gateway, "gateway")?;
-    normalize_gateway_identifier(&claims.registry_instance_id, "registry")?;
-    normalize_gateway_identifier(&claims.repository, "repository")?;
-    normalize_gateway_actions(&claims.actions)?;
-    if claims.actions.is_empty() {
-        bail!("gateway token must contain at least one action");
-    }
-    normalize_gateway_identifier(&claims.subject_principal, "principal")?;
-    normalize_gateway_identifier(&claims.credential_id, "credential id")?;
-    if claims.credential_generation == 0 {
-        bail!("gateway token credential generation must be nonzero");
-    }
-    if claims.iat <= 0 || claims.exp == 0 {
-        bail!("gateway token time fields are invalid");
-    }
-    normalize_gateway_identifier(&claims.jti, "token id")?;
-    Ok(())
-}
-
-fn validate_gateway_token_requirement(requirement: &GatewayTokenRequirement) -> Result<()> {
-    validate_tenant(requirement.tenant_id)?;
-    normalize_gateway_identifier(&requirement.gateway, "gateway")?;
-    normalize_gateway_identifier(&requirement.registry_instance_id, "registry")?;
-    normalize_gateway_identifier(&requirement.repository, "repository")?;
-    normalize_gateway_identifier(&requirement.action, "action")?;
-    Ok(())
-}
-
-fn validate_gateway_secret(secret: &str) -> Result<()> {
-    if secret.is_empty() || secret.contains('\0') || secret.chars().any(char::is_control) {
-        bail!("gateway secret is invalid");
-    }
-    Ok(())
-}
-
-fn verify_gateway_credential_secret(secret_hash: &str, presented_secret: &str) -> Result<()> {
-    validate_gateway_secret(presented_secret)?;
-    if secret_hash.starts_with("$argon2") {
-        let parsed = PasswordHash::new(secret_hash)
-            .map_err(|_| anyhow!("gateway credential secret hash is invalid"))?;
-        Argon2::default()
-            .verify_password(presented_secret.as_bytes(), &parsed)
-            .map_err(|_| anyhow!("gateway credential secret mismatch"))?;
-        return Ok(());
-    }
-    if let Some(expected) = secret_hash.strip_prefix("sha256:") {
-        let actual = sha256_hex(presented_secret.as_bytes());
-        if expected.len() == actual.len()
-            && constant_time_eq::constant_time_eq(expected.as_bytes(), actual.as_bytes())
-        {
-            return Ok(());
-        }
-    }
-    bail!("gateway credential secret mismatch")
-}
-
-fn validate_gateway_slug(value: &str, label: &str) -> Result<()> {
-    if value.is_empty() || value.len() > 255 {
-        bail!("gateway {label} length is invalid");
-    }
-    if !value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        bail!("gateway {label} contains an unsafe character");
-    }
-    Ok(())
-}
-
-fn validate_gateway_repository_prefix(value: &str) -> Result<()> {
-    if value.is_empty() {
-        return Ok(());
-    }
-    normalize_gateway_identifier(value, "repository prefix")?;
-    Ok(())
-}
-
-fn normalize_gateway_host(input: &str) -> Result<String> {
-    let host = input.trim_end_matches('.').to_ascii_lowercase();
-    if host.is_empty() || host.len() > 253 {
-        bail!("gateway host length is invalid");
-    }
-    if host.contains("..") || host.starts_with('.') || host.ends_with('.') {
-        bail!("gateway host has an empty label");
-    }
-    for label in host.split('.') {
-        if label.is_empty() || label.len() > 63 {
-            bail!("gateway host label length is invalid");
-        }
-        if label.starts_with('-') || label.ends_with('-') {
-            bail!("gateway host label hyphen placement is invalid");
-        }
-        if !label
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        {
-            bail!("gateway host contains an unsafe character");
-        }
-    }
-    Ok(host)
-}
-
-fn normalize_gateway_path(input: &str) -> Result<String> {
-    if !input.starts_with('/') {
-        bail!("gateway path must start with /");
-    }
-    validate_gateway_path_prefix(input)?;
-    Ok(input.to_string())
-}
-
-fn validate_gateway_path_prefix(value: &str) -> Result<()> {
-    if !value.starts_with('/') {
-        bail!("gateway path prefix must start with /");
-    }
-    if value.contains('\\') || value.contains('%') || value.contains(char::is_control) {
-        bail!("gateway path prefix contains an unsafe character");
-    }
-    for segment in value.split('/') {
-        if matches!(segment, "." | "..") {
-            bail!("gateway path prefix contains an unsafe segment");
-        }
-    }
-    Ok(())
-}
-
-fn validate_tenant(tenant_id: i64) -> Result<()> {
-    if tenant_id <= 0 {
-        bail!("gateway tenant id must be positive");
-    }
-    Ok(())
-}
-
-fn validate_media_type(value: &str) -> Result<()> {
-    if value.is_empty()
-        || value.len() > 255
-        || value.contains(char::is_control)
-        || value.contains('/') && value.split('/').any(str::is_empty)
-    {
-        bail!("gateway media type is invalid");
-    }
-    Ok(())
-}
-
-fn validate_hash<T: Serialize>(record: &T, actual: &str) -> Result<()> {
-    let expected = hash_record(record)?;
-    if expected != actual {
-        bail!("gateway record hash mismatch");
-    }
-    Ok(())
-}
-
-fn hash_record<T: Serialize>(record: &T) -> Result<String> {
-    let mut value = serde_json::to_value(record)?;
-    if let Some(object) = value.as_object_mut() {
-        object.insert(
-            "record_hash".to_string(),
-            serde_json::Value::String(String::new()),
-        );
-    }
-    Ok(hex::encode(hash32(&serde_json::to_vec(&value)?)))
-}
-
-fn now_rfc3339() -> String {
-    Utc::now().to_rfc3339()
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
-}
-
-fn idempotency_hash(value: &str) -> Result<String> {
-    if value.is_empty() || value.contains(char::is_control) {
-        bail!("gateway idempotency key is invalid");
-    }
-    Ok(format!("sha256:{}", sha256_hex(value.as_bytes())))
-}
-
-fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
-    Ok(format!(
-        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
-    ))
-}
-
-fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
-    let encoded = target
-        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
-        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
-    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
-}
+mod coremeta;
+mod helpers;
+mod keys;
+mod metadata_rows;
+mod record_codec;
+mod registry_api;
+use helpers::*;
+use keys::*;
+use metadata_rows::*;
+pub(crate) use metadata_rows::{
+    GatewayStoredHandle, encode_gateway_metadata_row, materialize_committed_gateway_transaction,
+};
+use record_codec::*;
+pub use registry_api::*;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage::Storage;
-
-    fn digest(bytes: &[u8]) -> String {
-        format!("sha256:{}", sha256_hex(bytes))
-    }
-
-    #[tokio::test]
-    async fn gateway_repository_blob_tag_and_upload_session_are_corestore_records() {
-        let temp = tempfile::tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let repository = create_gateway_repository(
-            &storage,
-            1,
-            "docker",
-            "registry-a",
-            "containers/api",
-            "service-account/deployer",
-        )
-        .await
-        .unwrap();
-        assert_eq!(repository.schema, GATEWAY_REPOSITORY_SCHEMA);
-        assert_eq!(
-            read_gateway_repository(&storage, 1, "docker", "registry-a", "containers/api")
-                .await
-                .unwrap()
-                .unwrap(),
-            repository
-        );
-
-        let payload = b"container layer bytes";
-        let digest = digest(payload);
-        let blob = put_gateway_blob(
-            &storage,
-            1,
-            "docker",
-            "registry-a",
-            "containers/api",
-            &digest,
-            "application/vnd.oci.image.layer.v1.tar+gzip",
-            payload,
-            "service-account/deployer",
-        )
-        .await
-        .unwrap();
-        assert_eq!(blob.schema, GATEWAY_BLOB_SCHEMA);
-        let (read_blob, read_payload) = read_gateway_blob(
-            &storage,
-            1,
-            "docker",
-            "registry-a",
-            "containers/api",
-            &digest,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(read_blob, blob);
-        assert_eq!(read_payload, payload);
-
-        let first = update_gateway_tag(
-            &storage,
-            1,
-            "docker",
-            "registry-a",
-            "containers/api",
-            "latest",
-            &digest,
-            "service-account/deployer",
-            None,
-        )
-        .await
-        .unwrap();
-        let (_tag, ref_value) = read_gateway_tag(
-            &storage,
-            1,
-            "docker",
-            "registry-a",
-            "containers/api",
-            "latest",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(ref_value.generation, first.generation);
-        let stale = update_gateway_tag(
-            &storage,
-            1,
-            "docker",
-            "registry-a",
-            "containers/api",
-            "latest",
-            &digest,
-            "service-account/deployer",
-            Some(first.generation.saturating_sub(1)),
-        )
-        .await;
-        assert!(stale.is_err(), "stale tag generation must be rejected");
-
-        let upload = create_gateway_upload_session(
-            &storage,
-            1,
-            "docker",
-            "registry-a",
-            "containers/api",
-            Some(&digest),
-            "service-account/deployer",
-            "start-upload-main",
-            3600,
-        )
-        .await
-        .unwrap();
-        assert_eq!(upload.schema, GATEWAY_UPLOAD_SESSION_SCHEMA);
-        assert_eq!(upload.expected_digest.as_deref(), Some(digest.as_str()));
-        assert_eq!(upload.state, GatewayUploadSessionState::Open);
-    }
-
-    #[tokio::test]
-    async fn gateway_upload_finalisation_is_digest_checked_and_commits_session_atomically() {
-        let temp = tempfile::tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let payload = b"first second";
-        let expected_digest = digest(payload);
-        let upload = create_gateway_upload_session(
-            &storage,
-            1,
-            "docker",
-            "registry-a",
-            "containers/api",
-            Some(&expected_digest),
-            "service-account/deployer",
-            "start-upload-finalise",
-            3600,
-        )
-        .await
-        .unwrap();
-
-        let first = append_gateway_upload_part(
-            &storage,
-            1,
-            "docker",
-            "registry-a",
-            "containers/api",
-            &upload.upload_id,
-            "part_000001",
-            0,
-            b"first ",
-            "idem-first",
-        )
-        .await
-        .unwrap();
-        assert_eq!(first.record.state, GatewayUploadSessionState::Receiving);
-        let second = append_gateway_upload_part(
-            &storage,
-            1,
-            "docker",
-            "registry-a",
-            "containers/api",
-            &upload.upload_id,
-            "part_000002",
-            6,
-            b"second",
-            "idem-second",
-        )
-        .await
-        .unwrap();
-        assert_eq!(second.record.received_bytes, payload.len() as u64);
-
-        let wrong_digest = digest(b"wrong");
-        let wrong = finalise_gateway_upload_session(
-            &storage,
-            1,
-            "docker",
-            "registry-a",
-            "containers/api",
-            &upload.upload_id,
-            Some(&wrong_digest),
-            "application/vnd.oci.image.layer.v1.tar+gzip",
-            "service-account/deployer",
-        )
-        .await;
-        assert!(
-            wrong.is_err(),
-            "digest mismatch must reject upload finalisation"
-        );
-
-        let blob = finalise_gateway_upload_session(
-            &storage,
-            1,
-            "docker",
-            "registry-a",
-            "containers/api",
-            &upload.upload_id,
-            None,
-            "application/vnd.oci.image.layer.v1.tar+gzip",
-            "service-account/deployer",
-        )
-        .await
-        .unwrap();
-        assert_eq!(blob.digest, expected_digest);
-        let (_record, bytes) = read_gateway_blob(
-            &storage,
-            1,
-            "docker",
-            "registry-a",
-            "containers/api",
-            &expected_digest,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(bytes, payload);
-        let (session, _) = read_gateway_upload_session(
-            &storage,
-            1,
-            "docker",
-            "registry-a",
-            "containers/api",
-            &upload.upload_id,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(session.state, GatewayUploadSessionState::Committed);
-        assert_eq!(
-            session.committed_digest.as_deref(),
-            Some(expected_digest.as_str())
-        );
-    }
-
-    #[tokio::test]
-    async fn gateway_identifiers_reject_reserved_and_traversal_forms() {
-        for bad in [
-            "../secret",
-            "containers//api",
-            "containers/%2e%2e/api",
-            "containers\\api",
-            "_anvil",
-            "_system",
-            "_authz",
-            "_credentials",
-            "containers/_gateway/api",
-        ] {
-            assert!(
-                normalize_gateway_identifier(bad, "test").is_err(),
-                "{bad} must be rejected"
-            );
-        }
-        assert_eq!(
-            normalize_gateway_identifier("containers/api", "repository").unwrap(),
-            "containers/api"
-        );
-    }
-
-    #[tokio::test]
-    async fn gateway_upload_session_start_abort_and_expire_are_corestore_state_transitions() {
-        let temp = tempfile::tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let payload = b"idempotent upload";
-        let expected_digest = digest(payload);
-
-        let first = create_gateway_upload_session(
-            &storage,
-            1,
-            "docker",
-            "registry-a",
-            "containers/api",
-            Some(&expected_digest),
-            "service-account/deployer",
-            "same-start-key",
-            3600,
-        )
-        .await
-        .unwrap();
-        let retry = create_gateway_upload_session(
-            &storage,
-            1,
-            "docker",
-            "registry-a",
-            "containers/api",
-            Some(&expected_digest),
-            "service-account/deployer",
-            "same-start-key",
-            3600,
-        )
-        .await
-        .unwrap();
-        assert_eq!(retry.upload_id, first.upload_id);
-        assert_eq!(retry.idempotency_key_hash, first.idempotency_key_hash);
-
-        let conflict = create_gateway_upload_session(
-            &storage,
-            1,
-            "docker",
-            "registry-a",
-            "containers/api",
-            Some(&digest(b"different")),
-            "service-account/deployer",
-            "same-start-key",
-            3600,
-        )
-        .await;
-        assert!(
-            conflict.is_err(),
-            "same start idempotency key cannot change target digest"
-        );
-
-        let aborted = abort_gateway_upload_session(
-            &storage,
-            1,
-            "docker",
-            "registry-a",
-            "containers/api",
-            &first.upload_id,
-        )
-        .await
-        .unwrap();
-        assert_eq!(aborted.record.state, GatewayUploadSessionState::Aborted);
-        let append_after_abort = append_gateway_upload_part(
-            &storage,
-            1,
-            "docker",
-            "registry-a",
-            "containers/api",
-            &first.upload_id,
-            "part_000001",
-            0,
-            payload,
-            "append-after-abort",
-        )
-        .await;
-        assert!(append_after_abort.is_err());
-
-        let expired = create_gateway_upload_session(
-            &storage,
-            1,
-            "docker",
-            "registry-a",
-            "containers/api",
-            Some(&expected_digest),
-            "service-account/deployer",
-            "expired-start-key",
-            1,
-        )
-        .await
-        .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        let expired = expire_gateway_upload_session(
-            &storage,
-            1,
-            "docker",
-            "registry-a",
-            "containers/api",
-            &expired.upload_id,
-        )
-        .await
-        .unwrap();
-        assert_eq!(expired.record.state, GatewayUploadSessionState::Expired);
-    }
-
-    #[tokio::test]
-    async fn gateway_audit_records_are_corestore_append_stream_records() {
-        let temp = tempfile::tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let payload = b"gateway audited payload";
-        let expected_digest = digest(payload);
-        let record = GatewayAuditRecord {
-            schema: String::new(),
-            tenant_id: 1,
-            gateway: "docker".to_string(),
-            registry_instance_id: "registry-a".to_string(),
-            operation: "manifest_put".to_string(),
-            repository: "containers/api".to_string(),
-            package: None,
-            version_or_reference: Some("latest".to_string()),
-            digest: Some(expected_digest.clone()),
-            subject_principal: "service-account/deployer".to_string(),
-            credential_id: Some("cred-a".to_string()),
-            request_id: "req-0001".to_string(),
-            result: "success".to_string(),
-            created_at: String::new(),
-            record_hash: String::new(),
-        };
-
-        let first = append_gateway_audit_record(&storage, record.clone(), Some("request-req-0001"))
-            .await
-            .unwrap();
-        assert_eq!(first.record.schema, GATEWAY_AUDIT_SCHEMA);
-        assert_eq!(first.stream.sequence, 1);
-        assert!(!first.stream.idempotent_replay);
-        assert_eq!(
-            first.record.digest.as_deref(),
-            Some(expected_digest.as_str())
-        );
-
-        let replay =
-            append_gateway_audit_record(&storage, record.clone(), Some("request-req-0001"))
-                .await
-                .unwrap();
-        assert_eq!(replay.stream.sequence, first.stream.sequence);
-        assert!(replay.stream.idempotent_replay);
-
-        let read = read_gateway_audit_records(&storage, 1, "docker", "registry-a", 0, 100)
-            .await
-            .unwrap();
-        assert_eq!(read.len(), 1);
-        assert_eq!(read[0].audit, first.record);
-        assert_eq!(read[0].stream.record_kind, GATEWAY_AUDIT_SCHEMA);
-        assert_eq!(
-            read[0].stream.payload,
-            serde_json::to_vec(&first.record).unwrap()
-        );
-        assert_eq!(
-            read[0].stream.payload_hash,
-            format!("sha256:{}", sha256_hex(&read[0].stream.payload))
-        );
-
-        let bad_record = GatewayAuditRecord {
-            repository: "_authz".to_string(),
-            request_id: "req-0002".to_string(),
-            ..record
-        };
-        assert!(
-            append_gateway_audit_record(&storage, bad_record, None)
-                .await
-                .is_err(),
-            "reserved gateway audit repository names must be rejected"
-        );
-    }
-
-    #[tokio::test]
-    async fn gateway_credential_record_is_corestore_backed_and_hash_checked() {
-        let temp = tempfile::tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let record = GatewayCredentialRecord {
-            schema: GATEWAY_CREDENTIAL_SCHEMA.to_string(),
-            tenant_id: 1,
-            credential_id: "cred-a".to_string(),
-            gateway: "docker".to_string(),
-            subject_principal: "service-account/deployer".to_string(),
-            secret_hash: hash_gateway_credential_secret("gateway-secret").unwrap(),
-            created_at: now_rfc3339(),
-            revoked_at: None,
-            record_hash: String::new(),
-        };
-        let generation = put_gateway_credential_record(&storage, record, None)
-            .await
-            .unwrap();
-        assert_eq!(generation, 1);
-        let (credential, ref_value) =
-            read_gateway_credential_record(&storage, 1, "docker", "cred-a")
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(credential.subject_principal, "service-account/deployer");
-        let revoked_generation =
-            revoke_gateway_credential_record(&storage, 1, "docker", "cred-a", ref_value.generation)
-                .await
-                .unwrap();
-        assert!(revoked_generation > generation);
-        let (revoked, _) = read_gateway_credential_record(&storage, 1, "docker", "cred-a")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(revoked.revoked_at.is_some());
-
-        let refs = CoreStore::new(storage.clone())
-            .await
-            .unwrap()
-            .list_ref_names("gateway_credential:")
-            .await
-            .unwrap();
-        assert_eq!(refs.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn gateway_token_challenge_maps_credential_to_principal_and_revocation() {
-        let temp = tempfile::tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let record = GatewayCredentialRecord {
-            schema: GATEWAY_CREDENTIAL_SCHEMA.to_string(),
-            tenant_id: 1,
-            credential_id: "cred-token".to_string(),
-            gateway: "docker".to_string(),
-            subject_principal: "service-account/deployer".to_string(),
-            secret_hash: hash_gateway_credential_secret("gateway-secret").unwrap(),
-            created_at: now_rfc3339(),
-            revoked_at: None,
-            record_hash: String::new(),
-        };
-        put_gateway_credential_record(&storage, record, None)
-            .await
-            .unwrap();
-
-        let requested_actions = vec!["pull".to_string(), "push".to_string()];
-        let token = issue_gateway_access_token(
-            &storage,
-            1,
-            "docker",
-            "registry-a",
-            "containers/api",
-            "cred-token",
-            "gateway-secret",
-            &requested_actions,
-            GATEWAY_ACCESS_TOKEN_MAX_TTL_SECONDS + 30,
-            "gateway-signing-secret",
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            token.expires_in_seconds,
-            GATEWAY_ACCESS_TOKEN_MAX_TTL_SECONDS
-        );
-        assert_eq!(token.claims.subject_principal, "service-account/deployer");
-        assert_eq!(token.claims.actions, vec!["pull", "push"]);
-
-        let requirement = GatewayTokenRequirement {
-            tenant_id: 1,
-            gateway: "docker".to_string(),
-            registry_instance_id: "registry-a".to_string(),
-            repository: "containers/api".to_string(),
-            action: "pull".to_string(),
-        };
-        let claims = validate_gateway_access_token(
-            &storage,
-            &token.access_token,
-            "gateway-signing-secret",
-            Some(&requirement),
-        )
-        .await
-        .unwrap();
-        assert_eq!(claims.credential_id, "cred-token");
-
-        let wrong_action = GatewayTokenRequirement {
-            action: "delete".to_string(),
-            ..requirement.clone()
-        };
-        assert!(
-            validate_gateway_access_token(
-                &storage,
-                &token.access_token,
-                "gateway-signing-secret",
-                Some(&wrong_action),
-            )
-            .await
-            .is_err(),
-            "gateway token scopes must not bypass route-level action checks"
-        );
-
-        let (_credential, ref_value) =
-            read_gateway_credential_record(&storage, 1, "docker", "cred-token")
-                .await
-                .unwrap()
-                .unwrap();
-        revoke_gateway_credential_record(&storage, 1, "docker", "cred-token", ref_value.generation)
-            .await
-            .unwrap();
-        assert!(
-            validate_gateway_access_token(
-                &storage,
-                &token.access_token,
-                "gateway-signing-secret",
-                Some(&requirement),
-            )
-            .await
-            .is_err(),
-            "credential revocation must invalidate previously issued gateway tokens"
-        );
-    }
-
-    #[tokio::test]
-    async fn gateway_mount_resolution_uses_corestore_records_and_fixed_priority() {
-        let temp = tempfile::tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let mut exact = GatewayMountRecord {
-            schema: GATEWAY_MOUNT_SCHEMA.to_string(),
-            mount_id: "docker-primary".to_string(),
-            gateway: "docker".to_string(),
-            hosts: vec!["registry.example.test".to_string()],
-            path_prefixes: vec!["/".to_string(), "/v2/".to_string()],
-            mesh_id: "mesh-a".to_string(),
-            region: "eu-west-1".to_string(),
-            anvil_storage_tenant_id: "storage-tenant-a".to_string(),
-            authz_scope: AuthzScopeRef {
-                anvil_storage_tenant_id: "storage-tenant-a".to_string(),
-                authz_realm_id: "realm-a".to_string(),
-            },
-            tenant_id: "tenant-a".to_string(),
-            registry_instance_id: "registry-a".to_string(),
-            default_bucket: "packages".to_string(),
-            repository_prefix: String::new(),
-            state: GatewayMountState::Active,
-            generation: 0,
-            record_hash: String::new(),
-        };
-        let first_generation = put_gateway_mount_record(&storage, exact.clone(), None)
-            .await
-            .unwrap();
-        assert_eq!(first_generation, 1);
-
-        exact.default_bucket = "packages-v2".to_string();
-        let stale =
-            put_gateway_mount_record(&storage, exact.clone(), Some(first_generation + 10)).await;
-        assert!(stale.is_err(), "stale gateway mount generation is rejected");
-        let second_generation = put_gateway_mount_record(&storage, exact, Some(first_generation))
-            .await
-            .unwrap();
-        assert_eq!(second_generation, 2);
-
-        let exact_resolution =
-            resolve_gateway_mount(&storage, "REGISTRY.EXAMPLE.TEST.", "/v2/containers/api")
-                .await
-                .unwrap()
-                .expect("exact host alias mount");
-        assert_eq!(
-            exact_resolution.match_kind,
-            GatewayMountMatchKind::ExactHostAlias
-        );
-        assert_eq!(exact_resolution.matched_path_prefix, "/v2/");
-        assert_eq!(exact_resolution.ref_generation, 2);
-        assert_eq!(
-            exact_resolution.record.authz_scope.authz_realm_id,
-            "realm-a"
-        );
-        assert_eq!(exact_resolution.record.default_bucket, "packages-v2");
-
-        let virtual_mount = GatewayMountRecord {
-            schema: GATEWAY_MOUNT_SCHEMA.to_string(),
-            mount_id: "docker-virtual".to_string(),
-            gateway: "docker".to_string(),
-            hosts: vec![],
-            path_prefixes: vec!["/".to_string()],
-            mesh_id: "mesh-a".to_string(),
-            region: "eu-west-1".to_string(),
-            anvil_storage_tenant_id: "storage-tenant-b".to_string(),
-            authz_scope: AuthzScopeRef {
-                anvil_storage_tenant_id: "storage-tenant-b".to_string(),
-                authz_realm_id: "realm-b".to_string(),
-            },
-            tenant_id: "tenant-b".to_string(),
-            registry_instance_id: "registry-b".to_string(),
-            default_bucket: "packages".to_string(),
-            repository_prefix: String::new(),
-            state: GatewayMountState::Active,
-            generation: 0,
-            record_hash: String::new(),
-        };
-        put_gateway_mount_record(&storage, virtual_mount, None)
-            .await
-            .unwrap();
-        let virtual_resolution = resolve_gateway_mount(
-            &storage,
-            "registry-b.tenant-b.eu-west-1.anvil-storage.com",
-            "/v2/containers/api/manifests/latest",
-        )
-        .await
-        .unwrap()
-        .expect("virtual host regional mount");
-        assert_eq!(
-            virtual_resolution.match_kind,
-            GatewayMountMatchKind::VirtualHostRegional
-        );
-        assert_eq!(
-            virtual_resolution.record.authz_scope.authz_realm_id,
-            "realm-b"
-        );
-
-        let path_style_resolution = resolve_gateway_mount(
-            &storage,
-            "eu-west-1.anvil-storage.com",
-            "/tenant-b/_gateway/docker/registry-b/v2/containers/api/tags/list",
-        )
-        .await
-        .unwrap()
-        .expect("path-style regional mount");
-        assert_eq!(
-            path_style_resolution.match_kind,
-            GatewayMountMatchKind::PathStyleRegional
-        );
-        assert_eq!(
-            path_style_resolution.matched_path_prefix,
-            "/tenant-b/_gateway/docker/registry-b/"
-        );
-
-        assert!(
-            resolve_gateway_mount(
-                &storage,
-                "eu-west-1.anvil-storage.com",
-                "/tenant-b/_gateway/npm/registry-b/package",
-            )
-            .await
-            .unwrap()
-            .is_none(),
-            "route parsing must not infer another gateway from caller-controlled path text"
-        );
-    }
-}
+mod tests;

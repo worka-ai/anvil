@@ -330,18 +330,7 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
 
     info!(access_key_id = %parsed.access_key_id, "SigV4 authentication successful");
 
-    // Attach claims and continue
-    let scopes = match state.persistence.get_policies_for_app(app_details.id).await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(error = %e, access_key_id = %parsed.access_key_id, "Failed to fetch policies for app");
-            return Response::builder()
-                .status(500)
-                .body(Body::from("Failed to fetch policies"))
-                .unwrap();
-        }
-    };
-
+    // Attach identity claims only. Authorisation is resolved through Zanzibar at the service boundary.
     if is_streaming && payload_hash == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" {
         let timestamp = parts
             .headers
@@ -369,7 +358,6 @@ pub async fn sigv4_auth(State(state): State<AppState>, req: Request, next: Next)
         sub: app_details.id.to_string(),
         tenant_id: app_details.tenant_id,
         jti: None,
-        scopes,
         exp: 0, // SigV4 has its own expiry mechanism
     };
     req.extensions_mut().insert(claims);
@@ -949,12 +937,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aws_chunked_decoder_still_decodes_unsigned_legacy_streams() {
+    async fn aws_chunked_decoder_decodes_unsigned_streams_when_verification_is_absent() {
         let body = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n".to_vec();
 
         let decoded = decode_aws_chunked_body(Body::from(body), None)
             .await
-            .expect("unsigned legacy stream should decode");
+            .expect("unsigned stream should decode when verification is absent");
 
         assert_eq!(decoded.as_ref(), b"hello world");
     }

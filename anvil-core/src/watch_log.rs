@@ -1,26 +1,51 @@
-use crate::core_store::{AppendStreamRecord, CoreStore, ReadStream, StreamAppendReceipt};
+use crate::core_store::{
+    AppendStreamRecord, CoreStore, ReadStream, StreamAppendReceipt, decode_deterministic_proto,
+    encode_deterministic_proto,
+};
 use crate::formats::{hash32, watch::WatchRecord};
 use crate::persistence::{Bucket, Object, ObjectWatchEvent};
 use crate::storage::Storage;
 use anyhow::{Result, anyhow};
-use serde::{Deserialize, Serialize};
+use prost::Message;
 
 const OBJECT_WATCH_PARTITION_FAMILY: u16 = 1;
 const OBJECT_WATCH_RECORD_KIND: u16 = 1;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct ObjectWatchPayload {
     bucket_name: String,
     key: String,
     event_type: String,
     version_id: Option<String>,
-    #[serde(default)]
     mutation_id: Option<String>,
-    #[serde(default)]
     payload_hash: Option<String>,
     etag: Option<String>,
     size: i64,
     is_delete_marker: bool,
+    emitted_at: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ObjectWatchPayloadProto {
+    #[prost(string, tag = "1")]
+    bucket_name: String,
+    #[prost(string, tag = "2")]
+    key: String,
+    #[prost(string, tag = "3")]
+    event_type: String,
+    #[prost(string, optional, tag = "4")]
+    version_id: Option<String>,
+    #[prost(string, optional, tag = "5")]
+    mutation_id: Option<String>,
+    #[prost(string, optional, tag = "6")]
+    payload_hash: Option<String>,
+    #[prost(string, optional, tag = "7")]
+    etag: Option<String>,
+    #[prost(int64, tag = "8")]
+    size: i64,
+    #[prost(bool, tag = "9")]
+    is_delete_marker: bool,
+    #[prost(string, tag = "10")]
     emitted_at: String,
 }
 
@@ -30,7 +55,7 @@ pub async fn append_object_watch_record(
     object: &Object,
     event: &ObjectWatchEvent,
 ) -> Result<StreamAppendReceipt> {
-    let payload = serde_json::to_vec(&ObjectWatchPayload {
+    let payload = encode_object_watch_payload(&ObjectWatchPayload {
         bucket_name: event.bucket_name.clone(),
         key: event.key.clone(),
         event_type: event.event_type.clone(),
@@ -43,7 +68,7 @@ pub async fn append_object_watch_record(
         emitted_at: event
             .created_at
             .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
-    })?;
+    });
     let record = WatchRecord::new(
         event.id as u128,
         OBJECT_WATCH_PARTITION_FAMILY,
@@ -62,6 +87,8 @@ pub async fn append_object_watch_record(
             partition_id: hex::encode(partition_id(bucket.tenant_id, bucket.id)),
             record_kind: "object_watch".to_string(),
             payload: record.encode(),
+            content_type: None,
+            user_metadata_json: "{}".to_string(),
             fence: None,
             transaction_id: None,
             idempotency_key: Some(format!(
@@ -80,13 +107,14 @@ pub async fn latest_object_watch_cursor(
 ) -> Result<Option<u128>> {
     let records = read_object_watch_records(storage, tenant_id, bucket_id).await?;
     let expected = version_id.to_string();
-    Ok(records
-        .into_iter()
-        .filter_map(|record| {
-            let payload: ObjectWatchPayload = serde_json::from_slice(&record.payload).ok()?;
-            (payload.version_id.as_deref() == Some(expected.as_str())).then_some(record.cursor)
-        })
-        .max())
+    let mut latest = None;
+    for record in records {
+        let payload = decode_object_watch_payload(&record.payload)?;
+        if payload.version_id.as_deref() == Some(expected.as_str()) {
+            latest = latest.max(Some(record.cursor));
+        }
+    }
+    Ok(latest)
 }
 
 pub async fn list_object_watch_events(
@@ -104,7 +132,7 @@ pub async fn list_object_watch_events(
         if record.cursor <= after_cursor as u128 {
             continue;
         }
-        let payload: ObjectWatchPayload = serde_json::from_slice(&record.payload)?;
+        let payload = decode_object_watch_payload(&record.payload)?;
         if !payload.key.starts_with(prefix) {
             continue;
         }
@@ -144,6 +172,38 @@ pub async fn list_object_watch_events(
     Ok(events)
 }
 
+fn encode_object_watch_payload(payload: &ObjectWatchPayload) -> Vec<u8> {
+    encode_deterministic_proto(&ObjectWatchPayloadProto {
+        bucket_name: payload.bucket_name.clone(),
+        key: payload.key.clone(),
+        event_type: payload.event_type.clone(),
+        version_id: payload.version_id.clone(),
+        mutation_id: payload.mutation_id.clone(),
+        payload_hash: payload.payload_hash.clone(),
+        etag: payload.etag.clone(),
+        size: payload.size,
+        is_delete_marker: payload.is_delete_marker,
+        emitted_at: payload.emitted_at.clone(),
+    })
+}
+
+fn decode_object_watch_payload(bytes: &[u8]) -> Result<ObjectWatchPayload> {
+    let proto =
+        decode_deterministic_proto::<ObjectWatchPayloadProto>(bytes, "object watch payload")?;
+    Ok(ObjectWatchPayload {
+        bucket_name: proto.bucket_name,
+        key: proto.key,
+        event_type: proto.event_type,
+        version_id: proto.version_id,
+        mutation_id: proto.mutation_id,
+        payload_hash: proto.payload_hash,
+        etag: proto.etag,
+        size: proto.size,
+        is_delete_marker: proto.is_delete_marker,
+        emitted_at: proto.emitted_at,
+    })
+}
+
 async fn read_object_watch_records(
     storage: &Storage,
     tenant_id: i64,
@@ -162,10 +222,11 @@ async fn read_object_watch_records(
         if record.record_kind != "object_watch" {
             continue;
         }
-        let (watch_record, used) = WatchRecord::decode(&record.payload)?;
+        let (mut watch_record, used) = WatchRecord::decode(&record.payload)?;
         if used != record.payload.len() {
             return Err(anyhow!("object watch CoreStore record has trailing bytes"));
         }
+        watch_record.cursor = u128::from(record.sequence);
         decoded.push(watch_record);
     }
     Ok(decoded)
@@ -279,6 +340,8 @@ mod tests {
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].cursor, 1);
         assert_eq!(decoded[1].cursor, 2);
+        assert_ne!(decoded[0].payload.first().copied(), Some(b'{'));
+        assert!(decode_object_watch_payload(&decoded[0].payload).is_ok());
     }
 
     #[tokio::test]
@@ -309,7 +372,7 @@ mod tests {
             latest_object_watch_cursor(&storage, bucket.tenant_id, bucket.id, first.version_id)
                 .await
                 .unwrap(),
-            Some(10)
+            Some(1)
         );
         assert_eq!(
             latest_object_watch_cursor(&storage, bucket.tenant_id, bucket.id, uuid::Uuid::new_v4())
@@ -325,11 +388,11 @@ mod tests {
         assert_eq!(docs[0].key, "docs/a.txt");
 
         let after_first =
-            list_object_watch_events(&storage, bucket.tenant_id, bucket.id, "", 10, 10)
+            list_object_watch_events(&storage, bucket.tenant_id, bucket.id, "", 1, 10)
                 .await
                 .unwrap();
         assert_eq!(after_first.len(), 1);
-        assert_eq!(after_first[0].id, 11);
+        assert_eq!(after_first[0].id, 2);
         assert_eq!(after_first[0].event_type, "delete");
     }
 }

@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
 
     steps:
     - name: Checkout repository
@@ -27,6 +27,18 @@ jobs:
 
     - name: Setup Rust
       uses: dtolnay/rust-toolchain@stable
+
+    - name: Install system build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          clang \
+          cmake \
+          libclang-dev \
+          pkg-config \
+          libssl-dev \
+          protobuf-compiler
 
     - name: Cache Cargo dependencies
       uses: actions/cache@v4
@@ -36,9 +48,7 @@ jobs:
           ~/.cargo/registry/index/
           ~/.cargo/registry/cache/
           ~/.cargo/git/db/
-          target/
-          documentation/target/
-        key: ${{ runner.os }}-docs-cargo-${{ hashFiles('**/Cargo.lock', 'documentation/**') }}
+        key: ${{ runner.os }}-docs-cargo-v2-${{ hashFiles('**/Cargo.lock', 'documentation/**') }}
 
     - name: Install Fission CLI
       run: |
@@ -62,7 +72,7 @@ jobs:
 
   deploy:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

@@ -1,5 +1,9 @@
-use crate::formats::{Hash32, hash32};
+use crate::{
+    core_store::encode_deterministic_proto,
+    formats::{Hash32, hash32},
+};
 use anyhow::{Result, anyhow};
+use prost::Message;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_MAX_CHANGESET_SIZE_BYTES: usize = 16 * 1024 * 1024;
@@ -31,6 +35,24 @@ pub struct PersonalDbVoterAck {
     pub log_index: u64,
     pub log_hash: String,
     pub signature: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct PersonalDbVoterAckHashSetProto {
+    #[prost(message, repeated, tag = "1")]
+    voter_acks: Vec<PersonalDbVoterAckHashProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct PersonalDbVoterAckHashProto {
+    #[prost(string, tag = "1")]
+    replica_id: String,
+    #[prost(uint64, tag = "2")]
+    log_index: u64,
+    #[prost(string, tag = "3")]
+    log_hash: String,
+    #[prost(string, tag = "4")]
+    signature: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,7 +91,9 @@ pub fn validate_submit_personaldb_changeset(
     }
     canonicalize_voter_acks(&mut request.voter_acks);
     validate_voter_acks(&request.voter_acks)?;
-    let voter_acks_hash = hash32(&serde_json::to_vec(&request.voter_acks)?);
+    let voter_acks_hash = hash32(&encode_deterministic_proto(&voter_acks_hash_proto(
+        &request.voter_acks,
+    )));
     Ok(ValidatedPersonalDbChangeset {
         request,
         changeset_payload_hash: actual_payload_hash,
@@ -95,6 +119,20 @@ pub fn validate_configured_limit(limit: usize) -> Result<()> {
 
 fn canonicalize_voter_acks(acks: &mut Vec<PersonalDbVoterAck>) {
     acks.sort();
+}
+
+fn voter_acks_hash_proto(acks: &[PersonalDbVoterAck]) -> PersonalDbVoterAckHashSetProto {
+    PersonalDbVoterAckHashSetProto {
+        voter_acks: acks
+            .iter()
+            .map(|ack| PersonalDbVoterAckHashProto {
+                replica_id: ack.replica_id.clone(),
+                log_index: ack.log_index,
+                log_hash: ack.log_hash.clone(),
+                signature: ack.signature.clone(),
+            })
+            .collect(),
+    }
 }
 
 fn validate_voter_acks(acks: &[PersonalDbVoterAck]) -> Result<()> {

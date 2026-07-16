@@ -44,20 +44,20 @@ title = "Learn"
 href = "/learn/overview/"
 
 [[site.nav]]
+title = "Architecture"
+href = "/architecture/overview/"
+
+[[site.nav]]
 title = "Tutorials"
 href = "/tutorials/overview/"
 
 [[site.nav]]
-title = "Developers"
-href = "/developers/native-api/"
-
-[[site.nav]]
 title = "Operators"
-href = "/operators/deployment/"
+href = "/operators/overview/"
 
 [[site.nav]]
 title = "Reference"
-href = "/reference/configuration/"
+href = "/reference/public-cli/"
 
 [[site.nav]]
 title = "Blog"
@@ -72,17 +72,17 @@ sidebar = "site/learn-sidebar.toml"
 
 [[site.routes]]
 kind = "content"
+path = "/architecture"
+source = "content/architecture"
+template = "fission::site::documentation"
+sidebar = "site/architecture-sidebar.toml"
+
+[[site.routes]]
+kind = "content"
 path = "/tutorials"
 source = "content/tutorials"
 template = "fission::site::documentation"
 sidebar = "site/tutorial-sidebar.toml"
-
-[[site.routes]]
-kind = "content"
-path = "/developers"
-source = "content/developers"
-template = "fission::site::documentation"
-sidebar = "site/developer-sidebar.toml"
 
 [[site.routes]]
 kind = "content"

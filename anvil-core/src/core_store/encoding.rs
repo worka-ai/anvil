@@ -1,5 +1,6 @@
-use super::types::{SourceId, SourceKind};
+use super::types::{AuthzScopeRef, SourceId, SourceKind};
 use anyhow::{Result, anyhow, bail};
+use std::collections::BTreeMap;
 
 const STRING_TAG: u8 = 0x30;
 const BYTES_TAG: u8 = 0x31;
@@ -40,6 +41,23 @@ impl EncodedTypedValue {
 }
 
 impl SourceKind {
+    fn from_binary_code(code: u16) -> Result<Self> {
+        match code {
+            1 => Ok(Self::ObjectCurrent),
+            2 => Ok(Self::ObjectVersion),
+            3 => Ok(Self::AppendRecord),
+            4 => Ok(Self::AuthzResource),
+            5 => Ok(Self::PackageRepository),
+            6 => Ok(Self::PackageVersion),
+            7 => Ok(Self::PackageFile),
+            8 => Ok(Self::PackageTag),
+            9 => Ok(Self::GitObject),
+            10 => Ok(Self::PersonalDatabaseRecord),
+            11 => Ok(Self::MeshControlRecord),
+            other => Err(anyhow!("unknown SourceId kind code {other}")),
+        }
+    }
+
     fn binary_code(self) -> u16 {
         match self {
             Self::ObjectCurrent => 1,
@@ -69,7 +87,7 @@ impl SourceId {
         push_len_bytes(&mut out, self.resource_id.as_bytes())?;
         out.extend_from_slice(&self.generation.to_le_bytes());
         out.push(u8::from(self.tombstone));
-        let variant = serde_json::to_vec(&self.variant)?;
+        let variant = encode_string_map(&self.variant)?;
         push_len_bytes(&mut out, &variant)?;
         Ok(out)
     }
@@ -77,6 +95,39 @@ impl SourceId {
     pub fn sort_key(&self) -> Result<Vec<u8>> {
         // SourceId sort order follows the RFC tuple. Length-prefixing preserves tuple boundaries.
         self.encode_binary()
+    }
+
+    pub fn decode_binary(input: &[u8]) -> Result<Self> {
+        let mut cursor = BinaryCursor::new(input);
+        let version = cursor.read_u16()?;
+        if version != 1 {
+            bail!("unsupported SourceId binary version {version}");
+        }
+        let kind = SourceKind::from_binary_code(cursor.read_u16()?)?;
+        let mesh_id = cursor.read_string()?;
+        let anvil_storage_tenant_id = cursor.read_string()?;
+        let authz_realm_id = cursor.read_string()?;
+        let resource_namespace = cursor.read_string()?;
+        let resource_id = cursor.read_string()?;
+        let generation = cursor.read_u64()?;
+        let tombstone = cursor.read_bool()?;
+        let variant_bytes = cursor.read_len_bytes()?.to_vec();
+        cursor.finish()?;
+        Ok(Self {
+            schema: "anvil.query.source_id.v1".to_string(),
+            mesh_id,
+            anvil_storage_tenant_id: anvil_storage_tenant_id.clone(),
+            authz_scope: AuthzScopeRef {
+                anvil_storage_tenant_id,
+                authz_realm_id,
+            },
+            kind,
+            resource_namespace,
+            resource_id,
+            generation,
+            tombstone,
+            variant: decode_string_map(&variant_bytes)?,
+        })
     }
 }
 
@@ -144,6 +195,93 @@ fn push_len_bytes(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
     out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(value);
     Ok(())
+}
+
+fn encode_string_map(map: &BTreeMap<String, String>) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let len = u32::try_from(map.len()).map_err(|_| anyhow!("CoreStore map too large"))?;
+    out.extend_from_slice(&len.to_le_bytes());
+    for (key, value) in map {
+        push_len_bytes(&mut out, key.as_bytes())?;
+        push_len_bytes(&mut out, value.as_bytes())?;
+    }
+    Ok(out)
+}
+
+fn decode_string_map(input: &[u8]) -> Result<BTreeMap<String, String>> {
+    let mut cursor = BinaryCursor::new(input);
+    let len = cursor.read_u32()? as usize;
+    let mut out = BTreeMap::new();
+    for _ in 0..len {
+        let key = cursor.read_string()?;
+        let value = cursor.read_string()?;
+        out.insert(key, value);
+    }
+    cursor.finish()?;
+    Ok(out)
+}
+
+struct BinaryCursor<'a> {
+    input: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> BinaryCursor<'a> {
+    fn new(input: &'a [u8]) -> Self {
+        Self { input, offset: 0 }
+    }
+
+    fn read_exact(&mut self, len: usize) -> Result<&'a [u8]> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| anyhow!("SourceId cursor overflow"))?;
+        if end > self.input.len() {
+            bail!("SourceId binary is truncated");
+        }
+        let out = &self.input[self.offset..end];
+        self.offset = end;
+        Ok(out)
+    }
+
+    fn read_u16(&mut self) -> Result<u16> {
+        Ok(u16::from_le_bytes(self.read_exact(2)?.try_into().unwrap()))
+    }
+
+    fn read_u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.read_exact(4)?.try_into().unwrap()))
+    }
+
+    fn read_u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.read_exact(8)?.try_into().unwrap()))
+    }
+
+    fn read_bool(&mut self) -> Result<bool> {
+        match self.read_exact(1)?[0] {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => Err(anyhow!("invalid SourceId bool byte {other}")),
+        }
+    }
+
+    fn read_len_bytes(&mut self) -> Result<&'a [u8]> {
+        let len = self.read_u32()? as usize;
+        self.read_exact(len)
+    }
+
+    fn read_string(&mut self) -> Result<String> {
+        let bytes = self.read_len_bytes()?;
+        std::str::from_utf8(bytes)
+            .map(|value| value.to_string())
+            .map_err(|error| anyhow!("SourceId string is not UTF-8: {error}"))
+    }
+
+    fn finish(self) -> Result<()> {
+        if self.offset != self.input.len() {
+            bail!("SourceId binary has trailing bytes");
+        }
+        Ok(())
+    }
 }
 
 fn push_escaped_terminated(out: &mut Vec<u8>, value: &[u8]) {

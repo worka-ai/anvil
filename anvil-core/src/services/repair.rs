@@ -1,7 +1,7 @@
 use crate::anvil_api::repair_service_server::RepairService;
 use crate::anvil_api::*;
 use crate::{
-    AppState, auth, authz_repair, directory_repair, index_repair,
+    AppState, access_control, auth, authz_repair, directory_repair, index_repair,
     permissions::AnvilAction,
     personaldb_repair,
     repair_finding::{RepairFinding, RepairSubjectRef},
@@ -25,9 +25,14 @@ impl RepairService for AppState {
         validate_component(&req.index_name, "index_name")?;
 
         let resource = format!("{}/{}", req.bucket_name, req.index_name);
-        if !auth::is_authorized(AnvilAction::RepairRun, &resource, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::RepairRun,
+            &resource,
+        )
+        .await?;
 
         let report = self
             .persistence
@@ -38,7 +43,7 @@ impl RepairService for AppState {
                 req.rebuild,
             )
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(repair_error_status)?;
         let (source_cursor_low, source_cursor_high) = split_u128(report.source_cursor);
         let build = report
             .build
@@ -80,15 +85,20 @@ impl RepairService for AppState {
         let req = request.into_inner();
         validate_component(&req.bucket_name, "bucket_name")?;
 
-        if !auth::is_authorized(AnvilAction::RepairRun, &req.bucket_name, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::RepairRun,
+            &req.bucket_name,
+        )
+        .await?;
 
         let report = self
             .persistence
             .repair_directory_index(claims.tenant_id, &req.bucket_name, req.rebuild)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(repair_error_status)?;
         let (source_cursor_low, source_cursor_high) = split_u128(report.source_cursor);
         Ok(Response::new(RepairDirectoryIndexResponse {
             status: directory_repair::status_name(&report.status).to_string(),
@@ -130,9 +140,14 @@ impl RepairService for AppState {
         validate_component(&req.scope_kind, "scope_kind")?;
         validate_component(&req.scope_id, "scope_id")?;
 
-        if !auth::is_authorized(AnvilAction::RepairRead, &req.scope_id, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::RepairRead,
+            &req.scope_id,
+        )
+        .await?;
 
         let findings = self
             .persistence
@@ -158,9 +173,14 @@ impl RepairService for AppState {
         validate_component(&req.derived_index_id, "derived_index_id")?;
 
         let resource = format!("tenant-{}/authz/{}", claims.tenant_id, req.derived_index_id);
-        if !auth::is_authorized(AnvilAction::RepairRun, &resource, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::RepairRun,
+            &resource,
+        )
+        .await?;
 
         let report = self
             .persistence
@@ -195,9 +215,14 @@ impl RepairService for AppState {
         validate_component(&req.database_id, "database_id")?;
 
         let resource = format!("tenant-{}/{}", claims.tenant_id, req.database_id);
-        if !auth::is_authorized(AnvilAction::RepairRun, &resource, &claims.scopes) {
-            return Err(Status::permission_denied("Permission denied"));
-        }
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::RepairRun,
+            &resource,
+        )
+        .await?;
 
         let report = self
             .persistence
@@ -248,6 +273,15 @@ fn repair_subject_record(subject: &RepairSubjectRef) -> RepairSubjectRecord {
         has_cursor: subject.cursor.is_some(),
         expected_hash: subject.expected_hash.clone().unwrap_or_default(),
         actual_hash: subject.actual_hash.clone().unwrap_or_default(),
+    }
+}
+
+fn repair_error_status(error: anyhow::Error) -> Status {
+    let message = error.to_string();
+    if message.contains("bucket not found") || message.contains("index definition not found") {
+        Status::not_found(message)
+    } else {
+        Status::internal(message)
     }
 }
 

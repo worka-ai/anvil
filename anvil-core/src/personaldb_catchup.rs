@@ -1,6 +1,7 @@
 use crate::{
     formats::personaldb::PersonalDbLogRecord,
     personaldb_commit_store::{
+        decode_commit_certificate, encode_commit_certificate,
         read_personaldb_changeset_payload_by_index, read_personaldb_changeset_payload_ref,
         read_personaldb_commit_certificate, read_personaldb_commit_certificate_ref,
     },
@@ -43,7 +44,7 @@ pub struct PersonalDbCatchUpEntry {
     pub record: PersonalDbLogRecord,
     pub changeset_bytes: Vec<u8>,
     pub certificate: PersonalDbCommitCertificate,
-    pub certificate_json: Vec<u8>,
+    pub certificate_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,13 +243,13 @@ async fn load_catch_up_entry(
     signing_key: &[u8],
 ) -> Result<PersonalDbCatchUpEntry> {
     let changeset_bytes = load_changeset_bytes(storage, tenant_id, database_id, &record).await?;
-    let (certificate, certificate_json) =
+    let (certificate, certificate_bytes) =
         load_certificate(storage, tenant_id, database_id, &record, signing_key).await?;
     Ok(PersonalDbCatchUpEntry {
         record,
         changeset_bytes,
         certificate,
-        certificate_json,
+        certificate_bytes,
     })
 }
 
@@ -286,15 +287,15 @@ async fn load_certificate(
     record: &PersonalDbLogRecord,
     signing_key: &[u8],
 ) -> Result<(PersonalDbCommitCertificate, Vec<u8>)> {
-    let certificate_json = if !record.inline_certificate_json.is_empty() {
-        record.inline_certificate_json.clone()
+    let certificate_bytes = if !record.inline_certificate_bytes.is_empty() {
+        record.inline_certificate_bytes.clone()
     } else if !record.certificate_ref.is_empty() {
         let certificate_ref = std::str::from_utf8(&record.certificate_ref)?;
         let certificate =
             read_personaldb_commit_certificate_ref(storage, certificate_ref, signing_key)
                 .await?
                 .ok_or_else(|| anyhow!("personaldb commit certificate is missing"))?;
-        serde_json::to_vec(&certificate)?
+        encode_commit_certificate(&certificate)?
     } else {
         let entry_hash = hex::encode(record.entry_hash);
         let certificate = read_personaldb_commit_certificate(
@@ -307,9 +308,9 @@ async fn load_certificate(
         )
         .await?
         .ok_or_else(|| anyhow!("personaldb commit certificate is missing"))?;
-        serde_json::to_vec(&certificate)?
+        encode_commit_certificate(&certificate)?
     };
-    let certificate: PersonalDbCommitCertificate = serde_json::from_slice(&certificate_json)?;
+    let certificate = decode_commit_certificate(&certificate_bytes)?;
     certificate.verify(signing_key)?;
     let certificate_hash = certificate
         .certificate_hash
@@ -332,7 +333,7 @@ async fn load_certificate(
             "personaldb commit certificate payload hash mismatch"
         ));
     }
-    Ok((certificate, certificate_json))
+    Ok((certificate, certificate_bytes))
 }
 
 fn ensure_contiguous_chain(records: &[PersonalDbLogRecord]) -> Result<()> {
@@ -385,6 +386,7 @@ mod tests {
             write_personaldb_group_manifest, write_personaldb_snapshots_head,
         },
         personaldb_segment::{PersonalDbLogSegmentWrite, write_personaldb_log_segment},
+        personaldb_snapshot_store::personaldb_snapshot_manifest_ref_name,
     };
     use tempfile::{TempDir, tempdir};
 
@@ -416,7 +418,10 @@ mod tests {
         assert!(entries.has_more);
         assert_eq!(entries.entries[0].changeset_bytes, b"change-1");
         assert_eq!(entries.entries[1].record.log_index, 2);
-        assert!(entries.entries[0].certificate_json.starts_with(b"{"));
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&entries.entries[0].certificate_bytes)
+                .is_err()
+        );
         entries.entries[0].certificate.verify(KEY).unwrap();
     }
 
@@ -643,7 +648,7 @@ mod tests {
                 database_id: "db-alpha".to_string(),
                 log_index: 3,
                 log_hash: hex::encode(records.last().unwrap().entry_hash),
-                segment_path: segment_ref,
+                segment_ref: segment_ref,
                 row_index_generation: 0,
                 policy_epoch: 1,
                 membership_epoch: 1,
@@ -665,7 +670,13 @@ mod tests {
                 database_id: "db-alpha".to_string(),
                 latest_snapshot_log_index: 2,
                 latest_snapshot_log_hash: hex::encode(records[1].entry_hash),
-                latest_snapshot_manifest_path: "_anvil/personaldb/tenants/tenant-3/groups/db-alpha/snapshots/manifests/00000000000000000002-state.json".to_string(),
+                latest_snapshot_manifest_ref: personaldb_snapshot_manifest_ref_name(
+                    3,
+                    "db-alpha",
+                    2,
+                    &hex::encode([4; 32]),
+                )
+                .unwrap(),
                 retained_snapshot_count: 1,
                 updated_at: now(),
                 updated_by_node: "node-a".to_string(),

@@ -1,123 +1,160 @@
 # Anvil
 
-Anvil is a production object storage platform that makes storage, search, authorisation, live change streams, and local-first database witnessing part of one system.
+Anvil is a production object storage platform with indexing, search, relationship authorisation, durable watches, and PersonalDB witnessing built into the storage layer.
 
-Most applications begin with a simple storage requirement: put bytes under a name and read them later. Real products quickly need more. They need predictable paths, fast listings, metadata filters, text search, semantic retrieval, access checks on every result, live updates when data changes, auditable background indexing, and a way to sync local-first SQLite data without turning the application server into a pile of bespoke storage glue.
+A normal object store can put bytes under a key and read them later. Product systems usually need much more: predictable path layouts, version history, metadata filters, full text search, vector retrieval, access checks on every result, live change streams, background repair evidence, static delivery, S3-compatible tooling, and a way to sync local-first SQLite applications without adding a separate database service. Anvil treats those capabilities as storage responsibilities instead of leaving every application to rebuild them.
 
-Anvil moves those concerns into the storage layer. It stores objects, maintains indexes, evaluates relationship authorisation, exposes durable watches, and witnesses PersonalDB changesets using a single object-native architecture.
+## Current Capabilities
 
-## What Anvil Provides
+- **Object storage:** tenants, buckets, keys, object versions, current pointers, delete markers, checksums, range reads, copy/delete operations, multipart flows, native gRPC APIs, and S3-compatible object access.
+- **CoreStore durability:** objects, metadata, indexes, authorisation records, PersonalDB state, mesh lifecycle records, gateway records, leases, audit events, and repair findings persist through immutable objects, ordered streams, and compare-and-swap refs.
+- **Indexes and search:** path indexes, metadata-filter indexes, typed JSON indexes, full text indexes, vector indexes, and hybrid indexes with documented selector, extractor, build-policy, query, diagnostics, pagination, and catch-up shapes.
+- **Authorisation:** public policy scopes for tenant app credentials, Zanzibar-style relationship authorisation for tenant product data, and private system-realm relations for the admin API.
+- **Watch streams:** cursor-based streams for source changes and derived maintenance so applications and background workers can catch up without rescanning everything.
+- **PersonalDB witnessing:** SQLite changeset validation, commit certificates, catch-up, snapshots, projection records, row metadata, and repair evidence for local-first applications.
+- **Gateways:** native public API, S3-compatible object access, static host-alias routing, object links, and CoreStore-backed gateway foundation records.
+- **Operations:** Docker-first server deployment, separate public/admin listeners, tenant and app provisioning, least-privilege grants, topology lifecycle, diagnostics, repair, audit listing, and release gates.
 
-- **Object storage:** buckets, keys, versions, checksums, range reads, multipart upload flows, copy/delete operations, S3-compatible access, and native gRPC APIs.
-- **Object-native metadata:** bucket/object state, manifests, journals, derived index records, diagnostics, source artefacts, and PersonalDB state are stored inside Anvil rather than delegated to an external relational metadata store.
-- **Path and metadata indexes:** predictable key layouts, prefix navigation, metadata selectors, filters, and facets for application and operator workflows.
-- **Full text search:** tokenisation, ranking, phrase support, snippets, and result filtering that respects authorisation before exposing matches.
-- **Vector search:** Rust-native vector segment storage and nearest-neighbour search for text, image, audio, and video-derived embeddings.
-- **Relationship authorisation:** Zanzibar-style tuples, namespace rules, caveats, derived usersets, fail-closed internal namespaces, and permission checks on object, index, source, and PersonalDB paths.
-- **Watch streams:** durable cursor-based change streams used by applications, derived indexes, projections, and recovery tooling to catch up without rescanning whole buckets.
-- **PersonalDB witnessing:** SQLite changeset validation, commit certificates, snapshots, row metadata, authorised projections, projection writeback, repair evidence, and catch-up APIs for local-first applications.
-- **Source and model artefacts:** storage patterns for git packs, source indexes, model manifests, Hugging Face ingestion, media extraction diagnostics, and reproducibility records.
-- **Operational tooling:** an admin CLI, an application CLI, Docker image publication, S3 compatibility tests, release checks, and Fission-built documentation.
+## Architecture
 
+CoreStore is Anvil's durable boundary. It has three primitives:
 
-## Storage Architecture
+| Primitive | Purpose |
+| --- | --- |
+| `CoreObject` | Immutable bytes: payloads, index segments, snapshots, source packs, gateway blobs. |
+| `CoreStream` | Ordered facts: object mutations, authz tuple logs, audit events, append records, PersonalDB commits. |
+| `CoreRef` | CAS heads: current object pointers, index generations, PersonalDB heads, routing state, leases. |
 
-Anvil's durable boundary is CoreStore. CoreStore has three primitives: immutable `CoreObject`s, ordered `CoreStream`s, and compare-and-swap `CoreRef`s. Objects, metadata, indexes, authorisation, PersonalDB, mesh routing, gateway records, task leases, audits, and repair evidence all persist through those primitives.
+Feature-specific formats still exist where useful, but durable truth goes through those primitives. S3 is a gateway, not the storage model. The native API, S3 gateway, search, watches, PersonalDB, and admin workflows all resolve back to Anvil tenants, buckets, resources, authorisation, and CoreStore records.
 
-This keeps S3 compatibility in the right place. S3 is a gateway for existing object tools; it is not the internal storage model. Native APIs, S3-compatible APIs, search, watches, and admin operations all resolve into the same object, authorisation, and CoreStore path.
+CoreStore is split into a metadata plane and a byte plane. CoreMeta uses RocksDB column families for metadata, heads, versions, transactions, index definitions, segment locators, authz rows, mesh records, leases, and other small control records. Tiny payloads may be inlined according to the inline payload policy. Larger durable bytes are written through the CoreStore byte pipeline and stored as erasure-coded shard data. Index segments, stream payloads, PersonalDB pages, gateway blobs, and object bodies all follow that same rule.
 
 ## Release Surfaces
 
-This release ships Anvil through these supported surfaces:
-
-- **Server:** Docker image and release binaries. The server is not published to crates.io.
-- **Rust client:** the `anvil-storage` crate, published to crates.io.
-- **CLI/admin binaries:** packaged from the server build for operators.
-- **Documentation site:** a Fission static site published independently from code releases.
-- **Protocol bindings:** generated gRPC bindings are packaged inside the Rust client; internal node-to-node services are not exposed by the public client API.
+- **Server:** Docker image and release binaries. The server crate is not published to crates.io.
+- **Rust client:** `anvil-storage = "0.3.0"` on crates.io.
+- **Saga API:** reserved in the wire protocol and Rust client for forward compatibility; server-side saga execution is intentionally rejected in this release.
+- **CLIs:** `anvil` for tenant/public operations and `anvil-admin` for private admin-plane operations.
+- **Documentation:** Fission static site in `documentation/`, published by a separate docs workflow.
+- **Protocol bindings:** generated gRPC bindings are packaged with the Rust client.
 
 ## Quick Start
 
-Run the server from Docker:
+Anvil is Docker-first. Set `ANVIL_IMAGE` to the image published for the release you want to run, preferably pinned by tag or digest:
 
 ```sh
-docker pull ghcr.io/worka-ai/anvil:latest
-docker run --rm -p 50051:50051 -p 9000:9000 ghcr.io/worka-ai/anvil:latest
+export ANVIL_IMAGE="ghcr.io/worka-ai/anvil:v0.3.0"
+docker pull "$ANVIL_IMAGE"
+```
+
+For a real local setup, use the Docker tutorial because it also covers server secret material, first-start bootstrap, public/admin listener separation, and token flow:
+
+```sh
+fission site serve --project-dir documentation
+# then open /tutorials/setup-local-anvil/
 ```
 
 Add the Rust client to an application:
 
 ```toml
 [dependencies]
-anvil-storage = "0.2"
+anvil-storage = "0.3.0"
 ```
 
-Use the client:
+Use the client with a bearer token minted by Anvil:
 
 ```rust
-use anvil_storage::{AnvilClient, proto::ListBucketsRequest};
+use anvil_storage::{proto::ListBucketsRequest, AnvilClient};
 
-# async fn example(endpoint: String, token: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-let client = AnvilClient::connect_with_bearer(endpoint, token).await?;
-let response = client.buckets().list_buckets(ListBucketsRequest {}).await?;
-println!("{} buckets", response.into_inner().buckets.len());
-# Ok(())
-# }
+async fn example(
+    endpoint: String,
+    token: String,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let client = AnvilClient::connect_with_bearer(endpoint, token).await?;
+    let response = client.buckets().list_buckets(ListBucketsRequest {}).await?;
+    println!("{} buckets", response.into_inner().buckets.len());
+    Ok(())
+}
 ```
 
-Existing S3-compatible tools can also speak to Anvil through the S3 gateway when configured with Anvil-issued credentials.
+Existing S3-compatible tools can use the S3 gateway with Anvil-issued app credentials when the operation is object-shaped. Use the native API or Rust client for Anvil-specific features such as typed indexes, watches, PersonalDB, relationship authorisation, task leases, and repair workflows.
 
 ## Documentation
 
-The public documentation lives in `documentation/` and is built with Fission.
+The documentation is organised as five books:
 
-Start the local documentation site:
+- `documentation/content/learn/` teaches the concepts from first principles.
+- `documentation/content/architecture/` explains storage internals, CoreMeta, index formats, mesh transport, release status, and contributor rules.
+- `documentation/content/tutorials/` walks through concrete operations.
+- `documentation/content/operators/` covers deployment and production operation.
+- `documentation/content/reference/` documents the CLIs, authorisation action/resource strings, and index/query JSON shapes.
 
-```sh
-fission site serve --project-dir documentation
-```
-
-Build and check the static site:
+Build and check the site locally:
 
 ```sh
 fission site check --project-dir documentation --release
 fission site build --project-dir documentation --release
 ```
 
-The documentation is structured as a progressive guide:
-
-- `documentation/content/learn/` teaches object storage, metadata, indexing, search, authorisation, watches, and PersonalDB from first principles.
-- `documentation/content/tutorials/` shows each operation using release-supported client surfaces.
-- `documentation/content/developers/` explains how to build applications directly on Anvil.
-- `documentation/content/operators/` covers deployment, identity, indexing operations, backup, recovery, and release work.
-- `documentation/content/reference/` defines configuration, CLI commands, package surfaces, and security errors.
-- `documentation/src/app.rs` contains the Fission marketing home page.
-
 ## Development Checks
 
-Run these checks before publishing or changing core behaviour:
+Run these before changing core behaviour or opening a release PR:
 
 ```sh
 cargo fmt --all -- --check
-cargo test --workspace
-cargo publish --dry-run -p anvil-storage
+ANVIL_BUILD_PROFILE=release ANVIL_IMAGE=anvil:test ./scripts/build-image.sh
+./scripts/release-gates.sh
 ```
 
-Security-sensitive changes should include focused tests for the affected path and then the full workspace test suite. Request signing, token handling, reserved namespaces, object existence behaviour, relationship authorisation, S3 gateway behaviour, watch cursors, and PersonalDB witnessing are release-critical surfaces.
+`release-gates.sh` includes storage hardening checks, docs hardening, release-note rendering, the Fission documentation build, the Rust client publish dry run, Rust unit tests, server core integration tests, and Docker-backed integration groups. Each gate step prints start/finish timings and, where GNU `timeout` is available, is bounded by `ANVIL_GATE_STEP_TIMEOUT_SECONDS` (default `1800`). `build-image.sh` defaults to a ci-profile image for PR and local test turnaround; set `ANVIL_BUILD_PROFILE=release` when building release evidence. Security-sensitive changes should also include focused tests for the affected path before the full gate.
+
+PR CI runs `build-image.sh` once for a fast `linux/amd64` ci-profile test image. Release builds run `build-image.sh` for both `linux/amd64` and `linux/arm64` with `ANVIL_BUILD_PROFILE=release`. The script uses Zig/cargo-zigbuild by default so the Linux binaries are compatible with the runtime image instead of accidentally depending on the GitHub runner's newer glibc. Docker integration tests run against the `linux/amd64` artifact, while the `linux/arm64` artifact is built and smoke-checked before publication. The release workflow publishes architecture-specific GHCR tags and then creates the public multi-architecture tag from those tested artifacts.
 
 ## Release Process
 
-The release process is intentionally split by surface:
+The release flow is designed so PR and release testing use the same gates:
 
-1. Open a PR containing the source, documentation, CI, and release-note changes.
-2. Merge to `main` after CI passes.
-3. Let GitHub Actions build and publish the Docker image.
-4. Let the independent documentation workflow publish the Fission static site.
-5. Publish the Rust client crate with `cargo publish -p anvil-storage`.
-6. Create the GitHub release with detailed notes and links to the Docker image, crate, documentation, and verification evidence.
+1. Open a PR containing source, docs, workflow, README, and blog/release-note changes.
+2. Merge to `main` only after CI passes.
+3. Tag the release.
+4. Let the release workflow test the Docker image, publish the tested image, publish `anvil-storage` if the version is new, render release notes from the release blog post, and create the GitHub release.
+5. Let the independent documentation workflow publish the Fission static site from `documentation/`.
 
-See `documentation/content/operators/release-checklist.md` for the operator checklist.
+See `documentation/content/operators/release-readiness-checklist.md` for the operator checklist and `documentation/content/architecture/release-status.md` for the release architecture status report.
 
 ## License
 
 Anvil is licensed under the Apache 2.0 License. See `LICENSE`.
+
+## Docker-first local run shape
+
+A single-node local run is useful for learning the planes before building a larger topology. Keep the storage path on a volume, generate real secret material for anything you intend to keep, and remember that the admin listener is private even in local demos.
+
+```sh
+export ANVIL_IMAGE="ghcr.io/worka-ai/anvil:v0.3.0"
+export ANVIL_SECRET_ENCRYPTION_KEY="$(anvil-admin key generate-secret-encryption-key)"
+
+docker run --rm \
+  --name anvil-local \
+  -p 127.0.0.1:50051:50051 \
+  -v anvil-local-data:/var/lib/anvil \
+  -e STORAGE_PATH=/var/lib/anvil \
+  -e REGION=local \
+  -e API_LISTEN_ADDR=0.0.0.0:50051 \
+  -e PUBLIC_API_ADDR=http://127.0.0.1:50051 \
+  -e ADMIN_LISTEN_ADDR=127.0.0.1:50052 \
+  -e JWT_SECRET="local-jwt-secret-change-me" \
+  -e ANVIL_SECRET_ENCRYPTION_KEY="$ANVIL_SECRET_ENCRYPTION_KEY" \
+  -e CLUSTER_SECRET="local-cluster-secret-change-me" \
+  -e BOOTSTRAP_SYSTEM_ADMIN_APP_NAME=ops-admin \
+  -e BOOTSTRAP_SYSTEM_ADMIN_CREDENTIAL_OUTPUT_PATH=/var/lib/anvil/first-admin.json \
+  "$ANVIL_IMAGE"
+```
+
+After the container is ready, the host can reach only the public plane at `http://127.0.0.1:50051`. The admin listener is bound to loopback inside the container and is deliberately not published to the host. For local admin smoke tests, run `anvil-admin` with `docker exec` so the command executes inside that private boundary; for example, pass `ANVIL_AUTH_TOKEN` into the container and let the in-container CLI call `http://127.0.0.1:50052`.
+
+Tenant applications should use only the public endpoint and the `anvil` CLI or Rust client. If a README example requires the admin CLI to read or write tenant objects, treat that as a documentation bug.
+
+## Plane quick reference
+
+Use the public plane for tenant-owned resources: buckets, objects, object links, tenant application credentials, public policy delegation, relationship tuples, index definitions and queries, watches, append streams, task leases, PersonalDB groups, tenant diagnostics, and tenant repair. Use the admin plane for operator-owned resources: tenants, first application handover, server-side policy grants, secret-envelope rotation, regions, cells, nodes, routing projection repair, administrative diagnostics, and administrative audit. The two planes share authentication mechanics, but they do not share authorisation: public policy scopes do not grant system-realm admin relations.

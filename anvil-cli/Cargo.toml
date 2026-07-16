@@ -16,11 +16,11 @@ exclude = [".env", "*.env", "anvil-data/**", "target/**"]
 
 publish = false
 [[bin]]
-name = "anvil-cli"
+name = "anvil"
 path = "src/main.rs"
 
 [[bin]]
-name = "admin"
+name = "anvil-admin"
 path = "src/bin/admin.rs"
 
 [dependencies]
@@ -35,9 +35,10 @@ serde_json = "1.0"
 confy = "0.6.1"
 dialoguer = "0.11.0"
 tokio-stream = "0.1"
-anvil = { package = "anvil-server", path = "../anvil", version = "0.2.0" }
+anvil = { package = "anvil-server", path = "../anvil", version = "0.3.0" }
 tempfile = "3.10.1"
 uuid = { version = "1.18", features = ["v4"] }
+blake3 = "1.8"
 
 [build-dependencies]
 tonic-build = "0.14.2"
@@ -46,3 +47,6 @@ tonic-build = "0.14.2"
 name = "confy_test"
 path = "tests/confy_test.rs"
 harness = true
+
+[dev-dependencies]
+anvil-test-utils = { package = "anvil-storage-test-utils", path = "../anvil-test-utils", version = "0.3.0" }

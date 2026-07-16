@@ -1,17 +1,17 @@
 use crate::{
     anvil_personaldb_sqlite_changeset::DecodedSqliteChangesetChange,
-    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
     formats::hash32,
+    personaldb_coremeta::{
+        read_personaldb_data_locator_bytes, read_personaldb_data_locator_row,
+        write_personaldb_bytes_as_data_locator,
+    },
     storage::Storage,
 };
 use anyhow::{Context, Result, anyhow};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rusqlite::Connection;
 use std::collections::BTreeSet;
 
 const PERSONALDB_SCHEMA_REF_PREFIX: &str = "personaldb_schema_sql:";
-const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 
 pub async fn write_personaldb_schema_sql(
     storage: &Storage,
@@ -22,29 +22,19 @@ pub async fn write_personaldb_schema_sql(
 ) -> Result<()> {
     validate_schema_sql(schema_sql, schema_hash)?;
     let ref_name = personaldb_schema_ref_name(tenant_id, database_id)?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.clone(),
-            bytes: schema_sql.as_bytes().to_vec(),
-            region_id: "local".to_string(),
-            mutation_id: format!("personaldb-schema:{tenant_id}:{database_id}:{schema_hash}"),
-        })
-        .await?;
-    store
-        .compare_and_swap_ref(CompareAndSwapRef {
-            ref_name,
-            expected_generation: None,
-            expected_target: None,
-            require_absent: false,
-            require_present: false,
-            fence: None,
-            authz_revision: None,
-            source_watch_cursor: None,
-            new_target: encode_core_object_ref_target(&object_ref)?,
-            transaction_id: None,
-        })
-        .await?;
+    write_personaldb_bytes_as_data_locator(
+        storage,
+        tenant_id,
+        database_id,
+        &ref_name,
+        "schema_sql",
+        1,
+        schema_sql.as_bytes().to_vec(),
+        schema_hash.to_string(),
+        vec![format!("schema_hash:{schema_hash}")],
+        format!("personaldb-schema:{tenant_id}:{database_id}:{schema_hash}"),
+    )
+    .await?;
     Ok(())
 }
 
@@ -54,18 +44,15 @@ pub async fn read_personaldb_schema_sql(
     database_id: &str,
     schema_hash: &str,
 ) -> Result<Option<String>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store
-        .read_ref(&personaldb_schema_ref_name(tenant_id, database_id)?)
-        .await?
+    let ref_name = personaldb_schema_ref_name(tenant_id, database_id)?;
+    let Some(row) = read_personaldb_data_locator_row(storage, tenant_id, database_id, &ref_name)?
     else {
         return Ok(None);
     };
-    let bytes = store
-        .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
-        })
-        .await?;
+    if row.data_kind != "schema_sql" {
+        return Err(anyhow!("PersonalDB schema locator has wrong data kind"));
+    }
+    let bytes = read_personaldb_data_locator_bytes(storage, &row).await?;
     if hex::encode(hash32(&bytes)) != schema_hash {
         return Err(anyhow!("PersonalDB schema hash mismatch"));
     }
@@ -96,20 +83,6 @@ fn validate_safe_component(value: &str, field: &'static str) -> Result<()> {
         return Err(anyhow!("{field} is not a safe component"));
     }
     Ok(())
-}
-
-fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
-    Ok(format!(
-        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
-    ))
-}
-
-fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
-    let encoded = target
-        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
-        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
-    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
 }
 
 pub fn validate_schema_sql(schema_sql: &str, schema_hash: &str) -> Result<()> {

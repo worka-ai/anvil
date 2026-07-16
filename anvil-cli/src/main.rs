@@ -59,25 +59,80 @@ enum Commands {
         #[clap(subcommand)]
         command: cli::auth::AuthCommands,
     },
+    /// Manage relationship authorisation tuples and schemas
+    Authz {
+        #[clap(subcommand)]
+        command: cli::authz::AuthzCommands,
+    },
+    /// Query tenant audit events
+    Audit {
+        #[clap(subcommand)]
+        command: cli::audit::AuditCommands,
+    },
+    /// Manage application credentials in the authenticated tenant
+    App {
+        #[clap(subcommand)]
+        command: cli::app::AppCommands,
+    },
+    /// Manage and query indexes
+    Index {
+        #[clap(subcommand)]
+        command: cli::index::IndexCommands,
+    },
+    /// Watch Anvil change streams
+    Watch {
+        #[clap(subcommand)]
+        command: cli::watch::WatchCommands,
+    },
+    /// Manage PersonalDB groups, projections and changesets
+    Personaldb {
+        #[clap(subcommand)]
+        command: cli::personaldb::PersonalDbCommands,
+    },
+    /// Manage append streams
+    Stream {
+        #[clap(subcommand)]
+        command: cli::stream::StreamCommands,
+    },
+    /// Manage explicit CoreStore transactions
+    Transaction {
+        #[clap(subcommand)]
+        command: cli::transaction::TransactionCommands,
+    },
+    /// Manage package registry catalogue entries
+    Registry {
+        #[clap(subcommand)]
+        command: cli::registry::RegistryCommands,
+    },
+    /// Manage coordination leases
+    Lease {
+        #[clap(subcommand)]
+        command: cli::lease::LeaseCommands,
+    },
+    /// Query tenant-scoped diagnostics
+    Diagnostics {
+        #[clap(subcommand)]
+        command: cli::diagnostics::DiagnosticsCommands,
+    },
+    /// Run tenant-scoped repairs
+    Repair {
+        #[clap(subcommand)]
+        command: cli::repair::RepairCommands,
+    },
+    /// Manage tenant-owned host aliases
+    HostAlias {
+        #[clap(subcommand)]
+        command: cli::host_alias::HostAliasCommands,
+    },
     /// Hugging Face integration
     Hf {
         #[clap(subcommand)]
         command: cli::hf::HfCommands,
     },
-    /// Manage mesh lifecycle administration
-    Admin {
-        #[clap(subcommand)]
-        command: cli::admin::AdminCommands,
-    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    eprintln!("[anvil-cli] starting v{}", env!("CARGO_PKG_VERSION"));
-    eprintln!(
-        "[anvil-cli] args: {:?}",
-        std::env::args().collect::<Vec<_>>()
-    );
     let cli = Cli::parse();
 
     if let Commands::Configure {
@@ -131,11 +186,47 @@ async fn main() -> anyhow::Result<()> {
         Commands::Auth { command } => {
             cli::auth::handle_auth_command(command, &ctx).await?;
         }
+        Commands::Authz { command } => {
+            cli::authz::handle_authz_command(command, &ctx).await?;
+        }
+        Commands::Audit { command } => {
+            cli::audit::handle_audit_command(command, &ctx).await?;
+        }
+        Commands::App { command } => {
+            cli::app::handle_app_command(command, &ctx).await?;
+        }
+        Commands::Index { command } => {
+            cli::index::handle_index_command(command, &ctx).await?;
+        }
+        Commands::Watch { command } => {
+            cli::watch::handle_watch_command(command, &ctx).await?;
+        }
+        Commands::Personaldb { command } => {
+            cli::personaldb::handle_personaldb_command(command, &ctx).await?;
+        }
+        Commands::Stream { command } => {
+            cli::stream::handle_stream_command(command, &ctx).await?;
+        }
+        Commands::Transaction { command } => {
+            cli::transaction::handle_transaction_command(command, &ctx).await?;
+        }
+        Commands::Registry { command } => {
+            cli::registry::handle_registry_command(command, &ctx).await?;
+        }
+        Commands::Lease { command } => {
+            cli::lease::handle_lease_command(command, &ctx).await?;
+        }
+        Commands::Diagnostics { command } => {
+            cli::diagnostics::handle_diagnostics_command(command, &ctx).await?;
+        }
+        Commands::Repair { command } => {
+            cli::repair::handle_repair_command(command, &ctx).await?;
+        }
+        Commands::HostAlias { command } => {
+            cli::host_alias::handle_host_alias_command(command, &ctx).await?;
+        }
         Commands::Hf { command } => {
             cli::hf::handle_hf_command(command, &ctx).await?;
-        }
-        Commands::Admin { command } => {
-            cli::admin::handle_admin_command(command, &ctx).await?;
         }
     }
 

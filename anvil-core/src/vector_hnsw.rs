@@ -254,7 +254,7 @@ impl HnswRsVectorIndexEngine {
         let mut results = Vec::with_capacity(limit.min(candidate_indexes.len()));
         for idx in candidate_indexes {
             let entry = &segment.entries[idx];
-            if !is_authorized(entry.record.authz_label_hash, authorized_labels) {
+            if !matches_authorized_label_filter(entry.record.authz_label_hash, authorized_labels) {
                 continue;
             }
             results.push(result_from_entry(query, metric, entry)?);
@@ -411,6 +411,7 @@ fn result_from_entry(
 ) -> Result<VectorSearchResult, FormatError> {
     Ok(VectorSearchResult {
         vector_id: entry.record.vector_id,
+        source_id_binary: entry.source_id_binary.clone(),
         score: vector_score(query, &entry.payload.values, metric)?,
         object_version_id: entry.record.object_version_id,
         chunk_id: entry.record.chunk_id,
@@ -426,7 +427,10 @@ fn dot_product(left: &[f32], right: &[f32]) -> f32 {
         .sum()
 }
 
-fn is_authorized(label: Hash32, authorized_labels: Option<&BTreeSet<Hash32>>) -> bool {
+fn matches_authorized_label_filter(
+    label: Hash32,
+    authorized_labels: Option<&BTreeSet<Hash32>>,
+) -> bool {
     authorized_labels.is_none_or(|labels| labels.contains(&label))
 }
 

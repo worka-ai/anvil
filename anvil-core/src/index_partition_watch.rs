@@ -1,5 +1,8 @@
 use crate::{
-    core_store::{AppendStreamRecord, CoreStore, ReadStream},
+    core_store::{
+        AppendStreamRecord, CoreStore, ReadStream, decode_deterministic_proto,
+        encode_deterministic_proto,
+    },
     formats::{Hash32, hash32, watch::WatchRecord},
     partition_fence::{
         OWNERSHIP_EXPIRED, OWNERSHIP_NOT_FOUND, OWNERSHIP_OWNER_MISMATCH, OWNERSHIP_STALE_FENCE,
@@ -8,6 +11,7 @@ use crate::{
     storage::Storage,
 };
 use anyhow::{Result, anyhow};
+use prost::Message;
 use serde::{Deserialize, Serialize};
 
 const INDEX_PARTITION_FAMILY: u16 = 7;
@@ -24,6 +28,28 @@ pub struct IndexPartitionWatchPayload {
     pub proof_hash: String,
     pub segment_hashes: Vec<String>,
     pub emitted_at: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct IndexPartitionWatchPayloadProto {
+    #[prost(string, tag = "1")]
+    index_id: String,
+    #[prost(string, tag = "2")]
+    index_kind: String,
+    #[prost(string, tag = "3")]
+    event_type: String,
+    #[prost(uint64, tag = "4")]
+    generation: u64,
+    #[prost(string, tag = "5")]
+    source_cursor: String,
+    #[prost(string, tag = "6")]
+    source_manifest_hash: String,
+    #[prost(string, tag = "7")]
+    proof_hash: String,
+    #[prost(string, repeated, tag = "8")]
+    segment_hashes: Vec<String>,
+    #[prost(string, tag = "9")]
+    emitted_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,7 +105,7 @@ pub async fn append_index_partition_watch_record(
         authz_revision,
         payload.generation,
         0,
-        serde_json::to_vec(&payload)?,
+        encode_index_partition_watch_payload(&payload),
     );
     core_store
         .append_stream(AppendStreamRecord {
@@ -92,6 +118,8 @@ pub async fn append_index_partition_watch_record(
             )),
             record_kind: "index_partition_watch".to_string(),
             payload: record.encode(),
+            content_type: None,
+            user_metadata_json: "{}".to_string(),
             fence: None,
             transaction_id: None,
             idempotency_key: Some(format!(
@@ -141,7 +169,7 @@ pub async fn list_index_partition_watch_events(
         {
             continue;
         }
-        let payload: IndexPartitionWatchPayload = serde_json::from_slice(&record.payload)?;
+        let payload = decode_index_partition_watch_payload(&record.payload)?;
         if payload.index_id != index_id {
             return Err(anyhow!("index partition watch payload scope mismatch"));
         }
@@ -324,6 +352,41 @@ fn require_nonempty(value: &str, field: &'static str) -> Result<()> {
         return Err(anyhow!("{field} must not be empty"));
     }
     Ok(())
+}
+
+fn encode_index_partition_watch_payload(payload: &IndexPartitionWatchPayload) -> Vec<u8> {
+    encode_deterministic_proto(&IndexPartitionWatchPayloadProto {
+        index_id: payload.index_id.clone(),
+        index_kind: payload.index_kind.clone(),
+        event_type: payload.event_type.clone(),
+        generation: payload.generation,
+        source_cursor: payload.source_cursor.to_string(),
+        source_manifest_hash: payload.source_manifest_hash.clone(),
+        proof_hash: payload.proof_hash.clone(),
+        segment_hashes: payload.segment_hashes.clone(),
+        emitted_at: payload.emitted_at.clone(),
+    })
+}
+
+fn decode_index_partition_watch_payload(bytes: &[u8]) -> Result<IndexPartitionWatchPayload> {
+    let proto = decode_deterministic_proto::<IndexPartitionWatchPayloadProto>(
+        bytes,
+        "index partition watch payload",
+    )?;
+    Ok(IndexPartitionWatchPayload {
+        index_id: proto.index_id,
+        index_kind: proto.index_kind,
+        event_type: proto.event_type,
+        generation: proto.generation,
+        source_cursor: proto
+            .source_cursor
+            .parse()
+            .map_err(|_| anyhow!("index partition watch source_cursor is not u128"))?,
+        source_manifest_hash: proto.source_manifest_hash,
+        proof_hash: proto.proof_hash,
+        segment_hashes: proto.segment_hashes,
+        emitted_at: proto.emitted_at,
+    })
 }
 
 #[cfg(test)]

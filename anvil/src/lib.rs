@@ -1,6 +1,10 @@
+#![recursion_limit = "512"]
+
 use anyhow::Result;
 use axum::ServiceExt;
+use axum::serve::ListenerExt;
 use once_cell::sync::OnceCell;
+use std::time::Instant;
 use tonic::service;
 use tower::ServiceExt as TowerServiceExt;
 use tracing::{error, info};
@@ -18,6 +22,7 @@ pub async fn run(
     admin_listener: tokio::net::TcpListener,
     config: anvil_core::config::Config,
 ) -> Result<()> {
+    config.validate_admin_listener_bind()?;
     let (tx, rx) = tokio::sync::mpsc::channel(100);
     let state = AppState::new(config, Some(tx)).await?;
     let swarm = anvil_core::cluster::create_swarm(state.config.clone()).await?;
@@ -47,20 +52,22 @@ pub async fn start_node_with_admin_listener(
         swarm.dial(multiaddr)?;
     }
 
-    let worker_state = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = anvil_core::worker::run(
-            worker_state.persistence.clone(),
-            worker_state.cluster.clone(),
-            worker_state.jwt_manager.clone(),
-            worker_state.object_manager.clone(),
-            worker_state.secret_keyring.clone(),
-        )
-        .await
-        {
-            error!("Worker process failed: {}", e);
-        }
-    });
+    if state.config.run_background_worker {
+        let worker_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = anvil_core::worker::run(
+                worker_state.persistence.clone(),
+                worker_state.cluster.clone(),
+                worker_state.jwt_manager.clone(),
+                worker_state.object_manager.clone(),
+                worker_state.secret_keyring.clone(),
+            )
+            .await
+            {
+                error!("Worker process failed: {}", e);
+            }
+        });
+    }
 
     // --- Services ---
     let state_clone = state.clone();
@@ -77,10 +84,15 @@ pub async fn start_node_with_admin_listener(
     }
 
     let grpc_axum = anvil_core::services::create_axum_router(grpc_router);
+    let admin_auth_state = state.clone();
+    let admin_auth_interceptor =
+        anvil_core::services::AuthInterceptorFn::new(move |req: tonic::Request<()>| {
+            middleware::admin_auth_interceptor(req, &admin_auth_state)
+        });
     let admin_axum = admin_listener.as_ref().map(|_| {
         anvil_core::services::create_axum_router(anvil_core::services::create_admin_grpc_router(
             state.clone(),
-            auth_interceptor.clone(),
+            admin_auth_interceptor.clone(),
         ))
     });
     let s3_app = s3_gateway::app(state.clone());
@@ -90,21 +102,56 @@ pub async fn start_node_with_admin_listener(
         let s3_router = s3_app.clone();
 
         async move {
+            let started_at = Instant::now();
+            let method = req.method().to_string();
+            let path = req.uri().path().to_string();
             let content_type = req
                 .headers()
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
+                .unwrap_or("")
+                .to_string();
 
-            if content_type.starts_with("application/grpc") {
-                grpc_router.oneshot(req).await
+            let plane = if content_type.starts_with("application/grpc") {
+                "public-grpc"
             } else {
-                tracing::info!(
-                    "[gRPC Mux] Routing to S3 gateway for content-type: {}",
-                    content_type
-                );
-                s3_router.oneshot(req).await
-            }
+                "s3"
+            };
+            let mux_request_id = uuid::Uuid::new_v4().simple().to_string();
+            let context = vec![
+                ("mux_request_id".to_string(), mux_request_id.clone()),
+                ("plane".to_string(), plane.to_string()),
+                ("method".to_string(), method.clone()),
+                ("path".to_string(), path.clone()),
+            ];
+            let response = anvil_core::perf::with_context(context, async move {
+                if content_type.starts_with("application/grpc") {
+                    grpc_router.oneshot(req).await
+                } else {
+                    tracing::info!(
+                        "[gRPC Mux] Routing to S3 gateway for content-type: {}",
+                        content_type
+                    );
+                    s3_router.oneshot(req).await
+                }
+            })
+            .await;
+            let status = response
+                .as_ref()
+                .map(|response| response.status().as_u16().to_string())
+                .unwrap_or_else(|_| "service_error".to_string());
+            anvil_core::perf::record_duration(
+                "anvil_request_mux",
+                &[
+                    ("mux_request_id", mux_request_id.as_str()),
+                    ("plane", plane),
+                    ("method", method.as_str()),
+                    ("path", path.as_str()),
+                    ("status", status.as_str()),
+                ],
+                started_at.elapsed(),
+            );
+            response
         }
     });
 
@@ -128,6 +175,11 @@ pub async fn start_node_with_admin_listener(
         outbound_events_rx,
     ));
     let server_task = tokio::spawn(async move {
+        let listener = listener.tap_io(|stream| {
+            if let Err(error) = stream.set_nodelay(true) {
+                tracing::warn!(%error, "failed to enable TCP_NODELAY on public connection");
+            }
+        });
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -137,9 +189,14 @@ pub async fn start_node_with_admin_listener(
     let admin_server_task = admin_listener
         .zip(admin_axum)
         .map(|(admin_listener, admin_app)| {
-            tokio::spawn(
-                async move { axum::serve(admin_listener, admin_app.into_make_service()).await },
-            )
+            tokio::spawn(async move {
+                let admin_listener = admin_listener.tap_io(|stream| {
+                    if let Err(error) = stream.set_nodelay(true) {
+                        tracing::warn!(%error, "failed to enable TCP_NODELAY on admin connection");
+                    }
+                });
+                axum::serve(admin_listener, admin_app.into_make_service()).await
+            })
         });
 
     // Run both tasks concurrently.

@@ -1,5 +1,6 @@
-use crate::persistence::Object;
+use crate::{core_store::encode_deterministic_proto, persistence::Object};
 use chrono::{DateTime, Utc};
+use prost::Message;
 use serde::{Deserialize, Serialize};
 
 pub const LINK_METADATA_CONTENT_TYPE: &str = "application/vnd.anvil.object-link+json";
@@ -31,6 +32,32 @@ pub struct ObjectLinkTarget {
     pub created_by: String,
 }
 
+#[derive(Clone, PartialEq, Message)]
+struct ObjectLinkDescriptorHashProto {
+    #[prost(string, tag = "1")]
+    schema: String,
+    #[prost(string, tag = "2")]
+    tenant_id: String,
+    #[prost(string, tag = "3")]
+    bucket_name: String,
+    #[prost(string, tag = "4")]
+    link_key: String,
+    #[prost(string, tag = "5")]
+    target_key: String,
+    #[prost(string, optional, tag = "6")]
+    target_version: Option<String>,
+    #[prost(string, tag = "7")]
+    resolution: String,
+    #[prost(string, tag = "8")]
+    created_at: String,
+    #[prost(string, tag = "9")]
+    updated_at: String,
+    #[prost(string, tag = "10")]
+    created_by: String,
+    #[prost(uint64, tag = "11")]
+    generation: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectLinkDescriptor {
     pub schema: String,
@@ -59,6 +86,8 @@ pub struct PutObjectLinkRequest {
     pub allow_dangling: bool,
     pub idempotency_key: String,
     pub created_by: String,
+    pub transaction_id: Option<String>,
+    pub transaction_principal: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +97,8 @@ pub struct DeleteObjectLinkRequest {
     pub link_key: String,
     pub expected_generation: u64,
     pub idempotency_key: String,
+    pub transaction_id: Option<String>,
+    pub transaction_principal: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,9 +180,37 @@ pub fn link_generation(link: &Object) -> Option<u64> {
 }
 
 pub fn link_metadata_hash(descriptor: &ObjectLinkDescriptor) -> String {
-    blake3::hash(&serde_json::to_vec(descriptor).expect("object link descriptor serializes"))
-        .to_hex()
-        .to_string()
+    blake3::hash(&encode_deterministic_proto(
+        &object_link_descriptor_hash_proto(descriptor),
+    ))
+    .to_hex()
+    .to_string()
+}
+
+fn object_link_descriptor_hash_proto(
+    descriptor: &ObjectLinkDescriptor,
+) -> ObjectLinkDescriptorHashProto {
+    ObjectLinkDescriptorHashProto {
+        schema: descriptor.schema.clone(),
+        tenant_id: descriptor.tenant_id.clone(),
+        bucket_name: descriptor.bucket_name.clone(),
+        link_key: descriptor.link_key.clone(),
+        target_key: descriptor.target_key.clone(),
+        target_version: descriptor.target_version.clone(),
+        resolution: match descriptor.resolution {
+            ObjectLinkResolution::Follow => "follow",
+            ObjectLinkResolution::Redirect => "redirect",
+        }
+        .to_string(),
+        created_at: descriptor
+            .created_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        updated_at: descriptor
+            .updated_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        created_by: descriptor.created_by.clone(),
+        generation: descriptor.generation,
+    }
 }
 
 pub fn link_metadata_etag(descriptor: &ObjectLinkDescriptor) -> String {
@@ -219,6 +278,7 @@ mod tests {
                 Some(json!({"channel": "stable"})),
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -231,6 +291,7 @@ mod tests {
                 12,
                 "etag-v2",
                 Some("application/octet-stream"),
+                None,
                 None,
                 None,
                 None,
@@ -257,6 +318,8 @@ mod tests {
             allow_dangling: false,
             idempotency_key: format!("idem-{link_key}"),
             created_by: "principal:test".to_string(),
+            transaction_id: None,
+            transaction_principal: None,
         }
     }
 
@@ -422,6 +485,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -434,6 +498,7 @@ mod tests {
                 7,
                 "etag-live-v2",
                 Some("application/octet-stream"),
+                None,
                 None,
                 None,
                 None,

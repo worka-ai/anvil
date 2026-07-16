@@ -1,9 +1,7 @@
-use crate::{
-    AppState,
-    auth::{AuthenticatedBearerToken, Claims},
-};
+use crate::{AppState, auth::AuthenticatedBearerToken};
 use axum::{http::HeaderMap, http::HeaderValue, response::Response};
 use http::Uri;
+use std::time::Instant;
 use tonic::{Request, Status};
 
 pub const ANVIL_REQUEST_ID_HEADER: &str = "x-anvil-request-id";
@@ -25,56 +23,62 @@ pub fn auth_interceptor<T>(mut req: Request<T>, state: &AppState) -> Result<Requ
     };
     tracing::info!("[auth_interceptor] path={} auth_present={}", uri, has_auth);
     // A list of public routes that do not require authentication.
-    const PUBLIC_ROUTES: &[&str] = &["/anvil.AuthService/GetAccessToken"];
-    if PUBLIC_ROUTES.contains(&uri.as_str()) {
-        // This is a public route, so we don't need to check for a token.
+    const PUBLIC_ROUTES: &[&str] = &[
+        "/anvil.AuthService/GetAccessToken",
+        "/anvil.ObjectService/GetObject",
+    ];
+    if PUBLIC_ROUTES.contains(&uri.as_str()) && !has_auth {
+        // Public routes may be called anonymously. If a bearer token is
+        // supplied we still authenticate it below so service methods can apply
+        // tenant-scoped permissions instead of falling back to anonymous reads.
         return Ok(req);
     }
 
-    match req.metadata().get("authorization") {
-        Some(t) => {
-            let token = t
-                .to_str()
-                .map_err(|_| Status::unauthenticated("Invalid token format"))?;
-            let token = token
-                .strip_prefix("Bearer ")
-                .ok_or_else(|| Status::unauthenticated("Invalid token format"))?;
+    authenticate_bearer(&mut req, state)?;
+    Ok(req)
+}
 
-            let bearer_token = token.to_string();
-            if state
-                .config
-                .anvil_bootstrap_admin_token
-                .as_deref()
-                .is_some_and(|bootstrap| !bootstrap.is_empty() && bootstrap == bearer_token)
-            {
-                req.extensions_mut().insert(Claims {
-                    sub: "bootstrap-admin".to_string(),
-                    exp: usize::MAX,
-                    scopes: vec![format!(
-                        "anvil_admin:*|anvil_admin:cluster:{}",
-                        state.config.mesh_id
-                    )],
-                    tenant_id: 0,
-                    jti: None,
-                });
-                req.extensions_mut()
-                    .insert(AuthenticatedBearerToken(bearer_token));
-                return Ok(req);
-            }
-
-            let claims = state
-                .jwt_manager
-                .verify_token(&bearer_token)
-                .map_err(|_| Status::unauthenticated("Unauthorised, invalid token"))?;
-
-            req.extensions_mut().insert(claims);
-            req.extensions_mut()
-                .insert(AuthenticatedBearerToken(bearer_token));
-
-            Ok(req)
-        }
-        None => Ok(req),
+/// Admin-plane authentication boundary. This only authenticates and rejects
+/// credentials that are clearly data-plane-only; method code still performs the
+/// Zanzibar system-realm relation check for the specific admin operation.
+pub fn admin_auth_interceptor<T>(
+    mut req: Request<T>,
+    state: &AppState,
+) -> Result<Request<T>, Status> {
+    let authenticated = authenticate_bearer(&mut req, state)?;
+    if authenticated.tenant_id != crate::system_realm::SYSTEM_STORAGE_TENANT_ID {
+        return Err(Status::permission_denied(
+            "Tenant data-plane credentials are not accepted on the admin listener",
+        ));
     }
+    Ok(req)
+}
+
+fn authenticate_bearer<T>(
+    req: &mut Request<T>,
+    state: &AppState,
+) -> Result<crate::auth::Claims, Status> {
+    let token = req
+        .metadata()
+        .get("authorization")
+        .ok_or_else(|| Status::unauthenticated("Missing bearer token"))?
+        .to_str()
+        .map_err(|_| Status::unauthenticated("Invalid token format"))?;
+    let token = token
+        .strip_prefix("Bearer ")
+        .ok_or_else(|| Status::unauthenticated("Invalid token format"))?;
+
+    let bearer_token = token.to_string();
+    let claims = state
+        .jwt_manager
+        .verify_token(&bearer_token)
+        .map_err(|_| Status::unauthenticated("Unauthorised, invalid token"))?;
+
+    req.extensions_mut().insert(claims.clone());
+    req.extensions_mut()
+        .insert(AuthenticatedBearerToken(bearer_token));
+
+    Ok(claims)
 }
 
 // This runs on the raw HTTP request before Tonic handles it.
@@ -111,11 +115,57 @@ pub async fn request_id_mw(
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
+    let started_at = Instant::now();
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+    let tenant_present = req.headers().contains_key("authorization");
+    let plane = if path.starts_with("/anvil.AdminService/") {
+        "admin"
+    } else if path.starts_with("/anvil.") {
+        "public-grpc"
+    } else {
+        "public-http"
+    };
     let request_id = uuid::Uuid::new_v4().simple().to_string();
     req.extensions_mut()
         .insert(AnvilRequestId(request_id.clone()));
 
-    let mut response = next.run(req).await;
+    let context = vec![
+        ("request_id".to_string(), request_id.clone()),
+        ("plane".to_string(), plane.to_string()),
+        ("method".to_string(), method.clone()),
+        ("path".to_string(), path.clone()),
+    ];
+    let mut response = crate::perf::with_context(context, next.run(req)).await;
+    let status = response.status().as_u16().to_string();
+    crate::perf::record_request_duration(
+        plane,
+        method.as_str(),
+        path.as_str(),
+        status.as_str(),
+        tenant_present,
+        false,
+        started_at.elapsed(),
+    );
+    crate::perf::record_trace_event(crate::perf::TraceEvent {
+        trace_id: &request_id,
+        span_id: "api-request",
+        parent_span_id: None,
+        request_id: Some(&request_id),
+        component: "api",
+        operation: "api.request",
+        writer_family: None,
+        bucket_hash: None,
+        boundary_schema_generation: None,
+        duration: started_at.elapsed(),
+        bytes_in: 0,
+        bytes_out: 0,
+        fsync_count: 0,
+        status: status.as_str(),
+    });
+    if response.status().is_client_error() || response.status().is_server_error() {
+        crate::perf::record_protocol_errors_total(path.as_str(), status.as_str());
+    }
     if let Ok(header_value) = HeaderValue::from_str(&request_id) {
         response
             .headers_mut()

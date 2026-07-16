@@ -1,409 +1,189 @@
 ---
 title: Authorisation
-description: Learn authentication, tenant bootstrap, app credentials, token scopes, relationship tuples, namespaces, usersets, caveats, delegation, and fail-closed protections.
+description: Understand Anvil authentication, public policy scopes, relationship authorisation, realms, schemas, tuples, zookies, system-realm boundaries, and current implementation limits.
 ---
 
 # Authorisation
 
-**What this page gives you:** a complete mental model for who may call Anvil, how tenants receive credentials, what a tenant can delegate, how object-level relationships work, and why Anvil denies access whenever a decision cannot be proven safely.
+Authorisation answers a narrower question than identity: given this authenticated caller, this tenant, this resource, and this requested operation, is the operation allowed? Anvil has to answer that question for object reads, bucket creation, app management, relationship tuple writes, index queries, watches, gateways, public reads, repair jobs, and private admin operations.
 
-Authorisation is easier to reason about when each layer has one job:
+The model has two layers that are easy to blur if you come from a single-role system. **Public policy scopes** decide whether an application principal may call a public Anvil API method over a resource string. **Relationship authorisation** decides whether a product subject is related to an application object, using tuples and usersets. The private admin API uses a separate **system realm**. A tenant can be powerful inside its own storage tenant and still have no authority to create tenants, change mesh topology, or rewrite Anvil's built-in admin relations.
 
-1. **Bootstrap authority** creates tenants, applications, initial secrets, and initial policy grants.
-2. **Authentication** proves the caller identity.
-3. **Token scopes** decide whether that identity may use a broad API family or resource envelope.
-4. **Relationship authorisation** decides whether the identity is related to a particular object in the required way.
-5. **Caveats** add required conditions such as expiry, tenant context, device posture, or purpose.
-6. **Reserved namespace guards** block public access to Anvil-owned internal paths before normal object logic runs.
+Read this page with [Tenants, Apps, and Credentials](/tutorials/tenants-apps-and-credentials/), [Authorisation Grants and Revokes](/tutorials/authorisation/), [Authorisation Actions and Resources](/reference/authorisation-actions-and-resources/), [Public CLI](/reference/public-cli/), [Admin CLI](/reference/admin-cli/), and [Admin Plane](/operators/admin-plane/). Object and query implications are covered in [Object Model](/learn/object-model/), [Reads, Listing, and Links](/learn/reads-listing-and-links/), [Indexes and Query](/learn/indexes-and-query/), [Public Access](/tutorials/public-access/), and [S3 Gateway](/tutorials/s3-gateway/).
 
-A valid token is not enough on its own. The caller can still be denied for a private object, search result, watch stream, tuple write, source artefact, PersonalDB commit, or reserved namespace probe.
+## Authentication is not authorisation
 
-## The actors
+Authentication proves who made the request. In Anvil public APIs, an app exchanges its client id and client secret for a bearer token. The token contains a tenant id, a subject such as the app id, and minted public policy scopes. That token says, "this is app 17 in tenant 3, with these scopes, until expiry".
 
-Anvil separates deployment control, tenant applications, and application-level subjects.
+Authorisation then asks whether those scopes and any relevant relationship facts permit the operation. A token may authenticate the `docs-reader` app correctly and still fail an object read because it lacks `object:read` for that object and has no object-reader relationship. A token may let an owner app create another tenant-owned app and still fail a private admin call because app-management scopes are not system-realm admin relations.
 
-| Actor | Created by | Can authenticate directly to Anvil? | Main purpose |
-| --- | --- | --- | --- |
-| Deployment operator | Outside Anvil | Uses privileged bootstrap/admin tooling | Creates tenants, regions, application identities, initial secrets, and initial policy grants. |
-| Tenant | Deployment operator or an approved control-plane service | No. A tenant is a boundary, not a credential. | Owns buckets, objects, indexes, PersonalDB groups, source artefacts, policies, and relationship facts. |
-| Tenant application | Bootstrap/admin path | Yes, using `client_id` and `client_secret` exchanged for a bearer token. | Calls the native API or S3-compatible API for one tenant. |
-| Service job | Bootstrap/admin path | Yes, usually as a tenant application with narrow scopes. | Performs ingestion, indexing, repair, projection, or other automated work. |
-| End user subject | External identity system or tenant application | Not as a built-in Anvil user credential in the current public API. | Appears in relationship tuples, for example `user:amy`. |
-| Admin user | Bootstrap/admin path | Used by operator tooling, not ordinary data-plane applications. | Operates the deployment and performs privileged setup. |
+This separation matters for product users. Your application may have end users such as `user:amy` and `user:ben`. Those are usually relationship-authorisation subjects, not Anvil login accounts. An Anvil app principal can write or check tuples about them when it has the right public policy scopes. That does not mean those users can authenticate to Anvil directly unless your deployment adds such an authentication flow.
 
-The important distinction is that a tuple subject such as `user:amy` is not automatically an Anvil login account. It is an identity label that a tenant application maps from its own identity system and then uses in relationship checks.
+## Storage tenants and product users
 
-## Who can create tenants?
+An **Anvil storage tenant** is the storage and policy isolation boundary. Buckets, objects, app credentials, public policy grants, indexes, watches, repair findings, PersonalDB groups, and tenant-owned relationship tuples belong to one storage tenant. The public API derives the storage tenant from the authenticated token and rejects relationship-authorisation scopes that name a different storage tenant.
 
-Tenants are created by the deployment bootstrap/admin path, not by ordinary tenant applications. Tenant creation establishes an isolation boundary, so it must be controlled by the deployment operator or by a separate control-plane service that already holds equivalent authority.
-
-In the current implementation, tenant creation is an admin operation. Creating a tenant does not automatically create application credentials for that tenant. Bootstrap must also create at least one tenant application and grant that application the scopes it needs.
-
-A normal tenant token cannot create another tenant. It cannot use object writes, tuple writes, or policy grants to escape into a new administrative boundary.
-
-## What can a tenant do once created?
-
-A tenant can act only through application credentials and tokens issued for applications belonging to that tenant. What it can do depends on the scopes granted to those applications.
-
-Typical tenant capabilities include:
-
-- create and manage buckets when an application has bucket scopes;
-- write, read, list, and delete objects when an application has object scopes;
-- create and query indexes when an application has index scopes;
-- create PersonalDB groups, submit commits, read snapshots, and watch projections when an application has PersonalDB scopes;
-- write relationship tuples when an application has `authz:tuple_write` for the target namespace/object/relation envelope;
-- check relationship permissions when an application has `authz:check`;
-- watch tuple, namespace, derived, bucket, object, index, source, and PersonalDB changes when an application has the matching watch scope;
-- grant or revoke scoped access to other tenant applications only when the caller has `policy:grant` or `policy:revoke` for the target resource.
-
-A tenant cannot do these things through ordinary public APIs:
-
-- create another tenant;
-- mint new application credentials by itself;
-- grant itself authority it does not already have;
-- define or replace namespace schemas and caveat definitions;
-- read or write `_anvil/` internal paths;
-- bypass relationship checks by reading search, watch, projection, repair, or diagnostic paths.
-
-## How does a tenant get credentials?
-
-Credentials are created by bootstrap/admin tooling.
-
-The lifecycle is:
-
-```text
-operator/admin creates tenant
-  -> operator/admin creates tenant application
-  -> Anvil returns client_id and client_secret once
-  -> operator/admin grants policy scopes to that application
-  -> application calls GetAccessToken(client_id, client_secret, requested scopes)
-  -> Anvil verifies the secret and intersects requested scopes with assigned policy
-  -> Anvil returns a short-lived bearer token containing tenant id, subject id, and approved scopes
-```
-
-The returned token is the credential used for normal API calls. Requesting `*` or an empty scope list does not create new authority; it asks Anvil to issue the scopes already assigned to that application. If no assigned policy matches, token issuance fails.
-
-Secrets should be stored by the application operator as deployment secrets. Anvil does not expect browser clients or untrusted devices to hold tenant application secrets directly.
-
-## Can a tenant create its own users?
-
-Not as Anvil login accounts in the current public API.
-
-A tenant application may model users as relationship subjects:
+A storage tenant is not the same thing as a product user. One storage tenant may hold a whole customer workspace containing thousands of product users. Those users can be represented as relationship subjects:
 
 ```text
 user:amy
-group:engineering
-service:ingest-worker
+user:ben
+group:legal
+service:importer
+app:17
 ```
 
-It may then write relationship tuples involving those subjects if its token allows tuple writes. For example:
+Anvil's built-in object read path checks the authenticated app principal. It first accepts a matching public policy scope such as `object:read|documents/contracts/nda.pdf`. If the scope is absent, it can also check the default relationship-authorisation realm for the built-in object relation:
 
 ```text
-group:engineering#member@user:amy
-document:doc-42#viewer@userset:group/engineering#member
+object/documents/contracts/nda.pdf#reader <- app:17
 ```
 
-That does not create a password, WebAuthn credential, OAuth identity, or Anvil account for Amy. The tenant application remains responsible for authenticating Amy in its own identity layer, mapping her to the stable subject id `user:amy`, and calling Anvil with the appropriate token and relationship checks.
+That gives applications two tools. Public policy scopes are good for service-principal API authority. Relationship tuples are good for product sharing models, inherited membership, and object-level visibility that changes without rotating app secrets.
 
-If a deployment wants Anvil-backed end-user login, that is a control-plane feature above the current public data-plane API. It must still preserve the same rule: users may receive delegated access, but they must not be able to mint tenant, application, namespace-schema, or reserved-path authority for themselves.
+## Public policy scopes
 
-## What can a tenant delegate?
-
-A tenant can delegate only authority it already holds, and only through the appropriate API.
-
-| Delegation type | API | Example | Required caller authority |
-| --- | --- | --- | --- |
-| Application scope grant | `GrantAccess` | Grant app `reader-api` `object:read` on `bucket:documents/*`. | `policy:grant` on the target resource. |
-| Application scope revoke | `RevokeAccess` | Remove app `reader-api` `object:read` on `bucket:documents/*`. | `policy:revoke` on the target resource. |
-| Public bucket read toggle | `SetPublicAccess` | Allow anonymous read for `public-assets`. | `policy:grant` on `bucket:public-assets`. |
-| Relationship fact write | `WriteAuthzTuple` | Add `document:doc-42#viewer@user:amy`. | `authz:tuple_write` on that tuple resource envelope. |
-| Relationship fact removal | `WriteAuthzTuple` with `operation = remove` | Remove `document:doc-42#viewer@user:amy`. | `authz:tuple_write` on that tuple resource envelope. |
-
-Delegation is bounded. An application that can grant object read on one prefix cannot grant object write on another prefix unless its own token scopes permit that policy grant. A tuple writer for `document:*#viewer` cannot define a new `document` schema, register caveat code, or write unrelated tuple namespaces.
-
-## Authentication versus authorisation
-
-Authentication answers this question:
-
-> Who is making the request?
-
-Anvil authenticates applications and services with credentials and bearer tokens. A successful authentication step attaches a tenant id, subject id, and approved scopes to the request.
-
-Authorisation answers a different question:
-
-> May this identity perform this action on this resource now?
-
-The action matters. `object:read`, `object:write`, `index:read`, `authz:tuple_write`, `authz:check`, and `personaldb:commit` are different permissions. The resource matters too. A caller may read one bucket, write one prefix, check permissions for one namespace, and have no access elsewhere.
-
-## Token scopes are coarse gates
-
-A token scope is a broad capability. It is useful for service credentials, API-family access, and resource envelopes.
-
-Examples:
+Public policy scopes are minted into bearer tokens and checked by public/data-plane services. The scope format is:
 
 ```text
-object:read|bucket:documents/*
-object:write|bucket:uploads/tenants/acme/*
-index:read|bucket:documents
-policy:grant|tenant:acme
-authz:tuple_write|document/doc-42#viewer
+action|resource
 ```
 
-The exact resource string depends on the API being called. The important point is that scopes are coarse gates: they decide whether the caller is allowed to attempt an operation against that resource envelope.
+For example, `object:write|documents/inbox/report.json` lets the token ask the Object API to write that exact object resource. `authz:tuple_write|document/doc-42#viewer` lets the token ask the Auth service to write that relation. `index:read|documents` lets the token query or list indexes in the `documents` bucket under the current implementation.
 
-Scopes do not replace relationship authorisation. A scope can say the caller may call the object-read API for a bucket. It does not by itself say the caller is a viewer of `document:doc-42`.
+Scopes are attached to tenant apps. The private admin API can grant scopes during initial tenant handover. A tenant app can also delegate scopes through the public API when it has both `policy:grant` for the resource and the action it is trying to delegate. That non-escalation rule is important: a principal cannot grant `object:delete` on a resource unless it already has `object:delete` there.
 
-## Relationship authorisation is the object-level model
+Public delegation also rejects the global wildcard resource, wildcard actions, cross-tenant tenant resources, `system:` resources, `anvil_mesh:` resources, and reserved `_anvil/` resources. Those checks are there to stop tenant-side delegation from becoming private admin authority or internal-state access. Use exact resources or narrow suffix-prefix patterns, and treat broad grants as operational exceptions rather than examples.
 
-Product permissions are usually object-specific:
+Current resource checks are not uniformly fine-grained. Object listing currently checks `object:list` on the bucket name, not on an individual prefix. Index list, query, and diagnostics currently check `index:read` on the bucket name, not on one index definition. Tenant app lifecycle checks use `tenant:<tenant_id>`, not one app name. These are implementation boundaries, not design ideals; document them in runbooks and avoid pretending a narrower scope will be enforced where the service does not currently check it.
 
-- Amy can view one document.
-- Raj can edit one folder.
-- Members of a group can read all objects connected to that group.
-- A user can read a database row only when a relationship on another object permits it.
+## Relationship authorisation
 
-Anvil represents these facts as **relationship tuples**. A tuple says that an object has a named relation to a subject.
+Relationship authorisation stores facts about subjects and objects. The vocabulary is small, but each word matters.
+
+A **realm** is a relationship-authorisation scope inside a storage tenant. The API field is `AuthzScope { anvil_storage_tenant_id, authz_realm_id }`. If callers omit it, Anvil uses the tenant from the token and the default realm id `default`. The public CLI mostly works in that default realm; schema binding commands expose a realm id, while tuple, check, read, and watch helpers currently do not expose a general realm flag.
+
+A **namespace** names a kind of object in the relationship model, such as `document`, `project`, `folder`, or `object`. A namespace is a safe component, so it cannot contain slashes. An **object id** names a specific object inside that namespace. Object ids may contain slashes because they are identifiers, not filesystem paths. A **relation** names the relationship being granted or checked, such as `owner`, `viewer`, `member`, or `reader`.
+
+A **subject** is the thing that receives the relation. It has a `subject_kind` and a `subject_id`. A direct tuple might say:
 
 ```text
-document:doc-42#viewer@user:amy
-document:doc-42#editor@user:raj
-group:engineering#member@user:amy
-document:doc-42#viewer@userset:group/engineering#member
-document:doc-42#parent@folder:folder-7
+document/doc-42#viewer <- user:amy
 ```
 
-Read the first tuple as:
-
-> The object `document:doc-42` has relation `viewer` to subject `user:amy`.
-
-A permission check asks whether a subject is in the requested relation or computed relation for an object.
+That means subject kind `user`, subject id `amy`, relation `viewer`, object id `doc-42`, namespace `document`. A tuple can also use subject kind `userset`. A userset subject points at another relation:
 
 ```text
-Check: is user:amy in document:doc-42#viewer?
-Answer: allowed, because the tuple exists.
+document/doc-42#viewer <- userset:document/doc-42#owner
 ```
 
-## Tuple parts
+That does not copy the current owners into viewer tuples. It says that whoever is currently in the `owner` userset also satisfies `viewer`. Usersets are the foundation for inherited access, group membership, project membership, and similar product rules.
 
-A tuple has three visible parts: object, relation, and subject.
+## Schemas and current evaluator limits
 
-```text
-object#relation@subject
-```
+A schema is the reviewed contract for a relationship namespace. It records the namespace, intended relations, and relation rules. A schema revision has a digest. A schema binding attaches one schema revision to one realm with a binding generation, so rollout tools can use compare-and-swap instead of overwriting each other silently.
 
-The object also has two parts:
+Schemas are important for audit and operations, but you must understand the current evaluator. Today the public tuple/check path stores schemas and bindings, emits namespace watch events, and records revisions. The permission evaluator itself resolves current tuple facts and userset tuples. It does not yet execute a full Zanzibar schema language with computed relation rules and caveat expressions. If your product needs `viewer includes owner` today, write the userset tuple or the direct tuples needed by the current evaluator; do not rely on schema JSON alone to imply access.
 
-```text
-namespace:object_id
-```
+That makes schemas a forward-compatible contract rather than decorative documentation. They let teams review the intended model, bind a revision to a realm, watch namespace changes, and prepare for richer validation. They are not currently a substitute for writing the relationship facts that checks can actually resolve.
 
-The subject can be a direct subject:
+## Caveats today
 
-```text
-subject_kind:subject_id
-```
+The API and tuple records include a `caveat_hash` field. The current implementation validates that it is empty or a 32-byte hex hash and includes it in tuple matching. It does not currently store caveat expression bodies or evaluate request context such as time, device posture, purpose, or region.
 
-or a userset subject:
+Until caveat evaluation exists, treat `caveat_hash` as provenance or an advanced integration hook, not as a complete conditional-access system. If a tuple is meant to expire or depend on external context, enforce that in your application workflow or avoid granting the tuple until Anvil has the caveat semantics you need.
 
-```text
-userset:namespace/object_id#relation
-```
+## Revisions, zookies, and consistency
 
-Putting those together:
+Every committed relationship-authorisation write advances a tenant authz revision. A response zookie is the portable string form of that revision, currently `authz:<revision>`. Reads, checks, object listings, and query paths use revisions so callers can avoid reading from an older permission view than the one they just wrote.
 
-| Part | Example | Meaning |
-| --- | --- | --- |
-| Namespace | `document` | The typed object family. |
-| Object id | `doc-42` | The object inside that namespace. |
-| Relation | `viewer` | The relationship being asserted or checked. |
-| Subject kind | `user` | The type of subject. |
-| Subject id | `amy` | The concrete subject id. |
-| Userset subject | `userset:group/engineering#member` | Everyone currently in another object relation. |
+The consistency options are:
 
-Anvil API fields map directly to this structure:
-
-| API field | Example |
+| Option | Meaning |
 | --- | --- |
-| `namespace` | `document` |
-| `object_id` | `doc-42` |
-| `relation` | `viewer` |
-| `subject_kind` | `user` or `userset` |
-| `subject_id` | `amy` or `group/engineering#member` |
-| `caveat_hash` | empty for unconditional, or a verified caveat hash |
-| `operation` | `add` or `remove` |
+| `latest` or empty | Evaluate at the latest authz revision visible to the service. |
+| `at_least` with a zookie | Require the service to be at least as fresh as that revision, otherwise fail with an unavailable revision error. |
+| `exact` with a zookie | Evaluate at that exact revision. |
 
-## Namespace labels and schema definitions are different
+Use `at_least` when a workflow writes a tuple and then needs another process to observe it before returning data. Use `exact` for audit and reproducible checks. The current public CLI check/read helpers send `latest` and print zookies; use the API directly when you need explicit zookie consistency.
 
-The word **namespace** appears in two related but different places.
+Page tokens for authz reads and query results also bind revision and filter context. Do not edit them, reuse them with a different query, or assume they remain valid after a permission change.
 
-A **tuple namespace label** is the first field in a relationship fact:
+## Who creates tenants and apps
 
-```text
-document:doc-42#viewer@user:amy
-```
+Tenant creation is a private admin-plane operation. `CreateTenant` requires the system-realm relation `manage_tenants`. A public tenant app cannot create another storage tenant by receiving a public policy scope, because storage tenants are outside the tenant's own boundary.
 
-Here `document` is just the typed label carried by the tuple. It does not create an object in Anvil by itself, it does not create a bucket or prefix, and it does not automatically attach to every stored object whose key looks like a document. Application or control-plane code decides that stored object `bucket=files, key=contracts/doc-42.pdf` is represented in authorisation checks as `document:doc-42`.
+The first app for a tenant is normally created by an operator through the private admin API. That is the handover point: the operator creates the storage tenant, creates an initial tenant app, and grants a small set of public policy scopes to that app. The tenant can then use the public API for routine work.
 
-A **namespace schema definition** is privileged policy. It says which relations are meaningful for a tuple namespace label, which subject kinds are allowed, which usersets may be referenced, which caveats are valid, and which computed permissions may be checked. Ordinary users and ordinary tenant applications must not invent or change those definitions through object writes.
+Tenant-owned app creation is public API work once delegated. A tenant app with `app:create` on `tenant:<tenant_id>` can create another app inside the same storage tenant. It can rotate or delete tenant apps only with the corresponding public app scopes. It still cannot change the system realm, create regions, register nodes, rotate server-side secret envelopes, or read admin audit logs.
 
-A schema definition may describe a product-neutral model like this:
+Public policy delegation is similarly bounded. A tenant app can grant another tenant app only permissions it already holds and only on resources public delegation allows. It cannot grant wildcard authority, cross-tenant authority, reserved `_anvil/` authority, or system-realm admin relations.
 
-```text
-namespace document
-  relation owner: user
-  relation editor: user | userset
-  relation viewer: user | userset
-  relation parent: folder
+## The system realm and private admin API
 
-  computed read  = owner | editor | viewer | parent.viewer
-  computed write = owner | editor
-```
+Anvil's private admin API is authorised by a built-in system realm. The system storage tenant id is `0`, the system realm id is `system`, and the built-in mesh namespace is `anvil_mesh` encoded internally under that realm. Admin relations include capabilities such as `manage_tenants`, `manage_apps`, `manage_policies`, `manage_regions`, `manage_nodes`, `manage_routing`, `run_repair`, `view_diagnostics`, and `view_audit_log`.
 
-This says:
+The system realm is installed during bootstrap. If it does not exist, startup can create or bind the first system administrator according to bootstrap configuration. Once it exists, stale bootstrap configuration is ignored and admin requests must authenticate and pass system-realm checks normally.
 
-- a `document` authorisation object can have owners, editors, viewers, and a parent folder;
-- editors and viewers may be direct users or usersets;
-- `read` is true when the subject is an owner, editor, viewer, or viewer of the parent folder;
-- `write` is true when the subject is an owner or editor.
+Tenant/public API principals do not define or modify this built-in system realm. A tenant may store a namespace named for its own product model and bind tenant-owned schemas in its own storage tenant. That does not create admin authority, because the private admin checks resolve against storage tenant `0`, realm `system`, and the built-in namespace. Do not expose the admin API as if it were another public tenant API, and do not model admin permissions as public policy grants.
 
-In the current public API, tenants and users write tuple facts and ask permission questions within the scopes they have been granted. Namespace schema lifecycle is a privileged bootstrap/admin concern. If a caller has `authz:tuple_write` for the `document` namespace, that caller may write allowed `document:*` tuple facts; it does not mean the caller can define what `document` means, add new computed permissions, or bypass the mapping between stored objects and authorisation objects.
+## Reserved internal namespaces and paths
 
-## Relationships are source facts
-
-A tuple write is a security mutation. It changes the source facts used by permission checks, authorised search, watches, and derived userset indexes.
-
-Examples:
+Anvil stores internal control records through CoreStore and sometimes under reserved object-key prefixes. Public object operations reject reserved object keys such as:
 
 ```text
-add    document:doc-42#viewer@user:amy
-remove document:doc-42#viewer@user:amy
-add    group:engineering#member@user:amy
-add    document:doc-42#viewer@userset:group/engineering#member
+_anvil/meta/
+_anvil/index/
+_anvil/authz/
+_anvil/watch/
+_anvil/personaldb/
+_anvil/git/
+_anvil/tmp/
 ```
 
-Tuple writes should carry a reason and actor identity. Operators need to answer who changed access, why, and at which authorisation revision.
+That is a security boundary, not a naming preference. A public-read bucket does not make those internal paths readable. A public policy grant should not target `_anvil/` resources. Relationship tuples should model product objects, not Anvil's internal storage layout.
 
-Tuple removal must be explicit. Deleting application data does not automatically mean every related authorisation fact is safe to ignore. The cleanup path should remove or supersede relationships deliberately.
+There is a similar naming concern around the system namespace. The built-in `anvil_mesh` namespace in the system realm belongs to Anvil. Tenant-owned authorisation should use product namespaces such as `document`, `project`, or `workspace` and should not try to mirror Anvil's system-realm names.
 
-## Usersets let relationships compose
+## Object reads, indexes, and public access
 
-A userset is the set of subjects in another object's relation.
+Object reads can be authorised in two ways. A caller with `object:read` for `bucket/key` may read the object. Without that scope, Anvil can check the default relationship-authorisation realm for `object/<bucket/key>#reader <- app:<caller-app-id>`. Object listings and object-version listings also filter results through object visibility unless the bucket is public-read.
+
+Indexes add another layer. To query an index, the caller needs `index:read` on the bucket under the current implementation. If the index definition uses the default `authorization_mode` value `inherit_object`, each returned hit must also pass object visibility. If the definition uses `index_only` or `public`, the query path skips the per-hit object read check; that is safe only when the indexed keys, metadata, text, vectors, and scores are intended for every principal that can query the index. The exact API field is named `authorization_mode`; the prose model is still authorisation.
+
+Public access is not an admin bypass. Current public-read bucket semantics make matching object data readable from public surfaces that can reach the public API, S3 gateway, or static hosting path. They do not make the admin API public, do not let anonymous callers write authz tuples, and do not relax reserved namespace checks. Public-read should be deliberate, auditable, and scoped to data you intend anyone to read.
+
+Gateway behaviour follows the same security model. S3 compatibility and static hosting are adapters over Anvil's buckets, objects, links, metadata, and public-read state. They are not separate places to hide a weaker permission model.
+
+## Watches, derived state, and revocation
+
+Relationship tuples are source records. Tuple writes emit authz watch events and advance derived userset state. Index queries, object visibility filters, page tokens, and repair flows need revisions so revokes stop leaking through stale derived views.
+
+A revoke is not just removing a row from a side table. It writes a new tuple-log record, advances the revision, and must be consumed by any derived view that caches permissions. If a search page, object listing, or projection uses an older authz revision, it may be intentionally stale or must fail based on the consistency the caller requested.
+
+Operationally, this means authorisation belongs in your derived-data design. Watch tuple logs when you maintain permission-sensitive projections. Store the zookie or revision your output was built against. Use repair when a derived authz index or permission-aware index drifts from source tuples.
+
+## Current gaps to design around
+
+The current implementation gives you a usable relationship-authorisation base, but it is not a complete Zanzibar product yet. The important limits are:
 
 ```text
-group:engineering#member@user:amy
-document:doc-42#viewer@userset:group/engineering#member
+schema documents and bindings are stored, but checks resolve tuple/userset facts rather than a full schema rule language
+caveat_hash is stored and matched, but caveat expression evaluation is not implemented
+public CLI tuple/check/read commands use the default realm and do not expose zookie consistency flags
+the public CLI has no helper for batched WriteAuthzTuples
+namespace and derived-lag authz watches are API-only; CLI watch helpers cover tuple logs
+some public policy resources are coarser than ideal, especially object listing and index read surfaces
 ```
 
-The first tuple puts Amy in the `member` relation of the engineering group. The second tuple says the document's viewers include that group membership userset. A permission check for `document:doc-42#viewer@user:amy` can therefore succeed through the userset path.
+Design applications with those facts in mind. Use the API directly when a production workflow needs exact consistency, non-default realms, batched writes, or richer evidence than the CLI prints. Keep schemas as reviewed contracts, keep tuple writes explicit, and do not use broad public policy grants to paper over missing surfaces.
 
-Usersets are useful for groups, parent containers, shared folders, tenant membership, and derived rows. They are also a place where cycles can happen. Anvil must evaluate usersets with bounded traversal and fail closed: a cycle, missing namespace, missing relation, invalid caveat, or stale derived userset must not grant access by accident.
+## What to take forward
 
-## Computed relations make policy reusable
+Anvil authorisation is a layered model. Authentication identifies the caller. Public policy scopes authorise public API calls. Relationship tuples and usersets model product access inside a storage tenant. Revisions and zookies make permission freshness explicit. The system realm authorises private admin operations and is not tenant-owned. Public access changes object read visibility, not Anvil's control plane. The safest designs keep those boundaries visible in code, credentials, runbooks, and audit logs.
 
-A direct relation is written as a tuple. A computed relation is evaluated from other relations.
+## Practical modelling pattern
 
-```text
-computed read = owner | editor | viewer | parent.viewer
-```
+Start with the public policy scope that lets an application call an Anvil service, then add relationship tuples only for product-level visibility. For a document viewer, the app might need `index:read` on the bucket so it can call the query API, while the query itself uses `inherit_object` and relationship tuples such as `document:doc-42#viewer@user:amy` to decide which hits Amy can see. Removing either layer should deny the result: no public scope means the app cannot call the service, and no relationship means the product subject cannot see the object.
 
-That expression means a subject can read a document when any one of these paths succeeds:
-
-- the subject is an `owner` of the document;
-- the subject is an `editor` of the document;
-- the subject is a `viewer` of the document;
-- the document has a parent folder and the subject is a `viewer` of that folder.
-
-Computed relations keep application code from copying policy everywhere. The application asks Anvil to check `read` or `write`; Anvil evaluates the current tuple graph, usersets, caveats, and consistency requirement.
-
-## Caveats attach conditions
-
-A caveat is a named condition attached to a relationship. It can express policy that depends on context.
-
-Examples:
-
-```text
-document:doc-42#viewer@user:amy with expires_before=2026-12-31T23:59:59Z
-document:doc-42#viewer@user:lee with network=trusted
-folder:folder-7#viewer@user:raj with purpose=audit
-```
-
-Anvil stores or references the caveat definition by hash. A tuple may carry a `caveat_hash`; the permission check must evaluate the matching caveat with request context. If the hash is invalid, missing, or points at a different caveat body, the safe result is denial or a security error.
-
-Caveats should be deterministic and reviewable. Do not hide business logic in a string that only one service understands.
-
-## Revisions and consistency
-
-Authorisation state changes over time. Tuple writes produce an authorisation revision and a token-like consistency marker. A caller can use that marker to say, "answer this check at least as fresh as the tuple write I just observed."
-
-This matters for search, watches, and local-first projections. A search index may have consumed object bytes but not the latest authorisation update. If the caller asks for strict authorisation consistency and the derived state is not ready, Anvil should return an index-readiness result rather than expose stale results.
-
-## Admin CLI and bootstrap boundaries
-
-The admin CLI and bootstrap path exist for privileged setup, not routine tenant behaviour. Use them to create and seed the control-plane facts that ordinary callers should not be able to invent for themselves.
-
-| Admin/bootstrap responsibility | Why it is privileged |
-| --- | --- |
-| Create tenants | Establishes the administrative boundary. |
-| Create applications and secrets | Mints identities that can authenticate. |
-| Grant token scopes | Decides which API families and resource envelopes a caller can use. |
-| Register namespace and caveat definitions | Changes how future permission checks interpret tuples. |
-| Seed first owner/admin relationships | Creates the initial trusted path for tenant administration. |
-| Register regions or placement policy | Affects where tenant data may be stored and served. |
-
-After bootstrap, tenant applications and users should work through scoped APIs. They can create objects, write application data, write allowed tuple facts, check permissions, open authorised watches, and query authorised indexes only when their token scopes and relationships allow it.
-
-They cannot:
-
-- create a new tenant boundary;
-- mint their own credentials or token scopes;
-- register or redefine namespace schemas or caveats through ordinary object writes;
-- treat a tuple namespace label as permission to create new authorisation semantics;
-- write tuples that violate namespace policy;
-- grant themselves broader administrative authority;
-- bypass permission checks by reading search, watch, projection, or authorisation internals;
-- access `_anvil/` paths through public object APIs.
-
-## Reserved namespaces fail closed
-
-Anvil owns internal paths under `_anvil/`. Public callers cannot read, list, write, copy, compose, delete, or range-read those paths. This is true even when the caller has broad bucket or object scopes.
-
-Reserved namespaces contain internal state such as index segments, authorisation tuple material, watch checkpoints, and PersonalDB material. Returning ordinary not-found semantics can leak whether internal state exists, so Anvil uses a hard `UnauthorizedReservedNamespace` failure for public access attempts.
-
-Structured insight should come from native or admin APIs that apply authentication, scopes, relationship checks, auditing, and redaction.
-
-## Authorisation must protect every exposure path
-
-Authorisation is not only for direct object downloads. These can also leak data:
-
-- bucket and prefix listings;
-- object metadata and tags;
-- full text counts, snippets, highlights, and facets;
-- vector neighbours and hybrid scores;
-- watch subscriptions and watch events;
-- source and model artefact queries;
-- PersonalDB group opens, commits, snapshots, and projections;
-- repair findings and diagnostics.
-
-Applications should call Anvil with the real caller identity and requested action. They should not run broad admin reads, filter in memory, and hope every exposure path was covered.
-
-## Request decision flow
-
-A safe request follows this order:
-
-```text
-receive request
-  -> authenticate caller
-  -> reject reserved namespace access
-  -> check token scope for API family and resource envelope
-  -> check relationship relation or computed relation
-  -> evaluate caveats with request context
-  -> verify required authorisation/index revision is available
-  -> return only authorised objects, rows, snippets, counts, events, or diagnostics
-```
-
-When any security step cannot prove access, the default is denial. Fail closed is the rule that keeps missing schema, stale derived state, invalid caveats, cycles, and internal-path probes from becoming data exposure.
-
-## What you can do after this page
-
-You should be able to explain tenant bootstrap, application credentials, token scopes, relationship authorisation, tuple syntax, namespace typing, usersets, computed relations, caveats, delegation boundaries, and fail-closed reserved namespaces. Next, learn the authorisation tutorial operations or how watches keep derived state current.
+Keep admin authority out of that model. A system-realm relation such as `manage_regions` is for operators changing Anvil topology. It is not a stronger tenant role, and it should not be used to let product code bypass public policy or relationship checks.

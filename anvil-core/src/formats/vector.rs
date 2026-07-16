@@ -1,4 +1,5 @@
 use super::{FormatError, Hash32};
+use prost::Message;
 use std::convert::TryInto;
 
 pub const VECTOR_BODY_HEADER_LEN: usize = 8 + 8 + 8 + 8 + 8;
@@ -371,6 +372,7 @@ pub const VECTOR_INDEX_SCHEMA: &str = "anvil.index.vector_definition.v1";
 pub struct VectorIndexDefinition {
     pub source: serde_json::Value,
     pub extractor: serde_json::Value,
+    pub definition_hash: String,
     pub embedding_provider: String,
     pub dimension: u16,
     pub metric: VectorMetric,
@@ -385,6 +387,72 @@ pub struct VectorIndexDefinition {
     pub hnsw_ef_construction: u16,
     pub hnsw_ef_search_default: u16,
     pub provenance_hash: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct VectorDefinitionProto {
+    #[prost(string, tag = "1")]
+    schema: String,
+    #[prost(bytes = "vec", tag = "2")]
+    source_json: Vec<u8>,
+    #[prost(bytes = "vec", tag = "3")]
+    extractor_json: Vec<u8>,
+    #[prost(string, tag = "4")]
+    embedding_provider: String,
+    #[prost(string, tag = "5")]
+    embedding_model: String,
+    #[prost(string, optional, tag = "6")]
+    embedding_model_version: Option<String>,
+    #[prost(uint32, tag = "7")]
+    dimension: u32,
+    #[prost(string, tag = "8")]
+    modality: String,
+    #[prost(string, tag = "9")]
+    normalisation: String,
+    #[prost(bytes = "vec", tag = "10")]
+    chunking_json: Vec<u8>,
+    #[prost(string, tag = "11")]
+    ann_algorithm: String,
+    #[prost(string, tag = "12")]
+    metric: String,
+    #[prost(uint32, tag = "13")]
+    hnsw_m: u32,
+    #[prost(uint32, tag = "14")]
+    hnsw_ef_construction: u32,
+    #[prost(uint32, tag = "15")]
+    hnsw_ef_search_default: u32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct VectorDefinitionFragmentProto {
+    #[prost(string, tag = "1")]
+    schema: String,
+    #[prost(string, tag = "2")]
+    fragment_kind: String,
+    #[prost(bytes = "vec", tag = "3")]
+    canonical_json: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct VectorProvenanceProto {
+    #[prost(string, tag = "1")]
+    schema: String,
+    #[prost(string, tag = "2")]
+    provider: String,
+    #[prost(string, tag = "3")]
+    model: String,
+    #[prost(string, optional, tag = "4")]
+    model_version: Option<String>,
+    #[prost(uint32, tag = "5")]
+    dimension: u32,
+    #[prost(string, tag = "6")]
+    modality: String,
+    #[prost(string, tag = "7")]
+    normalisation: String,
+    #[prost(bytes = "vec", tag = "8")]
+    chunking_json: Vec<u8>,
+    #[prost(bytes = "vec", tag = "9")]
+    extractor_json: Vec<u8>,
 }
 
 impl VectorIndexDefinition {
@@ -469,8 +537,8 @@ impl VectorIndexDefinition {
                 field: "ann.ef_search_default",
             });
         }
-        let chunking_hash = definition_value_hash(&chunking)?;
-        let extractor_hash = definition_value_hash(&extractor)?;
+        let chunking_hash = definition_value_hash("chunking", &chunking)?;
+        let extractor_hash = definition_value_hash("extractor", &extractor)?;
         let provenance_hash = vector_provenance_hash(
             &embedding_provider,
             &embedding_model,
@@ -481,9 +549,25 @@ impl VectorIndexDefinition {
             &chunking,
             &extractor,
         )?;
+        let definition_hash = vector_definition_hash(
+            &source,
+            &extractor,
+            &embedding_provider,
+            &embedding_model,
+            embedding_model_version.as_deref(),
+            dimension,
+            modality,
+            &normalisation,
+            &chunking,
+            metric,
+            hnsw_m,
+            hnsw_ef_construction,
+            hnsw_ef_search_default,
+        )?;
         Ok(Self {
             source,
             extractor,
+            definition_hash,
             embedding_provider,
             dimension,
             metric,
@@ -502,12 +586,57 @@ impl VectorIndexDefinition {
     }
 }
 
-fn definition_value_hash(value: &serde_json::Value) -> Result<String, FormatError> {
-    let bytes =
-        serde_json::to_vec(value).map_err(|_| FormatError::InvalidVectorIndexDefinition {
-            field: "definition_hash",
-        })?;
-    Ok(format!("blake3:{}", blake3::hash(&bytes).to_hex()))
+fn vector_definition_hash(
+    source: &serde_json::Value,
+    extractor: &serde_json::Value,
+    provider: &str,
+    model: &str,
+    model_version: Option<&str>,
+    dimension: u16,
+    modality: VectorModality,
+    normalisation: &str,
+    chunking: &serde_json::Value,
+    metric: VectorMetric,
+    hnsw_m: u16,
+    hnsw_ef_construction: u16,
+    hnsw_ef_search_default: u16,
+) -> Result<String, FormatError> {
+    let proto = VectorDefinitionProto {
+        schema: VECTOR_INDEX_SCHEMA.to_string(),
+        source_json: canonical_json_bytes(source)?,
+        extractor_json: canonical_json_bytes(extractor)?,
+        embedding_provider: provider.to_string(),
+        embedding_model: model.to_string(),
+        embedding_model_version: model_version.map(str::to_string),
+        dimension: u32::from(dimension),
+        modality: modality.as_name().to_string(),
+        normalisation: normalisation.to_string(),
+        chunking_json: canonical_json_bytes(chunking)?,
+        ann_algorithm: "hnsw".to_string(),
+        metric: metric.as_name().to_string(),
+        hnsw_m: u32::from(hnsw_m),
+        hnsw_ef_construction: u32::from(hnsw_ef_construction),
+        hnsw_ef_search_default: u32::from(hnsw_ef_search_default),
+    };
+    Ok(format!(
+        "blake3:{}",
+        blake3::hash(&encode_proto(&proto)?).to_hex()
+    ))
+}
+
+fn definition_value_hash(
+    fragment_kind: &'static str,
+    value: &serde_json::Value,
+) -> Result<String, FormatError> {
+    let proto = VectorDefinitionFragmentProto {
+        schema: "anvil.index.vector_definition.fragment.v1".to_string(),
+        fragment_kind: fragment_kind.to_string(),
+        canonical_json: canonical_json_bytes(value)?,
+    };
+    Ok(format!(
+        "blake3:{}",
+        blake3::hash(&encode_proto(&proto)?).to_hex()
+    ))
 }
 
 fn vector_provenance_hash(
@@ -520,41 +649,57 @@ fn vector_provenance_hash(
     chunking: &serde_json::Value,
     extractor: &serde_json::Value,
 ) -> Result<String, FormatError> {
-    let mut provenance = serde_json::Map::new();
-    provenance.insert(
-        "provider".to_string(),
-        serde_json::Value::String(provider.to_string()),
-    );
-    provenance.insert(
-        "model".to_string(),
-        serde_json::Value::String(model.to_string()),
-    );
-    if let Some(model_version) = model_version {
-        provenance.insert(
-            "model_version".to_string(),
-            serde_json::Value::String(model_version.to_string()),
-        );
-    }
-    provenance.insert(
-        "dimension".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(dimension)),
-    );
-    provenance.insert(
-        "modality".to_string(),
-        serde_json::Value::String(modality.as_name().to_string()),
-    );
-    provenance.insert(
-        "normalisation".to_string(),
-        serde_json::Value::String(normalisation.to_string()),
-    );
-    provenance.insert("chunking".to_string(), chunking.clone());
-    provenance.insert("extractor".to_string(), extractor.clone());
-    let bytes = serde_json::to_vec(&serde_json::Value::Object(provenance)).map_err(|_| {
+    let proto = VectorProvenanceProto {
+        schema: "anvil.index.vector_provenance.v1".to_string(),
+        provider: provider.to_string(),
+        model: model.to_string(),
+        model_version: model_version.map(str::to_string),
+        dimension: u32::from(dimension),
+        modality: modality.as_name().to_string(),
+        normalisation: normalisation.to_string(),
+        chunking_json: canonical_json_bytes(chunking)?,
+        extractor_json: canonical_json_bytes(extractor)?,
+    };
+    Ok(format!(
+        "blake3:{}",
+        blake3::hash(&encode_proto(&proto)?).to_hex()
+    ))
+}
+
+fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, FormatError> {
+    serde_json::to_vec(&canonical_json(value)).map_err(|_| {
         FormatError::InvalidVectorIndexDefinition {
-            field: "provenance",
+            field: "definition_hash",
         }
-    })?;
-    Ok(format!("blake3:{}", blake3::hash(&bytes).to_hex()))
+    })
+}
+
+fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(canonical_json).collect())
+        }
+        serde_json::Value::Object(values) => {
+            let mut sorted = serde_json::Map::new();
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys {
+                sorted.insert(key.clone(), canonical_json(&values[key]));
+            }
+            serde_json::Value::Object(sorted)
+        }
+        scalar => scalar.clone(),
+    }
+}
+
+fn encode_proto(message: &impl Message) -> Result<Vec<u8>, FormatError> {
+    let mut bytes = Vec::with_capacity(message.encoded_len());
+    message
+        .encode(&mut bytes)
+        .map_err(|_| FormatError::InvalidVectorIndexDefinition {
+            field: "definition_hash",
+        })?;
+    Ok(bytes)
 }
 
 fn required_object_value(
@@ -625,6 +770,7 @@ pub struct VectorSearchCandidate {
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorSearchResult {
     pub vector_id: u64,
+    pub source_id_binary: Vec<u8>,
     pub score: f32,
     pub object_version_id: [u8; 16],
     pub chunk_id: u32,
@@ -704,6 +850,7 @@ pub fn select_authorized_vector_results(
         .take(result_count)
         .map(|(score, _, candidate)| VectorSearchResult {
             vector_id: candidate.record.vector_id,
+            source_id_binary: Vec::new(),
             score,
             object_version_id: candidate.record.object_version_id,
             chunk_id: candidate.record.chunk_id,

@@ -1,6 +1,5 @@
 use super::admin_cursor::{self, AdminCursorBinding};
 use crate::admin_audit::{self, AdminAuditEvent, AuditEventFilter};
-use crate::admin_auth::{self, AdminPrincipal, AnvilAdminCapability};
 use crate::anvil_api::admin_service_server::AdminService;
 use crate::anvil_api::*;
 use crate::mesh_lifecycle::{
@@ -8,13 +7,13 @@ use crate::mesh_lifecycle::{
     LifecycleState as CoreLifecycleState, NodeCapability as CoreNodeCapability,
     NodeDrainDescriptor, RegisterCellDescriptor, RegisterNodeDescriptor,
 };
-use crate::object_links;
 use crate::persistence;
 use crate::repair_finding::{RepairFinding, RepairSubjectRef};
 use crate::routing::{
     self, HostAliasDescriptor as CoreHostAliasDescriptor, HostAliasState as CoreHostAliasState,
     RoutingConfig,
 };
+use crate::system_realm::{AdminPrincipal, SystemAdminRelation};
 use crate::{
     AppState, auth, authz_repair, directory_repair, index_repair, mesh_control_stream,
     mesh_directory, persistence::Bucket, personaldb_repair,
@@ -23,13 +22,16 @@ use chrono::Utc;
 use serde_json::json;
 use tonic::{Request, Response, Status};
 
+mod rpc_mapping;
+pub use rpc_mapping::admin_rpc_relation_mapping;
+
 #[tonic::async_trait]
 impl AdminService for AppState {
     async fn create_tenant(
         &self,
         request: Request<CreateTenantRequest>,
     ) -> Result<Response<TenantAdminResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageTenants)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageTenants).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), true)?;
         let home_region = if req.home_region.trim().is_empty() {
@@ -71,7 +73,7 @@ impl AdminService for AppState {
         &self,
         request: Request<CreateApplicationRequest>,
     ) -> Result<Response<ApplicationSecretResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageApps)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageApps).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), true)?;
         let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
@@ -113,7 +115,7 @@ impl AdminService for AppState {
         &self,
         request: Request<RotateApplicationSecretRequest>,
     ) -> Result<Response<ApplicationSecretResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageApps)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageApps).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
@@ -161,16 +163,28 @@ impl AdminService for AppState {
         &self,
         request: Request<GrantApplicationPolicyRequest>,
     ) -> Result<Response<ApplicationPolicyResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManagePolicies)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManagePolicies).await?;
         let req = request.into_inner();
         let context = require_admin_action_context(req.context.as_ref())?;
         let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
         let app = resolve_tenant_app(self, tenant_id, &req.app_name).await?;
         validate_policy_parts(&req.action, &req.resource)?;
-        self.persistence
-            .grant_policy(app.id, &req.resource, &req.action)
-            .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+        let delegated_action = req
+            .action
+            .parse::<crate::permissions::AnvilAction>()
+            .map_err(|_| Status::invalid_argument("Invalid delegated action"))?;
+        crate::access_control::write_delegated_action_tuple(
+            &self.storage,
+            &self.persistence,
+            tenant_id,
+            &app.id.to_string(),
+            delegated_action,
+            &req.resource,
+            "add",
+            &principal.principal_id,
+            "admin access grant",
+        )
+        .await?;
         let audit_event_id = record_admin_audit_event(
             self,
             &principal,
@@ -202,16 +216,28 @@ impl AdminService for AppState {
         &self,
         request: Request<RevokeApplicationPolicyRequest>,
     ) -> Result<Response<ApplicationPolicyResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManagePolicies)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManagePolicies).await?;
         let req = request.into_inner();
         let context = require_admin_action_context(req.context.as_ref())?;
         let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
         let app = resolve_tenant_app(self, tenant_id, &req.app_name).await?;
         validate_policy_parts(&req.action, &req.resource)?;
-        self.persistence
-            .revoke_policy(app.id, &req.resource, &req.action)
-            .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+        let delegated_action = req
+            .action
+            .parse::<crate::permissions::AnvilAction>()
+            .map_err(|_| Status::invalid_argument("Invalid delegated action"))?;
+        crate::access_control::write_delegated_action_tuple(
+            &self.storage,
+            &self.persistence,
+            tenant_id,
+            &app.id.to_string(),
+            delegated_action,
+            &req.resource,
+            "remove",
+            &principal.principal_id,
+            "admin access revoke",
+        )
+        .await?;
         let audit_event_id = record_admin_audit_event(
             self,
             &principal,
@@ -239,6 +265,34 @@ impl AdminService for AppState {
         }))
     }
 
+    async fn grant_application_policies(
+        &self,
+        request: Request<ApplicationPoliciesRequest>,
+    ) -> Result<Response<ApplicationPoliciesResponse>, Status> {
+        mutate_application_policy_batch(
+            self,
+            request,
+            "add",
+            "admin.app.policy.batch_grant",
+            "admin access batch grant",
+        )
+        .await
+    }
+
+    async fn revoke_application_policies(
+        &self,
+        request: Request<ApplicationPoliciesRequest>,
+    ) -> Result<Response<ApplicationPoliciesResponse>, Status> {
+        mutate_application_policy_batch(
+            self,
+            request,
+            "remove",
+            "admin.app.policy.batch_revoke",
+            "admin access batch revoke",
+        )
+        .await
+    }
+
     async fn rotate_secret_encryption_key(
         &self,
         request: Request<RotateSecretEncryptionKeyRequest>,
@@ -246,8 +300,9 @@ impl AdminService for AppState {
         let principal = require_admin(
             &request,
             self,
-            AnvilAdminCapability::ManageSecretEncryptionKeys,
-        )?;
+            SystemAdminRelation::ManageSecretEncryptionKeys,
+        )
+        .await?;
         let req = request.into_inner();
         let context = require_admin_action_context(req.context.as_ref())?;
         let mut stats = SecretEncryptionRotationStats::default();
@@ -291,7 +346,7 @@ impl AdminService for AppState {
         &self,
         request: Request<CreateBucketAdminRequest>,
     ) -> Result<Response<BucketAdminResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageBuckets)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageBuckets).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), true)?;
         let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
@@ -299,6 +354,15 @@ impl AdminService for AppState {
             .persistence
             .create_bucket(tenant_id, &req.bucket_name, &req.region)
             .await?;
+        crate::access_control::grant_bucket_defaults(
+            &self.persistence,
+            &bucket,
+            &principal.principal_id,
+            &principal.principal_id,
+            "admin bucket create",
+        )
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
         let audit_event_id = record_admin_audit_event(
             self,
             &principal,
@@ -326,7 +390,7 @@ impl AdminService for AppState {
         &self,
         request: Request<SetBucketPublicAccessAdminRequest>,
     ) -> Result<Response<BucketAdminResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageBuckets)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageBuckets).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
@@ -364,279 +428,12 @@ impl AdminService for AppState {
         }))
     }
 
-    async fn create_object_link(
-        &self,
-        request: Request<CreateObjectLinkRequest>,
-    ) -> Result<Response<ObjectLinkResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageLinks)?;
-        let req = request.into_inner();
-        let context = require_mutation_context(req.context.as_ref(), true)?;
-        let request_id = context.request_id.clone();
-        let idempotency_key = context.idempotency_key.clone();
-        let bucket = resolve_link_bucket(self, &req.tenant_id, &req.bucket_name).await?;
-        let resolution = object_link_resolution_from_proto(req.resolution)?;
-        let target_version = parse_optional_uuid("target_version", req.target_version)?;
-        let mutation = self
-            .persistence
-            .put_object_link(object_links::PutObjectLinkRequest {
-                tenant_id: bucket.tenant_id,
-                bucket_id: bucket.id,
-                link_key: req.link_key,
-                target_key: req.target_key,
-                target_version,
-                resolution,
-                expected_generation: None,
-                create_only: true,
-                allow_dangling: req.allow_dangling,
-                idempotency_key,
-                created_by: principal_label(&principal),
-            })
-            .await
-            .map_err(object_link_status)?;
-        let audit_event_id = record_admin_audit_event(
-            self,
-            &principal,
-            context,
-            "admin.object_link.create",
-            &object_link_resource_id(
-                bucket.tenant_id,
-                &bucket.name,
-                &mutation.descriptor.link_key,
-            ),
-            json!({
-                "resource_kind": "object_link",
-                "tenant_id": bucket.tenant_id,
-                "bucket_id": bucket.id,
-                "bucket_name": &bucket.name,
-                "link_key": &mutation.descriptor.link_key,
-                "target_key": &mutation.descriptor.target_key,
-                "target_version": &mutation.descriptor.target_version,
-                "resolution": mutation.descriptor.resolution,
-                "allow_dangling": req.allow_dangling,
-                "generation": mutation.descriptor.generation,
-                "created_by": &mutation.descriptor.created_by,
-            }),
-        )
-        .await?;
-
-        Ok(Response::new(ObjectLinkResponse {
-            request_id,
-            link: Some(object_link_descriptor_to_proto(mutation.descriptor)),
-            audit_event_id,
-        }))
-    }
-
-    async fn update_object_link(
-        &self,
-        request: Request<UpdateObjectLinkRequest>,
-    ) -> Result<Response<ObjectLinkResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageLinks)?;
-        let req = request.into_inner();
-        let context = require_mutation_context(req.context.as_ref(), false)?;
-        let request_id = context.request_id.clone();
-        let idempotency_key = context.idempotency_key.clone();
-        let expected_generation = context.expected_generation;
-        let bucket = resolve_link_bucket(self, &req.tenant_id, &req.bucket_name).await?;
-        let resolution = object_link_resolution_from_proto(req.resolution)?;
-        let target_version = parse_optional_uuid("target_version", req.target_version)?;
-        let mutation = self
-            .persistence
-            .put_object_link(object_links::PutObjectLinkRequest {
-                tenant_id: bucket.tenant_id,
-                bucket_id: bucket.id,
-                link_key: req.link_key,
-                target_key: req.target_key,
-                target_version,
-                resolution,
-                expected_generation: Some(expected_generation),
-                create_only: false,
-                allow_dangling: req.allow_dangling,
-                idempotency_key,
-                created_by: principal_label(&principal),
-            })
-            .await
-            .map_err(object_link_status)?;
-        let audit_event_id = record_admin_audit_event(
-            self,
-            &principal,
-            context,
-            "admin.object_link.update",
-            &object_link_resource_id(
-                bucket.tenant_id,
-                &bucket.name,
-                &mutation.descriptor.link_key,
-            ),
-            json!({
-                "resource_kind": "object_link",
-                "tenant_id": bucket.tenant_id,
-                "bucket_id": bucket.id,
-                "bucket_name": &bucket.name,
-                "link_key": &mutation.descriptor.link_key,
-                "target_key": &mutation.descriptor.target_key,
-                "target_version": &mutation.descriptor.target_version,
-                "resolution": mutation.descriptor.resolution,
-                "allow_dangling": req.allow_dangling,
-                "previous_generation": expected_generation,
-                "generation": mutation.descriptor.generation,
-                "created_by": &mutation.descriptor.created_by,
-            }),
-        )
-        .await?;
-
-        Ok(Response::new(ObjectLinkResponse {
-            request_id,
-            link: Some(object_link_descriptor_to_proto(mutation.descriptor)),
-            audit_event_id,
-        }))
-    }
-
-    async fn delete_object_link(
-        &self,
-        request: Request<DeleteObjectLinkRequest>,
-    ) -> Result<Response<AdminMutationResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageLinks)?;
-        let req = request.into_inner();
-        let context = require_mutation_context(req.context.as_ref(), false)?;
-        let request_id = context.request_id.clone();
-        let idempotency_key = context.idempotency_key.clone();
-        let expected_generation = context.expected_generation;
-        let bucket = resolve_link_bucket(self, &req.tenant_id, &req.bucket_name).await?;
-        let deleted = self
-            .persistence
-            .delete_object_link(object_links::DeleteObjectLinkRequest {
-                tenant_id: bucket.tenant_id,
-                bucket_id: bucket.id,
-                link_key: req.link_key,
-                expected_generation,
-                idempotency_key,
-            })
-            .await
-            .map_err(object_link_status)?;
-        let audit_event_id = record_admin_audit_event(
-            self,
-            &principal,
-            context,
-            "admin.object_link.delete",
-            &object_link_resource_id(bucket.tenant_id, &bucket.name, &deleted.link_key),
-            json!({
-                "resource_kind": "object_link",
-                "tenant_id": bucket.tenant_id,
-                "bucket_id": bucket.id,
-                "bucket_name": &bucket.name,
-                "link_key": &deleted.link_key,
-                "previous_generation": expected_generation,
-                "generation": deleted.generation,
-            }),
-        )
-        .await?;
-
-        Ok(Response::new(AdminMutationResponse {
-            request_id,
-            resource_id: deleted.link_key,
-            generation: deleted.generation,
-            audit_event_id,
-            idempotent_replay: false,
-        }))
-    }
-
-    async fn read_object_link(
-        &self,
-        request: Request<ReadObjectLinkRequest>,
-    ) -> Result<Response<ObjectLinkResponse>, Status> {
-        require_admin(&request, self, AnvilAdminCapability::ManageLinks)?;
-        let req = request.into_inner();
-        let bucket = resolve_link_bucket(self, &req.tenant_id, &req.bucket_name).await?;
-        let descriptor = self
-            .persistence
-            .get_object_link(bucket.id, &req.link_key)
-            .await
-            .map_err(object_link_status)?
-            .ok_or_else(|| Status::not_found("Object link not found"))?;
-
-        Ok(Response::new(ObjectLinkResponse {
-            request_id: req.request_id,
-            link: Some(object_link_descriptor_to_proto(descriptor)),
-            audit_event_id: String::new(),
-        }))
-    }
-
-    async fn list_object_links(
-        &self,
-        request: Request<ListObjectLinksRequest>,
-    ) -> Result<Response<ListObjectLinksResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageLinks)?;
-        let req = request.into_inner();
-        let bucket = resolve_link_bucket(self, &req.tenant_id, &req.bucket_name).await?;
-        let page = req.page.as_ref();
-        let limit = page_limit(page);
-        let links = self
-            .persistence
-            .list_object_links(bucket.id, none_if_empty(&req.prefix))
-            .await
-            .map_err(object_link_status)?;
-        let revision = admin_cursor::collection_revision(
-            links
-                .iter()
-                .map(|link| (link.link_key.as_str(), link.generation)),
-        );
-        let tenant_id_filter = bucket.tenant_id.to_string();
-        let filters = [
-            ("tenant_id", tenant_id_filter.as_str()),
-            ("bucket_name", bucket.name.as_str()),
-            ("prefix", req.prefix.as_str()),
-        ];
-        let binding = AdminCursorBinding {
-            scope: "admin.list_object_links.v1",
-            filters: &filters,
-            principal: &principal,
-            limit,
-            revision: &revision,
-            sort: "link_key.asc",
-        };
-        let cursor =
-            admin_cursor::decode_page_cursor(page, &binding, self.config.jwt_secret.as_bytes())?;
-        let mut links = links
-            .into_iter()
-            .filter(|link| {
-                cursor
-                    .as_deref()
-                    .is_none_or(|cursor| link.link_key.as_str() > cursor)
-            })
-            .take(limit + 1)
-            .collect::<Vec<_>>();
-        let has_more = links.len() > limit;
-        if has_more {
-            links.truncate(limit);
-        }
-        let next_cursor = if has_more {
-            links.last().map_or(Ok(String::new()), |link| {
-                admin_cursor::encode_next_cursor(
-                    &link.link_key,
-                    &binding,
-                    self.config.jwt_secret.as_bytes(),
-                )
-            })?
-        } else {
-            String::new()
-        };
-
-        Ok(Response::new(ListObjectLinksResponse {
-            page: Some(PageResponse {
-                next_cursor,
-                has_more,
-            }),
-            links: links
-                .into_iter()
-                .map(object_link_descriptor_to_proto)
-                .collect(),
-        }))
-    }
-
     async fn create_host_alias(
         &self,
-        request: Request<CreateHostAliasRequest>,
+        request: Request<CreateHostAliasAdminRequest>,
     ) -> Result<Response<HostAliasResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageHostAliases)?;
+        let principal =
+            require_admin(&request, self, SystemAdminRelation::ManageHostAliases).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), true)?;
         let request_id = context.request_id.clone();
@@ -676,7 +473,8 @@ impl AdminService for AppState {
         &self,
         request: Request<ActivateHostAliasRequest>,
     ) -> Result<Response<HostAliasResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageHostAliases)?;
+        let principal =
+            require_admin(&request, self, SystemAdminRelation::ManageHostAliases).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let host_alias = self
@@ -709,7 +507,8 @@ impl AdminService for AppState {
         &self,
         request: Request<SuspendHostAliasRequest>,
     ) -> Result<Response<HostAliasResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageHostAliases)?;
+        let principal =
+            require_admin(&request, self, SystemAdminRelation::ManageHostAliases).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let host_alias = self
@@ -740,9 +539,10 @@ impl AdminService for AppState {
 
     async fn delete_host_alias(
         &self,
-        request: Request<DeleteHostAliasRequest>,
+        request: Request<DeleteHostAliasAdminRequest>,
     ) -> Result<Response<AdminMutationResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageHostAliases)?;
+        let principal =
+            require_admin(&request, self, SystemAdminRelation::ManageHostAliases).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let host_alias = self
@@ -777,7 +577,7 @@ impl AdminService for AppState {
         &self,
         request: Request<ReadHostAliasRequest>,
     ) -> Result<Response<HostAliasResponse>, Status> {
-        require_admin(&request, self, AnvilAdminCapability::ManageHostAliases)?;
+        require_admin(&request, self, SystemAdminRelation::ManageHostAliases).await?;
         let req = request.into_inner();
         let host_alias = self
             .persistence
@@ -797,7 +597,8 @@ impl AdminService for AppState {
         &self,
         request: Request<ListHostAliasesRequest>,
     ) -> Result<Response<ListHostAliasesResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageHostAliases)?;
+        let principal =
+            require_admin(&request, self, SystemAdminRelation::ManageHostAliases).await?;
         let req = request.into_inner();
         let page = req.page.as_ref();
         let limit = page_limit(page);
@@ -864,7 +665,7 @@ impl AdminService for AppState {
         &self,
         request: Request<CreateRegionRequest>,
     ) -> Result<Response<RegionResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRegions).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), true)?;
         let region = self
@@ -879,6 +680,14 @@ impl AdminService for AppState {
             })
             .await
             .map_err(lifecycle_status)?;
+        crate::access_control::grant_region_defaults(
+            &self.persistence,
+            &region.region,
+            &principal.principal_id,
+            "admin region create",
+        )
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
         let audit_event_id = record_admin_audit_event(
             self,
             &principal,
@@ -899,7 +708,7 @@ impl AdminService for AppState {
         &self,
         request: Request<ActivateRegionRequest>,
     ) -> Result<Response<RegionResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRegions).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let checkpoint =
@@ -932,7 +741,7 @@ impl AdminService for AppState {
         &self,
         request: Request<SetRegionReadOnlyRequest>,
     ) -> Result<Response<RegionResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRegions).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let region = self
@@ -964,7 +773,7 @@ impl AdminService for AppState {
         &self,
         request: Request<DrainRegionRequest>,
     ) -> Result<Response<DrainOperationResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRegions).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let default_disposition =
@@ -1062,7 +871,7 @@ impl AdminService for AppState {
         &self,
         request: Request<RemoveRegionRequest>,
     ) -> Result<Response<AdminMutationResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRegions).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let region = self
@@ -1096,7 +905,7 @@ impl AdminService for AppState {
         &self,
         request: Request<ListRegionsRequest>,
     ) -> Result<Response<ListRegionsResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRegions).await?;
         let req = request.into_inner();
         let page = req.page.as_ref();
         let limit = page_limit(page);
@@ -1159,7 +968,7 @@ impl AdminService for AppState {
         &self,
         request: Request<RegisterCellRequest>,
     ) -> Result<Response<CellResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRegions).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), true)?;
         let cell = self
@@ -1169,9 +978,19 @@ impl AdminService for AppState {
                 region: req.region,
                 cell_id: req.cell_id,
                 placement_weight: req.placement_weight,
+                failure_domain: req.failure_domain,
             })
             .await
             .map_err(lifecycle_status)?;
+        crate::access_control::grant_cell_defaults(
+            &self.persistence,
+            &cell.region,
+            &cell.cell_id,
+            &principal.principal_id,
+            "admin cell register",
+        )
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
         let audit_event_id = record_admin_audit_event(
             self,
             &principal,
@@ -1192,7 +1011,7 @@ impl AdminService for AppState {
         &self,
         request: Request<ActivateCellRequest>,
     ) -> Result<Response<CellResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRegions).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let cell = self
@@ -1225,7 +1044,7 @@ impl AdminService for AppState {
         &self,
         request: Request<DrainCellRequest>,
     ) -> Result<Response<DrainOperationResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRegions).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let cell = self
@@ -1260,7 +1079,7 @@ impl AdminService for AppState {
         &self,
         request: Request<RemoveCellRequest>,
     ) -> Result<Response<AdminMutationResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRegions).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let cell = self
@@ -1295,7 +1114,7 @@ impl AdminService for AppState {
         &self,
         request: Request<ListCellsRequest>,
     ) -> Result<Response<ListCellsResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRegions)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRegions).await?;
         let req = request.into_inner();
         let region_filter = none_if_empty(&req.region);
         let page = req.page.as_ref();
@@ -1368,7 +1187,7 @@ impl AdminService for AppState {
         &self,
         request: Request<RegisterNodeRequest>,
     ) -> Result<Response<NodeResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageNodes)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageNodes).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), true)?;
         let capabilities = req
@@ -1384,9 +1203,11 @@ impl AdminService for AppState {
                 region: req.region,
                 cell_id: req.cell_id,
                 libp2p_peer_id: req.libp2p_peer_id,
+                receipt_signing_public_key_proto: req.receipt_signing_public_key_proto,
                 public_api_addr: req.public_api_addr,
                 public_cluster_addrs: req.public_cluster_addrs,
                 capabilities,
+                capacity_json: req.capacity_json,
             })
             .await
             .map_err(lifecycle_status)?;
@@ -1406,11 +1227,74 @@ impl AdminService for AppState {
         }))
     }
 
+    async fn get_local_node_descriptor(
+        &self,
+        request: Request<GetLocalNodeDescriptorRequest>,
+    ) -> Result<Response<NodeResponse>, Status> {
+        require_admin(&request, self, SystemAdminRelation::ManageNodes).await?;
+        let request_id = request
+            .metadata()
+            .get(crate::middleware::ANVIL_REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        // This RPC is used by the Docker topology bootstrap before lifecycle
+        // projections and control streams are initialised. Build the descriptor
+        // from local runtime state instead of reading mesh lifecycle storage,
+        // otherwise early boot can recurse through CoreStore/control-stream
+        // bootstrap while the node is still trying to join the mesh.
+        let libp2p_peer_id = self
+            .cluster
+            .read()
+            .await
+            .iter()
+            .find_map(|(peer_id, info)| {
+                (info.grpc_addr == self.config.public_api_addr).then(|| peer_id.to_base58())
+            })
+            .ok_or_else(|| Status::unavailable("local cluster identity is not ready"))?;
+        let now = Utc::now().to_rfc3339();
+        let node = mesh_lifecycle::NodeDescriptor {
+            schema: mesh_lifecycle::NODE_DESCRIPTOR_SCHEMA.to_string(),
+            mesh_id: self.config.mesh_id.clone(),
+            node_id: self.config.node_id.clone(),
+            region: self.config.region.clone(),
+            cell_id: self.config.cell_id.clone(),
+            libp2p_peer_id,
+            receipt_signing_public_key_proto: self
+                .core_store
+                .local_receipt_signing_public_key_proto(),
+            public_api_addr: self.config.public_api_addr.clone(),
+            public_cluster_addrs: self.config.public_cluster_addrs.clone(),
+            capabilities: vec![
+                CoreNodeCapability::Object,
+                CoreNodeCapability::Index,
+                CoreNodeCapability::PersonalDb,
+                CoreNodeCapability::Metadata,
+                CoreNodeCapability::Gateway,
+                CoreNodeCapability::Admin,
+            ],
+            capacity_json_hash: mesh_lifecycle::capacity_json_hash("{}")
+                .map_err(lifecycle_status)?,
+            state: CoreLifecycleState::Joining,
+            drain: None,
+            last_heartbeat_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+            generation: 0,
+        };
+        Ok(Response::new(NodeResponse {
+            request_id,
+            node: Some(node_descriptor_to_proto(node)),
+            audit_event_id: String::new(),
+        }))
+    }
+
     async fn activate_node(
         &self,
         request: Request<ActivateNodeRequest>,
     ) -> Result<Response<NodeResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageNodes)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageNodes).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let node = self
@@ -1423,6 +1307,24 @@ impl AdminService for AppState {
             )
             .await
             .map_err(lifecycle_status)?;
+        crate::access_control::grant_node_defaults(
+            &self.persistence,
+            &node.region,
+            &node.cell_id,
+            &node.node_id,
+            &principal.principal_id,
+            "admin node activate",
+        )
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
+        crate::access_control::grant_internal_node_system_access(
+            &self.persistence,
+            &node.node_id,
+            &principal.principal_id,
+            "admin node activate",
+        )
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
         let audit_event_id = record_admin_audit_event(
             self,
             &principal,
@@ -1443,7 +1345,7 @@ impl AdminService for AppState {
         &self,
         request: Request<DrainNodeRequest>,
     ) -> Result<Response<DrainOperationResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageNodes)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageNodes).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let node = self
@@ -1483,7 +1385,7 @@ impl AdminService for AppState {
         &self,
         request: Request<ForceOfflineNodeRequest>,
     ) -> Result<Response<NodeResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageNodes)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageNodes).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let node = self
@@ -1516,7 +1418,7 @@ impl AdminService for AppState {
         &self,
         request: Request<RemoveNodeRequest>,
     ) -> Result<Response<AdminMutationResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageNodes)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageNodes).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let node = self
@@ -1551,7 +1453,7 @@ impl AdminService for AppState {
         &self,
         request: Request<ListNodesRequest>,
     ) -> Result<Response<ListNodesResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageNodes)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageNodes).await?;
         let req = request.into_inner();
         let page = req.page.as_ref();
         let limit = page_limit(page);
@@ -1618,7 +1520,7 @@ impl AdminService for AppState {
         &self,
         request: Request<ListRoutingRecordsRequest>,
     ) -> Result<Response<ListRoutingRecordsResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRouting)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRouting).await?;
         let req = request.into_inner();
         let family = routing_record_family_from_proto(req.family)?;
         let page = req.page.as_ref();
@@ -1685,7 +1587,7 @@ impl AdminService for AppState {
         &self,
         request: Request<RepairRoutingRecordRequest>,
     ) -> Result<Response<AdminMutationResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ManageRouting)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageRouting).await?;
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let family = routing_record_family_from_proto(req.family)?
@@ -1726,7 +1628,7 @@ impl AdminService for AppState {
         &self,
         request: Request<RunRepairRequest>,
     ) -> Result<Response<RepairTaskResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::RunRepair)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::RunRepair).await?;
         let req = request.into_inner();
         let context = require_admin_action_context(req.context.as_ref())?;
         let request_id = context.request_id.clone();
@@ -1767,7 +1669,7 @@ impl AdminService for AppState {
         &self,
         request: Request<ListDiagnosticsRequest>,
     ) -> Result<Response<DiagnosticsResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ViewDiagnostics)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ViewDiagnostics).await?;
         let req = request.into_inner();
         let request_id = require_request_id(&req.request_id)?.to_string();
         let page = req.page.as_ref();
@@ -1902,7 +1804,7 @@ impl AdminService for AppState {
         &self,
         request: Request<ListAuditEventsRequest>,
     ) -> Result<Response<AuditEventsResponse>, Status> {
-        let principal = require_admin(&request, self, AnvilAdminCapability::ViewAuditLog)?;
+        let principal = require_admin(&request, self, SystemAdminRelation::ViewAuditLog).await?;
         let req = request.into_inner();
         let request_id = require_request_id(&req.request_id)?.to_string();
         let page = req.page.as_ref();
@@ -1977,1581 +1879,84 @@ impl AdminService for AppState {
             data_source: "admin_audit_log".to_string(),
         }))
     }
-}
 
-fn require_admin<T>(
-    request: &Request<T>,
-    state: &AppState,
-    capability: AnvilAdminCapability,
-) -> Result<AdminPrincipal, Status> {
-    let claims = request
-        .extensions()
-        .get::<auth::Claims>()
-        .ok_or_else(|| Status::unauthenticated("Missing admin bearer token"))?;
-    if !admin_auth::has_admin_capability(claims, capability, &state.config.mesh_id) {
-        return Err(Status::permission_denied(format!(
-            "Missing anvil_admin capability {}",
-            capability.as_str()
-        )));
-    }
-    Ok(AdminPrincipal::from(claims))
-}
-
-fn require_mutation_context(
-    context: Option<&AdminRequestContext>,
-    create: bool,
-) -> Result<&AdminRequestContext, Status> {
-    let context = context.ok_or_else(|| Status::invalid_argument("Missing admin context"))?;
-    if context.request_id.trim().is_empty() {
-        return Err(Status::invalid_argument("Admin request_id is required"));
-    }
-    if context.idempotency_key.trim().is_empty() {
-        return Err(Status::invalid_argument(
-            "Admin idempotency_key is required",
-        ));
-    }
-    if context.audit_reason.trim().is_empty() {
-        return Err(Status::invalid_argument("Admin audit_reason is required"));
-    }
-    if create && context.expected_generation != 0 {
-        return Err(Status::invalid_argument(
-            "Create requests must use expected_generation = 0",
-        ));
-    }
-    if !create && context.expected_generation == 0 {
-        return Err(Status::invalid_argument(
-            "Update requests must include expected_generation",
-        ));
-    }
-    Ok(context)
-}
-
-fn require_admin_action_context(
-    context: Option<&AdminRequestContext>,
-) -> Result<&AdminRequestContext, Status> {
-    let context = context.ok_or_else(|| Status::invalid_argument("Missing admin context"))?;
-    require_request_id(&context.request_id)?;
-    if context.idempotency_key.trim().is_empty() {
-        return Err(Status::invalid_argument(
-            "Admin idempotency_key is required",
-        ));
-    }
-    if context.audit_reason.trim().is_empty() {
-        return Err(Status::invalid_argument("Admin audit_reason is required"));
-    }
-    Ok(context)
-}
-
-fn require_request_id(request_id: &str) -> Result<&str, Status> {
-    let request_id = request_id.trim();
-    if request_id.is_empty() {
-        return Err(Status::invalid_argument("Admin request_id is required"));
-    }
-    Ok(request_id)
-}
-
-async fn run_index_repair(
-    state: &AppState,
-    request_id: &str,
-    audit_event_id: &str,
-    req: &RunRepairRequest,
-) -> Result<RepairTaskResponse, Status> {
-    let tenant_id = resolve_tenant_id(state, &req.tenant_id).await?;
-    require_nonempty_admin_field(&req.bucket_name, "bucket_name")?;
-    require_nonempty_admin_field(&req.index_name, "index_name")?;
-    let bucket = state
-        .persistence
-        .get_bucket_by_name(tenant_id, &req.bucket_name)
-        .await
-        .map_err(|err| Status::internal(err.to_string()))?
-        .ok_or_else(|| Status::not_found("Bucket not found"))?;
-    let report = state
-        .persistence
-        .repair_index_from_base_journal(tenant_id, &bucket.name, &req.index_name, req.rebuild)
-        .await
-        .map_err(|err| Status::failed_precondition(err.to_string()))?;
-    let (source_cursor_low, source_cursor_high) = split_u128_admin(report.source_cursor);
-    let findings = report
-        .finding
-        .as_ref()
-        .map(repair_finding_to_admin_proto)
-        .transpose()?
-        .into_iter()
-        .collect::<Vec<_>>();
-    let repair_task_id = findings
-        .first()
-        .map(|finding| finding.repair_task_id.clone())
-        .unwrap_or_default();
-
-    Ok(RepairTaskResponse {
-        request_id: request_id.to_string(),
-        repair_task_id,
-        status: index_repair::status_name(&report.status).to_string(),
-        scope_kind: "index".to_string(),
-        scope_id: format!(
-            "tenant-{tenant_id}-bucket-{}-index-{}",
-            bucket.id, report.index_name
-        ),
-        findings,
-        audit_event_id: audit_event_id.to_string(),
-        details_json: json!({
-            "repair_kind": "index",
-            "bucket_name": report.bucket_name,
-            "index_name": report.index_name,
-            "index_storage_id": report.index_storage_id,
-            "source_cursor_low": source_cursor_low,
-            "source_cursor_high": source_cursor_high,
-            "reason": index_repair::status_reason(&report.status),
-            "rebuilt": report.build.is_some(),
-        })
-        .to_string(),
-    })
-}
-
-async fn run_directory_index_repair(
-    state: &AppState,
-    request_id: &str,
-    audit_event_id: &str,
-    req: &RunRepairRequest,
-) -> Result<RepairTaskResponse, Status> {
-    let tenant_id = resolve_tenant_id(state, &req.tenant_id).await?;
-    require_nonempty_admin_field(&req.bucket_name, "bucket_name")?;
-    let bucket = state
-        .persistence
-        .get_bucket_by_name(tenant_id, &req.bucket_name)
-        .await
-        .map_err(|err| Status::internal(err.to_string()))?
-        .ok_or_else(|| Status::not_found("Bucket not found"))?;
-    let report = state
-        .persistence
-        .repair_directory_index(tenant_id, &bucket.name, req.rebuild)
-        .await
-        .map_err(|err| Status::failed_precondition(err.to_string()))?;
-    let (source_cursor_low, source_cursor_high) = split_u128_admin(report.source_cursor);
-    let findings = report
-        .finding
-        .as_ref()
-        .map(repair_finding_to_admin_proto)
-        .transpose()?
-        .into_iter()
-        .collect::<Vec<_>>();
-    let repair_task_id = findings
-        .first()
-        .map(|finding| finding.repair_task_id.clone())
-        .unwrap_or_default();
-    let actual = report.actual.as_ref();
-
-    Ok(RepairTaskResponse {
-        request_id: request_id.to_string(),
-        repair_task_id,
-        status: directory_repair::status_name(&report.status).to_string(),
-        scope_kind: "bucket".to_string(),
-        scope_id: format!("tenant-{tenant_id}-bucket-{}", bucket.id),
-        findings,
-        audit_event_id: audit_event_id.to_string(),
-        details_json: json!({
-            "repair_kind": "directory_index",
-            "bucket_name": report.bucket_name,
-            "source_cursor_low": source_cursor_low,
-            "source_cursor_high": source_cursor_high,
-            "expected_entry_count": report.expected.entry_count,
-            "actual_entry_count": actual.map(|snapshot| snapshot.entry_count).unwrap_or_default(),
-            "expected_snapshot_hash": report.expected.snapshot_hash,
-            "actual_snapshot_hash": actual.map(|snapshot| snapshot.snapshot_hash.clone()).unwrap_or_default(),
-            "reason": directory_repair::status_reason(&report.status),
-            "rebuilt_manifest_hash": report
-                .rebuilt
-                .as_ref()
-                .map(|rebuilt| rebuilt.manifest_hash.clone())
-                .unwrap_or_default(),
-        })
-        .to_string(),
-    })
-}
-
-async fn run_authz_derived_index_repair(
-    state: &AppState,
-    request_id: &str,
-    audit_event_id: &str,
-    req: &RunRepairRequest,
-) -> Result<RepairTaskResponse, Status> {
-    let tenant_id = resolve_tenant_id(state, &req.tenant_id).await?;
-    require_nonempty_admin_field(&req.derived_index_id, "derived_index_id")?;
-    let report = state
-        .persistence
-        .repair_authz_derived_userset_index(tenant_id, &req.derived_index_id, req.rebuild)
-        .await
-        .map_err(|err| Status::failed_precondition(err.to_string()))?;
-    let findings = report
-        .finding
-        .as_ref()
-        .map(repair_finding_to_admin_proto)
-        .transpose()?
-        .into_iter()
-        .collect::<Vec<_>>();
-    let repair_task_id = findings
-        .first()
-        .map(|finding| finding.repair_task_id.clone())
-        .unwrap_or_default();
-
-    Ok(RepairTaskResponse {
-        request_id: request_id.to_string(),
-        repair_task_id,
-        status: authz_repair::status_name(&report.status).to_string(),
-        scope_kind: "authz_derived_index".to_string(),
-        scope_id: format!("tenant-{tenant_id}-authz-{}", report.derived_index_id),
-        findings,
-        audit_event_id: audit_event_id.to_string(),
-        details_json: json!({
-            "repair_kind": "authz_derived_index",
-            "derived_index_id": report.derived_index_id,
-            "processed_revision": report.processed_revision,
-            "latest_revision": report.latest_revision,
-            "source_records_hash": report.source_records_hash,
-            "reason": authz_repair::status_reason(&report.status),
-            "rebuilt": report.rebuilt_index.is_some(),
-        })
-        .to_string(),
-    })
-}
-
-async fn run_personaldb_log_chain_repair(
-    state: &AppState,
-    request_id: &str,
-    audit_event_id: &str,
-    req: &RunRepairRequest,
-) -> Result<RepairTaskResponse, Status> {
-    let tenant_id = resolve_tenant_id(state, &req.tenant_id).await?;
-    require_nonempty_admin_field(&req.database_id, "database_id")?;
-    let report = state
-        .persistence
-        .repair_personaldb_log_chain(tenant_id, &req.database_id)
-        .await
-        .map_err(|err| Status::failed_precondition(err.to_string()))?;
-    let findings = report
-        .finding
-        .as_ref()
-        .map(repair_finding_to_admin_proto)
-        .transpose()?
-        .into_iter()
-        .collect::<Vec<_>>();
-    let repair_task_id = findings
-        .first()
-        .map(|finding| finding.repair_task_id.clone())
-        .unwrap_or_default();
-
-    Ok(RepairTaskResponse {
-        request_id: request_id.to_string(),
-        repair_task_id,
-        status: personaldb_repair::status_name(&report.status).to_string(),
-        scope_kind: "personaldb".to_string(),
-        scope_id: format!("tenant-{tenant_id}-database-{}", report.database_id),
-        findings,
-        audit_event_id: audit_event_id.to_string(),
-        details_json: json!({
-            "repair_kind": "personaldb_log_chain",
-            "database_id": report.database_id,
-            "committed_log_index": report.committed_log_index,
-            "verified_log_index": report.verified_log_index,
-            "committed_log_hash": report.committed_log_hash,
-            "reason": personaldb_repair::status_reason(&report.status),
-        })
-        .to_string(),
-    })
-}
-
-async fn run_mesh_routing_projection_repair(
-    state: &AppState,
-    request_id: &str,
-    audit_event_id: &str,
-) -> Result<RepairTaskResponse, Status> {
-    let diagnostics = state
-        .persistence
-        .diagnose_mesh_routing_projection(None)
-        .await
-        .map_err(|err| Status::internal(err.to_string()))?;
-    let mut repaired_records = Vec::new();
-    let mut skipped_records = Vec::new();
-    let mut findings = Vec::new();
-    let repair_task_id = format!("mesh-routing-projection-repair-{audit_event_id}");
-
-    for (index, diagnostic) in diagnostics.into_iter().enumerate() {
-        if !diagnostic.repair_safe
-            || diagnostic.proposed_action != "repair_routing_record_from_control_stream"
-            || diagnostic.record_key.trim().is_empty()
-        {
-            let repair_result = json!({
-                "applied_action": "skipped",
-                "code": diagnostic.code,
-                "reason": "diagnostic is not safe for automatic routing projection repair",
-            });
-            let evidence = mesh_routing_projection_evidence(&diagnostic, Some(repair_result));
-            skipped_records.push(evidence.clone());
-            findings.push(mesh_routing_projection_repair_finding_record(
-                &repair_task_id,
-                index,
-                &diagnostic,
-                "RequiresOperatorReview",
-                "ManualReview",
-                &evidence,
-            ));
-            continue;
-        }
-        let Some(family) =
-            mesh_directory::RoutingRecordFamily::from_stream_family(&diagnostic.stream_family)
-        else {
-            let repair_result = json!({
-                "applied_action": "skipped",
-                "code": diagnostic.code,
-                "reason": "unknown routing record stream family",
-            });
-            let evidence = mesh_routing_projection_evidence(&diagnostic, Some(repair_result));
-            skipped_records.push(evidence.clone());
-            findings.push(mesh_routing_projection_repair_finding_record(
-                &repair_task_id,
-                index,
-                &diagnostic,
-                "RequiresOperatorReview",
-                "ManualReview",
-                &evidence,
-            ));
-            continue;
-        };
-        match state
-            .persistence
-            .repair_mesh_routing_record(family, &diagnostic.record_key)
-            .await
-        {
-            Ok(record) => {
-                let repair_result = json!({
-                    "applied_action": "repair_routing_record_from_control_stream",
-                    "descriptor_key": record.descriptor_key,
-                    "generation": record.generation,
-                });
-                let evidence = mesh_routing_projection_evidence(&diagnostic, Some(repair_result));
-                repaired_records.push(evidence.clone());
-                findings.push(mesh_routing_projection_repair_finding_record(
-                    &repair_task_id,
-                    index,
-                    &diagnostic,
-                    "RebuiltDerivedIndex",
-                    "RebuildDerivedIndex",
-                    &evidence,
-                ));
-            }
-            Err(err) => {
-                let repair_result = json!({
-                    "applied_action": "skipped",
-                    "code": diagnostic.code,
-                    "reason": err.to_string(),
-                });
-                let evidence = mesh_routing_projection_evidence(&diagnostic, Some(repair_result));
-                skipped_records.push(evidence.clone());
-                findings.push(mesh_routing_projection_repair_finding_record(
-                    &repair_task_id,
-                    index,
-                    &diagnostic,
-                    "RequiresOperatorReview",
-                    "ManualReview",
-                    &evidence,
-                ));
-            }
-        }
-    }
-
-    let status = if skipped_records.is_empty() {
-        "completed"
-    } else if repaired_records.is_empty() {
-        "failed"
-    } else {
-        "completed_with_warnings"
-    };
-
-    Ok(RepairTaskResponse {
-        request_id: request_id.to_string(),
-        repair_task_id,
-        status: status.to_string(),
-        scope_kind: "mesh_routing_projection".to_string(),
-        scope_id: state.config.mesh_id.clone(),
-        findings,
-        audit_event_id: audit_event_id.to_string(),
-        details_json: json!({
-            "repair_kind": "mesh_routing_projection",
-            "repaired_count": repaired_records.len(),
-            "skipped_count": skipped_records.len(),
-            "repaired_records": repaired_records,
-            "skipped_records": skipped_records,
-        })
-        .to_string(),
-    })
-}
-
-fn require_nonempty_admin_field(value: &str, field: &'static str) -> Result<(), Status> {
-    if value.trim().is_empty() {
-        return Err(Status::invalid_argument(format!("{field} is required")));
-    }
-    Ok(())
-}
-
-fn validate_diagnostic_severity(value: &str) -> Result<(), Status> {
-    match value {
-        "info" | "warning" | "error" => Ok(()),
-        _ => Err(Status::invalid_argument("Invalid diagnostic severity")),
-    }
-}
-
-fn index_diagnostic_to_admin_record(
-    diagnostic: persistence::IndexDiagnostic,
-) -> Result<DiagnosticRecord, Status> {
-    let cursor =
-        u64::try_from(diagnostic.id).map_err(|_| Status::internal("Invalid diagnostic cursor"))?;
-    Ok(DiagnosticRecord {
-        diagnostic_id: format!("index-diagnostic-{cursor}"),
-        scope_kind: "index".to_string(),
-        scope_id: diagnostic
-            .index_id
-            .map(|index_id| {
-                format!(
-                    "tenant-{}-bucket-{}-index-{}",
-                    diagnostic.tenant_id, diagnostic.bucket_id, index_id
-                )
-            })
-            .unwrap_or_else(|| {
-                format!(
-                    "tenant-{}-bucket-{}-index-{}",
-                    diagnostic.tenant_id, diagnostic.bucket_id, diagnostic.index_name
-                )
-            }),
-        source: "index_diagnostic_journal".to_string(),
-        severity: diagnostic.severity,
-        code: diagnostic.code,
-        message: diagnostic.message,
-        object_key: diagnostic.object_key,
-        version_id: diagnostic
-            .version_id
-            .map(|version_id| version_id.to_string())
-            .unwrap_or_default(),
-        details_json: diagnostic.details.to_string(),
-        created_at_nanos: diagnostic
-            .created_at
-            .timestamp_nanos_opt()
-            .ok_or_else(|| Status::internal("Invalid diagnostic timestamp"))?,
-        cursor,
-    })
-}
-
-async fn mesh_routing_projection_diagnostics(
-    state: &AppState,
-) -> Result<Vec<DiagnosticRecord>, Status> {
-    state
-        .persistence
-        .diagnose_mesh_routing_projection(None)
-        .await
-        .map_err(|err| Status::internal(err.to_string()))?
-        .into_iter()
-        .enumerate()
-        .map(|(index, diagnostic)| {
-            mesh_routing_projection_diagnostic_to_admin_record(
-                u64::try_from(index + 1)
-                    .map_err(|_| Status::internal("Too many mesh diagnostics"))?,
-                diagnostic,
-            )
-        })
-        .collect()
-}
-
-fn mesh_routing_projection_diagnostic_to_admin_record(
-    cursor: u64,
-    diagnostic: mesh_control_stream::ControlProjectionDiagnostic,
-) -> Result<DiagnosticRecord, Status> {
-    let details = mesh_routing_projection_evidence(&diagnostic, None);
-    let scope_id = format!(
-        "{}/{}/{}",
-        diagnostic.stream_family, diagnostic.partition, diagnostic.record_key
-    );
-    Ok(DiagnosticRecord {
-        diagnostic_id: format!("mesh-routing-projection-{cursor}"),
-        scope_kind: "routing_record".to_string(),
-        scope_id,
-        source: "mesh_routing_projection".to_string(),
-        severity: diagnostic.severity.to_string(),
-        code: diagnostic.code.to_string(),
-        message: diagnostic.message,
-        object_key: String::new(),
-        version_id: String::new(),
-        details_json: details.to_string(),
-        created_at_nanos: Utc::now().timestamp_nanos_opt().unwrap_or_default(),
-        cursor,
-    })
-}
-
-fn mesh_routing_projection_evidence(
-    diagnostic: &mesh_control_stream::ControlProjectionDiagnostic,
-    repair_result: Option<serde_json::Value>,
-) -> serde_json::Value {
-    let family = mesh_directory::RoutingRecordFamily::from_stream_family(&diagnostic.stream_family);
-    let descriptor_key = family
-        .filter(|_| !diagnostic.record_key.trim().is_empty())
-        .and_then(|family| {
-            mesh_directory::routing_record_descriptor_key_for_key(family, &diagnostic.record_key)
-                .ok()
-        });
-    let expected_partition = family
-        .filter(|_| !diagnostic.record_key.trim().is_empty())
-        .and_then(|family| {
-            mesh_directory::routing_record_partition_for_key(family, &diagnostic.record_key).ok()
-        });
-
-    json!({
-        "stream_family": &diagnostic.stream_family,
-        "partition": &diagnostic.partition,
-        "expected_partition": expected_partition,
-        "record_key": &diagnostic.record_key,
-        "descriptor_key": descriptor_key,
-        "stream_sequence": diagnostic.stream_sequence,
-        "stream_generation": diagnostic.stream_generation,
-        "stream_digest": diagnostic.stream_digest.as_deref(),
-        "projection_generation": diagnostic.projection_generation,
-        "projection_digest": diagnostic.projection_digest.as_deref(),
-        "repair_safe": diagnostic.repair_safe,
-        "proposed_action": diagnostic.proposed_action,
-        "repair_result": repair_result,
-    })
-}
-
-fn mesh_routing_projection_repair_finding_record(
-    repair_task_id: &str,
-    index: usize,
-    diagnostic: &mesh_control_stream::ControlProjectionDiagnostic,
-    status: &str,
-    proposed_action: &str,
-    evidence: &serde_json::Value,
-) -> RepairFindingRecord {
-    let subject_id = format!(
-        "{}/{}/{}",
-        diagnostic.stream_family, diagnostic.partition, diagnostic.record_key
-    );
-    let evidence_json = evidence.to_string();
-    RepairFindingRecord {
-        finding_id: format!("{repair_task_id}-finding-{:04}", index + 1),
-        scope_kind: "mesh_routing_projection".to_string(),
-        scope_id: subject_id.clone(),
-        repair_task_id: repair_task_id.to_string(),
-        lease_fence_token: 0,
-        severity: diagnostic.severity.to_string(),
-        status: status.to_string(),
-        code: diagnostic.code.to_string(),
-        message: diagnostic.message.clone(),
-        subjects: vec![RepairSubjectRecord {
-            subject_kind: "mesh_control_stream_record".to_string(),
-            subject_id,
-            generation: diagnostic.stream_generation.unwrap_or_default(),
-            has_generation: diagnostic.stream_generation.is_some(),
-            cursor_low: diagnostic.stream_sequence.unwrap_or_default(),
-            cursor_high: 0,
-            has_cursor: diagnostic.stream_sequence.is_some(),
-            expected_hash: diagnostic.stream_digest.clone().unwrap_or_default(),
-            actual_hash: diagnostic.projection_digest.clone().unwrap_or_default(),
-        }],
-        proposed_action: proposed_action.to_string(),
-        evidence_json,
-        created_at_nanos: Utc::now().timestamp_nanos_opt().unwrap_or_default(),
-        finding_hash: hex::encode(blake3::hash(evidence.to_string().as_bytes()).as_bytes()),
-    }
-}
-
-fn diagnostic_position(diagnostic: &DiagnosticRecord) -> String {
-    format!(
-        "{}:{:020}:{}",
-        diagnostic.source, diagnostic.cursor, diagnostic.diagnostic_id
-    )
-}
-
-async fn mesh_lifecycle_diagnostics(state: &AppState) -> Result<Vec<DiagnosticRecord>, Status> {
-    let mut diagnostics = Vec::new();
-    let mut cursor = 1_u64;
-    let mut push = |scope_kind: &str,
-                    scope_id: String,
-                    severity: &str,
-                    code: &str,
-                    message: String,
-                    details: serde_json::Value| {
-        diagnostics.push(DiagnosticRecord {
-            diagnostic_id: format!("mesh-diagnostic-{cursor}"),
-            scope_kind: scope_kind.to_string(),
-            scope_id,
-            source: "mesh_lifecycle".to_string(),
-            severity: severity.to_string(),
-            code: code.to_string(),
-            message,
-            object_key: String::new(),
-            version_id: String::new(),
-            details_json: details.to_string(),
-            created_at_nanos: Utc::now().timestamp_nanos_opt().unwrap_or_default(),
-            cursor,
-        });
-        cursor = cursor.saturating_add(1);
-    };
-
-    for region in state
-        .persistence
-        .list_region_descriptors()
-        .await
-        .map_err(lifecycle_status)?
-    {
-        if region.state != CoreLifecycleState::Active {
-            push(
-                "region",
-                region.region.clone(),
-                match region.state {
-                    CoreLifecycleState::Draining
-                    | CoreLifecycleState::Drained
-                    | CoreLifecycleState::DrainedWithExceptions
-                    | CoreLifecycleState::Offline
-                    | CoreLifecycleState::Removed => "warning",
-                    _ => "info",
-                },
-                "mesh_region_not_active",
-                format!(
-                    "region {} is {:?}; new writable placement is disabled",
-                    region.region, region.state
-                ),
-                json!({
-                    "generation": region.generation,
-                    "state": format!("{:?}", region.state),
-                    "default_cell": region.default_cell,
-                }),
-            );
-        }
-    }
-
-    for cell in state
-        .persistence
-        .list_cell_descriptors(None)
-        .await
-        .map_err(lifecycle_status)?
-    {
-        if cell.state != CoreLifecycleState::Active {
-            push(
-                "cell",
-                format!("{}/{}", cell.region, cell.cell_id),
-                "info",
-                "mesh_cell_not_active",
-                format!(
-                    "cell {}/{} is {:?}; node activation and placement are disabled",
-                    cell.region, cell.cell_id, cell.state
-                ),
-                json!({
-                    "generation": cell.generation,
-                    "state": format!("{:?}", cell.state),
-                    "placement_weight": cell.placement_weight,
-                }),
-            );
-        }
-    }
-
-    for node in state
-        .persistence
-        .list_node_descriptors(None, None)
-        .await
-        .map_err(lifecycle_status)?
-    {
-        if node.state != CoreLifecycleState::Active {
-            let runtime_ownership_blockers = match node.state {
-                CoreLifecycleState::Draining
-                | CoreLifecycleState::Drained
-                | CoreLifecycleState::Offline
-                | CoreLifecycleState::Removed => state
-                    .persistence
-                    .node_runtime_ownership_blockers(&node.node_id)
-                    .await
-                    .map_err(|err| Status::internal(err.to_string()))?,
-                _ => Vec::new(),
-            };
-            let proposed_action = if runtime_ownership_blockers.is_empty() {
-                "no_runtime_ownership_repair_needed"
-            } else {
-                "force_offline_node_to_expire_runtime_ownership"
-            };
-            push(
-                "node",
-                node.node_id.clone(),
-                match node.state {
-                    CoreLifecycleState::Draining
-                    | CoreLifecycleState::Drained
-                    | CoreLifecycleState::Offline
-                    | CoreLifecycleState::Removed => "warning",
-                    _ => "info",
-                },
-                "mesh_node_not_active",
-                format!(
-                    "node {} is {:?}; new ownership should not be assigned",
-                    node.node_id, node.state
-                ),
-                json!({
-                    "generation": node.generation,
-                    "state": format!("{:?}", node.state),
-                    "region": node.region,
-                    "cell_id": node.cell_id,
-                    "drain": node.drain,
-                    "runtime_ownership_blocker_count": runtime_ownership_blockers.len(),
-                    "runtime_ownership_blockers": runtime_ownership_blockers,
-                    "ownership_repair": {
-                        "node_id": node.node_id,
-                        "owner_region": node.region,
-                        "owner_cell": node.cell_id,
-                        "proposed_action": proposed_action,
-                    },
-                }),
-            );
-        }
-    }
-
-    let routing_record_count = state
-        .persistence
-        .list_mesh_routing_records(None)
-        .await
-        .map_err(|err| Status::internal(err.to_string()))?
-        .len();
-    push(
-        "mesh",
-        state.config.mesh_id.clone(),
-        "info",
-        "mesh_routing_projection_summary",
-        format!("mesh routing projection has {routing_record_count} records"),
-        json!({ "routing_record_count": routing_record_count }),
-    );
-
-    Ok(diagnostics)
-}
-
-fn repair_finding_to_admin_proto(finding: &RepairFinding) -> Result<RepairFindingRecord, Status> {
-    Ok(RepairFindingRecord {
-        finding_id: finding.finding_id.clone(),
-        scope_kind: finding.scope_kind.clone(),
-        scope_id: finding.scope_id.clone(),
-        repair_task_id: finding.repair_task_id.clone(),
-        lease_fence_token: finding.lease_fence_token,
-        severity: format!("{:?}", finding.severity),
-        status: format!("{:?}", finding.status),
-        code: finding.code.clone(),
-        message: finding.message.clone(),
-        subjects: finding
-            .subjects
-            .iter()
-            .map(repair_subject_to_admin_proto)
-            .collect(),
-        proposed_action: format!("{:?}", finding.proposed_action),
-        evidence_json: serde_json::to_string(&finding.evidence).unwrap_or_default(),
-        created_at_nanos: finding.created_at_nanos,
-        finding_hash: finding.finding_hash.clone().unwrap_or_default(),
-    })
-}
-
-fn repair_subject_to_admin_proto(subject: &RepairSubjectRef) -> RepairSubjectRecord {
-    let (cursor_low, cursor_high) = subject.cursor.map(split_u128_admin).unwrap_or((0, 0));
-    RepairSubjectRecord {
-        subject_kind: subject.subject_kind.clone(),
-        subject_id: subject.subject_id.clone(),
-        generation: subject.generation.unwrap_or_default(),
-        has_generation: subject.generation.is_some(),
-        cursor_low,
-        cursor_high,
-        has_cursor: subject.cursor.is_some(),
-        expected_hash: subject.expected_hash.clone().unwrap_or_default(),
-        actual_hash: subject.actual_hash.clone().unwrap_or_default(),
-    }
-}
-
-fn split_u128_admin(value: u128) -> (u64, u64) {
-    (value as u64, (value >> 64) as u64)
-}
-
-fn audit_event_id(principal: &AdminPrincipal, context: &AdminRequestContext) -> String {
-    format!("audit:{}:{}", principal.principal_id, context.request_id)
-}
-
-fn audit_event_id_with_suffix(
-    principal: &AdminPrincipal,
-    context: &AdminRequestContext,
-    suffix: &str,
-) -> String {
-    format!(
-        "audit:{}:{}:{}",
-        principal.principal_id,
-        context.request_id,
-        safe_audit_id_suffix(suffix)
-    )
-}
-
-async fn record_admin_audit_event(
-    state: &AppState,
-    principal: &AdminPrincipal,
-    context: &AdminRequestContext,
-    action: &str,
-    resource_id: &str,
-    details: serde_json::Value,
-) -> Result<String, Status> {
-    let audit_event_id = audit_event_id(principal, context);
-    let event = AdminAuditEvent {
-        schema: admin_audit::ADMIN_AUDIT_EVENT_SCHEMA.to_string(),
-        audit_event_id: audit_event_id.clone(),
-        request_id: context.request_id.clone(),
-        principal_id: principal.principal_id.clone(),
-        resource_id: resource_id.to_string(),
-        action: action.to_string(),
-        audit_reason: context.audit_reason.clone(),
-        created_at: Utc::now().to_rfc3339(),
-        details_json: admin_audit_details_json(context, details)?,
-    };
-    admin_audit::append_audit_event(&state.storage, &event)
-        .await
-        .map_err(|err| Status::internal(err.to_string()))?;
-    Ok(audit_event_id)
-}
-
-async fn record_admin_audit_event_with_suffix(
-    state: &AppState,
-    principal: &AdminPrincipal,
-    context: &AdminRequestContext,
-    action: &str,
-    resource_id: &str,
-    details: serde_json::Value,
-    suffix: &str,
-) -> Result<String, Status> {
-    let audit_event_id = audit_event_id_with_suffix(principal, context, suffix);
-    let event = AdminAuditEvent {
-        schema: admin_audit::ADMIN_AUDIT_EVENT_SCHEMA.to_string(),
-        audit_event_id: audit_event_id.clone(),
-        request_id: context.request_id.clone(),
-        principal_id: principal.principal_id.clone(),
-        resource_id: resource_id.to_string(),
-        action: action.to_string(),
-        audit_reason: context.audit_reason.clone(),
-        created_at: Utc::now().to_rfc3339(),
-        details_json: admin_audit_details_json(context, details)?,
-    };
-    admin_audit::append_audit_event(&state.storage, &event)
-        .await
-        .map_err(|err| Status::internal(err.to_string()))?;
-    Ok(audit_event_id)
-}
-
-fn safe_audit_id_suffix(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
-
-fn admin_audit_details_json(
-    context: &AdminRequestContext,
-    details: serde_json::Value,
-) -> Result<String, Status> {
-    let mut details = match details {
-        serde_json::Value::Object(map) => map,
-        other => {
-            let mut map = serde_json::Map::new();
-            map.insert("details".to_string(), other);
-            map
-        }
-    };
-    details.insert(
-        "idempotency_key".to_string(),
-        json!(context.idempotency_key.clone()),
-    );
-    details.insert(
-        "expected_generation".to_string(),
-        json!(context.expected_generation),
-    );
-    serde_json::to_string(&serde_json::Value::Object(details))
-        .map_err(|_| Status::internal("Failed to encode admin audit details"))
-}
-
-fn bucket_resource_id(tenant_id: i64, bucket_name: &str) -> String {
-    format!("tenant:{tenant_id}:bucket:{bucket_name}")
-}
-
-fn app_resource_id(tenant_id: i64, app_name: &str) -> String {
-    format!("tenant:{tenant_id}:app:{app_name}")
-}
-
-fn validate_policy_parts(action: &str, resource: &str) -> Result<(), Status> {
-    if action.trim().is_empty() {
-        return Err(Status::invalid_argument("policy action is required"));
-    }
-    if resource.trim().is_empty() {
-        return Err(Status::invalid_argument("policy resource is required"));
-    }
-    Ok(())
-}
-
-#[derive(Default)]
-struct SecretEncryptionRotationStats {
-    app_secrets_examined: u64,
-    app_secrets_rotated: u64,
-    hf_keys_examined: u64,
-    hf_keys_rotated: u64,
-    already_active: u64,
-}
-
-async fn rotate_application_secret_envelopes(
-    state: &AppState,
-    dry_run: bool,
-    stats: &mut SecretEncryptionRotationStats,
-) -> Result<(), Status> {
-    let tenants = state
-        .persistence
-        .list_tenants()
-        .await
-        .map_err(|err| Status::internal(err.to_string()))?;
-    for tenant in tenants {
-        let apps = state
-            .persistence
-            .list_apps_for_tenant(tenant.id)
-            .await
-            .map_err(|err| Status::internal(err.to_string()))?;
-        for app in apps {
-            let Some(details) = state
-                .persistence
-                .get_app_by_client_id(&app.client_id)
-                .await
-                .map_err(|err| Status::internal(err.to_string()))?
-            else {
-                continue;
-            };
-            stats.app_secrets_examined += 1;
-            match state
-                .secret_keyring
-                .reencrypt_if_needed(&details.client_secret_encrypted)
-                .map_err(|err| Status::internal(err.to_string()))?
-            {
-                Some(rotated) => {
-                    stats.app_secrets_rotated += 1;
-                    if !dry_run {
-                        state
-                            .persistence
-                            .update_app_secret(details.id, &rotated)
-                            .await
-                            .map_err(|err| Status::internal(err.to_string()))?;
-                    }
-                }
-                None => stats.already_active += 1,
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn rotate_hf_secret_envelopes(
-    state: &AppState,
-    dry_run: bool,
-    stats: &mut SecretEncryptionRotationStats,
-) -> Result<(), Status> {
-    let keys = state
-        .persistence
-        .hf_list_encrypted_keys()
-        .await
-        .map_err(|err| Status::internal(err.to_string()))?;
-    for key in keys {
-        stats.hf_keys_examined += 1;
-        match state
-            .secret_keyring
-            .reencrypt_if_needed(&key.token_encrypted)
-            .map_err(|err| Status::internal(err.to_string()))?
-        {
-            Some(rotated) => {
-                stats.hf_keys_rotated += 1;
-                if !dry_run {
-                    state
-                        .persistence
-                        .hf_update_key_encrypted(key.id, &rotated)
-                        .await
-                        .map_err(|err| Status::internal(err.to_string()))?;
-                }
-            }
-            None => stats.already_active += 1,
-        }
-    }
-    Ok(())
-}
-
-fn object_link_resource_id(tenant_id: i64, bucket_name: &str, link_key: &str) -> String {
-    format!(
-        "{}:link:{link_key}",
-        bucket_resource_id(tenant_id, bucket_name)
-    )
-}
-
-fn cell_resource_id(region: &str, cell_id: &str) -> String {
-    format!("region:{region}:cell:{cell_id}")
-}
-
-fn host_alias_audit_details(host_alias: &CoreHostAliasDescriptor) -> serde_json::Value {
-    json!({
-        "resource_kind": "host_alias",
-        "hostname": &host_alias.hostname,
-        "tenant_id": &host_alias.tenant_id,
-        "bucket_name": &host_alias.bucket_name,
-        "region": &host_alias.region,
-        "prefix": &host_alias.prefix,
-        "state": host_alias.state,
-        "generation": host_alias.generation,
-    })
-}
-
-fn region_audit_details(region: &mesh_lifecycle::RegionDescriptor) -> serde_json::Value {
-    json!({
-        "resource_kind": "region",
-        "mesh_id": &region.mesh_id,
-        "region": &region.region,
-        "state": region.state,
-        "public_base_url": &region.public_base_url,
-        "virtual_host_suffix": &region.virtual_host_suffix,
-        "placement_weight": region.placement_weight,
-        "default_cell": &region.default_cell,
-        "generation": region.generation,
-    })
-}
-
-fn cell_audit_details(cell: &mesh_lifecycle::CellDescriptor) -> serde_json::Value {
-    json!({
-        "resource_kind": "cell",
-        "mesh_id": &cell.mesh_id,
-        "region": &cell.region,
-        "cell_id": &cell.cell_id,
-        "state": cell.state,
-        "placement_weight": cell.placement_weight,
-        "generation": cell.generation,
-    })
-}
-
-fn node_audit_details(node: &mesh_lifecycle::NodeDescriptor) -> serde_json::Value {
-    json!({
-        "resource_kind": "node",
-        "mesh_id": &node.mesh_id,
-        "node_id": &node.node_id,
-        "region": &node.region,
-        "cell_id": &node.cell_id,
-        "libp2p_peer_id": &node.libp2p_peer_id,
-        "public_api_addr": &node.public_api_addr,
-        "public_cluster_addrs": &node.public_cluster_addrs,
-        "capabilities": &node.capabilities,
-        "state": node.state,
-        "drain": &node.drain,
-        "generation": node.generation,
-    })
-}
-
-fn add_audit_detail(details: &mut serde_json::Value, key: &str, value: serde_json::Value) {
-    if let serde_json::Value::Object(map) = details {
-        map.insert(key.to_string(), value);
-    }
-}
-
-fn bucket_drain_overrides_details(overrides: &[BucketDrainOverride]) -> Vec<serde_json::Value> {
-    overrides
-        .iter()
-        .map(|override_| {
-            json!({
-                "tenant_id": &override_.tenant_id,
-                "bucket_name": &override_.bucket_name,
-                "disposition": region_drain_disposition_name(override_.disposition),
-                "disposition_code": override_.disposition,
-                "reason": &override_.reason,
-                "expires_at": none_if_empty(&override_.expires_at),
-            })
-        })
-        .collect()
-}
-
-fn bucket_drain_override_from_proto(
-    override_: &BucketDrainOverride,
-) -> Result<persistence::RegionDrainBucketOverride, Status> {
-    let disposition = region_drain_disposition_from_proto(override_.disposition, false)?;
-    if override_.tenant_id.trim().is_empty() {
-        return Err(Status::invalid_argument(
-            "bucket drain override tenant_id is required",
-        ));
-    }
-    if override_.bucket_name.trim().is_empty() {
-        return Err(Status::invalid_argument(
-            "bucket drain override bucket_name is required",
-        ));
-    }
-    if override_.reason.trim().is_empty() && disposition.allows_drained_exception() {
-        return Err(Status::invalid_argument(
-            "bucket drain override reason is required for drain exceptions",
-        ));
-    }
-    Ok(persistence::RegionDrainBucketOverride {
-        tenant_id: override_.tenant_id.trim().to_string(),
-        bucket_name: override_.bucket_name.trim().to_string(),
-        disposition,
-        reason: override_.reason.trim().to_string(),
-        expires_at: none_if_empty(&override_.expires_at).map(str::to_string),
-    })
-}
-
-fn region_drain_disposition_from_proto(
-    value: i32,
-    unspecified_defaults_to_block: bool,
-) -> Result<mesh_lifecycle::BucketDrainDisposition, Status> {
-    match value {
-        0 if unspecified_defaults_to_block => {
-            Ok(mesh_lifecycle::BucketDrainDisposition::BlockUntilEmpty)
-        }
-        1 => Ok(mesh_lifecycle::BucketDrainDisposition::BlockUntilEmpty),
-        2 => Ok(mesh_lifecycle::BucketDrainDisposition::RemainProxyOnly),
-        3 => Ok(mesh_lifecycle::BucketDrainDisposition::ReadOnlyUntilRemoved),
-        4 => Ok(mesh_lifecycle::BucketDrainDisposition::DeleteAfterRetention),
-        _ => Err(Status::invalid_argument(format!(
-            "unsupported region drain disposition code {value}"
-        ))),
-    }
-}
-
-fn region_drain_plan_details(report: &persistence::RegionDrainPlanReport) -> serde_json::Value {
-    json!({
-        "region": &report.region,
-        "decisions": report.decisions.iter().map(|decision| {
-            json!({
-                "tenant_id": &decision.tenant_id,
-                "bucket_name": &decision.bucket_name,
-                "disposition": decision.disposition.as_str(),
-                "reason": &decision.reason,
-                "expires_at": decision.expires_at.as_deref(),
-                "status_before": format!("{:?}", decision.status_before),
-                "status_after": format!("{:?}", decision.status_after),
-                "bucket_locator_generation_before": decision.bucket_locator_generation_before,
-                "bucket_locator_generation_after": decision.bucket_locator_generation_after,
-                "exception_written": decision.exception_written,
-                "locator_updated": decision.locator_updated,
-            })
-        }).collect::<Vec<_>>()
-    })
-}
-
-fn region_drain_disposition_name(value: i32) -> &'static str {
-    match value {
-        1 => "block_until_empty",
-        2 => "remain_proxy_only",
-        3 => "read_only_until_removed",
-        4 => "delete_after_retention",
-        _ => "unspecified",
-    }
-}
-
-fn audit_cursor_position(event: &AdminAuditEvent) -> String {
-    admin_audit::audit_event_position(event)
-}
-
-fn audit_event_to_proto(event: AdminAuditEvent) -> AuditEventRecord {
-    AuditEventRecord {
-        audit_event_id: event.audit_event_id,
-        request_id: event.request_id,
-        principal_id: event.principal_id,
-        resource_id: event.resource_id,
-        action: event.action,
-        audit_reason: event.audit_reason,
-        created_at: event.created_at,
-        details_json: event.details_json,
-    }
-}
-
-fn principal_label(principal: &AdminPrincipal) -> String {
-    format!("principal:{}", principal.principal_id)
-}
-
-fn generated_client_id() -> String {
-    format!("app_{}", uuid::Uuid::new_v4().simple())
-}
-
-fn generated_client_secret() -> String {
-    format!("secret_{}", uuid::Uuid::new_v4().simple())
-}
-
-fn encrypt_admin_client_secret(state: &AppState, client_secret: &str) -> Result<Vec<u8>, Status> {
-    state
-        .secret_keyring
-        .encrypt(client_secret.as_bytes())
-        .map_err(|err| Status::internal(err.to_string()))
-}
-
-fn bucket_to_proto(bucket: Bucket) -> crate::anvil_api::Bucket {
-    crate::anvil_api::Bucket {
-        name: bucket.name,
-        creation_date: bucket
-            .created_at
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        region: bucket.region,
-        is_public_read: bucket.is_public_read,
-        deleted: false,
-        bucket_id: bucket.id,
-    }
-}
-
-async fn resolve_link_bucket(
-    state: &AppState,
-    tenant_ref: &str,
-    bucket_name: &str,
-) -> Result<persistence::Bucket, Status> {
-    let tenant_id = resolve_tenant_id(state, tenant_ref).await?;
-    state
-        .persistence
-        .get_bucket_by_name(tenant_id, bucket_name)
-        .await
-        .map_err(|err| Status::internal(err.to_string()))?
-        .ok_or_else(|| Status::not_found("Bucket not found"))
-}
-
-async fn resolve_tenant_id(state: &AppState, tenant_ref: &str) -> Result<i64, Status> {
-    let tenant_ref = tenant_ref.trim();
-    if tenant_ref.is_empty() {
-        return Err(Status::invalid_argument("tenant_id is required"));
-    }
-    if let Ok(tenant_id) = tenant_ref.parse::<i64>() {
-        return Ok(tenant_id);
-    }
-    state
-        .persistence
-        .get_tenant_by_name(tenant_ref)
-        .await
-        .map_err(|err| Status::internal(err.to_string()))?
-        .map(|tenant| tenant.id)
-        .ok_or_else(|| Status::not_found("Tenant not found"))
-}
-
-async fn resolve_tenant_app(
-    state: &AppState,
-    tenant_id: i64,
-    app_name: &str,
-) -> Result<persistence::App, Status> {
-    let app_name = app_name.trim();
-    if app_name.is_empty() {
-        return Err(Status::invalid_argument("app_name is required"));
-    }
-    state
-        .persistence
-        .list_apps_for_tenant(tenant_id)
-        .await
-        .map_err(|err| Status::internal(err.to_string()))?
-        .into_iter()
-        .find(|app| app.name == app_name)
-        .ok_or_else(|| Status::not_found("Application not found"))
-}
-
-async fn routing_config_for_region(
-    state: &AppState,
-    region_name: &str,
-) -> Result<RoutingConfig, Status> {
-    let region_name = region_name.trim();
-    if region_name.is_empty() {
-        return Err(Status::invalid_argument("region is required"));
-    }
-    let region = state
-        .persistence
-        .list_region_descriptors()
-        .await
-        .map_err(lifecycle_status)?
-        .into_iter()
-        .find(|region| region.region == region_name)
-        .ok_or_else(|| Status::not_found("Region not found"))?;
-    let base_domain = base_domain_from_region_suffix(&region.region, &region.virtual_host_suffix)?;
-    RoutingConfig::new(base_domain).map_err(|err| Status::invalid_argument(err.to_string()))
-}
-
-fn base_domain_from_region_suffix(
-    region: &str,
-    virtual_host_suffix: &str,
-) -> Result<String, Status> {
-    let suffix = routing::normalize_alias_hostname(virtual_host_suffix)
-        .map_err(|err| Status::invalid_argument(err.to_string()))?;
-    let region_prefix = format!(
-        "{}.",
-        region.trim().trim_end_matches('.').to_ascii_lowercase()
-    );
-    Ok(suffix
-        .strip_prefix(&region_prefix)
-        .unwrap_or(&suffix)
-        .to_string())
-}
-
-fn parse_optional_uuid(
-    field_name: &'static str,
-    value: String,
-) -> Result<Option<uuid::Uuid>, Status> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Ok(None);
-    }
-    value
-        .parse::<uuid::Uuid>()
-        .map(Some)
-        .map_err(|_| Status::invalid_argument(format!("Invalid {field_name}")))
-}
-
-fn page_limit(page: Option<&PageRequest>) -> usize {
-    let requested = page.map(|page| page.limit).unwrap_or(100);
-    if requested == 0 {
-        100
-    } else {
-        requested.clamp(1, 1000) as usize
-    }
-}
-
-fn object_link_status(err: object_links::ObjectLinkError) -> Status {
-    match err {
-        object_links::ObjectLinkError::InvalidLinkKey
-        | object_links::ObjectLinkError::InvalidTargetKey
-        | object_links::ObjectLinkError::MissingExpectedGeneration => {
-            Status::invalid_argument(err.to_string())
-        }
-        object_links::ObjectLinkError::AlreadyExists => Status::already_exists(err.to_string()),
-        object_links::ObjectLinkError::BucketNotFound | object_links::ObjectLinkError::NotFound => {
-            Status::not_found(err.to_string())
-        }
-        object_links::ObjectLinkError::BucketTenantMismatch => {
-            Status::not_found("Bucket not found")
-        }
-        object_links::ObjectLinkError::GenerationConflict { .. } => {
-            Status::aborted(err.to_string())
-        }
-        object_links::ObjectLinkError::ExistingObjectIsNotLink
-        | object_links::ObjectLinkError::DanglingObjectLink
-        | object_links::ObjectLinkError::TargetNotBlob
-        | object_links::ObjectLinkError::LinkLoop
-        | object_links::ObjectLinkError::LinkDepthExceeded => {
-            Status::failed_precondition(err.to_string())
-        }
-        object_links::ObjectLinkError::Internal(_) => Status::internal(err.to_string()),
-    }
-}
-
-fn lifecycle_status(err: LifecycleError) -> Status {
-    match err {
-        LifecycleError::InvalidArgument(message) => Status::invalid_argument(message),
-        LifecycleError::AlreadyExists { .. } => Status::already_exists(err.to_string()),
-        LifecycleError::NotFound { .. } => Status::not_found(err.to_string()),
-        LifecycleError::GenerationConflict { .. } => Status::aborted(err.to_string()),
-        LifecycleError::LifecycleTransitionDenied { .. }
-        | LifecycleError::ActivationCheckpointNotReached { .. } => {
-            Status::failed_precondition(err.to_string())
-        }
-        LifecycleError::Io(_) | LifecycleError::Json(_) | LifecycleError::Other(_) => {
-            Status::internal(err.to_string())
-        }
-    }
-}
-
-fn node_capability_from_proto(value: i32) -> Result<CoreNodeCapability, Status> {
-    match value {
-        1 => Ok(CoreNodeCapability::Object),
-        2 => Ok(CoreNodeCapability::Index),
-        3 => Ok(CoreNodeCapability::PersonalDb),
-        4 => Ok(CoreNodeCapability::Gateway),
-        5 => Ok(CoreNodeCapability::Admin),
-        _ => Err(Status::invalid_argument("Invalid node capability")),
-    }
-}
-
-fn node_capability_to_proto(value: CoreNodeCapability) -> i32 {
-    match value {
-        CoreNodeCapability::Object => 1,
-        CoreNodeCapability::Index => 2,
-        CoreNodeCapability::PersonalDb => 3,
-        CoreNodeCapability::Gateway => 4,
-        CoreNodeCapability::Admin => 5,
-    }
-}
-
-fn lifecycle_state_to_proto(value: CoreLifecycleState) -> i32 {
-    match value {
-        CoreLifecycleState::Joining => 1,
-        CoreLifecycleState::Active => 2,
-        CoreLifecycleState::ReadOnly => 3,
-        CoreLifecycleState::Draining => 4,
-        CoreLifecycleState::Drained => 5,
-        CoreLifecycleState::DrainedWithExceptions => 6,
-        CoreLifecycleState::Offline => 7,
-        CoreLifecycleState::Removed => 8,
-    }
-}
-
-fn routing_record_family_from_proto(
-    value: i32,
-) -> Result<Option<mesh_directory::RoutingRecordFamily>, Status> {
-    match value {
-        0 => Ok(None),
-        1 => Ok(Some(mesh_directory::RoutingRecordFamily::TenantName)),
-        2 => Ok(Some(mesh_directory::RoutingRecordFamily::TenantLocator)),
-        3 => Ok(Some(mesh_directory::RoutingRecordFamily::BucketLocator)),
-        4 => Ok(Some(mesh_directory::RoutingRecordFamily::HostAlias)),
-        _ => Err(Status::invalid_argument("Invalid routing record family")),
-    }
-}
-
-fn routing_record_family_to_proto(value: mesh_directory::RoutingRecordFamily) -> i32 {
-    match value {
-        mesh_directory::RoutingRecordFamily::TenantName => 1,
-        mesh_directory::RoutingRecordFamily::TenantLocator => 2,
-        mesh_directory::RoutingRecordFamily::BucketLocator => 3,
-        mesh_directory::RoutingRecordFamily::HostAlias => 4,
-    }
-}
-
-fn routing_record_descriptor_to_proto(
-    value: mesh_directory::RoutingRecordDescriptor,
-) -> RoutingRecordDescriptor {
-    RoutingRecordDescriptor {
-        family: routing_record_family_to_proto(value.family),
-        record_key: value.record_key,
-        partition: value.partition,
-        descriptor_key: value.descriptor_key,
-        generation: value.generation,
-        payload_json: value.payload_json,
-    }
-}
-
-fn host_alias_state_to_proto(value: CoreHostAliasState) -> i32 {
-    match value {
-        CoreHostAliasState::PendingVerification => 1,
-        CoreHostAliasState::Active => 2,
-        CoreHostAliasState::Suspended => 3,
-        CoreHostAliasState::Deleted => 4,
-    }
-}
-
-fn object_link_resolution_from_proto(
-    value: i32,
-) -> Result<object_links::ObjectLinkResolution, Status> {
-    match value {
-        1 => Ok(object_links::ObjectLinkResolution::Follow),
-        2 => Ok(object_links::ObjectLinkResolution::Redirect),
-        _ => Err(Status::invalid_argument("Invalid object link resolution")),
-    }
-}
-
-fn object_link_resolution_to_proto(value: object_links::ObjectLinkResolution) -> i32 {
-    match value {
-        object_links::ObjectLinkResolution::Follow => 1,
-        object_links::ObjectLinkResolution::Redirect => 2,
-    }
-}
-
-fn object_link_descriptor_to_proto(
-    value: object_links::ObjectLinkDescriptor,
-) -> crate::anvil_api::ObjectLinkDescriptor {
-    crate::anvil_api::ObjectLinkDescriptor {
-        schema: value.schema,
-        tenant_id: value.tenant_id,
-        bucket_name: value.bucket_name,
-        link_key: value.link_key,
-        target_key: value.target_key,
-        target_version: value.target_version.unwrap_or_default(),
-        resolution: object_link_resolution_to_proto(value.resolution),
-        created_at: value
-            .created_at
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        updated_at: value
-            .updated_at
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        created_by: value.created_by,
-        generation: value.generation,
-    }
-}
-
-fn host_alias_descriptor_to_proto(
-    value: CoreHostAliasDescriptor,
-) -> crate::anvil_api::HostAliasDescriptor {
-    crate::anvil_api::HostAliasDescriptor {
-        schema: value.schema,
-        hostname: value.hostname,
-        tenant_id: value.tenant_id,
-        bucket_name: value.bucket_name,
-        region: value.region,
-        prefix: value.prefix,
-        state: host_alias_state_to_proto(value.state),
-        created_at: value.created_at,
-        updated_at: value.updated_at,
-        generation: value.generation,
-    }
-}
-
-fn node_descriptor_to_proto(value: mesh_lifecycle::NodeDescriptor) -> NodeDescriptor {
-    NodeDescriptor {
-        schema: value.schema,
-        mesh_id: value.mesh_id,
-        node_id: value.node_id,
-        region: value.region,
-        cell_id: value.cell_id,
-        libp2p_peer_id: value.libp2p_peer_id,
-        public_api_addr: value.public_api_addr,
-        public_cluster_addrs: value.public_cluster_addrs,
-        capabilities: value
-            .capabilities
+    async fn list_storage_classes(
+        &self,
+        request: Request<ListStorageClassesRequest>,
+    ) -> Result<Response<ListStorageClassesResponse>, Status> {
+        let _principal = require_admin(&request, self, SystemAdminRelation::ViewSystem).await?;
+        let req = request.into_inner();
+        let request_id = require_request_id(&req.request_id)?.to_string();
+        let catalog = self.core_store.storage_class_catalog();
+        let storage_classes = self
+            .core_store
+            .list_storage_classes()
             .into_iter()
-            .map(node_capability_to_proto)
-            .collect(),
-        state: lifecycle_state_to_proto(value.state),
-        drain: value.drain.map(node_drain_descriptor_to_proto),
-        last_heartbeat_at: value.last_heartbeat_at.unwrap_or_default(),
-        created_at: value.created_at,
-        updated_at: value.updated_at,
-        generation: value.generation,
+            .filter(|class| req.include_operator_only || class.tenant_selectable)
+            .map(|class| storage_class_to_proto(&class, &catalog.default_class_id))
+            .collect();
+        Ok(Response::new(ListStorageClassesResponse {
+            request_id,
+            storage_classes,
+            default_class_id: catalog.default_class_id.clone(),
+        }))
+    }
+
+    async fn get_storage_class(
+        &self,
+        request: Request<GetStorageClassRequest>,
+    ) -> Result<Response<StorageClassResponse>, Status> {
+        let _principal = require_admin(&request, self, SystemAdminRelation::ViewSystem).await?;
+        let req = request.into_inner();
+        let request_id = require_request_id(&req.request_id)?.to_string();
+        let class = self
+            .core_store
+            .get_storage_class(&req.class_id)
+            .map_err(|err| Status::not_found(err.to_string()))?;
+        Ok(Response::new(StorageClassResponse {
+            request_id,
+            storage_class: Some(storage_class_to_proto(
+                &class,
+                &self.core_store.storage_class_catalog().default_class_id,
+            )),
+        }))
     }
 }
 
-fn node_drain_descriptor_to_proto(
-    value: NodeDrainDescriptor,
-) -> crate::anvil_api::NodeDrainDescriptor {
-    crate::anvil_api::NodeDrainDescriptor {
-        started_at: value.started_at,
-        graceful_timeout_ms: value.graceful_timeout_ms,
-        force_after_timeout: value.force_after_timeout,
+mod helpers;
+use helpers::*;
+
+fn storage_class_to_proto(
+    class: &crate::core_store::CoreStorageClass,
+    default_class_id: &str,
+) -> StorageClassDescriptor {
+    StorageClassDescriptor {
+        class_id: class.class_id.clone(),
+        description: class.description.clone(),
+        metadata_profile_id: class.metadata_profile.profile_id.clone(),
+        metadata_replica_count: u32::from(class.metadata_profile.replica_count),
+        metadata_prepare_quorum: u32::from(class.metadata_profile.prepare_quorum),
+        metadata_certificate_persist_quorum: u32::from(
+            class.metadata_profile.certificate_persist_quorum,
+        ),
+        metadata_fsync_mode: class.metadata_profile.fsync_mode.clone(),
+        byte_profile_id: class.byte_profile.profile_id.clone(),
+        byte_codec_id: class.byte_profile.codec_id.clone(),
+        data_shards: u32::from(class.byte_profile.data_shards),
+        parity_shards: u32::from(class.byte_profile.parity_shards),
+        read_quorum: u32::from(class.byte_profile.read_quorum),
+        write_publish_threshold: u32::from(class.byte_profile.write_publish_threshold),
+        target_block_bytes: class.byte_profile.target_block_bytes,
+        max_shard_bytes: class.byte_profile.max_shard_bytes,
+        compression: class.byte_profile.compression.clone(),
+        encryption: class.byte_profile.encryption.clone(),
+        inline_payload_enabled: class.inline_payload_policy.enabled,
+        max_inline_payload_bytes: class.inline_payload_policy.max_raw_payload_bytes,
+        absolute_inline_record_max_bytes: class
+            .inline_payload_policy
+            .absolute_encoded_record_max_bytes,
+        min_cell_spread: u32::from(class.min_cell_spread),
+        tenant_selectable: class.tenant_selectable,
+        is_default: class.class_id == default_class_id,
     }
-}
-
-fn region_descriptor_to_proto(value: mesh_lifecycle::RegionDescriptor) -> RegionDescriptor {
-    RegionDescriptor {
-        schema: value.schema,
-        mesh_id: value.mesh_id,
-        region: value.region,
-        state: lifecycle_state_to_proto(value.state),
-        public_base_url: value.public_base_url,
-        virtual_host_suffix: value.virtual_host_suffix,
-        placement_weight: value.placement_weight,
-        default_cell: value.default_cell.unwrap_or_default(),
-        created_at: value.created_at,
-        updated_at: value.updated_at,
-        generation: value.generation,
-    }
-}
-
-fn cell_descriptor_to_proto(value: mesh_lifecycle::CellDescriptor) -> CellDescriptor {
-    CellDescriptor {
-        schema: value.schema,
-        mesh_id: value.mesh_id,
-        region: value.region,
-        cell_id: value.cell_id,
-        state: lifecycle_state_to_proto(value.state),
-        placement_weight: value.placement_weight,
-        created_at: value.created_at,
-        updated_at: value.updated_at,
-        generation: value.generation,
-    }
-}
-
-fn empty_to_none(value: String) -> Option<String> {
-    if value.is_empty() { None } else { Some(value) }
-}
-
-fn none_if_empty(value: &str) -> Option<&str> {
-    if value.is_empty() { None } else { Some(value) }
 }

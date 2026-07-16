@@ -20,7 +20,7 @@ use crate::{
 };
 use anyhow::{Context, Result, anyhow};
 use rusqlite::Connection;
-use std::{io::Cursor, path::PathBuf};
+use std::{io::Cursor, path::Path};
 use tempfile::NamedTempFile;
 
 pub const DEFAULT_SNAPSHOT_ENTRY_THRESHOLD: u64 = 1024;
@@ -142,12 +142,14 @@ async fn build_snapshot(
     committed_head: &PersonalDbCommittedHead,
     new_records: &[PersonalDbLogRecord],
 ) -> Result<PersonalDbSnapshotBuildResult> {
+    // Class C scratch: the SQLite file is a build workspace, not the snapshot's durable state.
     let temp = NamedTempFile::new_in(storage.temp_dir_path())?;
     let temp_path = temp.path().to_path_buf();
     drop(temp);
 
     if let Some(snapshot_head) = previous_snapshot {
-        restore_snapshot_database(storage, request, signing_key, snapshot_head, &temp_path).await?;
+        restore_snapshot_database_scratch(storage, request, signing_key, snapshot_head, &temp_path)
+            .await?;
     }
 
     {
@@ -217,16 +219,16 @@ async fn build_snapshot(
     })
 }
 
-async fn restore_snapshot_database(
+async fn restore_snapshot_database_scratch(
     storage: &Storage,
     request: PersonalDbSnapshotBuildRequest<'_>,
     signing_key: &[u8],
     snapshot_head: &PersonalDbSnapshotsHead,
-    target_path: &PathBuf,
+    target_path: &Path,
 ) -> Result<()> {
     let manifest = read_personaldb_snapshot_manifest_by_ref(
         storage,
-        &snapshot_head.latest_snapshot_manifest_path,
+        &snapshot_head.latest_snapshot_manifest_ref,
         signing_key,
     )
     .await?
@@ -272,7 +274,7 @@ async fn publish_snapshots_head(
         database_id: request.database_id.to_string(),
         latest_snapshot_log_index: manifest.log_index,
         latest_snapshot_log_hash: manifest.log_hash.clone(),
-        latest_snapshot_manifest_path: manifest_ref,
+        latest_snapshot_manifest_ref: manifest_ref,
         retained_snapshot_count: 1,
         updated_at: chrono::Utc::now().to_rfc3339(),
         updated_by_node: request.created_by_node.to_string(),
@@ -506,7 +508,7 @@ mod tests {
                 .expect("snapshots head should be published");
         assert_eq!(snapshots_head.latest_snapshot_log_index, 2);
         assert_eq!(
-            snapshots_head.latest_snapshot_manifest_path,
+            snapshots_head.latest_snapshot_manifest_ref,
             personaldb_snapshot_manifest_ref_name(9, "db-snapshot", 2, &built.manifest.state_hash)
                 .unwrap()
         );
@@ -663,7 +665,7 @@ mod tests {
                 database_id: "db-snapshot".to_string(),
                 log_index: record_count,
                 log_hash: hex::encode(records.last().unwrap().entry_hash),
-                segment_path: segment_ref,
+                segment_ref: segment_ref,
                 row_index_generation: record_count,
                 policy_epoch: 1,
                 membership_epoch: 1,

@@ -1,25 +1,30 @@
 [[items]]
 title = "Reference"
-href = "/reference/configuration/"
+href = "/reference/public-cli/"
 level = 0
 group = true
 
 [[items]]
-title = "Configuration"
-href = "/reference/configuration/"
+title = "Public CLI"
+href = "/reference/public-cli/"
 level = 1
 
 [[items]]
-title = "CLI"
-href = "/reference/cli/"
+title = "Admin CLI"
+href = "/reference/admin-cli/"
 level = 1
 
 [[items]]
-title = "Security Errors"
-href = "/reference/security-errors/"
+title = "CLI Workflows"
+href = "/reference/cli-workflows/"
 level = 1
 
 [[items]]
-title = "Package Publishing"
-href = "/reference/package-publishing/"
+title = "Authorisation Actions and Resources"
+href = "/reference/authorisation-actions-and-resources/"
+level = 1
+
+[[items]]
+title = "Index Definitions and Query JSON"
+href = "/reference/index-definitions-and-query-json/"
 level = 1

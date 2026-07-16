@@ -1,29 +1,154 @@
 use crate::{
-    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    core_store::{
+        CoreBoundaryValue, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
+    },
     formats::{
-        BinaryEnvelopeHeader, BinaryFileFooter, COMMON_FOOTER_LEN, COMMON_HEADER_LEN, FileFamily,
-        Hash32,
+        FileFamily, Hash32, decode_writer_segment, encode_writer_segment_header,
         full_text::{
             BuiltFullTextPostings, FullTextBodyHeader, Posting, TermEntry, decode_postings,
         },
-        hash32,
+        hash32, header_field_bytes, header_field_string, header_field_u64, required_header_bytes,
+        required_header_string, required_header_u64, single_body_range_index,
+        table::{
+            TableRow, WriterBodyTable, decode_writer_body_table, decode_writer_body_tables,
+            encode_writer_body_tables,
+        },
+        unix_nanos_from_rfc3339,
+        writer::{
+            WriterBuildOutput, WriterFamily, WriterSegmentBuildInput,
+            build_writer_segment_logical_file, canonical_logical_file_id,
+        },
     },
+    index_coremeta::{self, IndexSegmentCoreMetaRecord},
     storage::Storage,
+    writer_segment_range::RangeAddressedWriterSegment,
 };
 use anyhow::{Context, Result, anyhow};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use prost::Message;
 use serde::{Deserialize, Serialize};
-use std::convert::TryInto;
+use std::{collections::BTreeMap, convert::TryInto};
 
 const FULL_TEXT_SEGMENT_REF_PREFIX: &str = "full_text_segment:";
-const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 
-const FULL_TEXT_POSTINGS_BLOCK_MAGIC: &[u8; 8] = b"ANVFTSPB";
+const FULL_TEXT_POSTINGS_BLOCK_MAGIC: &[u8; 8] = b"ANPOST1\0";
 const FULL_TEXT_POSTINGS_BLOCK_VERSION: u16 = 1;
 const FULL_TEXT_POSTINGS_SKIP_STRIDE: u32 = 128;
 const FULL_TEXT_POSTINGS_BLOCK_HEADER_LEN: usize = 8 + 2 + 2 + 4 + 8 + 8 + 4;
 const FULL_TEXT_SKIP_ENTRY_LEN: usize = 8 + 8 + 8 + 2 + 16;
+const TABLE_FULL_TEXT_FIELD_CATALOG: u16 = 0x0201;
+const TABLE_FULL_TEXT_ANALYSER_CATALOG: u16 = 0x0202;
+const TABLE_FULL_TEXT_TERM_DICTIONARY: u16 = 0x0203;
+const TABLE_FULL_TEXT_POSTINGS_BLOCK: u16 = 0x0204;
+const TABLE_FULL_TEXT_POSTINGS_BY_TERM: u16 = 0x0205;
+const TABLE_FULL_TEXT_STORED_FIELDS: u16 = 0x0207;
+
+#[derive(Clone, PartialEq, Message)]
+struct FullTextFieldCatalogProto {
+    #[prost(string, tag = "1")]
+    schema: String,
+    #[prost(string, tag = "2")]
+    index_id: String,
+    #[prost(uint64, tag = "3")]
+    generation: u64,
+    #[prost(uint64, tag = "4")]
+    dictionary_bytes_len: u64,
+    #[prost(uint64, tag = "5")]
+    term_count: u64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct FullTextAnalyserCatalogProto {
+    #[prost(string, tag = "1")]
+    schema: String,
+    #[prost(bytes, tag = "2")]
+    tokenizer_json: Vec<u8>,
+    #[prost(bytes, tag = "3")]
+    scorer_json: Vec<u8>,
+    #[prost(string, tag = "4")]
+    codec: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct FullTextDocumentTableProto {
+    #[prost(string, tag = "1")]
+    schema: String,
+    #[prost(message, repeated, tag = "2")]
+    rows: Vec<FullTextDocumentTableRowProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct FullTextDocumentTableRowProto {
+    #[prost(uint64, tag = "1")]
+    document_id: u64,
+    #[prost(uint32, tag = "2")]
+    field_id: u32,
+    #[prost(string, tag = "3")]
+    object_key: String,
+    #[prost(string, tag = "4")]
+    version_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullTextDocumentRef {
+    pub document_id: u64,
+    pub field_id: u16,
+    pub object_key: String,
+    pub version_id: uuid::Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullTextDocumentTableRow {
+    pub document_id: u64,
+    pub field_id: u16,
+    pub object_key: String,
+    pub version_id: uuid::Uuid,
+}
+
+pub fn encode_full_text_document_table(rows: &[FullTextDocumentTableRow]) -> Result<Vec<u8>> {
+    encode_proto_message(FullTextDocumentTableProto {
+        schema: "anvil.index.full_text.document_table.v1".to_string(),
+        rows: rows
+            .iter()
+            .map(|row| FullTextDocumentTableRowProto {
+                document_id: row.document_id,
+                field_id: u32::from(row.field_id),
+                object_key: row.object_key.clone(),
+                version_id: row.version_id.to_string(),
+            })
+            .collect(),
+    })
+}
+
+pub fn decode_full_text_document_table(
+    bytes: &[u8],
+) -> Result<BTreeMap<(u64, u16), FullTextDocumentRef>> {
+    let proto =
+        FullTextDocumentTableProto::decode(bytes).context("decode full text document table")?;
+    if proto.schema != "anvil.index.full_text.document_table.v1" {
+        return Err(anyhow!(
+            "full text document table schema mismatch: found {:?} in {} bytes",
+            proto.schema,
+            bytes.len()
+        ));
+    }
+    let mut out = BTreeMap::new();
+    for row in proto.rows {
+        let field_id =
+            u16::try_from(row.field_id).context("full text document table field id exceeds u16")?;
+        let version_id = uuid::Uuid::parse_str(&row.version_id)
+            .context("full text document table version id is not a UUID")?;
+        out.insert(
+            (row.document_id, field_id),
+            FullTextDocumentRef {
+                document_id: row.document_id,
+                field_id,
+                object_key: row.object_key,
+                version_id,
+            },
+        );
+    }
+    Ok(out)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FullTextSkipEntry {
@@ -69,80 +194,120 @@ pub struct FullTextSegmentWrite<'a> {
     pub scorer: serde_json::Value,
     pub source_cursor: u64,
     pub authz_revision: u64,
+    pub boundary_values: &'a [CoreBoundaryValue],
     pub built_postings: &'a BuiltFullTextPostings,
     pub document_table: &'a [u8],
 }
 
 pub async fn write_full_text_segment(
     storage: &Storage,
-    input: FullTextSegmentWrite<'_>,
+    write: FullTextSegmentWrite<'_>,
 ) -> Result<String> {
-    let encoded_terms = encode_terms(&input.built_postings.terms);
+    let encoded_terms = encode_terms(&write.built_postings.terms);
     let encoded_postings_block = encode_postings_block(
-        &input.built_postings.postings,
-        &input.built_postings.postings_bytes,
+        &write.built_postings.postings,
+        &write.built_postings.postings_bytes,
     )?;
     let postings_bytes = zstd::stream::encode_all(&encoded_postings_block[..], 3)
         .context("compress full text postings block")?;
-    let body = encode_full_text_body(&encoded_terms, &postings_bytes, input.document_table)?;
-    let segment_hash = hash32(&body);
-    let ref_name =
-        full_text_segment_ref_name(input.index_id, input.generation, &hex::encode(segment_hash))?;
-
     let header = FullTextSegmentHeader {
-        index_id: input.index_id.to_string(),
-        generation: input.generation,
-        tokenizer: input.tokenizer,
-        scorer: input.scorer,
-        source_cursor: input.source_cursor,
-        authz_revision: input.authz_revision,
+        index_id: write.index_id.to_string(),
+        generation: write.generation,
+        tokenizer: write.tokenizer,
+        scorer: write.scorer,
+        source_cursor: write.source_cursor,
+        authz_revision: write.authz_revision,
         dictionary_bytes_len: encoded_terms.len() as u64,
-        term_count: input.built_postings.terms.len() as u64,
+        term_count: write.built_postings.terms.len() as u64,
         postings_bytes_len: postings_bytes.len() as u64,
-        posting_count: input.built_postings.postings.len() as u64,
+        posting_count: write.built_postings.postings.len() as u64,
         codec: "zstd".to_string(),
         created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
     };
-    let header_json = serde_json::to_vec(&header)?;
-    let envelope = BinaryEnvelopeHeader::new(FileFamily::FullTextSegment, 0, 0, header_json);
-    let encoded_header = envelope.encode();
-    let (first_hash, last_hash) = term_hash_bounds(&input.built_postings.terms);
-    let footer = BinaryFileFooter::new(
-        &encoded_header,
-        &body,
-        input.built_postings.terms.len() as u64,
+    let body = encode_full_text_body(
+        &header,
+        &encoded_terms,
+        &postings_bytes,
+        &write.built_postings.postings_bytes,
+        write.document_table,
+    )?;
+    let body_hash = hash32(&body);
+    let ref_name =
+        full_text_segment_ref_name(write.index_id, write.generation, &hex::encode(body_hash))?;
+    let logical_file_id = canonical_logical_file_id(
+        WriterFamily::FullText,
+        write.generation,
+        &ref_name,
+        &body_hash,
+    );
+    let (first_hash, last_hash) = term_hash_bounds(&write.built_postings.terms);
+    let header_proto = encode_full_text_header_proto(&logical_file_id, &header)?;
+    let range_index = single_body_range_index(
+        body.len(),
+        write.built_postings.terms.len() as u64,
         first_hash,
         last_hash,
-    );
-
-    let mut bytes = Vec::with_capacity(encoded_header.len() + body.len() + COMMON_FOOTER_LEN);
-    bytes.extend_from_slice(&encoded_header);
-    bytes.extend_from_slice(&body);
-    bytes.extend_from_slice(&footer.encode());
+    )?;
+    let built_segment = build_writer_segment_logical_file(WriterSegmentBuildInput {
+        file_family: FileFamily::FullTextSegment,
+        writer_family: WriterFamily::FullText,
+        writer_generation: write.generation,
+        logical_file_id,
+        header_proto,
+        body,
+        range_index,
+        record_count: write.built_postings.terms.len() as u64,
+        first_record_hash: first_hash,
+        last_record_hash: last_hash,
+        boundary_values: write.boundary_values.to_vec(),
+        mutation_id: format!("full-text-segment:{}:{}", write.index_id, write.generation),
+        region_id: "local".to_string(),
+        pipeline_policy: CorePipelinePolicy::default(),
+        trace_context: CoreTraceContext::default(),
+    })?;
+    let segment_length = built_segment.encoded.bytes.len() as u64;
+    let segment_file_hash = blake3::hash(&built_segment.encoded.bytes)
+        .to_hex()
+        .to_string();
 
     let store = CoreStore::new(storage.clone()).await?;
-    let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.clone(),
-            bytes,
-            region_id: "local".to_string(),
-            mutation_id: format!("full-text-segment:{}:{}", input.index_id, input.generation),
+    let receipt = store
+        .write_format_build_output(WriterBuildOutput {
+            logical_files: vec![built_segment.logical_file],
+            core_meta_mutations: Vec::new(),
         })
         .await?;
-    store
-        .compare_and_swap_ref(CompareAndSwapRef {
-            ref_name: ref_name.clone(),
-            expected_generation: None,
-            expected_target: None,
-            require_absent: true,
-            require_present: false,
-            fence: None,
-            authz_revision: None,
-            source_watch_cursor: None,
-            new_target: encode_core_object_ref_target(&object_ref)?,
-            transaction_id: None,
-        })
-        .await?;
+    let object_ref = receipt
+        .written_object_refs
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("CoreFormatWriter returned no full text object"))?;
+    let core_object_ref_target = encode_core_object_ref_target(&object_ref)?;
+    index_coremeta::write_index_segment_coremeta_record(
+        storage,
+        &IndexSegmentCoreMetaRecord {
+            index_id: write.index_id.to_string(),
+            index_kind: "full_text".to_string(),
+            writer_family: WriterFamily::FullText.as_str().to_string(),
+            segment_ref: ref_name.clone(),
+            core_object_ref_target,
+            segment_hash: segment_file_hash,
+            segment_length,
+            generation: write.generation,
+            source_kind: "object_current".to_string(),
+            source_cursor: write.source_cursor,
+            authz_realm_id: "default".to_string(),
+            authz_scope_hash: index_coremeta::segment_authz_scope_hash(
+                "full_text",
+                "per_row_label",
+            ),
+            authz_revision: write.authz_revision,
+            row_count: write.built_postings.terms.len() as u64,
+            field_names: Vec::new(),
+            created_at_unix_nanos: unix_nanos_from_rfc3339(&header.created_at),
+        },
+    )
+    .await?;
     Ok(ref_name)
 }
 
@@ -156,13 +321,13 @@ pub async fn read_full_text_segment(
 
 pub async fn read_full_text_segment_bytes(storage: &Storage, segment_ref: &str) -> Result<Vec<u8>> {
     let store = CoreStore::new(storage.clone()).await?;
-    let ref_value = store
-        .read_ref(segment_ref)
-        .await?
-        .ok_or_else(|| anyhow!("full text segment ref is missing"))?;
+    let index_id = full_text_index_id_from_segment_ref(segment_ref)?;
+    let segment =
+        index_coremeta::read_index_segment_coremeta_record_by_ref(storage, &index_id, segment_ref)?
+            .ok_or_else(|| anyhow!("full text segment CoreMeta row is missing"))?;
     store
         .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
+            object_ref: decode_core_object_ref_target(&segment.core_object_ref_target)?,
         })
         .await
 }
@@ -177,16 +342,107 @@ pub async fn read_latest_full_text_segment(
     Ok(Some(read_full_text_segment(storage, &segment_ref).await?))
 }
 
+pub async fn read_latest_full_text_segment_terms(
+    storage: &Storage,
+    index_id: &str,
+    query_terms: &[Vec<u8>],
+) -> Result<Option<DecodedFullTextSegment>> {
+    let Some(segment_ref) = latest_full_text_segment_ref(storage, index_id).await? else {
+        return Ok(None);
+    };
+    read_full_text_segment_terms(storage, &segment_ref, query_terms)
+        .await
+        .map(Some)
+}
+
+pub async fn read_full_text_segment_terms(
+    storage: &Storage,
+    segment_ref: &str,
+    query_terms: &[Vec<u8>],
+) -> Result<DecodedFullTextSegment> {
+    let segment =
+        RangeAddressedWriterSegment::open(storage, segment_ref, FileFamily::FullTextSegment)
+            .await?;
+    let header = decode_full_text_header_proto(&segment.header)?;
+    let directory = segment.read_body_table_directory().await?;
+    let dictionary_entry =
+        RangeAddressedWriterSegment::table_entry(&directory, TABLE_FULL_TEXT_TERM_DICTIONARY)?;
+    let postings_entry =
+        RangeAddressedWriterSegment::table_entry(&directory, TABLE_FULL_TEXT_POSTINGS_BY_TERM)?;
+    let stored_fields_entry =
+        RangeAddressedWriterSegment::table_entry(&directory, TABLE_FULL_TEXT_STORED_FIELDS)?;
+
+    let mut terms = Vec::new();
+    let mut postings_bytes = Vec::new();
+    let mut postings = Vec::new();
+    for term_bytes in query_terms {
+        let dictionary_rows = segment
+            .read_table_pages_matching_key_prefix(dictionary_entry, term_bytes)
+            .await?;
+        let Some(dictionary_row) = dictionary_rows
+            .into_iter()
+            .find(|row| row.key == *term_bytes)
+        else {
+            continue;
+        };
+        let (mut term, used) = TermEntry::decode(&dictionary_row.value)?;
+        if used != dictionary_row.value.len() {
+            return Err(anyhow!("full text dictionary row has trailing bytes"));
+        }
+        let posting_rows = segment
+            .read_table_pages_matching_key_prefix(postings_entry, term_bytes)
+            .await?;
+        let Some(posting_row) = posting_rows.into_iter().find(|row| row.key == *term_bytes) else {
+            continue;
+        };
+        let offset = postings_bytes.len() as u64;
+        let postings_for_term = decode_postings(&posting_row.value)?;
+        term.postings_offset = offset;
+        term.postings_len = u32::try_from(posting_row.value.len())
+            .context("full text term postings row exceeds u32")?;
+        term.doc_frequency = postings_for_term.len().min(u32::MAX as usize) as u32;
+        postings_bytes.extend_from_slice(&posting_row.value);
+        postings.extend(postings_for_term);
+        terms.push(term);
+    }
+
+    let stored_fields_bytes = segment.read_table_bytes(stored_fields_entry).await?;
+    let stored_fields_table = decode_writer_body_table(stored_fields_entry, &stored_fields_bytes)?;
+    let document_table = stored_fields_table
+        .rows
+        .into_iter()
+        .find(|row| row.key == b"document-table".as_slice())
+        .map(|row| row.value)
+        .ok_or_else(|| anyhow!("full text document table missing"))?;
+
+    Ok(DecodedFullTextSegment {
+        header,
+        body_header: FullTextBodyHeader {
+            dictionary_block_count: 1,
+            postings_block_count: query_terms.len().min(u32::MAX as usize) as u32,
+            document_table_offset: 0,
+        },
+        terms,
+        postings,
+        posting_skips: Vec::new(),
+        postings_bytes,
+        document_table,
+    })
+}
+
 pub async fn latest_full_text_segment_ref(
     storage: &Storage,
     index_id: &str,
 ) -> Result<Option<String>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let mut refs = store
-        .list_ref_names(&full_text_segment_ref_prefix(index_id)?)
-        .await?;
-    refs.sort_by_key(|value| generation_from_ref(value).unwrap_or(0));
-    Ok(refs.pop())
+    require_safe_component(index_id, "full text index id")?;
+    Ok(
+        index_coremeta::latest_index_segment_coremeta_record_for_family(
+            storage,
+            index_id,
+            WriterFamily::FullText.as_str(),
+        )?
+        .map(|record| record.segment_ref),
+    )
 }
 
 pub(crate) async fn full_text_segment_hash_exists(
@@ -195,17 +451,13 @@ pub(crate) async fn full_text_segment_hash_exists(
     generation: u64,
     expected_segment_hash: &str,
 ) -> Result<bool> {
+    require_safe_component(index_id, "full text index id")?;
     validate_hex32(expected_segment_hash, "full text expected segment hash")?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let refs = store
-        .list_ref_names(&full_text_segment_ref_prefix(index_id)?)
-        .await?;
-    for segment_ref in refs {
-        if generation_from_ref(&segment_ref) != Some(generation) {
+    for record in index_coremeta::list_index_segment_coremeta_records(storage, index_id)? {
+        if record.generation != generation {
             continue;
         }
-        let bytes = read_full_text_segment_bytes(storage, &segment_ref).await?;
-        if blake3::hash(&bytes).to_hex().as_str() == expected_segment_hash {
+        if record.segment_hash == expected_segment_hash {
             return Ok(true);
         }
     }
@@ -213,93 +465,181 @@ pub(crate) async fn full_text_segment_hash_exists(
 }
 
 pub fn decode_full_text_segment(bytes: &[u8]) -> Result<DecodedFullTextSegment> {
-    let envelope = BinaryEnvelopeHeader::decode(bytes)?;
-    if envelope.family != FileFamily::FullTextSegment {
-        return Err(anyhow!("full text segment file family mismatch"));
+    let segment = decode_writer_segment(bytes, FileFamily::FullTextSegment)?;
+    let header = decode_full_text_header_proto(&segment.header)?;
+    decode_full_text_body(header, segment.body)
+}
+
+fn encode_full_text_header_proto(
+    logical_file_id: &str,
+    header: &FullTextSegmentHeader,
+) -> Result<Vec<u8>> {
+    Ok(encode_writer_segment_header(
+        "anvil.index.full_text_segment_header.v1",
+        logical_file_id,
+        FileFamily::FullTextSegment,
+        header.generation,
+        None,
+        None,
+        unix_nanos_from_rfc3339(&header.created_at),
+        vec![
+            header_field_string("index_id", header.index_id.clone()),
+            header_field_bytes("tokenizer_json", canonical_json_bytes(&header.tokenizer)?),
+            header_field_bytes("scorer_json", canonical_json_bytes(&header.scorer)?),
+            header_field_u64("source_cursor", header.source_cursor),
+            header_field_u64("authz_revision", header.authz_revision),
+            header_field_u64("dictionary_bytes_len", header.dictionary_bytes_len),
+            header_field_u64("term_count", header.term_count),
+            header_field_u64("postings_bytes_len", header.postings_bytes_len),
+            header_field_u64("posting_count", header.posting_count),
+            header_field_string("codec", header.codec.clone()),
+            header_field_string("created_at", header.created_at.clone()),
+        ],
+    ))
+}
+
+fn decode_full_text_header_proto(
+    header: &crate::formats::WriterSegmentHeaderProto,
+) -> Result<FullTextSegmentHeader> {
+    Ok(FullTextSegmentHeader {
+        index_id: required_header_string(header, "index_id")?,
+        generation: header.writer_generation,
+        tokenizer: serde_json::from_slice(&required_header_bytes(header, "tokenizer_json")?)?,
+        scorer: serde_json::from_slice(&required_header_bytes(header, "scorer_json")?)?,
+        source_cursor: required_header_u64(header, "source_cursor")?,
+        authz_revision: required_header_u64(header, "authz_revision")?,
+        dictionary_bytes_len: required_header_u64(header, "dictionary_bytes_len")?,
+        term_count: required_header_u64(header, "term_count")?,
+        postings_bytes_len: required_header_u64(header, "postings_bytes_len")?,
+        posting_count: required_header_u64(header, "posting_count")?,
+        codec: required_header_string(header, "codec")?,
+        created_at: required_header_string(header, "created_at")?,
+    })
+}
+
+fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>> {
+    serde_json::to_vec(&canonical_json(value)).context("encode canonical full text JSON metadata")
+}
+
+fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(canonical_json).collect())
+        }
+        serde_json::Value::Object(values) => {
+            let mut sorted = serde_json::Map::new();
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys {
+                sorted.insert(key.clone(), canonical_json(&values[key]));
+            }
+            serde_json::Value::Object(sorted)
+        }
+        other => other.clone(),
     }
-    if bytes.len() < COMMON_FOOTER_LEN {
-        return Err(anyhow!("full text segment is shorter than footer"));
-    }
-    let header_end = COMMON_HEADER_LEN
-        .checked_add(envelope.header_json.len())
-        .ok_or_else(|| anyhow!("full text segment header length overflow"))?;
-    let footer_start = bytes
-        .len()
-        .checked_sub(COMMON_FOOTER_LEN)
-        .ok_or_else(|| anyhow!("full text segment footer length overflow"))?;
-    if footer_start < header_end {
-        return Err(anyhow!("full text segment body overlaps header"));
-    }
-    let encoded_header = &bytes[..header_end];
-    let body = &bytes[header_end..footer_start];
-    let footer = BinaryFileFooter::decode(&bytes[footer_start..])?;
-    footer.verify(encoded_header, body)?;
-    let header: FullTextSegmentHeader = serde_json::from_slice(&envelope.header_json)?;
-    decode_full_text_body(header, body)
 }
 
 fn encode_full_text_body(
+    header: &FullTextSegmentHeader,
     dictionary_bytes: &[u8],
     postings_bytes: &[u8],
+    raw_postings_bytes: &[u8],
     document_table: &[u8],
 ) -> Result<Vec<u8>> {
-    let document_table_offset = FullTextBodyHeader::encode(&FullTextBodyHeader {
-        dictionary_block_count: 1,
-        postings_block_count: 1,
-        document_table_offset: 0,
+    let term_rows = dictionary_rows(dictionary_bytes)?;
+    encode_writer_body_tables(&[
+        WriterBodyTable {
+            table_id: TABLE_FULL_TEXT_FIELD_CATALOG,
+            row_type_id: TABLE_FULL_TEXT_FIELD_CATALOG,
+            rows: vec![TableRow {
+                key: header.index_id.as_bytes().to_vec(),
+                value: encode_full_text_field_catalog(header)?,
+            }],
+        },
+        WriterBodyTable {
+            table_id: TABLE_FULL_TEXT_ANALYSER_CATALOG,
+            row_type_id: TABLE_FULL_TEXT_ANALYSER_CATALOG,
+            rows: vec![TableRow {
+                key: full_text_analyser_catalog_key(header)?,
+                value: encode_full_text_analyser_catalog(header)?,
+            }],
+        },
+        WriterBodyTable {
+            table_id: TABLE_FULL_TEXT_TERM_DICTIONARY,
+            row_type_id: TABLE_FULL_TEXT_TERM_DICTIONARY,
+            rows: term_rows,
+        },
+        WriterBodyTable {
+            table_id: TABLE_FULL_TEXT_POSTINGS_BLOCK,
+            row_type_id: TABLE_FULL_TEXT_POSTINGS_BLOCK,
+            rows: vec![TableRow {
+                key: b"postings-block-0".to_vec(),
+                value: postings_bytes.to_vec(),
+            }],
+        },
+        WriterBodyTable {
+            table_id: TABLE_FULL_TEXT_POSTINGS_BY_TERM,
+            row_type_id: TABLE_FULL_TEXT_POSTINGS_BY_TERM,
+            rows: postings_by_term_rows(dictionary_bytes, raw_postings_bytes)?,
+        },
+        WriterBodyTable {
+            table_id: TABLE_FULL_TEXT_STORED_FIELDS,
+            row_type_id: TABLE_FULL_TEXT_STORED_FIELDS,
+            rows: vec![TableRow {
+                key: b"document-table".to_vec(),
+                value: document_table.to_vec(),
+            }],
+        },
+    ])
+    .map_err(anyhow::Error::from)
+}
+
+fn encode_full_text_field_catalog(header: &FullTextSegmentHeader) -> Result<Vec<u8>> {
+    encode_proto_message(FullTextFieldCatalogProto {
+        schema: "anvil.index.full_text.field_catalog.v1".to_string(),
+        index_id: header.index_id.clone(),
+        generation: header.generation,
+        dictionary_bytes_len: header.dictionary_bytes_len,
+        term_count: header.term_count,
     })
-    .len()
-    .checked_add(dictionary_bytes.len())
-    .and_then(|value| value.checked_add(postings_bytes.len()))
-    .ok_or_else(|| anyhow!("full text body offset overflow"))?;
-    let body_header = FullTextBodyHeader {
-        dictionary_block_count: 1,
-        postings_block_count: 1,
-        document_table_offset: document_table_offset as u64,
-    };
-    let mut out = Vec::with_capacity(document_table_offset + document_table.len());
-    out.extend_from_slice(&body_header.encode());
-    out.extend_from_slice(dictionary_bytes);
-    out.extend_from_slice(postings_bytes);
-    out.extend_from_slice(document_table);
-    Ok(out)
+}
+
+fn encode_full_text_analyser_catalog(header: &FullTextSegmentHeader) -> Result<Vec<u8>> {
+    encode_proto_message(FullTextAnalyserCatalogProto {
+        schema: "anvil.index.full_text.analyser_catalog.v1".to_string(),
+        tokenizer_json: canonical_json_bytes(&header.tokenizer)?,
+        scorer_json: canonical_json_bytes(&header.scorer)?,
+        codec: header.codec.clone(),
+    })
+}
+
+fn full_text_analyser_catalog_key(header: &FullTextSegmentHeader) -> Result<Vec<u8>> {
+    let mut key = Vec::new();
+    key.extend_from_slice(&hash32(&canonical_json_bytes(&header.tokenizer)?));
+    key.extend_from_slice(&hash32(&canonical_json_bytes(&header.scorer)?));
+    Ok(key)
+}
+
+fn encode_proto_message(message: impl Message) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    message.encode(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn decode_full_text_body(
     header: FullTextSegmentHeader,
     body: &[u8],
 ) -> Result<DecodedFullTextSegment> {
-    let body_header = FullTextBodyHeader::decode(body)?;
-    let document_table_offset = usize::try_from(body_header.document_table_offset)
-        .context("full text document table offset exceeds usize")?;
-    if document_table_offset > body.len() {
-        return Err(anyhow!(
-            "full text document table offset exceeds body length"
-        ));
+    let (dictionary_bytes, encoded_postings_bytes, document_table) = decode_full_text_tables(body)?;
+    if dictionary_bytes.len() as u64 != header.dictionary_bytes_len {
+        return Err(anyhow!("full text dictionary length does not match header"));
     }
-    let dictionary_start = crate::formats::full_text::FULL_TEXT_BODY_HEADER_LEN;
-    let dictionary_len = usize::try_from(header.dictionary_bytes_len)
-        .context("full text dictionary length exceeds usize")?;
-    let postings_len = usize::try_from(header.postings_bytes_len)
-        .context("full text postings length exceeds usize")?;
-    let dictionary_end = dictionary_start
-        .checked_add(dictionary_len)
-        .ok_or_else(|| anyhow!("full text dictionary end overflow"))?;
-    let postings_end = dictionary_end
-        .checked_add(postings_len)
-        .ok_or_else(|| anyhow!("full text postings end overflow"))?;
-    if postings_end != document_table_offset {
-        return Err(anyhow!(
-            "full text header lengths do not match document table offset"
-        ));
+    if encoded_postings_bytes.len() as u64 != header.postings_bytes_len {
+        return Err(anyhow!("full text postings length does not match header"));
     }
-    if postings_end > body.len() {
-        return Err(anyhow!("full text postings exceed body length"));
-    }
-    let terms = decode_terms(&body[dictionary_start..dictionary_end], header.term_count)?;
-    let encoded_postings_bytes = &body[dictionary_end..postings_end];
+    let terms = decode_terms(&dictionary_bytes, header.term_count)?;
     let encoded_postings_block = match header.codec.as_str() {
-        "zstd" => zstd::stream::decode_all(encoded_postings_bytes)
+        "zstd" => zstd::stream::decode_all(encoded_postings_bytes.as_slice())
             .context("decompress full text postings block")?,
         other => return Err(anyhow!("unsupported full text postings codec {other}")),
     };
@@ -309,16 +649,101 @@ fn decode_full_text_body(
     if postings.len() as u64 != header.posting_count {
         return Err(anyhow!("full text posting count does not match header"));
     }
-    let document_table = body[document_table_offset..].to_vec();
     Ok(DecodedFullTextSegment {
         header,
-        body_header,
+        body_header: FullTextBodyHeader {
+            dictionary_block_count: 1,
+            postings_block_count: 1,
+            document_table_offset: 0,
+        },
         terms,
         postings,
         posting_skips,
         postings_bytes,
         document_table,
     })
+}
+
+fn dictionary_rows(dictionary_bytes: &[u8]) -> Result<Vec<TableRow>> {
+    let mut rows = Vec::new();
+    let mut input = dictionary_bytes;
+    while !input.is_empty() {
+        let (term, used) = TermEntry::decode(input)?;
+        let encoded = term.encode();
+        rows.push(TableRow {
+            key: term.term_utf8.clone(),
+            value: encoded,
+        });
+        input = &input[used..];
+    }
+    rows.sort_by(|left, right| left.key.cmp(&right.key));
+    Ok(rows)
+}
+
+fn postings_by_term_rows(
+    dictionary_bytes: &[u8],
+    raw_postings_bytes: &[u8],
+) -> Result<Vec<TableRow>> {
+    let mut rows = Vec::new();
+    let mut input = dictionary_bytes;
+    while !input.is_empty() {
+        let (term, used) = TermEntry::decode(input)?;
+        let start = usize::try_from(term.postings_offset)
+            .context("full text term postings offset exceeds usize")?;
+        let len = usize::try_from(term.postings_len)
+            .context("full text term postings length exceeds usize")?;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| anyhow!("full text term postings range overflow"))?;
+        let postings = raw_postings_bytes
+            .get(start..end)
+            .ok_or_else(|| anyhow!("full text term postings range is outside postings bytes"))?;
+        rows.push(TableRow {
+            key: term.term_utf8.clone(),
+            value: postings.to_vec(),
+        });
+        input = &input[used..];
+    }
+    rows.sort_by(|left, right| left.key.cmp(&right.key));
+    Ok(rows)
+}
+
+fn decode_full_text_tables(body: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let tables = decode_writer_body_tables(body)?;
+    let mut dictionary_bytes = Vec::new();
+    let mut postings_bytes = None;
+    let mut document_table = None;
+    for table in tables {
+        match table.table_id {
+            TABLE_FULL_TEXT_TERM_DICTIONARY => {
+                for row in table.rows {
+                    dictionary_bytes.extend_from_slice(&row.value);
+                }
+            }
+            TABLE_FULL_TEXT_POSTINGS_BLOCK => {
+                let row = table
+                    .rows
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow!("full text postings table is empty"))?;
+                postings_bytes = Some(row.value);
+            }
+            TABLE_FULL_TEXT_STORED_FIELDS => {
+                let row = table
+                    .rows
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow!("full text document table is empty"))?;
+                document_table = Some(row.value);
+            }
+            _ => {}
+        }
+    }
+    Ok((
+        dictionary_bytes,
+        postings_bytes.ok_or_else(|| anyhow!("full text postings table missing"))?,
+        document_table.ok_or_else(|| anyhow!("full text document table missing"))?,
+    ))
 }
 
 fn encode_postings_block(postings: &[Posting], raw_postings_bytes: &[u8]) -> Result<Vec<u8>> {
@@ -558,6 +983,20 @@ fn full_text_segment_ref_name(
     ))
 }
 
+fn full_text_index_id_from_segment_ref(segment_ref: &str) -> Result<String> {
+    let rest = segment_ref
+        .strip_prefix(FULL_TEXT_SEGMENT_REF_PREFIX)
+        .ok_or_else(|| anyhow!("full text segment ref has invalid prefix"))?;
+    let rest = rest
+        .strip_prefix("index:")
+        .ok_or_else(|| anyhow!("full text segment ref is missing index component"))?;
+    let (index_id, _) = rest
+        .split_once(":generation:")
+        .ok_or_else(|| anyhow!("full text segment ref is missing generation component"))?;
+    require_safe_component(index_id, "full text index id")?;
+    Ok(index_id.to_string())
+}
+
 fn generation_from_ref(ref_name: &str) -> Option<u64> {
     ref_name
         .rsplit_once(":generation:")?
@@ -590,17 +1029,11 @@ fn validate_hex32(value: &str, field: &'static str) -> Result<()> {
 }
 
 fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
-    Ok(format!(
-        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
-    ))
+    crate::core_store::encode_core_object_ref_target(object_ref)
 }
 
 fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
-    let encoded = target
-        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
-        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
-    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
+    crate::core_store::decode_core_object_ref_target(target)
 }
 
 #[cfg(test)]
@@ -644,6 +1077,7 @@ mod tests {
                 scorer: serde_json::json!({"kind": "bm25"}),
                 source_cursor: 44,
                 authz_revision: 7,
+                boundary_values: &[],
                 built_postings: &built,
                 document_table,
             },
@@ -704,6 +1138,7 @@ mod tests {
                 scorer: serde_json::json!({"kind": "bm25"}),
                 source_cursor: 260,
                 authz_revision: 11,
+                boundary_values: &[],
                 built_postings: &built,
                 document_table: b"",
             },
@@ -783,6 +1218,7 @@ mod tests {
                 scorer: serde_json::json!({}),
                 source_cursor: 0,
                 authz_revision: 0,
+                boundary_values: &[],
                 built_postings: &built,
                 document_table: b"",
             },
@@ -792,7 +1228,7 @@ mod tests {
         let mut bytes = read_full_text_segment_bytes(&storage, &segment_ref)
             .await
             .unwrap();
-        bytes[COMMON_HEADER_LEN + 1] ^= 1;
+        bytes[crate::formats::WRITER_SEGMENT_FIXED_HEADER_LEN + 1] ^= 1;
         assert!(decode_full_text_segment(&bytes).is_err());
     }
 
@@ -811,6 +1247,7 @@ mod tests {
                     scorer: serde_json::json!({}),
                     source_cursor: generation,
                     authz_revision: 0,
+                    boundary_values: &[],
                     built_postings: &built,
                     document_table: b"",
                 },

@@ -1,22 +1,65 @@
 use crate::{
-    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    core_store::{decode_deterministic_proto, encode_deterministic_proto},
     formats::{Hash32, hash32},
     personaldb_control::PersonalDbCommitCertificate,
+    personaldb_coremeta::{
+        PersonalDbDataLocatorCoreMetaRow, personaldb_payload_hash,
+        read_personaldb_data_locator_bytes, read_personaldb_data_locator_row,
+        write_personaldb_bytes_as_data_locator, write_personaldb_data_locator_row,
+    },
     storage::Storage,
 };
 use anyhow::{Result, anyhow};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use prost::Message;
 
 const PERSONALDB_CHANGESET_BY_INDEX_REF_PREFIX: &str = "personaldb_changeset_payload_by_index:";
 const PERSONALDB_CHANGESET_BY_HASH_REF_PREFIX: &str = "personaldb_changeset_payload_by_hash:";
 const PERSONALDB_COMMIT_CERTIFICATE_REF_PREFIX: &str = "personaldb_commit_certificate:";
-const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersonalDbChangesetPayloadRefs {
     pub by_index_ref: String,
     pub by_hash_ref: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct PersonalDbCommitCertificateProto {
+    #[prost(uint32, tag = "1")]
+    format_version: u32,
+    #[prost(string, tag = "2")]
+    tenant_id: String,
+    #[prost(string, tag = "3")]
+    database_id: String,
+    #[prost(uint64, tag = "4")]
+    log_index: u64,
+    #[prost(string, tag = "5")]
+    previous_log_hash: String,
+    #[prost(string, tag = "6")]
+    entry_hash: String,
+    #[prost(string, tag = "7")]
+    changeset_payload_hash: String,
+    #[prost(string, tag = "8")]
+    verified_envelope_hash: String,
+    #[prost(uint64, tag = "9")]
+    client_log_epoch: u64,
+    #[prost(uint64, tag = "10")]
+    membership_epoch: u64,
+    #[prost(uint64, tag = "11")]
+    policy_epoch: u64,
+    #[prost(string, tag = "12")]
+    leader_replica_id: String,
+    #[prost(string, tag = "13")]
+    voter_acks_hash: String,
+    #[prost(uint64, tag = "14")]
+    authz_revision: u64,
+    #[prost(string, tag = "15")]
+    witness_node_id: String,
+    #[prost(string, tag = "16")]
+    witnessed_at: String,
+    #[prost(string, optional, tag = "17")]
+    certificate_hash: Option<String>,
+    #[prost(string, optional, tag = "18")]
+    witness_signature: Option<String>,
 }
 
 pub async fn write_personaldb_changeset_payload(
@@ -42,19 +85,37 @@ pub async fn write_personaldb_changeset_payload(
         &payload_hash_hex,
     )?;
 
-    let store = CoreStore::new(storage.clone()).await?;
-    let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: by_hash_ref.clone(),
-            bytes: changeset_bytes.to_vec(),
-            region_id: "local".to_string(),
-            mutation_id: format!(
-                "personaldb-changeset-payload:{tenant_id}:{database_id}:{log_index}:{payload_hash_hex}"
-            ),
-        })
-        .await?;
-    put_immutable_ref_target(&store, &by_hash_ref, changeset_bytes, &object_ref).await?;
-    put_immutable_ref_target(&store, &by_index_ref, changeset_bytes, &object_ref).await?;
+    let by_hash_row = write_personaldb_bytes_as_data_locator(
+        storage,
+        tenant_id,
+        database_id,
+        &by_hash_ref,
+        "changeset",
+        log_index,
+        changeset_bytes.to_vec(),
+        payload_hash_hex.clone(),
+        vec![format!("log_index:{log_index:020}")],
+        format!(
+            "personaldb-changeset-payload:{tenant_id}:{database_id}:{log_index}:{payload_hash_hex}"
+        ),
+    )
+    .await?;
+    let by_index_row = PersonalDbDataLocatorCoreMetaRow {
+        tenant_id,
+        group_id: database_id.to_string(),
+        data_id: by_index_ref.clone(),
+        data_kind: "changeset".to_string(),
+        generation: log_index,
+        sqlite_changeset_hash: payload_hash_hex,
+        payload_locator: by_hash_row.payload_locator.clone(),
+        projection_keys: by_hash_row.projection_keys.clone(),
+        transaction_id: format!(
+            "personaldb-changeset-index:{tenant_id}:{database_id}:{log_index}:{}",
+            by_hash_row.sqlite_changeset_hash
+        ),
+        created_at_unix_nanos: by_hash_row.created_at_unix_nanos,
+    };
+    write_personaldb_data_locator_row(storage, &by_index_row, &[]).await?;
 
     Ok(PersonalDbChangesetPayloadRefs {
         by_index_ref,
@@ -97,15 +158,15 @@ pub async fn read_personaldb_changeset_payload_ref(
     ref_name: &str,
     expected_payload_hash: Hash32,
 ) -> Result<Option<Vec<u8>>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store.read_ref(ref_name).await? else {
+    let (tenant_id, database_id) = personaldb_ref_scope(ref_name)?;
+    let Some(row) = read_personaldb_data_locator_row(storage, tenant_id, &database_id, ref_name)?
+    else {
         return Ok(None);
     };
-    let bytes = store
-        .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
-        })
-        .await?;
+    if row.data_kind != "changeset" {
+        return Err(anyhow!("personaldb changeset locator has wrong data kind"));
+    }
+    let bytes = read_personaldb_data_locator_bytes(storage, &row).await?;
     if hash32(&bytes) != expected_payload_hash {
         return Err(anyhow!("personaldb changeset payload hash mismatch"));
     }
@@ -132,20 +193,23 @@ pub async fn write_personaldb_commit_certificate(
         certificate.log_index,
         &certificate.entry_hash,
     )?;
-    let bytes = serde_json::to_vec_pretty(certificate)?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.clone(),
-            bytes: bytes.clone(),
-            region_id: "local".to_string(),
-            mutation_id: format!(
-                "personaldb-commit-certificate:{tenant_id}:{database_id}:{}:{}",
-                certificate.log_index, certificate.entry_hash
-            ),
-        })
-        .await?;
-    put_immutable_ref_target(&store, &ref_name, &bytes, &object_ref).await?;
+    let bytes = encode_commit_certificate(certificate)?;
+    write_personaldb_bytes_as_data_locator(
+        storage,
+        tenant_id,
+        database_id,
+        &ref_name,
+        "commit_certificate",
+        certificate.log_index,
+        bytes,
+        personaldb_payload_hash(certificate.entry_hash.as_bytes()),
+        vec![format!("entry_hash:{}", certificate.entry_hash)],
+        format!(
+            "personaldb-commit-certificate:{tenant_id}:{database_id}:{}:{}",
+            certificate.log_index, certificate.entry_hash
+        ),
+    )
+    .await?;
     Ok(ref_name)
 }
 
@@ -167,18 +231,85 @@ pub async fn read_personaldb_commit_certificate_ref(
     ref_name: &str,
     signing_key: &[u8],
 ) -> Result<Option<PersonalDbCommitCertificate>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store.read_ref(ref_name).await? else {
+    let (tenant_id, database_id) = personaldb_ref_scope(ref_name)?;
+    let Some(row) = read_personaldb_data_locator_row(storage, tenant_id, &database_id, ref_name)?
+    else {
         return Ok(None);
     };
-    let bytes = store
-        .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&ref_value.target)?,
-        })
-        .await?;
-    let certificate: PersonalDbCommitCertificate = serde_json::from_slice(&bytes)?;
+    if row.data_kind != "commit_certificate" {
+        return Err(anyhow!(
+            "personaldb commit certificate locator has wrong data kind"
+        ));
+    }
+    let bytes = read_personaldb_data_locator_bytes(storage, &row).await?;
+    let certificate = decode_commit_certificate(&bytes)?;
     certificate.verify(signing_key)?;
     Ok(Some(certificate))
+}
+
+pub(crate) fn encode_commit_certificate(
+    certificate: &PersonalDbCommitCertificate,
+) -> Result<Vec<u8>> {
+    Ok(encode_deterministic_proto(&commit_certificate_to_proto(
+        certificate,
+    )))
+}
+
+pub(crate) fn decode_commit_certificate(bytes: &[u8]) -> Result<PersonalDbCommitCertificate> {
+    commit_certificate_from_proto(decode_deterministic_proto::<
+        PersonalDbCommitCertificateProto,
+    >(bytes, "personaldb commit certificate")?)
+}
+
+fn commit_certificate_to_proto(
+    certificate: &PersonalDbCommitCertificate,
+) -> PersonalDbCommitCertificateProto {
+    PersonalDbCommitCertificateProto {
+        format_version: u32::from(certificate.format_version),
+        tenant_id: certificate.tenant_id.clone(),
+        database_id: certificate.database_id.clone(),
+        log_index: certificate.log_index,
+        previous_log_hash: certificate.previous_log_hash.clone(),
+        entry_hash: certificate.entry_hash.clone(),
+        changeset_payload_hash: certificate.changeset_payload_hash.clone(),
+        verified_envelope_hash: certificate.verified_envelope_hash.clone(),
+        client_log_epoch: certificate.client_log_epoch,
+        membership_epoch: certificate.membership_epoch,
+        policy_epoch: certificate.policy_epoch,
+        leader_replica_id: certificate.leader_replica_id.clone(),
+        voter_acks_hash: certificate.voter_acks_hash.clone(),
+        authz_revision: certificate.authz_revision,
+        witness_node_id: certificate.witness_node_id.clone(),
+        witnessed_at: certificate.witnessed_at.clone(),
+        certificate_hash: certificate.certificate_hash.clone(),
+        witness_signature: certificate.witness_signature.clone(),
+    }
+}
+
+fn commit_certificate_from_proto(
+    proto: PersonalDbCommitCertificateProto,
+) -> Result<PersonalDbCommitCertificate> {
+    Ok(PersonalDbCommitCertificate {
+        format_version: u16::try_from(proto.format_version)
+            .map_err(|_| anyhow!("personaldb commit certificate version exceeds u16"))?,
+        tenant_id: proto.tenant_id,
+        database_id: proto.database_id,
+        log_index: proto.log_index,
+        previous_log_hash: proto.previous_log_hash,
+        entry_hash: proto.entry_hash,
+        changeset_payload_hash: proto.changeset_payload_hash,
+        verified_envelope_hash: proto.verified_envelope_hash,
+        client_log_epoch: proto.client_log_epoch,
+        membership_epoch: proto.membership_epoch,
+        policy_epoch: proto.policy_epoch,
+        leader_replica_id: proto.leader_replica_id,
+        voter_acks_hash: proto.voter_acks_hash,
+        authz_revision: proto.authz_revision,
+        witness_node_id: proto.witness_node_id,
+        witnessed_at: proto.witnessed_at,
+        certificate_hash: proto.certificate_hash,
+        witness_signature: proto.witness_signature,
+    })
 }
 
 pub fn personaldb_changeset_payload_by_index_ref_name(
@@ -251,6 +382,47 @@ fn validate_scope_component(tenant_id: i64, database_id: &str) -> Result<()> {
     Ok(())
 }
 
+fn personaldb_ref_scope(ref_name: &str) -> Result<(i64, String)> {
+    if ![
+        PERSONALDB_CHANGESET_BY_INDEX_REF_PREFIX,
+        PERSONALDB_CHANGESET_BY_HASH_REF_PREFIX,
+        PERSONALDB_COMMIT_CERTIFICATE_REF_PREFIX,
+    ]
+    .iter()
+    .any(|prefix| ref_name.starts_with(prefix))
+    {
+        return Err(anyhow!(
+            "personaldb CoreMeta data id has unsupported ref prefix"
+        ));
+    }
+    if ref_name.contains('/') || ref_name.contains('\\') || ref_name.chars().any(char::is_control) {
+        return Err(anyhow!(
+            "personaldb CoreMeta data id must not be a storage path"
+        ));
+    }
+    let tenant_marker = "tenant:";
+    let database_marker = ":database:";
+    let tenant_start = ref_name
+        .find(tenant_marker)
+        .ok_or_else(|| anyhow!("personaldb CoreMeta data id is missing tenant"))?
+        + tenant_marker.len();
+    let database_marker_offset = ref_name[tenant_start..]
+        .find(database_marker)
+        .ok_or_else(|| anyhow!("personaldb CoreMeta data id is missing database"))?
+        + tenant_start;
+    let tenant_id = ref_name[tenant_start..database_marker_offset]
+        .parse::<i64>()
+        .map_err(|_| anyhow!("personaldb CoreMeta data id tenant is invalid"))?;
+    let database_start = database_marker_offset + database_marker.len();
+    let database_end = ref_name[database_start..]
+        .find(':')
+        .map(|offset| database_start + offset)
+        .unwrap_or(ref_name.len());
+    let database_id = ref_name[database_start..database_end].to_string();
+    validate_scope_component(tenant_id, &database_id)?;
+    Ok((tenant_id, database_id))
+}
+
 fn decode_hex32(value: &str, field: &'static str) -> Result<Hash32> {
     if value.len() != 64 || !value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(anyhow!("{field} must be hex32"));
@@ -260,59 +432,14 @@ fn decode_hex32(value: &str, field: &'static str) -> Result<Hash32> {
         .map_err(|_| anyhow!("{field} must be hex32"))?)
 }
 
-async fn put_immutable_ref_target(
-    store: &CoreStore,
-    ref_name: &str,
-    bytes: &[u8],
-    object_ref: &CoreObjectRef,
-) -> Result<()> {
-    let target = encode_core_object_ref_target(object_ref)?;
-    match store
-        .compare_and_swap_ref(CompareAndSwapRef {
-            ref_name: ref_name.to_string(),
-            expected_generation: None,
-            expected_target: None,
-            require_absent: true,
-            require_present: false,
-            fence: None,
-            authz_revision: None,
-            source_watch_cursor: None,
-            new_target: target,
-            transaction_id: None,
-        })
-        .await
-    {
-        Ok(_) => Ok(()),
-        Err(err) => {
-            let Some(existing) = store.read_ref(ref_name).await? else {
-                return Err(err);
-            };
-            let existing_bytes = store
-                .get_blob(GetBlob {
-                    object_ref: decode_core_object_ref_target(&existing.target)?,
-                })
-                .await?;
-            if existing_bytes == bytes {
-                Ok(())
-            } else {
-                Err(anyhow!("personaldb immutable commit ref collision"))
-            }
-        }
-    }
+#[cfg(test)]
+fn encode_core_object_ref_target(object_ref: &crate::core_store::CoreObjectRef) -> Result<String> {
+    crate::core_store::encode_core_object_ref_target(object_ref)
 }
 
-fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
-    Ok(format!(
-        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
-    ))
-}
-
-fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
-    let encoded = target
-        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
-        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
-    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
+#[cfg(test)]
+fn decode_core_object_ref_target(target: &str) -> Result<crate::core_store::CoreObjectRef> {
+    crate::core_store::decode_core_object_ref_target(target)
 }
 
 #[cfg(test)]
@@ -373,36 +500,20 @@ mod tests {
             write_personaldb_changeset_payload(&storage, 9, "db-alpha", 1, payload_hash, b"good")
                 .await
                 .unwrap();
-        let store = CoreStore::new(storage.clone()).await.unwrap();
-        let corrupt = store
-            .put_blob(PutBlob {
-                logical_name: "corrupt-changeset".to_string(),
-                bytes: b"corrupt".to_vec(),
-                region_id: "local".to_string(),
-                mutation_id: "corrupt-changeset".to_string(),
-            })
-            .await
-            .unwrap();
-        let current = store
-            .read_ref(&refs.by_hash_ref)
-            .await
-            .unwrap()
-            .expect("changeset ref exists");
-        store
-            .compare_and_swap_ref(CompareAndSwapRef {
-                ref_name: refs.by_hash_ref,
-                expected_generation: Some(current.generation),
-                expected_target: Some(current.target),
-                require_absent: false,
-                require_present: true,
-                fence: None,
-                authz_revision: None,
-                source_watch_cursor: None,
-                new_target: encode_core_object_ref_target(&corrupt).unwrap(),
-                transaction_id: None,
-            })
-            .await
-            .unwrap();
+        write_personaldb_bytes_as_data_locator(
+            &storage,
+            9,
+            "db-alpha",
+            &refs.by_hash_ref,
+            "changeset",
+            2,
+            b"corrupt".to_vec(),
+            hex::encode(hash32(b"corrupt")),
+            vec!["log_index:00000000000000000002".to_string()],
+            "corrupt-changeset".to_string(),
+        )
+        .await
+        .unwrap();
         assert!(
             read_personaldb_changeset_payload_by_hash(&storage, 9, "db-alpha", payload_hash)
                 .await
@@ -449,38 +560,29 @@ mod tests {
                 .await
                 .unwrap();
 
-        let store = CoreStore::new(storage.clone()).await.unwrap();
-        let mut value = serde_json::to_value(&certificate).unwrap();
-        value["authz_revision"] = serde_json::json!(99);
-        let corrupt = store
-            .put_blob(PutBlob {
-                logical_name: "corrupt-certificate".to_string(),
-                bytes: serde_json::to_vec_pretty(&value).unwrap(),
-                region_id: "local".to_string(),
-                mutation_id: "corrupt-certificate".to_string(),
-            })
-            .await
-            .unwrap();
-        let current = store
-            .read_ref(&ref_name)
-            .await
+        let row = read_personaldb_data_locator_row(&storage, 9, "db-alpha", &ref_name)
             .unwrap()
-            .expect("certificate ref exists");
-        store
-            .compare_and_swap_ref(CompareAndSwapRef {
-                ref_name,
-                expected_generation: Some(current.generation),
-                expected_target: Some(current.target),
-                require_absent: false,
-                require_present: true,
-                fence: None,
-                authz_revision: None,
-                source_watch_cursor: None,
-                new_target: encode_core_object_ref_target(&corrupt).unwrap(),
-                transaction_id: None,
-            })
+            .expect("certificate locator exists");
+        let mut value = read_personaldb_data_locator_bytes(&storage, &row)
             .await
             .unwrap();
+        *value
+            .last_mut()
+            .expect("stored commit certificate bytes are not empty") ^= 0x01;
+        write_personaldb_bytes_as_data_locator(
+            &storage,
+            9,
+            "db-alpha",
+            &ref_name,
+            "commit_certificate",
+            certificate.log_index + 1,
+            value,
+            personaldb_payload_hash(certificate.entry_hash.as_bytes()),
+            vec![format!("entry_hash:{}", certificate.entry_hash)],
+            "corrupt-certificate".to_string(),
+        )
+        .await
+        .unwrap();
         assert!(
             read_personaldb_commit_certificate(
                 &storage,

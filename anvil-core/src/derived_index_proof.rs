@@ -1,18 +1,21 @@
 use crate::{
-    core_store::{CompareAndSwapRef, CoreObjectRef, CoreStore, GetBlob, PutBlob},
+    core_store::{
+        CF_INDEX_ROWS, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaRowCommonProto, CoreMetaStore,
+        CoreMetaTuplePart, CoreMetaVisibilityState, CoreStore, TABLE_DERIVED_INDEX_PROOF_ROW,
+        core_meta_root_key_hash, core_meta_tuple_key, decode_deterministic_proto,
+        encode_deterministic_proto,
+    },
     formats::hash32,
     storage::Storage,
 };
 use anyhow::{Result, anyhow};
 use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hmac::{Hmac, Mac};
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
-const DERIVED_INDEX_PROOF_REF_PREFIX: &str = "derived_index_proof:";
-const CORE_OBJECT_REF_TARGET_PREFIX: &str = "core-object-ref:";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DerivedIndexProof {
@@ -45,6 +48,48 @@ pub struct DerivedIndexProofWrite {
     pub segment_hashes: Vec<String>,
     pub built_by_node: String,
     pub built_at_nanos: i64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct DerivedIndexProofProto {
+    #[prost(uint32, tag = "1")]
+    format_version: u32,
+    #[prost(string, tag = "2")]
+    index_id: String,
+    #[prost(string, tag = "3")]
+    index_kind: String,
+    #[prost(string, tag = "4")]
+    partition_family: String,
+    #[prost(string, tag = "5")]
+    partition_id: String,
+    #[prost(string, tag = "6")]
+    source_watch_stream_id: String,
+    #[prost(string, tag = "7")]
+    source_cursor: String,
+    #[prost(string, tag = "8")]
+    source_manifest_hash: String,
+    #[prost(uint64, tag = "9")]
+    generation: u64,
+    #[prost(string, repeated, tag = "10")]
+    segment_hashes: Vec<String>,
+    #[prost(string, tag = "11")]
+    built_by_node: String,
+    #[prost(int64, tag = "12")]
+    built_at_nanos: i64,
+    #[prost(string, optional, tag = "13")]
+    proof_hash: Option<String>,
+    #[prost(string, optional, tag = "14")]
+    proof_signature: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct DerivedIndexProofRowProto {
+    #[prost(message, optional, tag = "1")]
+    common: Option<CoreMetaRowCommonProto>,
+    #[prost(string, tag = "2")]
+    schema: String,
+    #[prost(bytes, tag = "3")]
+    proof_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,7 +144,7 @@ pub fn hash_derived_index_proof(proof: &DerivedIndexProof) -> Result<String> {
     let mut unsigned = proof.clone();
     unsigned.proof_hash = None;
     unsigned.proof_signature = None;
-    Ok(hex::encode(hash32(&serde_json::to_vec(&unsigned)?)))
+    Ok(hex::encode(hash32(&encode_derived_index_proof(&unsigned)?)))
 }
 
 pub async fn write_derived_index_proof(
@@ -125,24 +170,7 @@ pub async fn write_derived_index_proof(
         proof_signature: None,
     }
     .seal(signing_key)?;
-    write_derived_index_proof_ref(
-        storage,
-        &versioned_proof_ref_name(
-            &sealed.index_id,
-            sealed.generation,
-            sealed.proof_hash.as_deref().expect("sealed proof has hash"),
-        )?,
-        &sealed,
-        true,
-    )
-    .await?;
-    write_derived_index_proof_ref(
-        storage,
-        &head_proof_ref_name(&sealed.index_id)?,
-        &sealed,
-        false,
-    )
-    .await?;
+    write_derived_index_proof_rows(storage, &sealed).await?;
     Ok(sealed)
 }
 
@@ -152,7 +180,7 @@ pub async fn read_latest_derived_index_proof(
     signing_key: &[u8],
 ) -> Result<Option<DerivedIndexProof>> {
     let Some(proof) =
-        read_derived_index_proof_ref(storage, &head_proof_ref_name(index_id)?).await?
+        read_derived_index_proof_row(storage, &head_proof_tuple_key(index_id)?).await?
     else {
         return Ok(None);
     };
@@ -273,84 +301,170 @@ fn require_safe_component(value: &str, field: &'static str) -> Result<()> {
     Ok(())
 }
 
-async fn write_derived_index_proof_ref(
+async fn write_derived_index_proof_rows(
     storage: &Storage,
-    ref_name: &str,
     proof: &DerivedIndexProof,
-    require_absent: bool,
 ) -> Result<()> {
+    let proof_hash = proof
+        .proof_hash
+        .as_deref()
+        .ok_or_else(|| anyhow!("sealed derived index proof is missing proof hash"))?;
+    let versioned_key = versioned_proof_tuple_key(&proof.index_id, proof.generation, proof_hash)?;
+    let head_key = head_proof_tuple_key(&proof.index_id)?;
+    let payload = encode_derived_index_proof_row(proof)?;
     let store = CoreStore::new(storage.clone()).await?;
-    let object_ref = store
-        .put_blob(PutBlob {
-            logical_name: ref_name.to_string(),
-            bytes: serde_json::to_vec_pretty(proof)?,
-            region_id: "local".to_string(),
-            mutation_id: format!(
+    let versioned_op = CoreMetaBatchOp {
+        cf: CF_INDEX_ROWS,
+        table_id: TABLE_DERIVED_INDEX_PROOF_ROW,
+        tuple_key: &versioned_key,
+        common: None,
+        kind: CoreMetaBatchOpKind::Put(&payload),
+    };
+    let head_op = CoreMetaBatchOp {
+        cf: CF_INDEX_ROWS,
+        table_id: TABLE_DERIVED_INDEX_PROOF_ROW,
+        tuple_key: &head_key,
+        common: None,
+        kind: CoreMetaBatchOpKind::Put(&payload),
+    };
+    store
+        .commit_coremeta_batch_by_embedded_roots(
+            &format!(
                 "derived-index-proof:{}:{}",
                 proof.index_id, proof.generation
             ),
-        })
-        .await?;
-    store
-        .compare_and_swap_ref(CompareAndSwapRef {
-            ref_name: ref_name.to_string(),
-            expected_generation: None,
-            expected_target: None,
-            require_absent,
-            require_present: false,
-            fence: None,
-            authz_revision: None,
-            source_watch_cursor: None,
-            new_target: encode_core_object_ref_target(&object_ref)?,
-            transaction_id: None,
-        })
+            &[versioned_op, head_op],
+        )
         .await?;
     Ok(())
 }
 
-async fn read_derived_index_proof_ref(
+async fn read_derived_index_proof_row(
     storage: &Storage,
-    ref_name: &str,
+    tuple_key: &[u8],
 ) -> Result<Option<DerivedIndexProof>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(ref_value) = store.read_ref(ref_name).await? else {
+    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
+    let Some(bytes) = meta.get(CF_INDEX_ROWS, TABLE_DERIVED_INDEX_PROOF_ROW, tuple_key)? else {
         return Ok(None);
     };
-    let object_ref = decode_core_object_ref_target(&ref_value.target)?;
-    let bytes = store.get_blob(GetBlob { object_ref }).await?;
-    Ok(Some(serde_json::from_slice(&bytes)?))
+    Ok(Some(decode_derived_index_proof_row(&bytes)?))
 }
 
-fn head_proof_ref_name(index_id: &str) -> Result<String> {
+fn encode_derived_index_proof(proof: &DerivedIndexProof) -> Result<Vec<u8>> {
+    Ok(encode_deterministic_proto(&derived_index_proof_to_proto(
+        proof,
+    )))
+}
+
+fn decode_derived_index_proof(bytes: &[u8]) -> Result<DerivedIndexProof> {
+    derived_index_proof_from_proto(decode_deterministic_proto::<DerivedIndexProofProto>(
+        bytes,
+        "derived index proof",
+    )?)
+}
+
+fn encode_derived_index_proof_row(proof: &DerivedIndexProof) -> Result<Vec<u8>> {
+    proof
+        .proof_hash
+        .as_ref()
+        .ok_or_else(|| anyhow!("sealed derived index proof is missing proof hash"))?;
+    Ok(encode_deterministic_proto(&DerivedIndexProofRowProto {
+        common: Some(CoreMetaRowCommonProto {
+            realm_id: proof.partition_family.clone(),
+            root_key_hash: core_meta_root_key_hash(&format!(
+                "derived-index-proof/{}/{}",
+                proof.index_id, proof.partition_id
+            )),
+            root_generation: proof.generation,
+            transaction_id: format!(
+                "derived-index-proof:{}:{}",
+                proof.index_id, proof.generation
+            ),
+            visibility_state: CoreMetaVisibilityState::Committed as i32,
+            created_at_unix_nanos: proof.built_at_nanos.max(0) as u64,
+            payload_schema_version: 1,
+        }),
+        schema: "anvil.coremeta.derived_index_proof.v1".to_string(),
+        proof_bytes: encode_derived_index_proof(proof)?,
+    }))
+}
+
+fn decode_derived_index_proof_row(bytes: &[u8]) -> Result<DerivedIndexProof> {
+    let row =
+        decode_deterministic_proto::<DerivedIndexProofRowProto>(bytes, "derived index proof row")?;
+    if row.schema != "anvil.coremeta.derived_index_proof.v1" {
+        return Err(anyhow!("derived index proof row has invalid schema"));
+    }
+    row.common
+        .as_ref()
+        .ok_or_else(|| anyhow!("derived index proof row missing CoreMeta common"))?;
+    decode_derived_index_proof(&row.proof_bytes)
+}
+
+fn derived_index_proof_to_proto(proof: &DerivedIndexProof) -> DerivedIndexProofProto {
+    DerivedIndexProofProto {
+        format_version: u32::from(proof.format_version),
+        index_id: proof.index_id.clone(),
+        index_kind: proof.index_kind.clone(),
+        partition_family: proof.partition_family.clone(),
+        partition_id: proof.partition_id.clone(),
+        source_watch_stream_id: proof.source_watch_stream_id.clone(),
+        source_cursor: proof.source_cursor.to_string(),
+        source_manifest_hash: proof.source_manifest_hash.clone(),
+        generation: proof.generation,
+        segment_hashes: proof.segment_hashes.clone(),
+        built_by_node: proof.built_by_node.clone(),
+        built_at_nanos: proof.built_at_nanos,
+        proof_hash: proof.proof_hash.clone(),
+        proof_signature: proof.proof_signature.clone(),
+    }
+}
+
+fn derived_index_proof_from_proto(proto: DerivedIndexProofProto) -> Result<DerivedIndexProof> {
+    Ok(DerivedIndexProof {
+        format_version: u16::try_from(proto.format_version)
+            .map_err(|_| anyhow!("derived index proof version exceeds u16"))?,
+        index_id: proto.index_id,
+        index_kind: proto.index_kind,
+        partition_family: proto.partition_family,
+        partition_id: proto.partition_id,
+        source_watch_stream_id: proto.source_watch_stream_id,
+        source_cursor: proto
+            .source_cursor
+            .parse()
+            .map_err(|_| anyhow!("derived index proof source_cursor is not u128"))?,
+        source_manifest_hash: proto.source_manifest_hash,
+        generation: proto.generation,
+        segment_hashes: proto.segment_hashes,
+        built_by_node: proto.built_by_node,
+        built_at_nanos: proto.built_at_nanos,
+        proof_hash: proto.proof_hash,
+        proof_signature: proto.proof_signature,
+    })
+}
+
+fn head_proof_tuple_key(index_id: &str) -> Result<Vec<u8>> {
     require_safe_component(index_id, "index_id")?;
-    Ok(format!(
-        "{DERIVED_INDEX_PROOF_REF_PREFIX}index:{index_id}:head"
-    ))
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("derived-index-proof"),
+        CoreMetaTuplePart::Utf8(index_id),
+        CoreMetaTuplePart::Utf8("head"),
+    ])
 }
 
-fn versioned_proof_ref_name(index_id: &str, generation: u64, proof_hash: &str) -> Result<String> {
+fn versioned_proof_tuple_key(index_id: &str, generation: u64, proof_hash: &str) -> Result<Vec<u8>> {
     require_safe_component(index_id, "index_id")?;
     if generation == 0 {
         return Err(anyhow!("derived index proof generation must be nonzero"));
     }
     validate_hex32(proof_hash, "proof_hash")?;
-    Ok(format!(
-        "{DERIVED_INDEX_PROOF_REF_PREFIX}index:{index_id}:generation:{generation:020}:hash:{proof_hash}"
-    ))
-}
-
-fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
-    Ok(format!(
-        "{CORE_OBJECT_REF_TARGET_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(object_ref)?)
-    ))
-}
-
-fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
-    let encoded = target
-        .strip_prefix(CORE_OBJECT_REF_TARGET_PREFIX)
-        .ok_or_else(|| anyhow!("CoreStore ref target is not a CoreObjectRef"))?;
-    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?)
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("derived-index-proof"),
+        CoreMetaTuplePart::Utf8(index_id),
+        CoreMetaTuplePart::Utf8("generation"),
+        CoreMetaTuplePart::U64(generation),
+        CoreMetaTuplePart::Hash(proof_hash),
+    ])
 }
 
 #[cfg(test)]
@@ -370,13 +484,15 @@ mod tests {
         assert_eq!(proof.generation, 7);
         assert_eq!(proof.source_cursor, 42);
         let proof_hash = proof.proof_hash.as_deref().unwrap();
-        let store = CoreStore::new(storage.clone()).await.unwrap();
+        let meta = CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
         assert!(
-            store
-                .read_ref(&versioned_proof_ref_name("full-text-alpha", 7, proof_hash).unwrap())
-                .await
-                .unwrap()
-                .is_some()
+            meta.get(
+                CF_INDEX_ROWS,
+                TABLE_DERIVED_INDEX_PROOF_ROW,
+                &versioned_proof_tuple_key("full-text-alpha", 7, proof_hash).unwrap()
+            )
+            .unwrap()
+            .is_some()
         );
         assert_eq!(
             read_latest_derived_index_proof(&storage, "full-text-alpha", KEY)
@@ -424,46 +540,26 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let store = CoreStore::new(storage.clone()).await.unwrap();
-        let head = store
-            .read_ref(&head_proof_ref_name("full-text-alpha").unwrap())
-            .await
+        let meta = CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
+        let head_key = head_proof_tuple_key("full-text-alpha").unwrap();
+        let mut value = meta
+            .get(CF_INDEX_ROWS, TABLE_DERIVED_INDEX_PROOF_ROW, &head_key)
             .unwrap()
             .unwrap();
-        let object_ref = decode_core_object_ref_target(&head.target).unwrap();
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&store.get_blob(GetBlob { object_ref }).await.unwrap()).unwrap();
-        value["source_cursor"] = serde_json::json!(999);
-        let tampered = store
-            .put_blob(PutBlob {
-                logical_name: "derived-index-proof-tamper".to_string(),
-                bytes: serde_json::to_vec_pretty(&value).unwrap(),
-                region_id: "local".to_string(),
-                mutation_id: "derived-index-proof-tamper".to_string(),
-            })
-            .await
-            .unwrap();
-        store
-            .compare_and_swap_ref(CompareAndSwapRef {
-                ref_name: head_proof_ref_name("full-text-alpha").unwrap(),
-                expected_generation: Some(head.generation),
-                expected_target: Some(head.target),
-                require_absent: false,
-                require_present: true,
-                fence: None,
-                authz_revision: None,
-                source_watch_cursor: None,
-                new_target: encode_core_object_ref_target(&tampered).unwrap(),
-                transaction_id: None,
-            })
-            .await
-            .unwrap();
+        *value.last_mut().expect("stored proof bytes are not empty") ^= 0x01;
+        meta.put(
+            CF_INDEX_ROWS,
+            TABLE_DERIVED_INDEX_PROOF_ROW,
+            &head_key,
+            &value,
+        )
+        .unwrap();
         assert!(
             read_latest_derived_index_proof(&storage, "full-text-alpha", KEY)
                 .await
                 .is_err()
         );
-        assert!(head_proof_ref_name("../escape").is_err());
+        assert!(head_proof_tuple_key("../escape").is_err());
         let mut invalid = proof(7, 42, hex::encode([8; 32]));
         invalid.segment_hashes = Vec::new();
         assert!(
