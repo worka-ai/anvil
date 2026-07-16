@@ -1136,7 +1136,10 @@ mod tests {
                     scope: Some(scope(&root)),
                     preconditions: vec![predecessor_precondition.clone()],
                     boundary_values: Vec::new(),
-                    ttl_ms: 250,
+                    // This transaction must remain open long enough for the
+                    // staged write to finish on slow CI, then expire before the
+                    // successor commit validates stream predecessor ordering.
+                    ttl_ms: 5_000,
                     purpose: "stage an abandoned predecessor".to_string(),
                 },
                 &claims,
@@ -1157,7 +1160,7 @@ mod tests {
         });
         predecessor_request.extensions_mut().insert(claims.clone());
         state.mutation_batch(predecessor_request).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5_500)).await;
 
         let successor_precondition = absent_objects(&bucket.name, &["successor.json"]);
         let successor = state
