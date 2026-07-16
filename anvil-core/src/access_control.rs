@@ -1013,22 +1013,36 @@ pub async fn system_realm_relationship_allows(
     relation: &str,
     authz_revision: Option<i64>,
 ) -> Result<bool> {
-    let revision = match authz_revision {
-        Some(revision) => revision,
-        None => authz_journal::latest_authz_revision(storage, SYSTEM_STORAGE_TENANT_ID).await?,
-    };
-    authz_journal::resolve_permission_at_revision(
-        storage,
-        SYSTEM_STORAGE_TENANT_ID,
-        &system_realm_namespace(namespace),
-        object_id,
-        relation,
-        APP_SUBJECT_KIND,
-        &claims.sub,
-        "",
-        revision,
-    )
-    .await
+    let namespace = system_realm_namespace(namespace);
+    match authz_revision {
+        Some(revision) => {
+            authz_journal::resolve_permission_at_revision(
+                storage,
+                SYSTEM_STORAGE_TENANT_ID,
+                &namespace,
+                object_id,
+                relation,
+                APP_SUBJECT_KIND,
+                &claims.sub,
+                "",
+                revision,
+            )
+            .await
+        }
+        None => {
+            authz_journal::resolve_current_permission(
+                storage,
+                SYSTEM_STORAGE_TENANT_ID,
+                &namespace,
+                object_id,
+                relation,
+                APP_SUBJECT_KIND,
+                &claims.sub,
+                "",
+            )
+            .await
+        }
+    }
 }
 
 pub async fn require_system_realm_permission(
