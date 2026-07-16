@@ -185,6 +185,20 @@ async fn authz_resolves_direct_and_nested_userset_tuples() {
         .await
         .unwrap()
     );
+    assert!(
+        resolve_current_permission(
+            &storage, 42, "document", "alpha", "viewer", "user", "alice", ""
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        !resolve_current_permission(
+            &storage, 42, "document", "alpha", "viewer", "user", "bob", ""
+        )
+        .await
+        .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -247,6 +261,13 @@ async fn authz_userset_removal_and_cycles_do_not_grant_access() {
     assert!(
         resolve_permission_at_revision(
             &storage, 42, "document", "alpha", "viewer", "user", "alice", "", 3
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        !resolve_current_permission(
+            &storage, 42, "document", "alpha", "viewer", "user", "alice", ""
         )
         .await
         .unwrap()

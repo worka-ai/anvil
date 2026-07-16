@@ -743,6 +743,31 @@ pub async fn resolve_permission_at_revision(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub async fn resolve_current_permission(
+    storage: &Storage,
+    tenant_id: i64,
+    namespace: &str,
+    object_id: &str,
+    relation: &str,
+    subject_kind: &str,
+    subject_id: &str,
+    caveat_hash: &str,
+) -> Result<bool> {
+    resolve_permission_from_current_view_at_revision(
+        storage,
+        tenant_id,
+        namespace,
+        object_id,
+        relation,
+        subject_kind,
+        subject_id,
+        caveat_hash,
+        i64::MAX,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn resolve_permission_from_current_view_at_revision(
     storage: &Storage,
     tenant_id: i64,
