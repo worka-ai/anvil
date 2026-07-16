@@ -90,6 +90,49 @@ async fn empty_bucket_index_build_materialises_an_empty_typed_json_segment() {
         .is_some(),
         "empty typed JSON indexes must be queryable as empty results"
     );
+
+    persistence
+        .create_object(
+            tenant.id,
+            bucket.id,
+            "items/one.json",
+            "hash-one",
+            2,
+            "etag-one",
+            Some("application/json"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let stats = metadata_journal::active_object_journal_stats(
+        &persistence.storage,
+        &bucket,
+        &persistence.partition_owner_signing_key,
+    )
+    .await
+    .unwrap();
+    let current_cursor = index_repair::source_cursor_from_stats(stats);
+    assert!(current_cursor > 0);
+    persistence
+        .build_index_task(
+            tenant.id,
+            bucket.id,
+            index.id,
+            index.version,
+            current_cursor,
+        )
+        .await
+        .unwrap()
+        .expect("advanced typed JSON index build outcome");
+
+    let stale = persistence
+        .build_index_task(tenant.id, bucket.id, index.id, index.version, 0)
+        .await
+        .unwrap();
+    assert!(stale.is_none(), "stale index tasks must be skipped");
 }
 
 #[tokio::test]
