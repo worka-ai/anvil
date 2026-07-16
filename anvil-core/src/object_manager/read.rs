@@ -295,7 +295,7 @@ impl ObjectManager {
             .ok_or_else(|| Status::not_found("Object not found"))?;
         if transaction_id.is_none() {
             if visibility.defers_write_maintenance() {
-                self.schedule_deferred_object_maintenance(bucket.clone());
+                self.schedule_deferred_object_maintenance(bucket.clone(), object_key);
             }
             if visibility.requires_watch_visible() {
                 self.publish_object_watch_event(tenant_id, &bucket, &delete_marker, "delete", true)
@@ -383,7 +383,7 @@ impl ObjectManager {
             .ok_or_else(|| Status::not_found("Object version not found"))?;
         if transaction_id.is_none() {
             if visibility.defers_write_maintenance() {
-                self.schedule_deferred_object_maintenance(bucket.clone());
+                self.schedule_deferred_object_maintenance(bucket.clone(), object_key);
             }
             if visibility.requires_watch_visible() {
                 self.publish_object_watch_event(
