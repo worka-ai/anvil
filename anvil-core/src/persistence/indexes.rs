@@ -405,6 +405,20 @@ impl Persistence {
             return Ok(None);
         }
         let index_storage_id = index_journal::index_storage_id(tenant_id, bucket_id, index.id);
+        if watch_checkpoint::read_watch_checkpoint(
+            &self.storage,
+            "object_metadata",
+            &index_storage_id,
+            &self.partition_owner_signing_key,
+        )
+        .await?
+        .is_some_and(|checkpoint| checkpoint.cursor > source_cursor)
+        {
+            // A newer build already published this index. Replaying an older
+            // queued task would waste work and then violate checkpoint
+            // monotonicity when it tried to publish its stale cursor.
+            return Ok(None);
+        }
         self.ensure_index_build_ownership_fence(tenant_id, bucket_id, &index_storage_id)
             .await?;
         let outcome = match index.kind.as_str() {
