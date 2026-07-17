@@ -1516,6 +1516,189 @@ pub async fn acknowledge_personaldb_witness_receipt(
     )
 }
 
+pub async fn commit_personaldb_witnessed_proposal(
+    authority: &PersonalDbAdmissionAuthority<'_>,
+    request: &SignCertificateAndHeadV1,
+) -> Result<ProposalAdmissionReservationV1> {
+    let stored = read_personaldb_proposal_reservation(authority.storage, &request.reservation_id)?
+        .ok_or_else(|| anyhow!("proposal reservation not found"))?;
+    let tenant_id = stored.tenant_id;
+    let reservation = stored.reservation;
+    let identity = &reservation.identity;
+    let receipt = read_witness_dual_signing_receipt(authority.storage, &request.reservation_id)?
+        .ok_or_else(|| anyhow!("witness dual-signing receipt not found"))?;
+    validate_receipt_request(&receipt, request)?;
+    validate_stored_receipt(authority, &receipt)?;
+    let receipt_hash = receipt.hash_sha256()?;
+    let slot_key = slot_key(
+        tenant_id,
+        &identity.database_id,
+        next_log_index(identity)?,
+        identity.client_log_epoch,
+    )?;
+    let slot = read_slot_row(authority.storage, &slot_key)?
+        .ok_or_else(|| anyhow!("proposal slot not found"))?;
+    if reservation.state == ProposalAdmissionReservationStateV1::Committed {
+        if reservation.witness_dual_signing_receipt_sha256 == Some(receipt_hash)
+            && reservation.terminal_commit_certificate_sha256
+                == Some(receipt.signed_commit_certificate_sha256)
+            && reservation.terminal_committed_head_sha256
+                == Some(receipt.signed_committed_head_sha256)
+            && slot.state == ProposalAdmissionSlotStateV1::Committed
+            && slot.witness_dual_signing_receipt_sha256 == Some(receipt_hash)
+            && slot.terminal_committed_head_sha256 == Some(receipt.signed_committed_head_sha256)
+        {
+            return Ok(reservation);
+        }
+        bail!("proposal committed reservation is incomplete");
+    }
+    if reservation.state != ProposalAdmissionReservationStateV1::Signing
+        || reservation.reservation_revision != request.signing_reservation_revision
+        || reservation.witness_dual_signing_receipt_sha256 != Some(receipt_hash)
+        || slot.reservation_id != identity.reservation_id
+        || slot.state != ProposalAdmissionSlotStateV1::Signed
+        || slot.witness_dual_signing_receipt_sha256 != Some(receipt_hash)
+        || slot.terminal_committed_head_sha256 != Some(receipt.signed_committed_head_sha256)
+    {
+        bail!("proposal reservation cannot be committed from its current state");
+    }
+
+    let guard = load_group_guard(authority, tenant_id, &identity.database_id).await?;
+    if identity.fencing_generation != guard.owner.fence_token
+        || identity.fencing_generation != authority.write_permit.fence_token
+        || identity.primary_server_id != guard.owner.owner_node_id
+        || identity.primary_server_id != authority.write_permit.owner_node_id
+        || identity.leader_lease_id != personaldb_group_leader_lease_id(&guard.owner)
+        || identity.leader_lease_revision != guard.owner.recovery_epoch
+    {
+        bail!("proposal reservation leader lease is stale at commit finalisation");
+    }
+    let committed_head = decode_committed_head(&receipt.signed_committed_head)?;
+    let current_head_bytes = encode_committed_head(&guard.head)?;
+    if guard.head != committed_head
+        || domain_hash(SIGNED_HEAD_HASH_DOMAIN, &current_head_bytes)
+            != receipt.signed_committed_head_sha256
+    {
+        bail!("proposal witnessed head is not the current committed head");
+    }
+    let committed_certificate = decode_commit_certificate(&receipt.signed_commit_certificate)?;
+    if domain_hash(
+        SIGNED_CERTIFICATE_HASH_DOMAIN,
+        &encode_commit_certificate(&committed_certificate)?,
+    ) != receipt.signed_commit_certificate_sha256
+    {
+        bail!("proposal witnessed certificate hash does not match receipt");
+    }
+
+    let terminal_revision = request
+        .signing_reservation_revision
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("proposal reservation revision overflow"))?;
+    let mut committed_reservation = reservation.clone();
+    committed_reservation.reservation_revision = terminal_revision;
+    committed_reservation.state = ProposalAdmissionReservationStateV1::Committed;
+    committed_reservation.terminal_commit_certificate_sha256 =
+        Some(receipt.signed_commit_certificate_sha256);
+    committed_reservation.terminal_committed_head_sha256 =
+        Some(receipt.signed_committed_head_sha256);
+
+    let mut committed_slot = slot.clone();
+    committed_slot.state = ProposalAdmissionSlotStateV1::Committed;
+    committed_slot.slot_revision = committed_slot
+        .slot_revision
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("proposal slot revision overflow"))?;
+    validate_reservation(&committed_reservation)?;
+    validate_slot(&committed_slot)?;
+
+    let reservation_key = reservation_key(&identity.reservation_id)?;
+    let current_reservation_payload = read_raw_row(
+        authority.storage,
+        TABLE_PERSONALDB_PROPOSAL_RESERVATION_ROW,
+        &reservation_key,
+    )?
+    .ok_or_else(|| anyhow!("proposal reservation disappeared"))?;
+    let current_slot_payload = read_raw_row(
+        authority.storage,
+        TABLE_PERSONALDB_PROPOSAL_SLOT_ROW,
+        &slot_key,
+    )?
+    .ok_or_else(|| anyhow!("proposal slot disappeared"))?;
+    let receipt_key = receipt_key(&identity.reservation_id)?;
+    let receipt_payload = read_raw_row(
+        authority.storage,
+        TABLE_PERSONALDB_WITNESS_RECEIPT_ROW,
+        &receipt_key,
+    )?
+    .ok_or_else(|| anyhow!("witness receipt disappeared"))?;
+    let transaction_id = format!("personaldb-admission-commit:{}", hex::encode(receipt_hash));
+    let root_generation =
+        next_group_root_generation(authority.storage, tenant_id, &identity.database_id).await?;
+    let common = row_common(
+        tenant_id,
+        &identity.database_id,
+        root_generation,
+        &transaction_id,
+        unix_seconds_to_nanos(authority.now_unix_seconds)?,
+    );
+    let reservation_payload = encode_deterministic_proto(&ReservationRowProto {
+        common: Some(common.clone()),
+        reservation: Some(reservation_to_proto(&committed_reservation)),
+    });
+    let slot_payload = encode_deterministic_proto(&SlotRowProto {
+        common: Some(common),
+        slot: Some(slot_to_proto(&committed_slot)),
+    });
+    commit_group_batch(
+        authority.storage,
+        transaction_id,
+        tenant_id,
+        &identity.database_id,
+        &authority.write_permit.owner_node_id,
+        vec![
+            guard.owner_precondition,
+            guard.head_precondition,
+            exact_precondition(
+                TABLE_PERSONALDB_PROPOSAL_RESERVATION_ROW,
+                reservation_key.clone(),
+                &current_reservation_payload,
+            ),
+            exact_precondition(
+                TABLE_PERSONALDB_PROPOSAL_SLOT_ROW,
+                slot_key.clone(),
+                &current_slot_payload,
+            ),
+            exact_precondition(
+                TABLE_PERSONALDB_WITNESS_RECEIPT_ROW,
+                receipt_key,
+                &receipt_payload,
+            ),
+        ],
+        vec![
+            put_operation(
+                tenant_id,
+                &identity.database_id,
+                TABLE_PERSONALDB_PROPOSAL_RESERVATION_ROW,
+                reservation_key,
+                reservation_payload,
+            ),
+            put_operation(
+                tenant_id,
+                &identity.database_id,
+                TABLE_PERSONALDB_PROPOSAL_SLOT_ROW,
+                slot_key,
+                slot_payload,
+            ),
+        ],
+    )
+    .await?;
+    Ok(
+        read_personaldb_proposal_reservation(authority.storage, &request.reservation_id)?
+            .ok_or_else(|| anyhow!("committed proposal reservation disappeared"))?
+            .reservation,
+    )
+}
+
 pub fn read_personaldb_proposal_reservation(
     storage: &Storage,
     reservation_id: &str,
@@ -1780,8 +1963,22 @@ fn validate_stored_receipt(
         .ok_or_else(|| anyhow!("witness receipt reservation not found"))?;
     let reservation = stored.reservation;
     let identity = &reservation.identity;
-    if reservation.state != ProposalAdmissionReservationStateV1::Signing
-        || reservation.reservation_revision != receipt.signing_reservation_revision
+    let receipt_hash = receipt.hash_sha256()?;
+    let signing_reservation_matches = reservation.state
+        == ProposalAdmissionReservationStateV1::Signing
+        && reservation.reservation_revision == receipt.signing_reservation_revision;
+    let terminal_revision = receipt
+        .signing_reservation_revision
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("proposal reservation revision overflow"))?;
+    let committed_reservation_matches = reservation.state
+        == ProposalAdmissionReservationStateV1::Committed
+        && reservation.reservation_revision == terminal_revision
+        && reservation.witness_dual_signing_receipt_sha256 == Some(receipt_hash)
+        && reservation.terminal_commit_certificate_sha256
+            == Some(receipt.signed_commit_certificate_sha256)
+        && reservation.terminal_committed_head_sha256 == Some(receipt.signed_committed_head_sha256);
+    if (!signing_reservation_matches && !committed_reservation_matches)
         || identity.witness_key_id != receipt.witness_key_id
         || identity.witness_key_generation != receipt.witness_key_generation
     {

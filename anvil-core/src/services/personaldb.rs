@@ -50,8 +50,9 @@ use crate::{
         BeginWitnessSigningV1, PersonalDbAdmissionAuthority,
         ProposalAdmissionReservationIdentityV1, ProposalIdempotencyClaimIdentityV1,
         SignCertificateAndHeadV1, acknowledge_personaldb_witness_receipt,
-        begin_personaldb_witness_signing, derive_reservation_id, personaldb_group_leader_lease_id,
-        reserve_personaldb_proposal, sign_personaldb_certificate_and_head_with_keyring,
+        begin_personaldb_witness_signing, commit_personaldb_witnessed_proposal,
+        derive_reservation_id, personaldb_group_leader_lease_id, reserve_personaldb_proposal,
+        sign_personaldb_certificate_and_head_with_keyring,
     },
     personaldb_row_index::{PersonalDbRowIndexWrite, write_personaldb_row_index},
     personaldb_schema::{
@@ -1198,6 +1199,7 @@ impl AppState {
                 .checked_add(1)
                 .ok_or_else(|| Status::failed_precondition("PersonalDB row index overflow"))?
         };
+        let mut admission_terminal_request = None;
         let (certificate, record, committed_head) =
             if let Some(reservation) = admission_reservation.as_ref() {
                 let certificate_hash_hex =
@@ -1272,6 +1274,7 @@ impl AppState {
                     reservation_id: candidate.reservation_id.clone(),
                     signing_reservation_revision: candidate.signing_reservation_revision,
                 };
+                admission_terminal_request = Some(signing_request.clone());
                 let receipt = sign_personaldb_certificate_and_head_with_keyring(
                     &authority,
                     &signing_request,
@@ -1436,6 +1439,18 @@ impl AppState {
         )
         .await
         .map_err(internal_status)?;
+        if let Some(signing_request) = admission_terminal_request.as_ref() {
+            let authority = PersonalDbAdmissionAuthority {
+                storage: &self.storage,
+                trust_store: protocol_keyring.trust_store(),
+                write_permit: &write_permit,
+                partition_owner_signing_key: self.persistence.partition_owner_signing_key(),
+                now_unix_seconds: updated_at.timestamp(),
+            };
+            commit_personaldb_witnessed_proposal(&authority, signing_request)
+                .await
+                .map_err(internal_status)?;
+        }
 
         let watch_cursor = latest_personaldb_group_watch_cursor(
             &self.storage,

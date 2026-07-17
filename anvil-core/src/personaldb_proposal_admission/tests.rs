@@ -507,6 +507,42 @@ async fn keyring_witness_signing_persists_replayable_receipt() {
         acknowledged.witness_dual_signing_receipt_sha256,
         Some(receipt.hash_sha256().unwrap())
     );
+
+    let signed_head = decode_committed_head(&receipt.signed_committed_head).unwrap();
+    write_personaldb_committed_head(
+        &fixture.storage,
+        TENANT_ID,
+        DATABASE_ID,
+        &signed_head,
+        fixture.keyring.trust_store(),
+    )
+    .await
+    .unwrap();
+    let committed = commit_personaldb_witnessed_proposal(&fixture.authority(), &signing_request)
+        .await
+        .unwrap();
+    assert_eq!(
+        committed.state,
+        ProposalAdmissionReservationStateV1::Committed
+    );
+    assert_eq!(
+        committed.terminal_committed_head_sha256,
+        Some(receipt.signed_committed_head_sha256)
+    );
+    let replay = commit_personaldb_witnessed_proposal(&fixture.authority(), &signing_request)
+        .await
+        .unwrap();
+    assert_eq!(replay, committed);
+    let slot = read_proposal_admission_slot(
+        &fixture.storage,
+        TENANT_ID,
+        DATABASE_ID,
+        committed.identity.expected_previous_log_index + 1,
+        committed.identity.client_log_epoch,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(slot.state, ProposalAdmissionSlotStateV1::Committed);
 }
 
 struct CountingSigner {
