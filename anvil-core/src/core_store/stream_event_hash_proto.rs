@@ -31,6 +31,8 @@ struct StreamEventHashInputProto {
     content_type: Option<String>,
     #[prost(string, tag = "13")]
     user_metadata_json: String,
+    #[prost(string, tag = "14")]
+    authenticated_principal: String,
 }
 
 pub(in crate::core_store) fn encode_stream_event_hash_input(
@@ -50,6 +52,7 @@ pub(in crate::core_store) fn encode_stream_event_hash_input(
         created_at: record.created_at.clone(),
         content_type: record.content_type.clone(),
         user_metadata_json: record.user_metadata_json.clone(),
+        authenticated_principal: record.authenticated_principal.clone(),
     };
     let bytes = proto.encode_to_vec();
     let decoded = StreamEventHashInputProto::decode(bytes.as_slice())?;

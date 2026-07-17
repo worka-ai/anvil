@@ -77,6 +77,8 @@ struct StreamRecordHeaderProto {
     created_at: String,
     #[prost(string, tag = "18")]
     user_metadata_json: String,
+    #[prost(string, tag = "19")]
+    authenticated_principal: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -185,6 +187,7 @@ pub(super) fn encode_stream_segment(
             transaction_id: record.transaction_id.clone().unwrap_or_default(),
             created_at: record.created_at.clone(),
             user_metadata_json: record.user_metadata_json.clone(),
+            authenticated_principal: record.authenticated_principal.clone(),
         };
         let record_header_proto = encode_deterministic_proto(&record_header)?;
         bytes.extend_from_slice(&record.sequence.to_le_bytes());
@@ -296,6 +299,7 @@ pub(super) fn decode_stream_segment(bytes: &[u8]) -> Result<Vec<StreamRecord>> {
             } else {
                 record_header.user_metadata_json
             },
+            authenticated_principal: record_header.authenticated_principal,
             transaction_id: non_empty_string(record_header.transaction_id),
             idempotency_key_hash: non_empty_string(record_header.idempotency_key_hash),
             created_at: record_header.created_at,
@@ -615,6 +619,7 @@ mod tests {
             payload,
             content_type: None,
             user_metadata_json: "{}".to_string(),
+            authenticated_principal: "tenant/1/principal/test-writer".to_string(),
             transaction_id: None,
             idempotency_key_hash: Some(format!("sha256:key-{sequence}")),
             created_at,

@@ -341,6 +341,8 @@ pub struct AppendStreamRecord {
     pub content_type: Option<String>,
     #[serde(default)]
     pub user_meta: Option<JsonValue>,
+    #[serde(default)]
+    pub authenticated_principal: String,
     pub created_at: DateTime<Utc>,
 }
 

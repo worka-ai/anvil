@@ -1284,8 +1284,6 @@ impl ObjectService for AppState {
                 mutation_batch_operation::Op::AppendStreamRecord(op) => {
                     let stream_id = uuid::Uuid::parse_str(&op.stream_id)
                         .map_err(|_| Status::invalid_argument("Invalid stream_id"))?;
-                    let transaction_principal = transaction_id
-                        .map(|_| object_manager::transaction_principal_from_claims(&claims));
                     let record = self
                         .object_manager
                         .append_stream_record(
@@ -1297,7 +1295,6 @@ impl ObjectService for AppState {
                             op.content_type,
                             parse_user_metadata_json(&op.user_metadata_json)?,
                             transaction_id,
-                            transaction_principal.as_deref(),
                         )
                         .await?;
                     if transaction_id.is_none() {

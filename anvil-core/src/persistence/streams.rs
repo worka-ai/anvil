@@ -466,6 +466,7 @@ impl Persistence {
         payload_size: i64,
         content_type: Option<String>,
         user_meta: Option<JsonValue>,
+        authenticated_principal: &str,
     ) -> Result<AppendStreamRecordMutation> {
         let permit = self
             .append_metadata_write_permit(tenant_id, bucket_id)
@@ -479,6 +480,7 @@ impl Persistence {
             payload_size,
             content_type,
             user_meta,
+            authenticated_principal,
             &permit,
             &self.partition_owner_signing_key,
         )

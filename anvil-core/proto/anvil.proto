@@ -1859,6 +1859,7 @@ message AppendStreamRecordInfo {
     string content_type = 5;
     string user_metadata_json = 6;
     bytes payload = 7;
+    string authenticated_principal = 8;
 }
 
 message ReadAppendStreamResponse {

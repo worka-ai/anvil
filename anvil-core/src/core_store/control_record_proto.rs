@@ -135,6 +135,8 @@ struct StreamRecordIndexRowProto {
     content_type: Option<String>,
     #[prost(string, tag = "18")]
     user_metadata_json: String,
+    #[prost(string, tag = "19")]
+    authenticated_principal: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -893,6 +895,7 @@ fn stream_record_index_row_to_proto(
         created_at: value.created_at.clone(),
         content_type: value.content_type.clone(),
         user_metadata_json: value.user_metadata_json.clone(),
+        authenticated_principal: value.authenticated_principal.clone(),
     }
 }
 
@@ -920,6 +923,7 @@ fn stream_record_index_row_from_proto(
         } else {
             value.user_metadata_json
         },
+        authenticated_principal: value.authenticated_principal,
         inline_payload: value.inline_payload,
         payload_locator: value
             .payload_locator
