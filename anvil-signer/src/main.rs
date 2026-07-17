@@ -22,6 +22,7 @@ mod unix {
         time::Duration,
     };
     use tokio::net::{UnixListener, UnixStream};
+    use zeroize::Zeroizing;
 
     const SIGNER_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -238,13 +239,18 @@ mod unix {
         trust_record: PublicKeyTrustRecord,
     ) -> Result<Ed25519ProtocolSigner> {
         validate_private_key_file(path)?;
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("read PersonalDB signer key {}", path.display()))?;
-        match Ed25519ProtocolSigner::from_pkcs8_der_with_trust_record(&bytes, trust_record.clone())
-        {
+        // Scrub the file-backed key input on every return path after key construction.
+        let bytes = Zeroizing::new(
+            std::fs::read(path)
+                .with_context(|| format!("read PersonalDB signer key {}", path.display()))?,
+        );
+        match Ed25519ProtocolSigner::from_pkcs8_der_with_trust_record(
+            bytes.as_slice(),
+            trust_record.clone(),
+        ) {
             Ok(signer) => Ok(signer),
             Err(der_error) => {
-                let pem = std::str::from_utf8(&bytes).map_err(|_| der_error.clone())?;
+                let pem = std::str::from_utf8(bytes.as_slice()).map_err(|_| der_error.clone())?;
                 Ed25519ProtocolSigner::from_pkcs8_pem_with_trust_record(pem, trust_record)
                     .map_err(Into::into)
             }
@@ -325,7 +331,10 @@ mod unix {
                 encode_signer_request,
             },
         };
-        use personaldb_protocol::{KeyGeneration, KeyTrustPolicy};
+        use personaldb_protocol::{
+            KeyGeneration, KeyTrustPolicy, ProtocolSigner, PublicKeyTrustRecord,
+        };
+        use std::io::Write;
 
         #[test]
         fn witness_endpoint_rejects_group_control_object() {
@@ -361,6 +370,35 @@ mod unix {
                     message: "witness signer cannot sign group-control objects".to_string(),
                 }
             );
+        }
+
+        #[test]
+        fn loads_der_and_pem_private_key_inputs() {
+            let der = pkcs8(0x33);
+            let pem = format!(
+                "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+                "MC4CAQAwBQYDK2VwBCIEIDMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMz"
+            );
+            let trust_record = test_trust_record(&der);
+
+            for input in [der, pem.into_bytes()] {
+                let mut file = tempfile::NamedTempFile::new().unwrap();
+                file.write_all(&input).unwrap();
+                file.flush().unwrap();
+
+                let loaded = load_signer(file.path(), trust_record.clone()).unwrap();
+                assert_eq!(loaded.trust_record(), &trust_record);
+            }
+        }
+
+        fn test_trust_record(pkcs8: &[u8]) -> PublicKeyTrustRecord {
+            Ed25519ProtocolSigner::from_pkcs8_der(
+                pkcs8,
+                KeyTrustPolicy::new(KeyGeneration::new(1).unwrap(), SignaturePurpose::Witness, 0),
+            )
+            .unwrap()
+            .trust_record()
+            .clone()
         }
 
         fn pkcs8(seed: u8) -> Vec<u8> {

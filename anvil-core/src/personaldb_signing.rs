@@ -847,6 +847,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn production_manifest_schema_rejects_private_key_paths_and_in_process_modes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut cases = Vec::new();
+
+        let mut root_private_key = valid_manifest(directory.path());
+        root_private_key["private_key_pkcs8_path"] = serde_json::json!("/run/secrets/witness.pk8");
+        cases.push(("root private key", root_private_key));
+
+        let mut trusted_key_private_key = valid_manifest(directory.path());
+        trusted_key_private_key["trusted_keys"][0]["private_key_pkcs8_path"] =
+            serde_json::json!("/run/secrets/group-control.pk8");
+        cases.push(("trusted-key private key", trusted_key_private_key));
+
+        let mut endpoint_private_key = valid_manifest(directory.path());
+        endpoint_private_key["signer_endpoints"][0]["private_key_pkcs8_path"] =
+            serde_json::json!("/run/secrets/group-control.pk8");
+        cases.push(("endpoint private key", endpoint_private_key));
+
+        let mut root_mode = valid_manifest(directory.path());
+        root_mode["signer_mode"] = serde_json::json!("in_process");
+        cases.push(("root in-process mode", root_mode));
+
+        let mut endpoint_mode = valid_manifest(directory.path());
+        endpoint_mode["signer_endpoints"][0]["mode"] = serde_json::json!("in_process");
+        cases.push(("endpoint in-process mode", endpoint_mode));
+
+        for (name, manifest) in cases {
+            let path = write_manifest(directory.path(), manifest);
+            let error = PersonalDbProtocolKeyring::from_manifest_file(path).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("unknown field"),
+                "{name} was not rejected by the closed production manifest schema: {error:#}"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn unavailable_remote_signer_fails_closed() {

@@ -25,3 +25,7 @@ personaldb-protocol = { git = "ssh://git@github.com/worka-ai/personaldb.git", re
 tokio = { version = "1.47.1", features = ["macros", "net", "rt-multi-thread", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3.10.1"

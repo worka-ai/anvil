@@ -222,9 +222,11 @@ dependencies = [
  "clap",
  "hex",
  "personaldb-protocol",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
