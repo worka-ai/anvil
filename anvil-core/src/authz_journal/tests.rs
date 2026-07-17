@@ -133,6 +133,26 @@ async fn authz_journal_recovers_latest_exact_and_watch_ranges() {
     assert_eq!(watched[1].revision, 2);
 }
 
+#[tokio::test]
+async fn latest_authz_revision_uses_the_journal_head_not_a_tuple_scan() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let record = record(1, "add");
+    test_append_authz_tuple_record_unfenced(&storage, &record)
+        .await
+        .unwrap();
+
+    let meta = CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
+    meta.delete(
+        CF_AUTHZ,
+        TABLE_AUTHZ_TUPLE_PAGE_ROW,
+        &authz_tuple_current_row_key(&record).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(latest_authz_revision(&storage, 42).await.unwrap(), 1);
+}
+
 #[test]
 fn caveat_hash_validation_accepts_empty_or_hex32_only() {
     validate_optional_caveat_hash("").unwrap();
