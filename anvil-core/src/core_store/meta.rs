@@ -514,6 +514,51 @@ impl CoreMetaStore {
         Ok(records)
     }
 
+    pub fn scan_range(
+        &self,
+        cf: &'static str,
+        table_id: u16,
+        start_tuple_key: &[u8],
+        end_tuple_key: &[u8],
+    ) -> Result<Vec<CoreMetaRecord>> {
+        validate_meta_payload(cf, table_id, 0)?;
+        let start_key = core_meta_key(table_id, 0, start_tuple_key)?;
+        let end_key = core_meta_key(table_id, 0, end_tuple_key)?;
+        if start_key > end_key {
+            bail!("CoreMeta scan range start key exceeds end key");
+        }
+        let cf_name = cf;
+        let cf = self.cf(cf_name)?;
+        let iter = self
+            .db
+            .iterator_cf(&cf, IteratorMode::From(&start_key, Direction::Forward));
+        let mut records = Vec::new();
+        let mut scanned = 0_u64;
+        let mut bytes = 0_u64;
+        let started_at = Instant::now();
+        for item in iter {
+            let (key, value) = item?;
+            if key.as_ref() > end_key.as_slice() {
+                break;
+            }
+            scanned = scanned.saturating_add(1);
+            bytes = bytes.saturating_add((key.len() + value.len()) as u64);
+            records.push(CoreMetaRecord {
+                key: key.to_vec(),
+                payload: decode_envelope(cf_name, table_id, &value)?,
+            });
+        }
+        crate::perf::record_coremeta_duration(
+            "scan_range",
+            cf_name,
+            table_id,
+            scanned,
+            bytes,
+            started_at.elapsed(),
+        );
+        Ok(records)
+    }
+
     pub fn write_batch(&self, ops: &[CoreMetaBatchOp<'_>]) -> Result<()> {
         let mut batch = WriteBatch::default();
         let mut bytes = 0_u64;

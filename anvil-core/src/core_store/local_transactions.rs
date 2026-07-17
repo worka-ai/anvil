@@ -1,4 +1,6 @@
-use super::local_stream_control::control_record_proto::decode_stream_head_record;
+use super::local_stream_control::control_record_proto::{
+    decode_stream_head_record, decode_stream_record_index_row,
+};
 use super::local_tx_rows::{OwnedCoreMetaBatchOp, borrow_owned_coremeta_batch_ops};
 use super::*;
 use crate::formats::writer::WriterFamily;
@@ -396,15 +398,16 @@ impl CoreStore {
                     stream_id,
                     record_kind,
                     payload,
-                    idempotency_key: Some(idempotency_key),
+                    idempotency_key,
                 } => {
-                    let idempotency_key_hash =
-                        format!("sha256:{}", sha256_hex(idempotency_key.as_bytes()));
+                    let idempotency_key_hash = idempotency_key
+                        .as_deref()
+                        .map(|key| format!("sha256:{}", sha256_hex(key.as_bytes())));
                     let Some(receipt) = self
-                        .stream_idempotent_replay_by_hash_unlocked(
+                        .recover_stream_append_receipt_unlocked(
                             stream_id,
                             payload,
-                            Some(&idempotency_key_hash),
+                            idempotency_key_hash.as_deref(),
                             Some(&batch.transaction_id),
                         )
                         .await?
@@ -438,8 +441,7 @@ impl CoreStore {
                         prepared_record_hash: receipt.event_hash,
                     });
                 }
-                CoreMutationOperation::StreamAppend { .. }
-                | CoreMutationOperation::CoreMetaDelete { .. } => return Ok(None),
+                CoreMutationOperation::CoreMetaDelete { .. } => return Ok(None),
                 CoreMutationOperation::CoreMetaPut {
                     cf,
                     table_id,
@@ -486,6 +488,67 @@ impl CoreStore {
             }
         }
         Ok(Some(updates))
+    }
+
+    async fn recover_stream_append_receipt_unlocked(
+        &self,
+        stream_id: &str,
+        payload: &[u8],
+        idempotency_key_hash: Option<&str>,
+        transaction_id: Option<&str>,
+    ) -> Result<Option<StreamAppendReceipt>> {
+        let Some(head) = self.read_stream_head_from_meta(stream_id)? else {
+            return Ok(None);
+        };
+        let payload_hash = format!("sha256:{}", sha256_hex(payload));
+        // Pending writes are normally near the tail; point reads avoid a full
+        // CoreMeta table scan while retaining exhaustive recovery semantics.
+        for sequence in (1..=head.last_sequence).rev() {
+            let bytes = self
+                .meta
+                .get(
+                    CF_STREAM_RECORDS,
+                    TABLE_STREAM_RECORD_INDEX_ROW,
+                    &stream_record_key(stream_id, sequence),
+                )?
+                .ok_or_else(|| {
+                    anyhow!("CoreStore stream {stream_id} is missing record {sequence}")
+                })?;
+            let existing = decode_stream_record_index_row(&bytes)?;
+            validate_stream_record_index_row_metadata(stream_id, &existing)?;
+            if let Some(idempotency_key_hash) = idempotency_key_hash {
+                if let Some(receipt) = self
+                    .stream_idempotent_receipt_from_index_row_unlocked(
+                        stream_id,
+                        &payload_hash,
+                        idempotency_key_hash,
+                        transaction_id,
+                        existing,
+                    )
+                    .await?
+                {
+                    return Ok(Some(receipt));
+                }
+                continue;
+            }
+            if existing.transaction_id.as_deref() != transaction_id {
+                continue;
+            }
+            if existing.payload_hash != payload_hash {
+                bail!(
+                    "CoreStore recovered stream payload mismatch for stream {stream_id} transaction {}",
+                    transaction_id.unwrap_or("<none>")
+                );
+            }
+            return Ok(Some(StreamAppendReceipt {
+                stream_id: existing.stream_id,
+                sequence: existing.sequence,
+                cursor: existing.cursor,
+                event_hash: existing.event_hash,
+                idempotent_replay: true,
+            }));
+        }
+        Ok(None)
     }
 
     async fn apply_mutation_batch_operations_unlocked(

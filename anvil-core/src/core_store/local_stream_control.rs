@@ -517,10 +517,11 @@ impl CoreStore {
                 return Ok(Some(receipt));
             }
         }
-        for item in self.meta.scan_prefix(
+        for item in self.meta.scan_range(
             CF_STREAM_RECORDS,
             TABLE_STREAM_RECORD_INDEX_ROW,
-            &stream_record_prefix(stream_id),
+            &stream_record_key(stream_id, 1),
+            &stream_record_key(stream_id, u64::MAX),
         )? {
             let existing = decode_stream_record_index_row(&item.payload)?;
             validate_stream_record_index_row_metadata(stream_id, &existing)?;
@@ -543,7 +544,7 @@ impl CoreStore {
         Ok(None)
     }
 
-    async fn stream_idempotent_receipt_from_index_row_unlocked(
+    pub(super) async fn stream_idempotent_receipt_from_index_row_unlocked(
         &self,
         stream_id: &str,
         payload_hash: &str,

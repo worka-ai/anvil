@@ -710,7 +710,7 @@ async fn core_store_recovers_unfinalised_mutation_batch_pending_mutation_on_star
 }
 
 #[tokio::test]
-async fn core_store_recovery_finalises_materialised_stream_and_coremeta_batch() {
+async fn core_store_recovery_finalises_materialised_stream_without_operation_idempotency() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = Storage::new_at(tmp.path()).await.unwrap();
     let store = CoreStore::new(storage.clone()).await.unwrap();
@@ -754,7 +754,7 @@ async fn core_store_recovery_finalises_materialised_stream_and_coremeta_batch() 
                 stream_id: stream_id.to_string(),
                 record_kind: "object.put".to_string(),
                 payload: br#"{"object":"mixed-recovered"}"#.to_vec(),
-                idempotency_key: Some("mixed-recovered-event".to_string()),
+                idempotency_key: None,
             },
             CoreMutationOperation::CoreMetaPut {
                 partition_id: scope_partition.to_string(),

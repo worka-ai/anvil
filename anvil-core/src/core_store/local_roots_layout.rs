@@ -386,12 +386,13 @@ impl CoreStore {
         if head.schema != "anvil.core.stream_head.v1" || head.stream_id != stream_id {
             bail!("CoreStore stream head metadata row has invalid scope");
         }
-        let prefix = stream_record_prefix(stream_id);
         let mut records = Vec::new();
-        for item in
-            self.meta
-                .scan_prefix(CF_STREAM_RECORDS, TABLE_STREAM_RECORD_INDEX_ROW, &prefix)?
-        {
+        for item in self.meta.scan_range(
+            CF_STREAM_RECORDS,
+            TABLE_STREAM_RECORD_INDEX_ROW,
+            &stream_record_key(stream_id, 1),
+            &stream_record_key(stream_id, u64::MAX),
+        )? {
             let stored = decode_stream_record_index_row(&item.payload)?;
             if stored.stream_id != stream_id {
                 bail!("CoreStore stream record metadata row has invalid scope");
