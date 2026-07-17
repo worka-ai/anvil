@@ -323,15 +323,20 @@ impl CoreStore {
                 core_transaction_state_name(transaction.state)
             );
         }
-        self.validate_mutation_preconditions_unlocked(
-            &batch.preconditions,
-            &batch.committed_by_principal,
-            None,
-        )
-        .await?;
-
-        let (visible_updates, finalisation_error) =
-            self.apply_mutation_batch_operations_unlocked(&batch).await;
+        let recovered_updates = self
+            .recover_fully_applied_mutation_batch_updates_unlocked(&batch)
+            .await?;
+        let (visible_updates, finalisation_error) = if let Some(updates) = recovered_updates {
+            (updates, None)
+        } else {
+            self.validate_mutation_preconditions_unlocked(
+                &batch.preconditions,
+                &batch.committed_by_principal,
+                None,
+            )
+            .await?;
+            self.apply_mutation_batch_operations_unlocked(&batch).await
+        };
 
         let transaction_state = if finalisation_error.is_some() {
             CoreTransactionState::FinalisationFailed
@@ -377,6 +382,110 @@ impl CoreStore {
             visible_updates: transaction_visible_updates,
             finalisation_error,
         })
+    }
+
+    async fn recover_fully_applied_mutation_batch_updates_unlocked(
+        &self,
+        batch: &CoreMutationBatch,
+    ) -> Result<Option<Vec<CoreTransactionUpdate>>> {
+        let mut updates = Vec::with_capacity(batch.operations.len());
+        for operation in &batch.operations {
+            match operation {
+                CoreMutationOperation::StreamAppend {
+                    partition_id,
+                    stream_id,
+                    record_kind,
+                    payload,
+                    idempotency_key: Some(idempotency_key),
+                } => {
+                    let idempotency_key_hash =
+                        format!("sha256:{}", sha256_hex(idempotency_key.as_bytes()));
+                    let Some(receipt) = self
+                        .stream_idempotent_replay_by_hash_unlocked(
+                            stream_id,
+                            payload,
+                            Some(&idempotency_key_hash),
+                            Some(&batch.transaction_id),
+                        )
+                        .await?
+                    else {
+                        return Ok(None);
+                    };
+                    let record = self
+                        .read_stream_record_from_meta(stream_id, receipt.sequence)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "CoreStore recovered stream record {}:{} is missing",
+                                stream_id,
+                                receipt.sequence
+                            )
+                        })?;
+                    if record.partition_id != *partition_id
+                        || record.record_kind != *record_kind
+                        || record.transaction_id.as_deref() != Some(batch.transaction_id.as_str())
+                    {
+                        bail!(
+                            "CoreStore recovered stream operation identity mismatch for transaction {} stream {} sequence {}",
+                            batch.transaction_id,
+                            stream_id,
+                            receipt.sequence
+                        );
+                    }
+                    updates.push(CoreTransactionUpdate::StreamAppend {
+                        stream_id: stream_id.clone(),
+                        visible_sequence: receipt.sequence,
+                        prepared_record_hash: receipt.event_hash,
+                    });
+                }
+                CoreMutationOperation::StreamAppend { .. }
+                | CoreMutationOperation::CoreMetaDelete { .. } => return Ok(None),
+                CoreMutationOperation::CoreMetaPut {
+                    cf,
+                    table_id,
+                    tuple_key,
+                    payload,
+                    ..
+                } => {
+                    let canonical_cf = canonical_coremeta_cf_name(cf)?;
+                    let Some(current_payload) =
+                        self.read_coremeta_row(canonical_cf, *table_id, tuple_key)?
+                    else {
+                        return Ok(None);
+                    };
+                    if current_payload.as_slice() != payload.as_slice() {
+                        return Ok(None);
+                    }
+                    let common = core_meta_row_common_from_payload(&current_payload)?;
+                    if common.transaction_id != batch.transaction_id {
+                        bail!(
+                            "CoreStore recovered CoreMeta operation identity mismatch for transaction {} row {}/{}",
+                            batch.transaction_id,
+                            canonical_cf,
+                            table_id
+                        );
+                    }
+                    let Some(previous_payload_hash) = recovered_coremeta_previous_payload_hash(
+                        batch,
+                        canonical_cf,
+                        *table_id,
+                        tuple_key,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    updates.push(CoreTransactionUpdate::CoreMetaPut {
+                        cf: canonical_cf.to_string(),
+                        table_id: *table_id,
+                        tuple_key: tuple_key.clone(),
+                        previous_payload_hash,
+                        payload: payload.clone(),
+                        payload_hash: core_meta_payload_digest(*table_id, payload),
+                    });
+                }
+            }
+        }
+        Ok(Some(updates))
     }
 
     async fn apply_mutation_batch_operations_unlocked(
@@ -1078,6 +1187,52 @@ impl CoreStore {
         self.read_transaction_from_rows_unlocked(transaction_id)
             .await
     }
+}
+
+fn recovered_coremeta_previous_payload_hash(
+    batch: &CoreMutationBatch,
+    cf: &str,
+    table_id: u16,
+    tuple_key: &[u8],
+) -> Result<Option<Option<String>>> {
+    let mut recovered = None;
+    for precondition in &batch.preconditions {
+        let CoreMutationPrecondition::CoreMetaRow {
+            cf: candidate_cf,
+            table_id: candidate_table_id,
+            tuple_key: candidate_tuple_key,
+            expected_payload_hash,
+            require_absent,
+            require_present,
+        } = precondition
+        else {
+            continue;
+        };
+        if canonical_coremeta_cf_name(candidate_cf)? != cf
+            || *candidate_table_id != table_id
+            || candidate_tuple_key != tuple_key
+        {
+            continue;
+        }
+        if *require_absent && *require_present {
+            bail!("CoreStore CoreMeta precondition cannot require both absence and presence");
+        }
+        let previous = if *require_absent {
+            Some(None)
+        } else {
+            expected_payload_hash.clone().map(Some)
+        };
+        let Some(previous) = previous else {
+            return Ok(None);
+        };
+        if let Some(existing) = recovered.as_ref()
+            && existing != &previous
+        {
+            bail!("CoreStore recovered CoreMeta preconditions conflict");
+        }
+        recovered = Some(previous);
+    }
+    Ok(recovered)
 }
 
 pub(super) fn transaction_lists_stream_record(

@@ -710,6 +710,277 @@ async fn core_store_recovers_unfinalised_mutation_batch_pending_mutation_on_star
 }
 
 #[tokio::test]
+async fn core_store_recovery_finalises_materialised_stream_and_coremeta_batch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let store = CoreStore::new(storage.clone()).await.unwrap();
+    let transaction_id = "recover-materialised-mixed-batch";
+    let scope_partition = "tenant:t/bucket:b";
+    let stream_id = "object_metadata:t:b:mixed-recovered";
+    let row_key = core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("mixed-recovered")]).unwrap();
+    let row_payload = encode_core_meta_inline_payload_row(
+        b"mixed-recovered",
+        core_meta_committed_row_common(
+            scope_partition,
+            core_meta_root_key_hash("tenant:t/bucket:b/mixed-recovered"),
+            1,
+            transaction_id,
+            1,
+        ),
+    )
+    .unwrap();
+    let batch = CoreMutationBatch {
+        transaction_id: transaction_id.to_string(),
+        scope_partition: scope_partition.to_string(),
+        committed_by_principal: "principal:recovery".to_string(),
+        preconditions: vec![
+            CoreMutationPrecondition::StreamHead {
+                stream_id: stream_id.to_string(),
+                expected_last_sequence: 0,
+                expected_last_event_hash: ZERO_HASH.to_string(),
+            },
+            CoreMutationPrecondition::CoreMetaRow {
+                cf: CF_INLINE_PAYLOADS.to_string(),
+                table_id: TABLE_INLINE_PAYLOAD_ROW,
+                tuple_key: row_key.clone(),
+                expected_payload_hash: None,
+                require_absent: true,
+                require_present: false,
+            },
+        ],
+        operations: vec![
+            CoreMutationOperation::StreamAppend {
+                partition_id: scope_partition.to_string(),
+                stream_id: stream_id.to_string(),
+                record_kind: "object.put".to_string(),
+                payload: br#"{"object":"mixed-recovered"}"#.to_vec(),
+                idempotency_key: Some("mixed-recovered-event".to_string()),
+            },
+            CoreMutationOperation::CoreMetaPut {
+                partition_id: scope_partition.to_string(),
+                cf: CF_INLINE_PAYLOADS.to_string(),
+                table_id: TABLE_INLINE_PAYLOAD_ROW,
+                tuple_key: row_key.clone(),
+                payload: row_payload.clone(),
+            },
+        ],
+    };
+    store
+        .admit_core_mutation(
+            "mutation.batch",
+            "core_control",
+            CorePendingMutationTarget::MutationBatch {
+                transaction_id: batch.transaction_id.clone(),
+                scope_partition: batch.scope_partition.clone(),
+                operation_count: batch.operations.len() as u64,
+            },
+            batch.transaction_id.clone(),
+            Some(batch.transaction_id.clone()),
+            CorePendingMutationPayload::Inline(&encode_core_mutation_batch(&batch).unwrap()),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let CoreMutationOperation::StreamAppend {
+        partition_id,
+        stream_id,
+        record_kind,
+        payload,
+        idempotency_key,
+    } = &batch.operations[0]
+    else {
+        unreachable!();
+    };
+    store
+        .append_stream_unlocked(AppendStreamRecord {
+            stream_id: stream_id.clone(),
+            partition_id: partition_id.clone(),
+            record_kind: record_kind.clone(),
+            payload: payload.clone(),
+            content_type: None,
+            user_metadata_json: "{}".to_string(),
+            fence: None,
+            transaction_id: Some(batch.transaction_id.clone()),
+            idempotency_key: idempotency_key.clone(),
+        })
+        .await
+        .unwrap();
+    store
+        .commit_coremeta_batch_by_embedded_roots(
+            transaction_id,
+            &[CoreMetaBatchOp {
+                cf: CF_INLINE_PAYLOADS,
+                table_id: TABLE_INLINE_PAYLOAD_ROW,
+                tuple_key: &row_key,
+                common: None,
+                kind: CoreMetaBatchOpKind::Put(&row_payload),
+            }],
+        )
+        .await
+        .unwrap();
+    store.unregister_process_instance_for_tests();
+    drop(store);
+
+    let recovered = CoreStore::new(storage).await.unwrap();
+    let transaction = recovered
+        .read_transaction(transaction_id)
+        .await
+        .unwrap()
+        .expect("recovered mixed transaction");
+    assert_eq!(transaction.state, CoreTransactionState::Committed);
+    assert_eq!(transaction.visible_updates.len(), 2);
+    assert_eq!(
+        recovered
+            .meta
+            .get(CF_INLINE_PAYLOADS, TABLE_INLINE_PAYLOAD_ROW, &row_key)
+            .unwrap(),
+        Some(row_payload)
+    );
+    assert_eq!(
+        recovered
+            .read_stream(ReadStream {
+                stream_id: stream_id.to_string(),
+                after_sequence: 0,
+                limit: 10,
+            })
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "startup recovery must not duplicate the materialised stream append"
+    );
+    assert!(
+        read_test_pending_mutation_records(&recovered)
+            .await
+            .is_empty(),
+        "startup recovery must checkpoint the materialised mixed mutation"
+    );
+}
+
+#[tokio::test]
+async fn core_store_recovery_finalises_a_materialised_batch_after_its_stream_advances() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let store = CoreStore::new(storage.clone()).await.unwrap();
+    let stream_id = "object_metadata:t:b:materialised-before-finalisation";
+    let batch = CoreMutationBatch {
+        transaction_id: "recover-materialised-mutation-batch".to_string(),
+        scope_partition: "tenant:t/bucket:b".to_string(),
+        committed_by_principal: "principal:recovery".to_string(),
+        preconditions: vec![CoreMutationPrecondition::StreamHead {
+            stream_id: stream_id.to_string(),
+            expected_last_sequence: 0,
+            expected_last_event_hash: ZERO_HASH.to_string(),
+        }],
+        operations: vec![
+            CoreMutationOperation::StreamAppend {
+                partition_id: "tenant:t/bucket:b".to_string(),
+                stream_id: stream_id.to_string(),
+                record_kind: "object.put".to_string(),
+                payload: br#"{"object":"first"}"#.to_vec(),
+                idempotency_key: Some("materialised-first".to_string()),
+            },
+            CoreMutationOperation::StreamAppend {
+                partition_id: "tenant:t/bucket:b".to_string(),
+                stream_id: stream_id.to_string(),
+                record_kind: "directory.entry".to_string(),
+                payload: br#"{"directory":"first"}"#.to_vec(),
+                idempotency_key: Some("materialised-directory".to_string()),
+            },
+        ],
+    };
+    store
+        .admit_core_mutation(
+            "mutation.batch",
+            "core_control",
+            CorePendingMutationTarget::MutationBatch {
+                transaction_id: batch.transaction_id.clone(),
+                scope_partition: batch.scope_partition.clone(),
+                operation_count: batch.operations.len() as u64,
+            },
+            batch.transaction_id.clone(),
+            Some(batch.transaction_id.clone()),
+            CorePendingMutationPayload::Inline(&encode_core_mutation_batch(&batch).unwrap()),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    for operation in &batch.operations {
+        let CoreMutationOperation::StreamAppend {
+            partition_id,
+            stream_id,
+            record_kind,
+            payload,
+            idempotency_key,
+        } = operation
+        else {
+            unreachable!();
+        };
+        store
+            .append_stream_unlocked(AppendStreamRecord {
+                stream_id: stream_id.clone(),
+                partition_id: partition_id.clone(),
+                record_kind: record_kind.clone(),
+                payload: payload.clone(),
+                content_type: None,
+                user_metadata_json: "{}".to_string(),
+                fence: None,
+                transaction_id: Some(batch.transaction_id.clone()),
+                idempotency_key: idempotency_key.clone(),
+            })
+            .await
+            .unwrap();
+    }
+    store
+        .append_stream(AppendStreamRecord {
+            stream_id: stream_id.to_string(),
+            partition_id: "tenant:t/bucket:b".to_string(),
+            record_kind: "object.put".to_string(),
+            payload: br#"{"object":"later"}"#.to_vec(),
+            content_type: None,
+            user_metadata_json: "{}".to_string(),
+            fence: None,
+            transaction_id: None,
+            idempotency_key: Some("later-object".to_string()),
+        })
+        .await
+        .unwrap();
+    store.unregister_process_instance_for_tests();
+    drop(store);
+
+    let recovered = CoreStore::new(storage).await.unwrap();
+    let transaction = recovered
+        .read_transaction(&batch.transaction_id)
+        .await
+        .unwrap()
+        .expect("recovered materialised transaction");
+    assert_eq!(transaction.state, CoreTransactionState::Committed);
+    assert_eq!(transaction.visible_updates.len(), 2);
+    let records = recovered
+        .read_stream(ReadStream {
+            stream_id: stream_id.to_string(),
+            after_sequence: 0,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        records.len(),
+        3,
+        "recovery must not duplicate stream writes"
+    );
+    assert_eq!(records[0].record_kind, "object.put");
+    assert_eq!(records[1].record_kind, "directory.entry");
+    assert_eq!(records[2].payload, br#"{"object":"later"}"#);
+    assert!(
+        read_test_pending_mutation_records(&recovered)
+            .await
+            .is_empty(),
+        "startup recovery must finalise the already-materialised mutation"
+    );
+}
+
+#[tokio::test]
 async fn core_store_admission_rejects_when_pending_mutation_hard_limit_would_be_exceeded() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = Storage::new_at(tmp.path()).await.unwrap();
