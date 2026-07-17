@@ -19,9 +19,9 @@ pub struct Config {
     #[arg(long, env, default_value = "primary")]
     pub anvil_secret_encryption_key_id: String,
 
-    /// JSON manifest containing trusted PersonalDB Ed25519 keys and PKCS#8 signer paths.
+    /// JSON manifest containing trusted PersonalDB Ed25519 keys and role-scoped Unix signers.
     #[arg(long, env, default_value = "")]
-    pub personaldb_protocol_keyring_path: String,
+    pub personaldb_protocol_signing_manifest_path: String,
 
     /// Comma-delimited previous secret encryption keys as `key_id:hex`.
     #[arg(long, env, default_value = "")]

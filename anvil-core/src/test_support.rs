@@ -36,7 +36,7 @@ pub(crate) fn personaldb_protocol_keyring() -> PersonalDbProtocolKeyring {
         signers.iter().map(|signer| signer.trust_record().clone()),
     )
     .unwrap();
-    PersonalDbProtocolKeyring::new(trust_store, signers).unwrap()
+    PersonalDbProtocolKeyring::new_test_only(trust_store, signers).unwrap()
 }
 
 fn signer(

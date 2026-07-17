@@ -101,6 +101,7 @@ pub mod personaldb_repair;
 pub mod personaldb_row_index;
 pub mod personaldb_schema;
 pub mod personaldb_segment;
+pub mod personaldb_signer_protocol;
 pub mod personaldb_signing;
 pub mod personaldb_snapshot_builder;
 pub mod personaldb_snapshot_store;

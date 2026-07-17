@@ -74,6 +74,7 @@ fi
 
 build_args=(
   -p anvil-server --bin anvil-server
+  -p anvil-personaldb-signer --bin anvil-signer
   -p anvil-storage-cli --bin anvil --bin anvil-admin
 )
 
@@ -106,6 +107,7 @@ stage_dir="tmp/docker-bin"
 rm -rf "${stage_dir}"
 mkdir -p "${stage_dir}"
 cp "${bin_dir}/anvil-server" "${stage_dir}/anvil-server"
+cp "${bin_dir}/anvil-signer" "${stage_dir}/anvil-signer"
 cp "${bin_dir}/anvil" "${stage_dir}/anvil"
 cp "${bin_dir}/anvil-admin" "${stage_dir}/anvil-admin"
 

@@ -1,32 +1,54 @@
-use crate::anvil_api::SignatureEnvelopeV1 as WireSignatureEnvelopeV1;
+use crate::{
+    anvil_api::SignatureEnvelopeV1 as WireSignatureEnvelopeV1,
+    personaldb_signer_protocol::{
+        PersonalDbSignerResponse, PersonalDbSigningObject, decode_signer_response,
+        encode_signer_request, read_bounded_frame, write_bounded_frame,
+    },
+};
 use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use personaldb_protocol::{
-    Ed25519ProtocolSigner, Ed25519PublicKey, KeyGeneration, KeyId, ProtocolSignable,
-    ProtocolSigner, PublicKeyStatus, PublicKeyTrustRecord, PublicKeyTrustStore, SignatureAlgorithm,
-    SignatureEnvelopeV1, SignaturePurpose,
+    Ed25519PublicKey, KeyGeneration, KeyId, PublicKeyStatus, PublicKeyTrustRecord,
+    PublicKeyTrustStore, SignatureAlgorithm, SignatureEnvelopeV1, SignaturePurpose,
 };
 use prost::Message;
 use serde::Deserialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
+
+const PERSONALDB_SIGNER_TIMEOUT: Duration = Duration::from_secs(2);
+const REQUIRED_PERSONALDB_SIGNER_PURPOSES: [SignaturePurpose; 3] = [
+    SignaturePurpose::GroupControl,
+    SignaturePurpose::Snapshot,
+    SignaturePurpose::Witness,
+];
+
+#[async_trait]
+pub trait PersonalDbSignerProvider: Send + Sync + fmt::Debug {
+    fn purpose(&self) -> SignaturePurpose;
+    fn key_id(&self) -> &KeyId;
+
+    async fn sign(&self, object: &PersonalDbSigningObject) -> Result<SignatureEnvelopeV1>;
+}
 
 #[derive(Clone)]
 pub struct PersonalDbProtocolKeyring {
     trust_store: PublicKeyTrustStore,
-    signers: Arc<HashMap<SignaturePurpose, Arc<dyn ProtocolSigner>>>,
+    providers: Arc<HashMap<SignaturePurpose, Arc<dyn PersonalDbSignerProvider>>>,
 }
 
 impl fmt::Debug for PersonalDbProtocolKeyring {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let signer_key_ids = self
-            .signers
+            .providers
             .iter()
-            .map(|(purpose, signer)| (purpose, &signer.trust_record().key_id))
+            .map(|(purpose, provider)| (purpose, provider.key_id()))
             .collect::<Vec<_>>();
         formatter
             .debug_struct("PersonalDbProtocolKeyring")
@@ -37,32 +59,46 @@ impl fmt::Debug for PersonalDbProtocolKeyring {
 }
 
 impl PersonalDbProtocolKeyring {
-    pub fn new(
+    fn from_providers(
         trust_store: PublicKeyTrustStore,
-        signers: impl IntoIterator<Item = Arc<dyn ProtocolSigner>>,
+        providers: impl IntoIterator<Item = Arc<dyn PersonalDbSignerProvider>>,
     ) -> Result<Self> {
         if trust_store.is_empty() {
             bail!("PersonalDB protocol trust store must not be empty");
         }
 
         let mut by_purpose = HashMap::new();
-        for signer in signers {
-            let record = signer.trust_record();
-            let purpose = record.purpose;
-            record.validate()?;
+        let mut key_ids = HashSet::new();
+        for provider in providers {
+            let purpose = provider.purpose();
+            let record = trust_store.get(provider.key_id()).ok_or_else(|| {
+                anyhow!(
+                    "PersonalDB {} signer key {} is absent from the trust store",
+                    purpose,
+                    provider.key_id()
+                )
+            })?;
             if record.status != PublicKeyStatus::Active {
                 bail!(
                     "PersonalDB {} signer must use an active trust record",
                     purpose
                 );
             }
-            if trust_store.get(&record.key_id) != Some(record) {
+            if record.purpose != purpose {
                 bail!(
-                    "PersonalDB {} signer does not match its trust-store record",
-                    purpose
+                    "PersonalDB {} signer key {} is trusted only for {}",
+                    purpose,
+                    record.key_id,
+                    record.purpose
                 );
             }
-            if by_purpose.insert(purpose, signer).is_some() {
+            if !key_ids.insert(record.key_id.clone()) {
+                bail!(
+                    "PersonalDB signer key {} is shared by more than one purpose",
+                    record.key_id
+                );
+            }
+            if by_purpose.insert(purpose, provider).is_some() {
                 bail!(
                     "PersonalDB protocol keyring has more than one {} signer",
                     purpose
@@ -70,11 +106,7 @@ impl PersonalDbProtocolKeyring {
             }
         }
 
-        for purpose in [
-            SignaturePurpose::GroupControl,
-            SignaturePurpose::Snapshot,
-            SignaturePurpose::Witness,
-        ] {
+        for purpose in REQUIRED_PERSONALDB_SIGNER_PURPOSES {
             if !by_purpose.contains_key(&purpose) {
                 bail!("PersonalDB protocol keyring is missing the {purpose} signer");
             }
@@ -82,7 +114,7 @@ impl PersonalDbProtocolKeyring {
 
         Ok(Self {
             trust_store,
-            signers: Arc::new(by_purpose),
+            providers: Arc::new(by_purpose),
         })
     }
 
@@ -90,32 +122,96 @@ impl PersonalDbProtocolKeyring {
         &self.trust_store
     }
 
-    pub(crate) fn sign(&self, signable: &dyn ProtocolSignable) -> Result<SignatureEnvelopeV1> {
-        let metadata = signable.signature_metadata();
-        let signer = self
-            .signers
+    pub(crate) async fn sign(
+        &self,
+        object: PersonalDbSigningObject,
+    ) -> Result<SignatureEnvelopeV1> {
+        object.validate()?;
+        let metadata = object.metadata();
+        let provider = self
+            .providers
             .get(&metadata.purpose)
             .ok_or_else(|| anyhow!("PersonalDB {} signer is not configured", metadata.purpose))?;
-        let envelope = signer.sign(signable)?;
-        self.trust_store.verify(signable, &envelope)?;
+        let envelope = provider.sign(&object).await?;
+        if &envelope.key_id != provider.key_id() {
+            bail!(
+                "PersonalDB {} signer returned key {}, expected {}",
+                metadata.purpose,
+                envelope.key_id,
+                provider.key_id()
+            );
+        }
+        self.trust_store.verify(&object, &envelope)?;
         Ok(envelope)
     }
 
     pub fn from_manifest_file(path: impl AsRef<Path>) -> Result<Self> {
+        let manifest = PersonalDbProtocolSigningManifest::from_file(path)?;
+        let providers = manifest
+            .endpoints
+            .values()
+            .cloned()
+            .map(|endpoint| {
+                Arc::new(UnixPersonalDbSignerProvider { endpoint })
+                    as Arc<dyn PersonalDbSignerProvider>
+            })
+            .collect::<Vec<_>>();
+        Self::from_providers(manifest.trust_store, providers)
+    }
+
+    #[cfg(any(test, feature = "test-in-process-personaldb-signers"))]
+    #[doc(hidden)]
+    pub fn new_test_only(
+        trust_store: PublicKeyTrustStore,
+        signers: impl IntoIterator<Item = Arc<dyn personaldb_protocol::ProtocolSigner>>,
+    ) -> Result<Self> {
+        let providers = signers
+            .into_iter()
+            .map(|signer| {
+                Arc::new(TestOnlyInProcessSignerProvider { signer })
+                    as Arc<dyn PersonalDbSignerProvider>
+            })
+            .collect::<Vec<_>>();
+        Self::from_providers(trust_store, providers)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PersonalDbSignerEndpoint {
+    pub purpose: SignaturePurpose,
+    pub key_id: KeyId,
+    pub socket_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct PersonalDbProtocolSigningManifest {
+    trust_store: PublicKeyTrustStore,
+    endpoints: HashMap<SignaturePurpose, PersonalDbSignerEndpoint>,
+}
+
+impl PersonalDbProtocolSigningManifest {
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if path.as_os_str().is_empty() {
-            bail!("PersonalDB protocol keyring manifest path is required");
+            bail!("PersonalDB protocol signing manifest path is required");
         }
         let raw = std::fs::read(path).with_context(|| {
             format!(
-                "read PersonalDB protocol keyring manifest {}",
+                "read PersonalDB protocol signing manifest {}",
                 path.display()
             )
         })?;
-        let manifest: PersonalDbProtocolKeyringManifestV1 =
-            serde_json::from_slice(&raw).context("parse PersonalDB protocol keyring manifest")?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&raw).context("parse PersonalDB protocol signing manifest")?;
+        if value.get("signers").is_some() {
+            bail!(
+                "production PersonalDB startup refuses file-backed in-process signers; configure signer_endpoints"
+            );
+        }
+        let manifest: PersonalDbProtocolSigningManifestV1 =
+            serde_json::from_value(value).context("parse PersonalDB protocol signing manifest")?;
         if manifest.format_version != 1 {
-            bail!("unsupported PersonalDB protocol keyring manifest version");
+            bail!("unsupported PersonalDB protocol signing manifest version");
         }
 
         let records = manifest
@@ -123,36 +219,101 @@ impl PersonalDbProtocolKeyring {
             .into_iter()
             .map(PersonalDbTrustedKeyConfigV1::into_trust_record)
             .collect::<Result<Vec<_>>>()?;
-        let trust_store = PublicKeyTrustStore::from_records(records.clone())?;
-        let records_by_id = records
-            .into_iter()
-            .map(|record| (record.key_id.clone(), record))
-            .collect::<HashMap<_, _>>();
-        let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
-        let signers = manifest
-            .signers
-            .into_iter()
-            .map(|config| {
-                let record = records_by_id.get(&config.key_id).cloned().ok_or_else(|| {
-                    anyhow!(
-                        "PersonalDB signer key {} is absent from the trust store",
-                        config.key_id
-                    )
-                })?;
-                config.into_signer(base_dir, record)
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let trust_store = PublicKeyTrustStore::from_records(records)?;
+        if trust_store.is_empty() {
+            bail!("PersonalDB protocol trust store must not be empty");
+        }
 
-        Self::new(trust_store, signers)
+        let mut endpoints = HashMap::new();
+        let mut socket_paths = HashSet::new();
+        let mut key_ids = HashSet::new();
+        for config in manifest.signer_endpoints {
+            if !REQUIRED_PERSONALDB_SIGNER_PURPOSES.contains(&config.purpose) {
+                bail!(
+                    "PersonalDB {} is not an Anvil control-object signing purpose",
+                    config.purpose
+                );
+            }
+            if !config.socket_path.is_absolute() {
+                bail!(
+                    "PersonalDB {} signer socket path must be absolute",
+                    config.purpose
+                );
+            }
+            if config.socket_path.as_os_str().is_empty()
+                || config.socket_path.as_os_str().as_encoded_bytes().len() > 100
+            {
+                bail!(
+                    "PersonalDB {} signer socket path exceeds the Unix socket bound",
+                    config.purpose
+                );
+            }
+            let record = trust_store.get(&config.key_id).ok_or_else(|| {
+                anyhow!(
+                    "PersonalDB {} signer key {} is absent from the trust store",
+                    config.purpose,
+                    config.key_id
+                )
+            })?;
+            if record.purpose != config.purpose {
+                bail!(
+                    "PersonalDB {} endpoint uses key {} trusted only for {}",
+                    config.purpose,
+                    config.key_id,
+                    record.purpose
+                );
+            }
+            if record.status != PublicKeyStatus::Active {
+                bail!(
+                    "PersonalDB {} endpoint must use an active trust record",
+                    config.purpose
+                );
+            }
+            if !socket_paths.insert(config.socket_path.clone()) {
+                bail!("PersonalDB signer endpoints must use distinct socket paths");
+            }
+            if !key_ids.insert(config.key_id.clone()) {
+                bail!("PersonalDB signer endpoints must use distinct key IDs");
+            }
+            let endpoint = PersonalDbSignerEndpoint {
+                purpose: config.purpose,
+                key_id: config.key_id,
+                socket_path: config.socket_path,
+            };
+            if endpoints.insert(endpoint.purpose, endpoint).is_some() {
+                bail!(
+                    "PersonalDB protocol signing manifest has more than one {} endpoint",
+                    config.purpose
+                );
+            }
+        }
+        for purpose in REQUIRED_PERSONALDB_SIGNER_PURPOSES {
+            if !endpoints.contains_key(&purpose) {
+                bail!("PersonalDB protocol signing manifest is missing the {purpose} endpoint");
+            }
+        }
+
+        Ok(Self {
+            trust_store,
+            endpoints,
+        })
+    }
+
+    pub fn trust_store(&self) -> &PublicKeyTrustStore {
+        &self.trust_store
+    }
+
+    pub fn endpoint(&self, purpose: SignaturePurpose) -> Option<&PersonalDbSignerEndpoint> {
+        self.endpoints.get(&purpose)
     }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PersonalDbProtocolKeyringManifestV1 {
+struct PersonalDbProtocolSigningManifestV1 {
     format_version: u32,
     trusted_keys: Vec<PersonalDbTrustedKeyConfigV1>,
-    signers: Vec<PersonalDbSignerConfigV1>,
+    signer_endpoints: Vec<PersonalDbSignerEndpointConfigV1>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -194,38 +355,116 @@ impl PersonalDbTrustedKeyConfigV1 {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PersonalDbSignerConfigV1 {
+struct PersonalDbSignerEndpointConfigV1 {
+    purpose: SignaturePurpose,
     key_id: KeyId,
-    private_key_pkcs8_path: PathBuf,
+    socket_path: PathBuf,
 }
 
-impl PersonalDbSignerConfigV1 {
-    fn into_signer(
-        self,
-        base_dir: &Path,
-        trust_record: PublicKeyTrustRecord,
-    ) -> Result<Arc<dyn ProtocolSigner>> {
-        let key_path = if self.private_key_pkcs8_path.is_absolute() {
-            self.private_key_pkcs8_path
-        } else {
-            base_dir.join(self.private_key_pkcs8_path)
-        };
-        validate_private_key_file(&key_path)?;
-        let bytes = std::fs::read(&key_path)
-            .with_context(|| format!("read PersonalDB {} signing key", trust_record.purpose))?;
+#[derive(Clone)]
+struct UnixPersonalDbSignerProvider {
+    endpoint: PersonalDbSignerEndpoint,
+}
 
-        let signer = match Ed25519ProtocolSigner::from_pkcs8_der_with_trust_record(
-            &bytes,
-            trust_record.clone(),
-        ) {
-            Ok(signer) => signer,
-            Err(der_error) => {
-                let pem = std::str::from_utf8(&bytes).map_err(|_| der_error.clone())?;
-                Ed25519ProtocolSigner::from_pkcs8_pem_with_trust_record(pem, trust_record)
-                    .map_err(|_| der_error)?
+impl fmt::Debug for UnixPersonalDbSignerProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UnixPersonalDbSignerProvider")
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
+}
+
+#[async_trait]
+impl PersonalDbSignerProvider for UnixPersonalDbSignerProvider {
+    fn purpose(&self) -> SignaturePurpose {
+        self.endpoint.purpose
+    }
+
+    fn key_id(&self) -> &KeyId {
+        &self.endpoint.key_id
+    }
+
+    async fn sign(&self, object: &PersonalDbSigningObject) -> Result<SignatureEnvelopeV1> {
+        let metadata = object.metadata();
+        if metadata.purpose != self.endpoint.purpose {
+            bail!(
+                "PersonalDB {} endpoint cannot sign {} objects",
+                self.endpoint.purpose,
+                metadata.purpose
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let request = encode_signer_request(object)?;
+            let mut stream = tokio::time::timeout(
+                PERSONALDB_SIGNER_TIMEOUT,
+                tokio::net::UnixStream::connect(&self.endpoint.socket_path),
+            )
+            .await
+            .context("connect to PersonalDB signer timed out")?
+            .with_context(|| {
+                format!(
+                    "connect to PersonalDB {} signer at {}",
+                    self.endpoint.purpose,
+                    self.endpoint.socket_path.display()
+                )
+            })?;
+            tokio::time::timeout(
+                PERSONALDB_SIGNER_TIMEOUT,
+                write_bounded_frame(&mut stream, &request),
+            )
+            .await
+            .context("write to PersonalDB signer timed out")??;
+            let response =
+                tokio::time::timeout(PERSONALDB_SIGNER_TIMEOUT, read_bounded_frame(&mut stream))
+                    .await
+                    .context("read from PersonalDB signer timed out")??;
+            match decode_signer_response(&response)? {
+                PersonalDbSignerResponse::Signature(envelope) => Ok(envelope),
+                PersonalDbSignerResponse::Rejected { code, message } => {
+                    bail!("PersonalDB signer rejected request ({code}): {message}")
+                }
             }
-        };
-        Ok(Arc::new(signer))
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = object;
+            bail!("PersonalDB production signing requires Unix-domain signer endpoints")
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-in-process-personaldb-signers"))]
+struct TestOnlyInProcessSignerProvider {
+    signer: Arc<dyn personaldb_protocol::ProtocolSigner>,
+}
+
+#[cfg(any(test, feature = "test-in-process-personaldb-signers"))]
+impl fmt::Debug for TestOnlyInProcessSignerProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TestOnlyInProcessSignerProvider")
+            .field("trust_record", self.signer.trust_record())
+            .finish()
+    }
+}
+
+#[cfg(any(test, feature = "test-in-process-personaldb-signers"))]
+#[async_trait]
+impl PersonalDbSignerProvider for TestOnlyInProcessSignerProvider {
+    fn purpose(&self) -> SignaturePurpose {
+        self.signer.trust_record().purpose
+    }
+
+    fn key_id(&self) -> &KeyId {
+        &self.signer.trust_record().key_id
+    }
+
+    async fn sign(&self, object: &PersonalDbSigningObject) -> Result<SignatureEnvelopeV1> {
+        self.signer.sign(object).map_err(Into::into)
     }
 }
 
@@ -261,28 +500,12 @@ fn decode_canonical_public_key(value: &str) -> Result<Ed25519PublicKey> {
     Ed25519PublicKey::try_from(decoded.as_slice()).map_err(Into::into)
 }
 
-fn validate_private_key_file(path: &Path) -> Result<()> {
-    let metadata = std::fs::metadata(path)
-        .with_context(|| format!("inspect PersonalDB private key {}", path.display()))?;
-    if !metadata.is_file() {
-        bail!("PersonalDB private key path must name a regular file");
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            bail!("PersonalDB private key must not be group- or world-accessible");
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use personaldb_protocol::{
-        DatabaseId, KeyTrustPolicy, SignatureDomain, SignatureError, SignatureMetadata,
-        SignatureScope, SigningPayload,
+        DatabaseId, Ed25519ProtocolSigner, KeyTrustPolicy, ProtocolSignable, ProtocolSigner,
+        SignatureDomain, SignatureError, SignatureMetadata, SignatureScope, SigningPayload,
     };
 
     #[derive(Debug, Clone)]
@@ -512,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn production_keyring_requires_active_signers_for_every_anvil_purpose() {
+    fn test_keyring_requires_active_signers_for_every_anvil_purpose() {
         let witness = Arc::new(signer(
             0x49,
             KeyTrustPolicy::new(KeyGeneration::new(1).unwrap(), SignaturePurpose::Witness, 0)
@@ -522,7 +745,7 @@ mod tests {
         let store = PublicKeyTrustStore::from_records([witness.trust_record().clone()]).unwrap();
 
         assert!(
-            PersonalDbProtocolKeyring::new(store, [witness])
+            PersonalDbProtocolKeyring::new_test_only(store, [witness])
                 .unwrap_err()
                 .to_string()
                 .contains("must use an active trust record")
@@ -530,26 +753,223 @@ mod tests {
     }
 
     #[test]
-    fn manifest_loader_uses_canonical_trust_records_and_pkcs8_keys() {
+    fn production_manifest_loads_public_trust_and_remote_endpoints_only() {
         let directory = tempfile::tempdir().unwrap();
+        let manifest_path = write_manifest(directory.path(), valid_manifest(directory.path()));
+
+        let keyring = PersonalDbProtocolKeyring::from_manifest_file(manifest_path).unwrap();
+        assert_eq!(keyring.trust_store().len(), 3);
+    }
+
+    #[test]
+    fn production_manifest_rejects_wrong_purpose_endpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut manifest = valid_manifest(directory.path());
+        let witness_key = manifest["signer_endpoints"][2]["key_id"].clone();
+        manifest["signer_endpoints"][0]["key_id"] = witness_key;
+        let manifest_path = write_manifest(directory.path(), manifest);
+
+        let error = PersonalDbProtocolKeyring::from_manifest_file(manifest_path).unwrap_err();
+        assert!(error.to_string().contains("trusted only for witness"));
+    }
+
+    #[test]
+    fn production_manifest_rejects_shared_endpoint_and_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut shared_endpoint = valid_manifest(directory.path());
+        shared_endpoint["signer_endpoints"][1]["socket_path"] =
+            shared_endpoint["signer_endpoints"][0]["socket_path"].clone();
+        let path = write_manifest(directory.path(), shared_endpoint);
+        assert!(
+            PersonalDbProtocolKeyring::from_manifest_file(path)
+                .unwrap_err()
+                .to_string()
+                .contains("distinct socket paths")
+        );
+
+        let mut shared_key = valid_manifest(directory.path());
+        let duplicate = shared_key["signer_endpoints"][0].clone();
+        shared_key["signer_endpoints"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "purpose": duplicate["purpose"].clone(),
+                "key_id": duplicate["key_id"].clone(),
+                "socket_path": directory.path().join("duplicate.sock"),
+            }));
+        let path = write_manifest(directory.path(), shared_key);
+        assert!(
+            PersonalDbProtocolKeyring::from_manifest_file(path)
+                .unwrap_err()
+                .to_string()
+                .contains("distinct key IDs")
+        );
+    }
+
+    #[test]
+    fn production_manifest_rejects_missing_purpose_endpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut manifest = valid_manifest(directory.path());
+        manifest["signer_endpoints"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|endpoint| endpoint["purpose"] != "snapshot");
+        let path = write_manifest(directory.path(), manifest);
+
+        assert!(
+            PersonalDbProtocolKeyring::from_manifest_file(path)
+                .unwrap_err()
+                .to_string()
+                .contains("missing the snapshot endpoint")
+        );
+    }
+
+    #[test]
+    fn production_refuses_file_backed_signer_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut manifest = valid_manifest(directory.path());
+        let endpoints = manifest
+            .as_object_mut()
+            .unwrap()
+            .remove("signer_endpoints")
+            .unwrap();
+        manifest["signers"] = serde_json::json!([{
+            "key_id": endpoints[0]["key_id"].clone(),
+            "private_key_pkcs8_path": "witness.pk8"
+        }]);
+        let path = write_manifest(directory.path(), manifest);
+
+        let error = PersonalDbProtocolKeyring::from_manifest_file(path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("refuses file-backed in-process signers")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unavailable_remote_signer_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest_path = write_manifest(directory.path(), valid_manifest(directory.path()));
+        let keyring = PersonalDbProtocolKeyring::from_manifest_file(manifest_path).unwrap();
+
+        let error = keyring
+            .sign(PersonalDbSigningObject::CommitCertificate(
+                sample_commit_certificate(),
+            ))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("connect to PersonalDB witness signer"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn malformed_remote_signature_fails_before_trust_verification() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("witness.sock");
+        let mut manifest = valid_manifest(directory.path());
+        manifest["signer_endpoints"][2]["socket_path"] =
+            serde_json::json!(socket_path.to_string_lossy());
+        let manifest_path = write_manifest(directory.path(), manifest.clone());
+        let keyring = PersonalDbProtocolKeyring::from_manifest_file(manifest_path).unwrap();
+        let witness_key = manifest["signer_endpoints"][2]["key_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_bounded_frame(&mut stream).await.unwrap();
+            let response = crate::personaldb_signer_protocol::encode_test_signer_response(
+                WireSignatureEnvelopeV1 {
+                    format_version: 1,
+                    hash_algorithm: 1,
+                    signature_algorithm: 1,
+                    key_id: witness_key,
+                    signature: vec![0; 63],
+                },
+            )
+            .unwrap();
+            write_bounded_frame(&mut stream, &response).await.unwrap();
+        });
+
+        let error = keyring
+            .sign(PersonalDbSigningObject::CommitCertificate(
+                sample_commit_certificate(),
+            ))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("64 bytes"));
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_signature_is_verified_by_the_coordinator() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("witness.sock");
+        let mut manifest = valid_manifest(directory.path());
+        manifest["signer_endpoints"][2]["socket_path"] =
+            serde_json::json!(socket_path.to_string_lossy());
+        let manifest_path = write_manifest(directory.path(), manifest.clone());
+        let keyring = PersonalDbProtocolKeyring::from_manifest_file(manifest_path).unwrap();
+        let witness_key = manifest["signer_endpoints"][2]["key_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_bounded_frame(&mut stream).await.unwrap();
+            let response = crate::personaldb_signer_protocol::encode_test_signer_response(
+                WireSignatureEnvelopeV1 {
+                    format_version: 1,
+                    hash_algorithm: 1,
+                    signature_algorithm: 1,
+                    key_id: witness_key,
+                    signature: vec![0; 64],
+                },
+            )
+            .unwrap();
+            write_bounded_frame(&mut stream, &response).await.unwrap();
+        });
+
+        let error = keyring
+            .sign(PersonalDbSigningObject::CommitCertificate(
+                sample_commit_certificate(),
+            ))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("invalid Ed25519 signature"));
+        server.await.unwrap();
+    }
+
+    fn signer(seed: u8, policy: KeyTrustPolicy) -> Ed25519ProtocolSigner {
+        Ed25519ProtocolSigner::from_pkcs8_der(&pkcs8(seed), policy).unwrap()
+    }
+
+    fn pkcs8(seed: u8) -> Vec<u8> {
+        let mut bytes = hex::decode("302e020100300506032b657004220420").unwrap();
+        bytes.extend([seed; 32]);
+        bytes
+    }
+
+    fn valid_manifest(directory: &Path) -> serde_json::Value {
         let mut trusted_keys = Vec::new();
-        let mut signer_configs = Vec::new();
-        for (seed, purpose, filename) in [
-            (0x51, SignaturePurpose::GroupControl, "group-control.pk8"),
-            (0x52, SignaturePurpose::Snapshot, "snapshot.pk8"),
-            (0x53, SignaturePurpose::Witness, "witness.pk8"),
+        let mut signer_endpoints = Vec::new();
+        for (seed, purpose, socket_name) in [
+            (0x51, SignaturePurpose::GroupControl, "group-control.sock"),
+            (0x52, SignaturePurpose::Snapshot, "snapshot.sock"),
+            (0x53, SignaturePurpose::Witness, "witness.sock"),
         ] {
-            let policy = KeyTrustPolicy::new(KeyGeneration::new(1).unwrap(), purpose, 0);
-            let signer = signer(seed, policy);
+            let signer = signer(
+                seed,
+                KeyTrustPolicy::new(KeyGeneration::new(1).unwrap(), purpose, 0),
+            );
             let record = signer.trust_record();
-            let key_path = directory.path().join(filename);
-            std::fs::write(&key_path, pkcs8(seed)).unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-                    .unwrap();
-            }
             trusted_keys.push(serde_json::json!({
                 "format_version": record.format_version,
                 "signature_algorithm": record.signature_algorithm,
@@ -563,31 +983,45 @@ mod tests {
                 "valid_until_log_index": record.valid_until_log_index,
                 "status": record.status,
             }));
-            signer_configs.push(serde_json::json!({
+            signer_endpoints.push(serde_json::json!({
+                "purpose": purpose,
                 "key_id": record.key_id,
-                "private_key_pkcs8_path": filename,
+                "socket_path": directory.join(socket_name),
             }));
         }
-        let manifest = serde_json::json!({
+        serde_json::json!({
             "format_version": 1,
             "trusted_keys": trusted_keys,
-            "signers": signer_configs,
-        });
-        let manifest_path = directory.path().join("keyring.json");
-        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-
-        let keyring = PersonalDbProtocolKeyring::from_manifest_file(manifest_path).unwrap();
-        assert_eq!(keyring.trust_store().len(), 3);
-        keyring.sign(&TestSignable::witness(1)).unwrap();
+            "signer_endpoints": signer_endpoints,
+        })
     }
 
-    fn signer(seed: u8, policy: KeyTrustPolicy) -> Ed25519ProtocolSigner {
-        Ed25519ProtocolSigner::from_pkcs8_der(&pkcs8(seed), policy).unwrap()
+    fn write_manifest(directory: &Path, manifest: serde_json::Value) -> PathBuf {
+        let path = directory.join("personaldb-signing.json");
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        path
     }
 
-    fn pkcs8(seed: u8) -> Vec<u8> {
-        let mut bytes = hex::decode("302e020100300506032b657004220420").unwrap();
-        bytes.extend([seed; 32]);
-        bytes
+    fn sample_commit_certificate() -> crate::personaldb_control::PersonalDbCommitCertificate {
+        crate::personaldb_control::PersonalDbCommitCertificate {
+            format_version: 2,
+            tenant_id: "tenant".to_string(),
+            database_id: "db".to_string(),
+            log_index: 1,
+            previous_log_hash: hex::encode([0; 32]),
+            entry_hash: hex::encode([1; 32]),
+            changeset_payload_hash: hex::encode([2; 32]),
+            verified_envelope_hash: hex::encode([3; 32]),
+            client_log_epoch: 1,
+            membership_epoch: 1,
+            policy_epoch: 1,
+            leader_replica_id: "replica".to_string(),
+            voter_acks_hash: hex::encode([4; 32]),
+            authz_revision: 1,
+            witness_node_id: "node".to_string(),
+            witnessed_at: "2026-07-17T00:00:00Z".to_string(),
+            certificate_hash: None,
+            witness_signature: None,
+        }
     }
 }

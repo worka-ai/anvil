@@ -1,6 +1,7 @@
 use crate::{
     core_store::encode_deterministic_proto,
     formats::{Hash32, hash32},
+    personaldb_signer_protocol::PersonalDbSigningObject,
     personaldb_signing::PersonalDbProtocolKeyring,
 };
 use anyhow::{Result, anyhow};
@@ -172,7 +173,7 @@ struct PersonalDbCommitCertificateHashProto {
 }
 
 impl PersonalDbGroupManifest {
-    pub fn seal(mut self, keyring: &PersonalDbProtocolKeyring) -> Result<Self> {
+    pub async fn seal(mut self, keyring: &PersonalDbProtocolKeyring) -> Result<Self> {
         validate_group_manifest_unsigned(&self)?;
         require_unsealed(
             self.manifest_hash.as_ref(),
@@ -180,7 +181,9 @@ impl PersonalDbGroupManifest {
             "personaldb group manifest",
         )?;
         let hash = group_manifest_hash_bytes(&self)?;
-        let signature = keyring.sign(&self)?;
+        let signature = keyring
+            .sign(PersonalDbSigningObject::GroupManifest(self.clone()))
+            .await?;
         self.manifest_hash = Some(hex::encode(hash));
         self.manifest_signature = Some(signature);
         Ok(self)
@@ -202,7 +205,7 @@ impl PersonalDbGroupManifest {
 }
 
 impl PersonalDbSnapshotManifest {
-    pub fn seal(mut self, keyring: &PersonalDbProtocolKeyring) -> Result<Self> {
+    pub async fn seal(mut self, keyring: &PersonalDbProtocolKeyring) -> Result<Self> {
         validate_snapshot_manifest_unsigned(&self)?;
         require_unsealed(
             self.manifest_hash.as_ref(),
@@ -210,7 +213,9 @@ impl PersonalDbSnapshotManifest {
             "personaldb snapshot manifest",
         )?;
         let hash = snapshot_manifest_hash_bytes(&self)?;
-        let signature = keyring.sign(&self)?;
+        let signature = keyring
+            .sign(PersonalDbSigningObject::SnapshotManifest(self.clone()))
+            .await?;
         self.manifest_hash = Some(hex::encode(hash));
         self.manifest_signature = Some(signature);
         Ok(self)
@@ -232,7 +237,7 @@ impl PersonalDbSnapshotManifest {
 }
 
 impl PersonalDbCommitCertificate {
-    pub fn seal(mut self, keyring: &PersonalDbProtocolKeyring) -> Result<Self> {
+    pub async fn seal(mut self, keyring: &PersonalDbProtocolKeyring) -> Result<Self> {
         validate_commit_certificate_unsigned(&self)?;
         require_unsealed(
             self.certificate_hash.as_ref(),
@@ -240,7 +245,9 @@ impl PersonalDbCommitCertificate {
             "personaldb commit certificate",
         )?;
         let hash = commit_certificate_hash_bytes(&self)?;
-        let signature = keyring.sign(&self)?;
+        let signature = keyring
+            .sign(PersonalDbSigningObject::CommitCertificate(self.clone()))
+            .await?;
         self.certificate_hash = Some(hex::encode(hash));
         self.witness_signature = Some(signature);
         Ok(self)
@@ -426,7 +433,7 @@ fn commit_certificate_hash_proto(
     }
 }
 
-fn validate_group_manifest_unsigned(manifest: &PersonalDbGroupManifest) -> Result<()> {
+pub(crate) fn validate_group_manifest_unsigned(manifest: &PersonalDbGroupManifest) -> Result<()> {
     if manifest.format_version != 2 {
         return Err(anyhow!("unsupported personaldb group manifest version"));
     }
@@ -441,7 +448,9 @@ fn validate_group_manifest_unsigned(manifest: &PersonalDbGroupManifest) -> Resul
     Ok(())
 }
 
-fn validate_snapshot_manifest_unsigned(manifest: &PersonalDbSnapshotManifest) -> Result<()> {
+pub(crate) fn validate_snapshot_manifest_unsigned(
+    manifest: &PersonalDbSnapshotManifest,
+) -> Result<()> {
     if manifest.format_version != 1 {
         return Err(anyhow!("unsupported personaldb snapshot manifest version"));
     }
@@ -463,7 +472,9 @@ fn validate_snapshot_manifest_unsigned(manifest: &PersonalDbSnapshotManifest) ->
     Ok(())
 }
 
-fn validate_commit_certificate_unsigned(certificate: &PersonalDbCommitCertificate) -> Result<()> {
+pub(crate) fn validate_commit_certificate_unsigned(
+    certificate: &PersonalDbCommitCertificate,
+) -> Result<()> {
     if certificate.format_version != 2 {
         return Err(anyhow!("unsupported personaldb commit certificate version"));
     }
@@ -527,10 +538,10 @@ mod tests {
     use crate::test_support::personaldb_protocol_keyring;
     use personaldb_protocol::signing_preimage;
 
-    #[test]
-    fn group_manifest_seal_verify_and_tamper_reject() {
+    #[tokio::test]
+    async fn group_manifest_seal_verify_and_tamper_reject() {
         let keyring = personaldb_protocol_keyring();
-        let manifest = sample_group_manifest().seal(&keyring).unwrap();
+        let manifest = sample_group_manifest().seal(&keyring).await.unwrap();
         manifest.verify(keyring.trust_store()).unwrap();
         assert_eq!(manifest.manifest_hash.as_deref().unwrap().len(), 64);
         assert_eq!(
@@ -549,20 +560,20 @@ mod tests {
         assert!(tampered.verify(keyring.trust_store()).is_err());
     }
 
-    #[test]
-    fn snapshot_manifest_seal_verify_and_tamper_reject() {
+    #[tokio::test]
+    async fn snapshot_manifest_seal_verify_and_tamper_reject() {
         let keyring = personaldb_protocol_keyring();
-        let manifest = sample_snapshot_manifest().seal(&keyring).unwrap();
+        let manifest = sample_snapshot_manifest().seal(&keyring).await.unwrap();
         manifest.verify(keyring.trust_store()).unwrap();
         let mut tampered = manifest;
         tampered.snapshot_object_hash = hex::encode([7; 32]);
         assert!(tampered.verify(keyring.trust_store()).is_err());
     }
 
-    #[test]
-    fn commit_certificate_seal_verify_and_tamper_reject() {
+    #[tokio::test]
+    async fn commit_certificate_seal_verify_and_tamper_reject() {
         let keyring = personaldb_protocol_keyring();
-        let certificate = sample_commit_certificate().seal(&keyring).unwrap();
+        let certificate = sample_commit_certificate().seal(&keyring).await.unwrap();
         certificate.verify(keyring.trust_store()).unwrap();
         assert_eq!(certificate.certificate_hash.as_deref().unwrap().len(), 64);
 
@@ -571,25 +582,25 @@ mod tests {
         assert!(tampered.verify(keyring.trust_store()).is_err());
     }
 
-    #[test]
-    fn group_manifest_rejects_unsupported_policy() {
+    #[tokio::test]
+    async fn group_manifest_rejects_unsupported_policy() {
         let keyring = personaldb_protocol_keyring();
         let mut manifest = sample_group_manifest();
         manifest.consistency_policy = "EventuallyAccepted".to_string();
-        assert!(manifest.seal(&keyring).is_err());
+        assert!(manifest.seal(&keyring).await.is_err());
     }
 
-    #[test]
-    fn signature_purpose_is_object_specific() {
+    #[tokio::test]
+    async fn signature_purpose_is_object_specific() {
         let keyring = personaldb_protocol_keyring();
-        let manifest = sample_group_manifest().seal(&keyring).unwrap();
-        let mut certificate = sample_commit_certificate().seal(&keyring).unwrap();
+        let manifest = sample_group_manifest().seal(&keyring).await.unwrap();
+        let mut certificate = sample_commit_certificate().seal(&keyring).await.unwrap();
         certificate.witness_signature = manifest.manifest_signature;
         assert!(certificate.verify(keyring.trust_store()).is_err());
     }
 
-    #[test]
-    fn commit_certificate_ed25519_vector() {
+    #[tokio::test]
+    async fn commit_certificate_ed25519_vector() {
         let keyring = personaldb_protocol_keyring();
         let unsigned = sample_commit_certificate();
         let unsigned_bytes = encode_deterministic_proto(&commit_certificate_hash_proto(&unsigned));
@@ -601,7 +612,7 @@ mod tests {
             SigningPayload::Sha256Digest(object_hash),
         )
         .unwrap();
-        let sealed = unsigned.seal(&keyring).unwrap();
+        let sealed = unsigned.seal(&keyring).await.unwrap();
         let envelope = sealed.witness_signature.as_ref().unwrap();
         let envelope_bytes = envelope.encode_deterministic().unwrap();
 

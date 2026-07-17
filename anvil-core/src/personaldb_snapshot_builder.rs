@@ -215,7 +215,8 @@ async fn build_snapshot(
         manifest_hash: None,
         manifest_signature: None,
     }
-    .seal(protocol_keyring)?;
+    .seal(protocol_keyring)
+    .await?;
 
     write_personaldb_snapshot(
         storage,
@@ -586,6 +587,7 @@ mod tests {
                 manifest_signature: None,
             }
             .seal(&keyring)
+            .await
             .unwrap();
             write_personaldb_group_manifest(&storage, 9, &manifest, keyring.trust_store())
                 .await
@@ -641,6 +643,7 @@ mod tests {
                     witness_signature: None,
                 }
                 .seal(&keyring)
+                .await
                 .unwrap();
                 let certificate_ref = write_personaldb_commit_certificate(
                     &storage,
@@ -698,6 +701,7 @@ mod tests {
                 head_signature: None,
             }
             .seal(&keyring)
+            .await
             .unwrap();
             write_personaldb_committed_head(
                 &storage,

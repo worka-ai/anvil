@@ -22,6 +22,7 @@ path = "src/lib.rs"
 [features]
 #Declare an enterprise feature, doesn't activate any depdendencies so leave it with an empty array
 enterprise = []
+test-in-process-personaldb-signers = []
 gcp = ["dep:prost-types", "tonic/tls-ring"]
 routeguide = ["dep:async-stream", "dep:tokio-stream", "dep:rand"]
 reflection = ["dep:tonic-reflection"]
@@ -47,6 +48,7 @@ tonic-prost = ["dep:tonic-prost"]
 
 [dependencies]
 anyhow = { version = "1" }
+async-trait = "0.1"
 base64 = "0.22"
 blake3 = "1.8.2"
 personaldb-protocol = { git = "ssh://git@github.com/worka-ai/personaldb.git", rev = "539cb9dfdcb10b3b83ac2333b2e07d47bffb58ae" }

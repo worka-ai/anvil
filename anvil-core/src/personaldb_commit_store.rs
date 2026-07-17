@@ -534,7 +534,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let keyring = personaldb_protocol_keyring();
-        let certificate = sample_certificate().seal(&keyring).unwrap();
+        let certificate = sample_certificate().seal(&keyring).await.unwrap();
 
         let ref_name = write_personaldb_commit_certificate(
             &storage,
@@ -573,7 +573,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let keyring = personaldb_protocol_keyring();
-        let certificate = sample_certificate().seal(&keyring).unwrap();
+        let certificate = sample_certificate().seal(&keyring).await.unwrap();
         let ref_name = write_personaldb_commit_certificate(
             &storage,
             9,
@@ -625,6 +625,7 @@ mod tests {
             ..sample_certificate()
         }
         .seal(&keyring)
+        .await
         .unwrap();
         assert!(
             write_personaldb_commit_certificate(

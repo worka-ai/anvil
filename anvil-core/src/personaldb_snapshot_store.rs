@@ -417,7 +417,10 @@ mod tests {
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let bytes = b"zstd sqlite snapshot bytes";
         let keyring = personaldb_protocol_keyring();
-        let manifest = sample_manifest(&storage, bytes).seal(&keyring).unwrap();
+        let manifest = sample_manifest(&storage, bytes)
+            .seal(&keyring)
+            .await
+            .unwrap();
 
         let result = write_personaldb_snapshot(
             &storage,
@@ -481,7 +484,10 @@ mod tests {
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let bytes = b"zstd sqlite snapshot bytes";
         let keyring = personaldb_protocol_keyring();
-        let manifest = sample_manifest(&storage, bytes).seal(&keyring).unwrap();
+        let manifest = sample_manifest(&storage, bytes)
+            .seal(&keyring)
+            .await
+            .unwrap();
         assert!(
             write_personaldb_snapshot(
                 &storage,
@@ -500,6 +506,7 @@ mod tests {
             ..sample_manifest(&storage, bytes)
         }
         .seal(&keyring)
+        .await
         .unwrap();
         assert!(
             write_personaldb_snapshot(
@@ -519,6 +526,7 @@ mod tests {
             ..sample_manifest(&storage, bytes)
         }
         .seal(&keyring)
+        .await
         .unwrap();
         assert!(
             write_personaldb_snapshot(
@@ -540,7 +548,10 @@ mod tests {
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let bytes = b"zstd sqlite snapshot bytes";
         let keyring = personaldb_protocol_keyring();
-        let manifest = sample_manifest(&storage, bytes).seal(&keyring).unwrap();
+        let manifest = sample_manifest(&storage, bytes)
+            .seal(&keyring)
+            .await
+            .unwrap();
         write_personaldb_snapshot(
             &storage,
             6,

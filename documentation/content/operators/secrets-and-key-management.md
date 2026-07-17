@@ -19,7 +19,8 @@ Operators should be able to name every secret in a running deployment and answer
 | `ANVIL_SECRET_ENCRYPTION_KEY` | Anvil server processes only | Losing it can make encrypted server-side secrets unrecoverable; leaking it exposes encrypted secret envelopes if storage is also available. |
 | `ANVIL_SECRET_ENCRYPTION_KEY_ID` | Anvil server configuration and operator records | Labels new encrypted envelopes; changing it without changing the key mostly changes metadata, but it must remain consistent and meaningful. |
 | `ANVIL_SECRET_ENCRYPTION_PREVIOUS_KEYS` | Anvil server processes during rotation | Allows old envelopes to decrypt while rotation rewrites them to the active key id. |
-| `PERSONALDB_PROTOCOL_KEYRING_PATH` and referenced PKCS#8 files | Anvil server processes only | Signs PersonalDB group manifests, snapshot manifests, commit certificates, and committed heads; loss prevents new control evidence, while leakage can forge evidence within the key's purpose, scope, generation, and log boundaries. |
+| `PERSONALDB_PROTOCOL_SIGNING_MANIFEST_PATH` | Anvil coordinators and role-scoped signer processes | Supplies public trust records and distinct Unix signer endpoints. It contains no private key. |
+| Purpose-scoped PersonalDB PKCS#8 key | Only the matching `anvil-signer` process | Signs one allowed class of PersonalDB control evidence; loss prevents new signatures for that purpose, while leakage can forge evidence within the key's scope, generation, and log boundaries. |
 | `CLUSTER_SECRET` | Anvil server processes in the same mesh | Protects cluster gossip metadata; a mismatch can make peers reject each other's signed cluster messages. |
 | Bootstrap first-admin credential | Initial system administrators or provisioning automation | Can mint a token for a powerful system principal until rotated, deleted, or access is otherwise removed. |
 | Tenant/app client secrets | The service or automation that owns the app credential | Can mint short-lived bearer tokens with that app's delegated public policy scopes. |
@@ -51,15 +52,19 @@ The recovery implication is severe: a backup of `STORAGE_PATH` without the key h
 
 ## PersonalDB Protocol Signing Keys
 
-`PERSONALDB_PROTOCOL_KEYRING_PATH` is mandatory at server startup. It names a
-JSON manifest containing trusted Ed25519 public keys and the file paths for the
-active online signers. These four protocol objects have no production HMAC or
-unsigned fallback.
+`PERSONALDB_PROTOCOL_SIGNING_MANIFEST_PATH` is mandatory at coordinator
+startup. It names a JSON manifest containing trusted Ed25519 public keys and
+three purpose-separated Unix-domain signer endpoints. The coordinator does not
+load private keys and has no file-backed signing mode. These four protocol
+objects have no production HMAC or unsigned fallback.
 
-Use a separate PKCS#8 Ed25519 private key for each purpose:
-`group-control`, `snapshot`, and `witness`. Private-key files must be regular
-files and, on Unix, must not be readable or writable by group or other users.
-Relative signer paths resolve from the manifest directory.
+Run one `anvil-signer` process for each purpose: `group-control`, `snapshot`,
+and `witness`. Use a separate Unix account or container boundary and a separate
+PKCS#8 Ed25519 private key for every process. Private-key files must be regular,
+non-symlink files and must not be accessible by group or other users. Create
+each socket parent as a mode-`0700` directory. The signer creates a mode-`0600`
+socket, verifies the connecting process UID against its explicit allowlist, and
+accepts only the bounded typed PersonalDB objects allowed for its purpose.
 
 The version-1 manifest has this shape:
 
@@ -81,25 +86,49 @@ The version-1 manifest has this shape:
       "status": "active"
     }
   ],
-  "signers": [
+  "signer_endpoints": [
     {
+      "purpose": "witness",
       "key_id": "sha256:<same canonical public-key ID>",
-      "private_key_pkcs8_path": "witness.pk8"
+      "socket_path": "/run/anvil-signers/witness/sign.sock"
     }
   ]
 }
 ```
 
-Provide one trusted-key and signer entry for each of the three purposes. Key IDs
-are SHA-256 over `personaldb-protocol`'s canonical deterministic protobuf
-public-key envelope, not over a PEM file or textual public key. The signer
-inherits generation, purpose, scopes, status, and log boundaries from the
+Provide exactly one endpoint for each of the three purposes. Socket paths and
+active key IDs must be distinct. Every endpoint key must exist as an active
+trust record for the exact same purpose; missing, overlapping, or
+wrong-purpose bindings stop coordinator startup. Legacy `signers` entries with
+`private_key_pkcs8_path` are rejected.
+
+Start a witness signer with configuration equivalent to:
+
+```bash
+anvil-signer \
+  --trust-manifest-path /run/anvil/personaldb-signing.json \
+  --purpose witness \
+  --key-id 'sha256:<canonical public-key ID>' \
+  --socket-path /run/anvil-signers/witness/sign.sock \
+  --private-key-pkcs8-path /run/secrets/witness/key.pk8 \
+  --allowed-peer-uid 10001
+```
+
+Repeat with independent directories, keys, key IDs, and processes for
+`group-control` and `snapshot`. Never mount `/run/secrets/witness` or another
+signer key directory into an `anvil-server` container.
+
+Key IDs are SHA-256 over `personaldb-protocol`'s canonical deterministic
+protobuf public-key envelope, not over a PEM file or textual public key. The
+signer derives generation, purpose, scopes, status, and log boundaries from the
 matching trusted-key record; none of those values are duplicated in a signature
-envelope. The server checks that each private key and active trust record agree
-before it starts. In the current Anvil PersonalDB model, the database ID is also
-the protocol group ID, so a non-empty `group_scopes` entry must use that same
-value. Leave either scope list empty only when the key is intentionally
-unrestricted on that dimension.
+envelope. The signer checks that its private key, configured purpose, endpoint,
+key ID, peer allowlist, and active trust record agree before binding its socket.
+The coordinator verifies every returned canonical envelope against its own
+trust store before accepting it. In the current Anvil PersonalDB model, the
+database ID is also the protocol group ID, so a non-empty `group_scopes` entry
+must use that same value. Leave either scope list empty only when the key is
+intentionally unrestricted on that dimension.
 
 For rotation, retain old public keys as `retiring` with an exclusive
 `valid_until_log_index` so historical evidence below that boundary remains

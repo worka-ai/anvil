@@ -12,6 +12,7 @@ use crate::{
         read_personaldb_data_locator_bytes, read_personaldb_data_locator_row,
         write_personaldb_bytes_as_data_locator_with_preconditions,
     },
+    personaldb_signer_protocol::PersonalDbSigningObject,
     personaldb_signing::{
         PersonalDbProtocolKeyring, signature_envelope_from_proto, signature_envelope_to_proto,
     },
@@ -159,7 +160,7 @@ struct PersonalDbGroupManifestProto {
 }
 
 impl PersonalDbCommittedHead {
-    pub fn seal(mut self, keyring: &PersonalDbProtocolKeyring) -> Result<Self> {
+    pub async fn seal(mut self, keyring: &PersonalDbProtocolKeyring) -> Result<Self> {
         validate_committed_head_unsigned(&self)?;
         require_unsealed(
             self.head_hash.as_ref(),
@@ -167,7 +168,9 @@ impl PersonalDbCommittedHead {
             "personaldb committed head",
         )?;
         let hash = hash_committed_head(&self)?;
-        let signature = keyring.sign(&self)?;
+        let signature = keyring
+            .sign(PersonalDbSigningObject::CommittedHead(self.clone()))
+            .await?;
         self.head_hash = Some(hash);
         self.head_signature = Some(signature);
         Ok(self)
@@ -396,7 +399,7 @@ pub async fn read_personaldb_snapshots_head(
     Ok(Some(head))
 }
 
-fn validate_committed_head_unsigned(head: &PersonalDbCommittedHead) -> Result<()> {
+pub(crate) fn validate_committed_head_unsigned(head: &PersonalDbCommittedHead) -> Result<()> {
     if head.format_version != 2 {
         return Err(anyhow!("unsupported personaldb committed head version"));
     }
@@ -873,7 +876,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let keyring = personaldb_protocol_keyring();
-        let head = sample_committed_head().seal(&keyring).unwrap();
+        let head = sample_committed_head().seal(&keyring).await.unwrap();
 
         write_personaldb_committed_head(&storage, 7, "db-alpha", &head, keyring.trust_store())
             .await
@@ -939,7 +942,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let keyring = personaldb_protocol_keyring();
-        let manifest = sample_group_manifest().seal(&keyring).unwrap();
+        let manifest = sample_group_manifest().seal(&keyring).await.unwrap();
 
         write_personaldb_group_manifest(&storage, 7, &manifest, keyring.trust_store())
             .await
@@ -988,7 +991,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let keyring = personaldb_protocol_keyring();
-        let head = sample_committed_head().seal(&keyring).unwrap();
+        let head = sample_committed_head().seal(&keyring).await.unwrap();
         write_personaldb_committed_head(&storage, 7, "db-alpha", &head, keyring.trust_store())
             .await
             .unwrap();
@@ -1030,13 +1033,14 @@ mod tests {
             log_hash: "not-hex".to_string(),
             ..sample_committed_head()
         };
-        assert!(invalid_hash.seal(&keyring).is_err());
+        assert!(invalid_hash.seal(&keyring).await.is_err());
 
         let wrong_scope = PersonalDbCommittedHead {
             database_id: "db-beta".to_string(),
             ..sample_committed_head()
         }
         .seal(&keyring)
+        .await
         .unwrap();
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();

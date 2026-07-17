@@ -133,13 +133,17 @@ A single-node local run is useful for learning the planes before building a larg
 ```sh
 export ANVIL_IMAGE="ghcr.io/worka-ai/anvil:v0.3.0"
 export ANVIL_SECRET_ENCRYPTION_KEY="$(anvil-admin key generate-secret-encryption-key)"
-export PERSONALDB_PROTOCOL_KEYRING_DIR="/absolute/path/to/personaldb-keyring"
+export PERSONALDB_PROTOCOL_SIGNING_MANIFEST="/absolute/path/to/personaldb-signing.json"
+export PERSONALDB_SIGNER_SOCKET_ROOT="/absolute/path/to/personaldb-signer-sockets"
 
 docker run --rm \
   --name anvil-local \
   -p 127.0.0.1:50051:50051 \
   -v anvil-local-data:/var/lib/anvil \
-  -v "$PERSONALDB_PROTOCOL_KEYRING_DIR:/run/secrets/personaldb:ro" \
+  -v "$PERSONALDB_PROTOCOL_SIGNING_MANIFEST:/run/anvil/personaldb-signing.json:ro" \
+  -v "$PERSONALDB_SIGNER_SOCKET_ROOT/group-control:/run/anvil-signers/group-control" \
+  -v "$PERSONALDB_SIGNER_SOCKET_ROOT/snapshot:/run/anvil-signers/snapshot" \
+  -v "$PERSONALDB_SIGNER_SOCKET_ROOT/witness:/run/anvil-signers/witness" \
   -e STORAGE_PATH=/var/lib/anvil \
   -e REGION=local \
   -e API_LISTEN_ADDR=0.0.0.0:50051 \
@@ -147,16 +151,17 @@ docker run --rm \
   -e ADMIN_LISTEN_ADDR=127.0.0.1:50052 \
   -e JWT_SECRET="local-jwt-secret-change-me" \
   -e ANVIL_SECRET_ENCRYPTION_KEY="$ANVIL_SECRET_ENCRYPTION_KEY" \
-  -e PERSONALDB_PROTOCOL_KEYRING_PATH=/run/secrets/personaldb/keyring.json \
+  -e PERSONALDB_PROTOCOL_SIGNING_MANIFEST_PATH=/run/anvil/personaldb-signing.json \
   -e CLUSTER_SECRET="local-cluster-secret-change-me" \
   -e BOOTSTRAP_SYSTEM_ADMIN_APP_NAME=ops-admin \
   -e BOOTSTRAP_SYSTEM_ADMIN_CREDENTIAL_OUTPUT_PATH=/var/lib/anvil/first-admin.json \
   "$ANVIL_IMAGE"
 ```
 
-The PersonalDB keyring directory contains the trust manifest and its three
-distinct group-control, snapshot, and witness PKCS#8 Ed25519 private keys.
-Private-key files must be mode `0600` and readable by container UID `10001`.
+Start one `anvil-signer` process for each of the `group-control`, `snapshot`,
+and `witness` socket paths before using PersonalDB control operations. Each
+signer receives only its own mode-`0600` PKCS#8 key. The coordinator receives
+the public trust manifest and socket directories, never a private-key mount.
 See [Secrets and Key Management](documentation/content/operators/secrets-and-key-management.md#personaldb-protocol-signing-keys)
 for the manifest contract and rotation behavior.
 

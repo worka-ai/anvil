@@ -905,6 +905,7 @@ mod tests {
                 witness_signature: None,
             }
             .seal(&protocol_keyring)
+            .await
             .unwrap();
             let certificate_ref = write_personaldb_commit_certificate(
                 &storage,
@@ -946,6 +947,7 @@ mod tests {
                 manifest_signature: None,
             }
             .seal(&protocol_keyring)
+            .await
             .unwrap();
             write_personaldb_group_manifest(&storage, 7, &manifest, protocol_keyring.trust_store())
                 .await
@@ -979,6 +981,7 @@ mod tests {
                 head_signature: None,
             }
             .seal(&protocol_keyring)
+            .await
             .unwrap();
             write_personaldb_committed_head(
                 &storage,

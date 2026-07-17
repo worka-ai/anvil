@@ -91,7 +91,7 @@ pub fn personaldb_test_protocol_keyring()
         signers.iter().map(|signer| signer.trust_record().clone()),
     )
     .unwrap();
-    PersonalDbProtocolKeyring::new(trust_store, signers).unwrap()
+    PersonalDbProtocolKeyring::new_test_only(trust_store, signers).unwrap()
 }
 
 async fn connect_docker_admin(addr: &str) -> AdminServiceClient<Channel> {

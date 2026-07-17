@@ -1,7 +1,8 @@
 version: "3.8"
 
-# The PersonalDB keyring directory must contain keyring.json plus its referenced
-# PKCS#8 files. Private keys must be readable by container UID 10001 and mode 0600.
+# The coordinator receives only the public signing manifest and three
+# purpose-separated Unix socket directories. Run one anvil-signer process per
+# purpose; mount each PKCS#8 key only into its matching signer process.
 networks:
   anvilnet:
     driver: bridge
@@ -14,7 +15,7 @@ services:
       - REGION=DOCKER_TEST
       - JWT_SECRET=docker-test-secret
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      - PERSONALDB_PROTOCOL_KEYRING_PATH=/run/secrets/personaldb/keyring.json
+      - PERSONALDB_PROTOCOL_SIGNING_MANIFEST_PATH=/run/anvil/personaldb/signing-manifest.json
       - CLUSTER_SECRET=docker-cluster-secret
       - API_LISTEN_ADDR=0.0.0.0:50051
       - CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/7443/quic-v1
@@ -28,7 +29,10 @@ services:
       - "7443:7443/udp"
     volumes:
       - anvil1_data:/var/lib/anvil
-      - ${PERSONALDB_PROTOCOL_KEYRING_DIR:?PERSONALDB_PROTOCOL_KEYRING_DIR is required}:/run/secrets/personaldb:ro
+      - ${PERSONALDB_PROTOCOL_SIGNING_MANIFEST_PATH:?PERSONALDB_PROTOCOL_SIGNING_MANIFEST_PATH is required}:/run/anvil/personaldb/signing-manifest.json:ro
+      - ${PERSONALDB_GROUP_CONTROL_SIGNER_SOCKET_DIR:?PERSONALDB_GROUP_CONTROL_SIGNER_SOCKET_DIR is required}:/run/anvil-signers/group-control
+      - ${PERSONALDB_SNAPSHOT_SIGNER_SOCKET_DIR:?PERSONALDB_SNAPSHOT_SIGNER_SOCKET_DIR is required}:/run/anvil-signers/snapshot
+      - ${PERSONALDB_WITNESS_SIGNER_SOCKET_DIR:?PERSONALDB_WITNESS_SIGNER_SOCKET_DIR is required}:/run/anvil-signers/witness
     networks: [anvilnet]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:50051/ready"]
@@ -46,7 +50,7 @@ services:
       - REGION=DOCKER_TEST
       - JWT_SECRET=docker-test-secret
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      - PERSONALDB_PROTOCOL_KEYRING_PATH=/run/secrets/personaldb/keyring.json
+      - PERSONALDB_PROTOCOL_SIGNING_MANIFEST_PATH=/run/anvil/personaldb/signing-manifest.json
       - CLUSTER_SECRET=docker-cluster-secret
       - API_LISTEN_ADDR=0.0.0.0:50051
       - CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/7444/quic-v1
@@ -60,7 +64,10 @@ services:
       - "7444:7443/udp"
     volumes:
       - anvil2_data:/var/lib/anvil
-      - ${PERSONALDB_PROTOCOL_KEYRING_DIR:?PERSONALDB_PROTOCOL_KEYRING_DIR is required}:/run/secrets/personaldb:ro
+      - ${PERSONALDB_PROTOCOL_SIGNING_MANIFEST_PATH:?PERSONALDB_PROTOCOL_SIGNING_MANIFEST_PATH is required}:/run/anvil/personaldb/signing-manifest.json:ro
+      - ${PERSONALDB_GROUP_CONTROL_SIGNER_SOCKET_DIR:?PERSONALDB_GROUP_CONTROL_SIGNER_SOCKET_DIR is required}:/run/anvil-signers/group-control
+      - ${PERSONALDB_SNAPSHOT_SIGNER_SOCKET_DIR:?PERSONALDB_SNAPSHOT_SIGNER_SOCKET_DIR is required}:/run/anvil-signers/snapshot
+      - ${PERSONALDB_WITNESS_SIGNER_SOCKET_DIR:?PERSONALDB_WITNESS_SIGNER_SOCKET_DIR is required}:/run/anvil-signers/witness
     networks: [anvilnet]
 
   anvil3:
@@ -73,7 +80,7 @@ services:
       - REGION=DOCKER_TEST
       - JWT_SECRET=docker-test-secret
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      - PERSONALDB_PROTOCOL_KEYRING_PATH=/run/secrets/personaldb/keyring.json
+      - PERSONALDB_PROTOCOL_SIGNING_MANIFEST_PATH=/run/anvil/personaldb/signing-manifest.json
       - CLUSTER_SECRET=docker-cluster-secret
       - API_LISTEN_ADDR=0.0.0.0:50051
       - CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/7445/quic-v1
@@ -87,7 +94,10 @@ services:
       - "7445:7443/udp"
     volumes:
       - anvil3_data:/var/lib/anvil
-      - ${PERSONALDB_PROTOCOL_KEYRING_DIR:?PERSONALDB_PROTOCOL_KEYRING_DIR is required}:/run/secrets/personaldb:ro
+      - ${PERSONALDB_PROTOCOL_SIGNING_MANIFEST_PATH:?PERSONALDB_PROTOCOL_SIGNING_MANIFEST_PATH is required}:/run/anvil/personaldb/signing-manifest.json:ro
+      - ${PERSONALDB_GROUP_CONTROL_SIGNER_SOCKET_DIR:?PERSONALDB_GROUP_CONTROL_SIGNER_SOCKET_DIR is required}:/run/anvil-signers/group-control
+      - ${PERSONALDB_SNAPSHOT_SIGNER_SOCKET_DIR:?PERSONALDB_SNAPSHOT_SIGNER_SOCKET_DIR is required}:/run/anvil-signers/snapshot
+      - ${PERSONALDB_WITNESS_SIGNER_SOCKET_DIR:?PERSONALDB_WITNESS_SIGNER_SOCKET_DIR is required}:/run/anvil-signers/witness
     networks: [anvilnet]
 
 volumes:

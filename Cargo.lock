@@ -214,6 +214,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "anvil-personaldb-signer"
+version = "0.3.0"
+dependencies = [
+ "anvil-storage-core",
+ "anyhow",
+ "clap",
+ "hex",
+ "personaldb-protocol",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "anvil-server"
 version = "0.3.0"
 dependencies = [
@@ -342,6 +356,7 @@ dependencies = [
  "anyhow",
  "argon2",
  "async-stream",
+ "async-trait",
  "aws-credential-types",
  "aws-sigv4",
  "aws-smithy-runtime-api",

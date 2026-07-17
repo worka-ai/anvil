@@ -3,6 +3,7 @@ resolver = "3"
 
 members = [
     "anvil",
+    "anvil-signer",
     "anvil-cli",
     "clients/rust",
     "crates/anvil-corestore-model",

@@ -161,6 +161,7 @@ impl PersonalDbService for AppState {
             manifest_signature: None,
         }
         .seal(protocol_keyring)
+        .await
         .map_err(internal_status)?;
         write_personaldb_schema_sql(
             &self.storage,
@@ -197,6 +198,7 @@ impl PersonalDbService for AppState {
             head_signature: None,
         }
         .seal(protocol_keyring)
+        .await
         .map_err(internal_status)?;
         write_personaldb_committed_head(
             &self.storage,
@@ -1060,6 +1062,7 @@ impl AppState {
             witness_signature: None,
         }
         .seal(protocol_keyring)
+        .await
         .map_err(internal_status)?;
         let certificate_ref = write_personaldb_commit_certificate(
             &self.storage,
@@ -1158,6 +1161,7 @@ impl AppState {
             head_signature: None,
         }
         .seal(protocol_keyring)
+        .await
         .map_err(internal_status)?;
         write_personaldb_committed_head_with_preconditions(
             &self.storage,
