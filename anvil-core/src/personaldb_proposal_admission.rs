@@ -25,7 +25,10 @@ use crate::{
         personaldb_committed_head_precondition, read_personaldb_committed_head,
         validate_committed_head_unsigned,
     },
-    personaldb_signing::{signature_envelope_from_proto, signature_envelope_to_proto},
+    personaldb_signer_protocol::PersonalDbSigningObject,
+    personaldb_signing::{
+        PersonalDbProtocolKeyring, signature_envelope_from_proto, signature_envelope_to_proto,
+    },
     storage::Storage,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -721,6 +724,105 @@ impl ProtocolSignable for RequiredGenerationSignable<'_> {
     }
 }
 
+enum WitnessSigningAuthority<'a> {
+    ProtocolSigner(&'a dyn ProtocolSigner),
+    Keyring(&'a PersonalDbProtocolKeyring),
+}
+
+impl WitnessSigningAuthority<'_> {
+    fn validate_bound_signer(
+        &self,
+        expected_key_id: &str,
+        expected_generation: u64,
+        database_id: &str,
+        log_index: u64,
+    ) -> Result<()> {
+        match self {
+            Self::ProtocolSigner(signer) => validate_bound_signer(
+                signer.trust_record(),
+                SignaturePurpose::Witness,
+                expected_key_id,
+                expected_generation,
+                database_id,
+                log_index,
+            ),
+            Self::Keyring(keyring) => {
+                let record = keyring.trust_record_for_purpose(SignaturePurpose::Witness)?;
+                validate_bound_signer(
+                    record,
+                    SignaturePurpose::Witness,
+                    expected_key_id,
+                    expected_generation,
+                    database_id,
+                    log_index,
+                )
+            }
+        }
+    }
+
+    async fn sign_certificate_with_required_generation(
+        &self,
+        certificate: &PersonalDbCommitCertificate,
+        generation: KeyGeneration,
+        trust_store: &PublicKeyTrustStore,
+    ) -> Result<SignatureEnvelopeV1> {
+        let signature = match self {
+            Self::ProtocolSigner(signer) => {
+                let signable = RequiredGenerationSignable {
+                    object: certificate,
+                    generation,
+                };
+                let signature = signer.sign(&signable)?;
+                trust_store.verify(&signable, &signature)?;
+                return Ok(signature);
+            }
+            Self::Keyring(keyring) => {
+                keyring
+                    .sign(PersonalDbSigningObject::CommitCertificate(
+                        certificate.clone(),
+                    ))
+                    .await?
+            }
+        };
+        let signable = RequiredGenerationSignable {
+            object: certificate,
+            generation,
+        };
+        trust_store.verify(&signable, &signature)?;
+        Ok(signature)
+    }
+
+    async fn sign_head_with_required_generation(
+        &self,
+        head: &PersonalDbCommittedHead,
+        generation: KeyGeneration,
+        trust_store: &PublicKeyTrustStore,
+    ) -> Result<SignatureEnvelopeV1> {
+        let signature = match self {
+            Self::ProtocolSigner(signer) => {
+                let signable = RequiredGenerationSignable {
+                    object: head,
+                    generation,
+                };
+                let signature = signer.sign(&signable)?;
+                trust_store.verify(&signable, &signature)?;
+                return Ok(signature);
+            }
+            Self::Keyring(keyring) => {
+                keyring
+                    .sign(PersonalDbSigningObject::CommittedHead(head.clone()))
+                    .await?
+            }
+        };
+        let signable = RequiredGenerationSignable {
+            object: head,
+            generation,
+        };
+        trust_store.verify(&signable, &signature)?;
+        Ok(signature)
+    }
+}
+
 pub fn sign_proposal_admission(
     reservation: &ProposalAdmissionReservationV1,
     signer: &dyn ProtocolSigner,
@@ -1133,6 +1235,32 @@ pub async fn sign_personaldb_certificate_and_head(
     request: &SignCertificateAndHeadV1,
     signer: &dyn ProtocolSigner,
 ) -> Result<WitnessDualSigningReceiptV1> {
+    sign_personaldb_certificate_and_head_with_authority(
+        authority,
+        request,
+        WitnessSigningAuthority::ProtocolSigner(signer),
+    )
+    .await
+}
+
+pub async fn sign_personaldb_certificate_and_head_with_keyring(
+    authority: &PersonalDbAdmissionAuthority<'_>,
+    request: &SignCertificateAndHeadV1,
+    keyring: &PersonalDbProtocolKeyring,
+) -> Result<WitnessDualSigningReceiptV1> {
+    sign_personaldb_certificate_and_head_with_authority(
+        authority,
+        request,
+        WitnessSigningAuthority::Keyring(keyring),
+    )
+    .await
+}
+
+async fn sign_personaldb_certificate_and_head_with_authority(
+    authority: &PersonalDbAdmissionAuthority<'_>,
+    request: &SignCertificateAndHeadV1,
+    signer: WitnessSigningAuthority<'_>,
+) -> Result<WitnessDualSigningReceiptV1> {
     validate_reservation_id(&request.reservation_id)?;
     if request.signing_reservation_revision == 0 {
         bail!("signing reservation revision must be nonzero");
@@ -1167,9 +1295,7 @@ pub async fn sign_personaldb_certificate_and_head(
     )?
     .ok_or_else(|| anyhow!("witness signing candidate not found"))?;
     validate_candidate_against_reservation(&candidate, &reservation)?;
-    validate_bound_signer(
-        signer.trust_record(),
-        SignaturePurpose::Witness,
+    signer.validate_bound_signer(
         &identity.witness_key_id,
         identity.witness_key_generation,
         &identity.database_id,
@@ -1185,28 +1311,18 @@ pub async fn sign_personaldb_certificate_and_head(
     validate_candidate_objects(tenant_id, identity, &certificate, &head)?;
 
     let generation = KeyGeneration::new(identity.witness_key_generation)?;
-    let certificate_signable = RequiredGenerationSignable {
-        object: &certificate,
-        generation,
-    };
-    let certificate_signature = signer.sign(&certificate_signable)?;
-    authority
-        .trust_store
-        .verify(&certificate_signable, &certificate_signature)?;
+    let certificate_signature = signer
+        .sign_certificate_with_required_generation(&certificate, generation, authority.trust_store)
+        .await?;
     certificate.certificate_hash = Some(crate::personaldb_control::hash_commit_certificate(
         &certificate,
     )?);
     certificate.witness_signature = Some(certificate_signature.clone());
     let signed_commit_certificate = encode_commit_certificate(&certificate)?;
 
-    let head_signable = RequiredGenerationSignable {
-        object: &head,
-        generation,
-    };
-    let head_signature = signer.sign(&head_signable)?;
-    authority
-        .trust_store
-        .verify(&head_signable, &head_signature)?;
+    let head_signature = signer
+        .sign_head_with_required_generation(&head, generation, authority.trust_store)
+        .await?;
     head.head_hash = Some(crate::personaldb_heads::hash_committed_head(&head)?);
     head.head_signature = Some(head_signature.clone());
     let signed_committed_head = encode_committed_head(&head)?;
@@ -1954,7 +2070,6 @@ fn validate_reservation_identity_shape(
         ("client_log_epoch", identity.client_log_epoch),
         ("fencing_generation", identity.fencing_generation),
         ("leader_lease_revision", identity.leader_lease_revision),
-        ("authorization_revision", identity.authorization_revision),
         (
             "proposal_admission_generation",
             identity.proposal_admission_generation,
@@ -2148,7 +2263,6 @@ fn validate_admission_shape(admission: &ProposalAdmissionV1) -> Result<()> {
     KeyId::new(admission.witness_key_id.clone())?;
     KeyGeneration::new(admission.witness_key_generation)?;
     if admission.fencing_generation == 0
-        || admission.authorization_revision == 0
         || admission.reservation_revision == 0
         || admission.issued_at_unix_seconds < 0
         || admission.expires_at_unix_seconds <= admission.issued_at_unix_seconds

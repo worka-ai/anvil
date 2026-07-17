@@ -465,6 +465,50 @@ async fn receipt_survives_crash_window_and_replays_without_signing_again() {
     );
 }
 
+#[tokio::test]
+async fn keyring_witness_signing_persists_replayable_receipt() {
+    let fixture = Fixture::new().await;
+    let (claim, identity) = fixture.claim_and_identity("keyring-receipt");
+    let reserved = reserve_personaldb_proposal(&fixture.authority(), claim, identity)
+        .await
+        .unwrap();
+    let candidate = begin_personaldb_witness_signing(
+        &fixture.authority(),
+        fixture.candidate_request(&reserved),
+    )
+    .await
+    .unwrap();
+    let signing_request = SignCertificateAndHeadV1 {
+        reservation_id: candidate.reservation_id.clone(),
+        signing_reservation_revision: candidate.signing_reservation_revision,
+    };
+
+    let receipt = sign_personaldb_certificate_and_head_with_keyring(
+        &fixture.authority(),
+        &signing_request,
+        &fixture.keyring,
+    )
+    .await
+    .unwrap();
+    let replay = sign_personaldb_certificate_and_head_with_keyring(
+        &fixture.authority(),
+        &signing_request,
+        &fixture.keyring,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay, receipt);
+
+    let acknowledged =
+        acknowledge_personaldb_witness_receipt(&fixture.authority(), &signing_request)
+            .await
+            .unwrap();
+    assert_eq!(
+        acknowledged.witness_dual_signing_receipt_sha256,
+        Some(receipt.hash_sha256().unwrap())
+    );
+}
+
 struct CountingSigner {
     inner: Arc<dyn ProtocolSigner>,
     count: Arc<AtomicUsize>,

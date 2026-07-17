@@ -123,6 +123,22 @@ impl PersonalDbProtocolKeyring {
         &self.trust_store
     }
 
+    pub(crate) fn trust_record_for_purpose(
+        &self,
+        purpose: SignaturePurpose,
+    ) -> Result<&PublicKeyTrustRecord> {
+        let provider = self
+            .providers
+            .get(&purpose)
+            .ok_or_else(|| anyhow!("PersonalDB {purpose} signer is not configured"))?;
+        self.trust_store.get(provider.key_id()).ok_or_else(|| {
+            anyhow!(
+                "PersonalDB {purpose} signer key {} is absent from the trust store",
+                provider.key_id()
+            )
+        })
+    }
+
     pub(crate) async fn sign(
         &self,
         object: PersonalDbSigningObject,

@@ -55,6 +55,32 @@ struct PersonalDbVoterAckHashProto {
     signature: String,
 }
 
+#[derive(Clone, PartialEq, Message)]
+struct PersonalDbClientProposalHashProto {
+    #[prost(string, tag = "1")]
+    database_id: String,
+    #[prost(string, tag = "2")]
+    principal: String,
+    #[prost(string, tag = "3")]
+    request_id: String,
+    #[prost(string, tag = "4")]
+    idempotency_key: String,
+    #[prost(uint64, tag = "5")]
+    base_log_index: u64,
+    #[prost(string, tag = "6")]
+    base_log_hash: String,
+    #[prost(uint64, tag = "7")]
+    client_log_epoch: u64,
+    #[prost(uint64, tag = "8")]
+    membership_epoch: u64,
+    #[prost(uint64, tag = "9")]
+    policy_epoch: u64,
+    #[prost(bytes = "vec", tag = "10")]
+    changeset_payload_hash: Vec<u8>,
+    #[prost(bytes = "vec", tag = "11")]
+    voter_acks_hash: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedPersonalDbChangeset {
     pub request: SubmitPersonalDbChangeset,
@@ -99,6 +125,24 @@ pub fn validate_submit_personaldb_changeset(
         changeset_payload_hash: actual_payload_hash,
         voter_acks_hash,
     })
+}
+
+pub fn client_proposal_hash(validated: &ValidatedPersonalDbChangeset) -> Hash32 {
+    hash32(&encode_deterministic_proto(
+        &PersonalDbClientProposalHashProto {
+            database_id: validated.request.database_id.clone(),
+            principal: validated.request.principal.clone(),
+            request_id: validated.request.request_id.clone(),
+            idempotency_key: validated.request.idempotency_key.clone(),
+            base_log_index: validated.request.base_log_index,
+            base_log_hash: validated.request.base_log_hash.clone(),
+            client_log_epoch: validated.request.client_log_epoch,
+            membership_epoch: validated.request.membership_epoch,
+            policy_epoch: validated.request.policy_epoch,
+            changeset_payload_hash: validated.changeset_payload_hash.to_vec(),
+            voter_acks_hash: validated.voter_acks_hash.to_vec(),
+        },
+    ))
 }
 
 pub fn default_max_changeset_size() -> usize {
@@ -185,6 +229,7 @@ mod tests {
         assert_eq!(validated.request.voter_acks[0].replica_id, "replica-a");
         assert_eq!(validated.request.voter_acks[1].replica_id, "replica-b");
         assert_ne!(validated.voter_acks_hash, [0; 32]);
+        assert_ne!(client_proposal_hash(&validated), [0; 32]);
     }
 
     #[test]
@@ -228,6 +273,7 @@ mod tests {
         let right =
             validate_submit_personaldb_changeset(right, DEFAULT_MAX_CHANGESET_SIZE_BYTES).unwrap();
         assert_eq!(left.voter_acks_hash, right.voter_acks_hash);
+        assert_eq!(client_proposal_hash(&left), client_proposal_hash(&right));
         assert_eq!(left.request.voter_acks, right.request.voter_acks);
     }
 
