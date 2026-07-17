@@ -23,8 +23,9 @@ use std::{
 };
 
 const PERSONALDB_SIGNER_TIMEOUT: Duration = Duration::from_secs(2);
-const REQUIRED_PERSONALDB_SIGNER_PURPOSES: [SignaturePurpose; 3] = [
+const REQUIRED_PERSONALDB_SIGNER_PURPOSES: [SignaturePurpose; 4] = [
     SignaturePurpose::GroupControl,
+    SignaturePurpose::ProposalAdmission,
     SignaturePurpose::Snapshot,
     SignaturePurpose::Witness,
 ];
@@ -863,14 +864,14 @@ mod tests {
         let manifest_path = write_manifest(directory.path(), valid_manifest(directory.path()));
 
         let keyring = PersonalDbProtocolKeyring::from_manifest_file(manifest_path).unwrap();
-        assert_eq!(keyring.trust_store().len(), 3);
+        assert_eq!(keyring.trust_store().len(), 4);
     }
 
     #[test]
     fn production_manifest_rejects_wrong_purpose_endpoint() {
         let directory = tempfile::tempdir().unwrap();
         let mut manifest = valid_manifest(directory.path());
-        let witness_key = manifest["signer_endpoints"][2]["key_id"].clone();
+        let witness_key = endpoint_for_purpose(&manifest, "witness")["key_id"].clone();
         manifest["signer_endpoints"][0]["key_id"] = witness_key;
         let manifest_path = write_manifest(directory.path(), manifest);
 
@@ -1011,11 +1012,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let socket_path = directory.path().join("witness.sock");
         let mut manifest = valid_manifest(directory.path());
-        manifest["signer_endpoints"][2]["socket_path"] =
+        let witness_endpoint_index = endpoint_index_for_purpose(&manifest, "witness");
+        manifest["signer_endpoints"][witness_endpoint_index]["socket_path"] =
             serde_json::json!(socket_path.to_string_lossy());
         let manifest_path = write_manifest(directory.path(), manifest.clone());
         let keyring = PersonalDbProtocolKeyring::from_manifest_file(manifest_path).unwrap();
-        let witness_key = manifest["signer_endpoints"][2]["key_id"]
+        let witness_key = endpoint_for_purpose(&manifest, "witness")["key_id"]
             .as_str()
             .unwrap()
             .to_string();
@@ -1053,11 +1055,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let socket_path = directory.path().join("witness.sock");
         let mut manifest = valid_manifest(directory.path());
-        manifest["signer_endpoints"][2]["socket_path"] =
+        let witness_endpoint_index = endpoint_index_for_purpose(&manifest, "witness");
+        manifest["signer_endpoints"][witness_endpoint_index]["socket_path"] =
             serde_json::json!(socket_path.to_string_lossy());
         let manifest_path = write_manifest(directory.path(), manifest.clone());
         let keyring = PersonalDbProtocolKeyring::from_manifest_file(manifest_path).unwrap();
-        let witness_key = manifest["signer_endpoints"][2]["key_id"]
+        let witness_key = endpoint_for_purpose(&manifest, "witness")["key_id"]
             .as_str()
             .unwrap()
             .to_string();
@@ -1104,8 +1107,13 @@ mod tests {
         let mut signer_endpoints = Vec::new();
         for (seed, purpose, socket_name) in [
             (0x51, SignaturePurpose::GroupControl, "group-control.sock"),
-            (0x52, SignaturePurpose::Snapshot, "snapshot.sock"),
-            (0x53, SignaturePurpose::Witness, "witness.sock"),
+            (
+                0x52,
+                SignaturePurpose::ProposalAdmission,
+                "proposal-admission.sock",
+            ),
+            (0x53, SignaturePurpose::Snapshot, "snapshot.sock"),
+            (0x54, SignaturePurpose::Witness, "witness.sock"),
         ] {
             let signer = signer(
                 seed,
@@ -1136,6 +1144,22 @@ mod tests {
             "trusted_keys": trusted_keys,
             "signer_endpoints": signer_endpoints,
         })
+    }
+
+    fn endpoint_index_for_purpose(manifest: &serde_json::Value, purpose: &str) -> usize {
+        manifest["signer_endpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|endpoint| endpoint["purpose"].as_str() == Some(purpose))
+            .unwrap()
+    }
+
+    fn endpoint_for_purpose<'a>(
+        manifest: &'a serde_json::Value,
+        purpose: &str,
+    ) -> &'a serde_json::Value {
+        &manifest["signer_endpoints"][endpoint_index_for_purpose(manifest, purpose)]
     }
 
     fn write_manifest(directory: &Path, manifest: serde_json::Value) -> PathBuf {
