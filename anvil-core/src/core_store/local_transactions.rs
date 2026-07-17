@@ -150,7 +150,7 @@ impl CoreStore {
         validate_batch_partitions(&batch)?;
 
         let step_start = std::time::Instant::now();
-        let _operation_guards = self.acquire_batch_locks(&batch).await?;
+        let operation_guards = self.acquire_batch_locks(&batch).await?;
         crate::emit_test_timing(
             format!("core_store.commit_mutation_batch acquire_batch_locks tx={timing_name}"),
             step_start.elapsed(),
@@ -188,46 +188,96 @@ impl CoreStore {
             step_start.elapsed(),
         );
         let batch_payload = encode_core_mutation_batch(&batch)?;
-        let pending_mutation_payload =
-            if batch_payload.len() <= CORE_PENDING_MUTATION_MAX_INLINE_PAYLOAD_BYTES {
-                CorePendingMutationPayload::Inline(&batch_payload)
-            } else {
-                CorePendingMutationPayload::Landed(&batch_payload)
-            };
-        let step_start = std::time::Instant::now();
-        let admission = self
-            .admit_core_mutation(
-                "mutation.batch",
-                WriterFamily::CoreControl.as_str(),
-                CorePendingMutationTarget::MutationBatch {
-                    transaction_id: batch.transaction_id.clone(),
-                    scope_partition: batch.scope_partition.clone(),
-                    operation_count: batch.operations.len() as u64,
-                },
-                batch.transaction_id.clone(),
-                Some(batch.transaction_id.clone()),
-                pending_mutation_payload,
-                Vec::new(),
-            )
-            .await?;
-        crate::emit_test_timing(
-            format!("core_store.commit_mutation_batch admission tx={timing_name}"),
-            step_start.elapsed(),
+        // Run admission and finalisation in an owned task. Once this task is
+        // spawned, cancelling an RPC cannot strand a durable pending mutation.
+        let store = self.clone();
+        let finalisation_timing_name = timing_name.clone();
+        let finalisation: tokio::task::JoinHandle<Result<CoreMutationBatchReceipt>> = tokio::spawn(
+            async move {
+                let _operation_guards = operation_guards;
+                let pending_mutation_payload =
+                    if batch_payload.len() <= CORE_PENDING_MUTATION_MAX_INLINE_PAYLOAD_BYTES {
+                        CorePendingMutationPayload::Inline(&batch_payload)
+                    } else {
+                        CorePendingMutationPayload::Landed(&batch_payload)
+                    };
+                let step_start = std::time::Instant::now();
+                let admission = store
+                    .admit_core_mutation(
+                        "mutation.batch",
+                        WriterFamily::CoreControl.as_str(),
+                        CorePendingMutationTarget::MutationBatch {
+                            transaction_id: batch.transaction_id.clone(),
+                            scope_partition: batch.scope_partition.clone(),
+                            operation_count: batch.operations.len() as u64,
+                        },
+                        batch.transaction_id.clone(),
+                        Some(batch.transaction_id.clone()),
+                        pending_mutation_payload,
+                        Vec::new(),
+                    )
+                    .await?;
+                crate::emit_test_timing(
+                    format!(
+                        "core_store.commit_mutation_batch admission tx={finalisation_timing_name}"
+                    ),
+                    step_start.elapsed(),
+                );
+                let first_attempt = store
+                    .finalise_admitted_mutation_batch(&batch, &admission, &finalisation_timing_name)
+                    .await;
+                match first_attempt {
+                    Ok(receipt) => Ok(receipt),
+                    Err(first_error) => {
+                        tracing::error!(
+                            transaction_id = %batch.transaction_id,
+                            error = %first_error,
+                            "CoreStore admitted mutation finalisation failed; recovering in-process"
+                        );
+                        let recovery = store.recover_admitted_mutation_batch_unlocked(batch);
+                        let receipt = recovery.await.with_context(|| {
+                            format!(
+                                "recover admitted CoreStore mutation after finalisation error: {first_error:#}"
+                            )
+                        })?;
+                        store
+                            .mark_pending_mutation_finalised_unlocked(
+                                &admission,
+                                core_transaction_state_name(receipt.state),
+                            )
+                            .await?;
+                        Ok(receipt)
+                    }
+                }
+            },
         );
+        let receipt = finalisation
+            .await
+            .context("join admitted CoreStore mutation finalisation task")??;
+        crate::emit_test_timing(
+            format!("core_store.commit_mutation_batch total tx={timing_name}"),
+            total_start.elapsed(),
+        );
+        Ok(receipt)
+    }
 
+    async fn finalise_admitted_mutation_batch(
+        &self,
+        batch: &CoreMutationBatch,
+        admission: &CorePendingMutationRecord,
+        timing_name: &str,
+    ) -> Result<CoreMutationBatchReceipt> {
         let step_start = std::time::Instant::now();
         let mut prepared_coremeta_ops = Vec::new();
-        let (visible_updates, finalisation_error) = match self
-            .prepare_mutation_batch_operations_unlocked(&batch)
-            .await
-        {
-            Some(Ok((ops, updates))) => {
-                prepared_coremeta_ops = ops;
-                (updates, None)
-            }
-            Some(Err(error)) => (Vec::new(), Some(format!("{error:#}"))),
-            None => self.apply_mutation_batch_operations_unlocked(&batch).await,
-        };
+        let (visible_updates, finalisation_error) =
+            match self.prepare_mutation_batch_operations_unlocked(batch).await {
+                Some(Ok((ops, updates))) => {
+                    prepared_coremeta_ops = ops;
+                    (updates, None)
+                }
+                Some(Err(error)) => (Vec::new(), Some(format!("{error:#}"))),
+                None => self.apply_mutation_batch_operations_unlocked(batch).await,
+            };
         crate::emit_test_timing(
             format!("core_store.commit_mutation_batch operations tx={timing_name}"),
             step_start.elapsed(),
@@ -273,7 +323,7 @@ impl CoreStore {
             .await?;
         prepared_coremeta_ops.extend(transaction_ops);
         self.mark_pending_mutation_finalised_with_result_and_ops_unlocked(
-            &admission,
+            admission,
             core_transaction_state_name(transaction_state),
             None,
             prepared_coremeta_ops,
@@ -283,14 +333,10 @@ impl CoreStore {
             format!("core_store.commit_mutation_batch write_transaction tx={timing_name}"),
             step_start.elapsed(),
         );
-        crate::emit_test_timing(
-            format!("core_store.commit_mutation_batch total tx={timing_name}"),
-            total_start.elapsed(),
-        );
 
         Ok(CoreMutationBatchReceipt {
-            transaction_id: batch.transaction_id,
-            scope_partition: batch.scope_partition,
+            transaction_id: batch.transaction_id.clone(),
+            scope_partition: batch.scope_partition.clone(),
             state: transaction_state,
             visible_updates: transaction_visible_updates,
             finalisation_error,

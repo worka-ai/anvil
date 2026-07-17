@@ -416,6 +416,15 @@ impl CoreStore {
                 },
             });
         }
+        self.prepare_new_stream_append_unlocked_with_idempotency_hash(input, idempotency_key_hash)
+            .await
+    }
+
+    pub(super) async fn prepare_new_stream_append_unlocked_with_idempotency_hash(
+        &self,
+        input: AppendStreamRecord,
+        idempotency_key_hash: Option<String>,
+    ) -> Result<PreparedStreamAppend> {
         let payload_hash = format!("sha256:{}", sha256_hex(&input.payload));
         let head = self.read_stream_head_from_meta(&input.stream_id)?;
         let (last_sequence, previous_event_hash) = head

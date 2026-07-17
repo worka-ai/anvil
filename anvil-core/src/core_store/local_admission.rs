@@ -881,20 +881,25 @@ impl CoreStore {
         let _stream_guard = self
             .acquire_named_lock("stream", CORE_TRANSACTION_STREAM_ID)
             .await?;
-        let prepared_stream = Box::pin(self.prepare_stream_append_unlocked_with_idempotency_hash(
-            AppendStreamRecord {
-                stream_id: CORE_TRANSACTION_STREAM_ID.to_string(),
-                partition_id: "system/core-control".to_string(),
-                record_kind: CORE_PENDING_MUTATION_FINALISATION_RECORD_KIND.to_string(),
-                payload: finalisation_payload.clone(),
-                content_type: Some("application/protobuf".to_string()),
-                user_metadata_json: "{}".to_string(),
-                fence: None,
-                transaction_id: Some(finalisation.mutation_id.clone()),
-                idempotency_key: Some(finalisation_idempotency_key),
-            },
-            Some(finalisation_idempotency_hash),
-        ))
+        // The finalisation index is written atomically with (or before) this
+        // stream record. Its absence proves this is a new append, so a replay
+        // scan of the ever-growing transaction stream is unnecessary here.
+        let prepared_stream = Box::pin(
+            self.prepare_new_stream_append_unlocked_with_idempotency_hash(
+                AppendStreamRecord {
+                    stream_id: CORE_TRANSACTION_STREAM_ID.to_string(),
+                    partition_id: "system/core-control".to_string(),
+                    record_kind: CORE_PENDING_MUTATION_FINALISATION_RECORD_KIND.to_string(),
+                    payload: finalisation_payload.clone(),
+                    content_type: Some("application/protobuf".to_string()),
+                    user_metadata_json: "{}".to_string(),
+                    fence: None,
+                    transaction_id: Some(finalisation.mutation_id.clone()),
+                    idempotency_key: Some(finalisation_idempotency_key),
+                },
+                Some(finalisation_idempotency_hash),
+            ),
+        )
         .await?;
         let combine_stream_metadata = prepared_stream
             .record
