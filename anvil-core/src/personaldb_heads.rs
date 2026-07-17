@@ -8,8 +8,9 @@ use crate::{
     personaldb_control::PersonalDbGroupManifest,
     personaldb_coremeta::{
         PersonalDbDataLocatorCoreMetaRow, PersonalDbGroupCoreMetaRow,
-        personaldb_group_coremeta_put_operation, personaldb_partition_id, personaldb_payload_hash,
-        read_personaldb_data_locator_bytes, read_personaldb_data_locator_row,
+        personaldb_data_locator_precondition, personaldb_group_coremeta_put_operation,
+        personaldb_partition_id, personaldb_payload_hash, read_personaldb_data_locator_bytes,
+        read_personaldb_data_locator_row,
         write_personaldb_bytes_as_data_locator_with_preconditions,
     },
     personaldb_signer_protocol::PersonalDbSigningObject,
@@ -363,6 +364,19 @@ pub async fn read_personaldb_committed_head(
     Ok(Some(head))
 }
 
+pub(crate) fn personaldb_committed_head_precondition(
+    storage: &Storage,
+    tenant_id: i64,
+    database_id: &str,
+) -> Result<CoreMutationPrecondition> {
+    personaldb_data_locator_precondition(
+        storage,
+        tenant_id,
+        database_id,
+        &personaldb_head_data_id(tenant_id, database_id, "committed_head")?,
+    )
+}
+
 pub async fn write_personaldb_snapshots_head(
     storage: &Storage,
     tenant_id: i64,
@@ -615,6 +629,17 @@ impl PersonalDbHeadRecordCodec for PersonalDbCommittedHead {
             "personaldb committed head",
         )?)
     }
+}
+
+pub(crate) fn encode_committed_head(head: &PersonalDbCommittedHead) -> Result<Vec<u8>> {
+    Ok(encode_deterministic_proto(&committed_head_to_proto(head)))
+}
+
+pub(crate) fn decode_committed_head(bytes: &[u8]) -> Result<PersonalDbCommittedHead> {
+    committed_head_from_proto(decode_deterministic_proto::<PersonalDbCommittedHeadProto>(
+        bytes,
+        "personaldb committed head",
+    )?)
 }
 
 impl PersonalDbHeadRecordCodec for PersonalDbSnapshotsHead {
