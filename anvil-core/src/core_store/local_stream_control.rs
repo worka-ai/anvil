@@ -517,29 +517,38 @@ impl CoreStore {
                 return Ok(Some(receipt));
             }
         }
-        for item in self.meta.scan_range(
-            CF_STREAM_RECORDS,
-            TABLE_STREAM_RECORD_INDEX_ROW,
-            &stream_record_key(stream_id, 1),
-            &stream_record_key(stream_id, u64::MAX),
-        )? {
-            let existing = decode_stream_record_index_row(&item.payload)?;
-            validate_stream_record_index_row_metadata(stream_id, &existing)?;
-            if Some(existing.sequence) == head_sequence {
-                continue;
+        const REPLAY_SCAN_BATCH_SIZE: u64 = 256;
+        let mut end_sequence = head_sequence.unwrap_or_default().saturating_sub(1);
+        while end_sequence > 0 {
+            let start_sequence = end_sequence
+                .saturating_sub(REPLAY_SCAN_BATCH_SIZE - 1)
+                .max(1);
+            for item in self.meta.scan_range_reverse(
+                CF_STREAM_RECORDS,
+                TABLE_STREAM_RECORD_INDEX_ROW,
+                &stream_record_key(stream_id, start_sequence),
+                &stream_record_key(stream_id, end_sequence),
+                REPLAY_SCAN_BATCH_SIZE as usize,
+            )? {
+                let existing = decode_stream_record_index_row(&item.payload)?;
+                validate_stream_record_index_row_metadata(stream_id, &existing)?;
+                if let Some(receipt) = self
+                    .stream_idempotent_receipt_from_index_row_unlocked(
+                        stream_id,
+                        &payload_hash,
+                        idempotency_key_hash,
+                        transaction_id,
+                        existing,
+                    )
+                    .await?
+                {
+                    return Ok(Some(receipt));
+                }
             }
-            if let Some(receipt) = self
-                .stream_idempotent_receipt_from_index_row_unlocked(
-                    stream_id,
-                    &payload_hash,
-                    idempotency_key_hash,
-                    transaction_id,
-                    existing,
-                )
-                .await?
-            {
-                return Ok(Some(receipt));
+            if start_sequence == 1 {
+                break;
             }
+            end_sequence = start_sequence - 1;
         }
         Ok(None)
     }
