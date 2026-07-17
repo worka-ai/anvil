@@ -46,7 +46,6 @@ pub struct Persistence {
     cell_id: String,
     owner_node_id: String,
     partition_owner_signing_key: Vec<u8>,
-    personaldb_signing_key: Vec<u8>,
     embedding_providers: EmbeddingProviderRegistry,
     object_metadata_compaction_frame_threshold: u64,
     object_metadata_compaction_bytes_threshold: u64,

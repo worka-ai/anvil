@@ -48,7 +48,6 @@ impl Persistence {
             cell_id: nonempty_or(&config.cell_id, "default"),
             owner_node_id: persistence_owner_node_id(config),
             partition_owner_signing_key: hex::decode(&config.anvil_secret_encryption_key)?,
-            personaldb_signing_key: config.anvil_secret_encryption_key.as_bytes().to_vec(),
             embedding_providers: EmbeddingProviderRegistry::from_config(config)?,
             object_metadata_compaction_frame_threshold: config
                 .object_metadata_compaction_frame_threshold,

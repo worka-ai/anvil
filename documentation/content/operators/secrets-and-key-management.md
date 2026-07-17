@@ -19,6 +19,7 @@ Operators should be able to name every secret in a running deployment and answer
 | `ANVIL_SECRET_ENCRYPTION_KEY` | Anvil server processes only | Losing it can make encrypted server-side secrets unrecoverable; leaking it exposes encrypted secret envelopes if storage is also available. |
 | `ANVIL_SECRET_ENCRYPTION_KEY_ID` | Anvil server configuration and operator records | Labels new encrypted envelopes; changing it without changing the key mostly changes metadata, but it must remain consistent and meaningful. |
 | `ANVIL_SECRET_ENCRYPTION_PREVIOUS_KEYS` | Anvil server processes during rotation | Allows old envelopes to decrypt while rotation rewrites them to the active key id. |
+| `PERSONALDB_PROTOCOL_KEYRING_PATH` and referenced PKCS#8 files | Anvil server processes only | Signs PersonalDB group manifests, snapshot manifests, commit certificates, and committed heads; loss prevents new control evidence, while leakage can forge evidence within the key's purpose, scope, generation, and log boundaries. |
 | `CLUSTER_SECRET` | Anvil server processes in the same mesh | Protects cluster gossip metadata; a mismatch can make peers reject each other's signed cluster messages. |
 | Bootstrap first-admin credential | Initial system administrators or provisioning automation | Can mint a token for a powerful system principal until rotated, deleted, or access is otherwise removed. |
 | Tenant/app client secrets | The service or automation that owns the app credential | Can mint short-lived bearer tokens with that app's delegated public policy scopes. |
@@ -47,6 +48,66 @@ anvil-admin key generate-secret-encryption-key
 This command does not contact a server. It prints one random hex value suitable for `ANVIL_SECRET_ENCRYPTION_KEY`. The explanatory warning is printed separately so operators understand that losing the key can make encrypted secrets unrecoverable. Generate one active key for a storage cluster, store it in a secret manager, and inject it only into Anvil server processes. Do not hand it to tenant applications, CI jobs that only call APIs, public CLIs, or operators running network-only admin commands.
 
 The recovery implication is severe: a backup of `STORAGE_PATH` without the key history needed to decrypt its envelopes may be incomplete. A key without the matching storage is also not useful. Backup plans must protect both durable storage and the relevant secret key history.
+
+## PersonalDB Protocol Signing Keys
+
+`PERSONALDB_PROTOCOL_KEYRING_PATH` is mandatory at server startup. It names a
+JSON manifest containing trusted Ed25519 public keys and the file paths for the
+active online signers. These four protocol objects have no production HMAC or
+unsigned fallback.
+
+Use a separate PKCS#8 Ed25519 private key for each purpose:
+`group-control`, `snapshot`, and `witness`. Private-key files must be regular
+files and, on Unix, must not be readable or writable by group or other users.
+Relative signer paths resolve from the manifest directory.
+
+The version-1 manifest has this shape:
+
+```json
+{
+  "format_version": 1,
+  "trusted_keys": [
+    {
+      "format_version": 1,
+      "signature_algorithm": "ed25519",
+      "key_id": "sha256:<64 lowercase hex>",
+      "key_generation": 1,
+      "purpose": "witness",
+      "public_key_b64u": "<32 raw bytes as unpadded base64url>",
+      "database_scopes": ["pdb_example"],
+      "group_scopes": ["pdb_example"],
+      "valid_from_log_index": 0,
+      "valid_until_log_index": null,
+      "status": "active"
+    }
+  ],
+  "signers": [
+    {
+      "key_id": "sha256:<same canonical public-key ID>",
+      "private_key_pkcs8_path": "witness.pk8"
+    }
+  ]
+}
+```
+
+Provide one trusted-key and signer entry for each of the three purposes. Key IDs
+are SHA-256 over `personaldb-protocol`'s canonical deterministic protobuf
+public-key envelope, not over a PEM file or textual public key. The signer
+inherits generation, purpose, scopes, status, and log boundaries from the
+matching trusted-key record; none of those values are duplicated in a signature
+envelope. The server checks that each private key and active trust record agree
+before it starts. In the current Anvil PersonalDB model, the database ID is also
+the protocol group ID, so a non-empty `group_scopes` entry must use that same
+value. Leave either scope list empty only when the key is intentionally
+unrestricted on that dimension.
+
+For rotation, retain old public keys as `retiring` with an exclusive
+`valid_until_log_index` so historical evidence below that boundary remains
+verifiable, and install a new `active` generation for new signatures.
+`revoked_future` and `compromised` records also require an exclusive
+`valid_until_log_index`; evidence at or after that boundary fails closed.
+Removing an old public key also removes the ability to verify retained history
+that it signed.
 
 ## Key IDs And Previous Keys
 

@@ -261,7 +261,11 @@ pub(super) async fn run_personaldb_log_chain_repair(
     require_nonempty_admin_field(&req.database_id, "database_id")?;
     let report = state
         .persistence
-        .repair_personaldb_log_chain(tenant_id, &req.database_id)
+        .repair_personaldb_log_chain(
+            tenant_id,
+            &req.database_id,
+            state.personaldb_protocol_keyring.trust_store(),
+        )
         .await
         .map_err(|err| Status::failed_precondition(err.to_string()))?;
     let findings = report

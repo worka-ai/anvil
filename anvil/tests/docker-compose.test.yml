@@ -38,12 +38,17 @@ services:
       - PUBLIC_API_ADDR=http://anvil1:50051
       - ENABLE_MDNS=false
       - STORAGE_PATH=/var/lib/anvil
-    command: ["anvil-server", "--init-cluster"]
+    command:
+      - /bin/sh
+      - /usr/local/share/anvil/create-personaldb-test-keyring.sh
+      - anvil-server
+      - --init-cluster
     ports:
       - "${ANVIL_TEST_API1_PORT:-55051}:50051"
       - "${ANVIL_TEST_ADMIN1_PORT:-56051}:50052"
     volumes:
       - anvil1_data:/var/lib/anvil
+      - ./fixtures/create-personaldb-test-keyring.sh:/usr/local/share/anvil/create-personaldb-test-keyring.sh:ro
     networks: [anvilnet]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:50051/ready"]
@@ -85,11 +90,16 @@ services:
       - ENABLE_MDNS=false
       - BOOTSTRAP_ADDRS=/dns4/anvil1/udp/7443/quic-v1
       - STORAGE_PATH=/var/lib/anvil
+    command:
+      - /bin/sh
+      - /usr/local/share/anvil/create-personaldb-test-keyring.sh
+      - anvil-server
     ports:
       - "${ANVIL_TEST_API2_PORT:-55052}:50051"
       - "${ANVIL_TEST_ADMIN2_PORT:-56052}:50052"
     volumes:
       - anvil2_data:/var/lib/anvil
+      - ./fixtures/create-personaldb-test-keyring.sh:/usr/local/share/anvil/create-personaldb-test-keyring.sh:ro
     networks: [anvilnet]
 
   anvil3:
@@ -126,11 +136,16 @@ services:
       - ENABLE_MDNS=false
       - BOOTSTRAP_ADDRS=/dns4/anvil1/udp/7443/quic-v1
       - STORAGE_PATH=/var/lib/anvil
+    command:
+      - /bin/sh
+      - /usr/local/share/anvil/create-personaldb-test-keyring.sh
+      - anvil-server
     ports:
       - "${ANVIL_TEST_API3_PORT:-55053}:50051"
       - "${ANVIL_TEST_ADMIN3_PORT:-56053}:50052"
     volumes:
       - anvil3_data:/var/lib/anvil
+      - ./fixtures/create-personaldb-test-keyring.sh:/usr/local/share/anvil/create-personaldb-test-keyring.sh:ro
     networks: [anvilnet]
 
   anvil4:
@@ -167,11 +182,16 @@ services:
       - ENABLE_MDNS=false
       - BOOTSTRAP_ADDRS=/dns4/anvil1/udp/7443/quic-v1
       - STORAGE_PATH=/var/lib/anvil
+    command:
+      - /bin/sh
+      - /usr/local/share/anvil/create-personaldb-test-keyring.sh
+      - anvil-server
     ports:
       - "${ANVIL_TEST_API4_PORT:-55054}:50051"
       - "${ANVIL_TEST_ADMIN4_PORT:-56054}:50052"
     volumes:
       - anvil4_data:/var/lib/anvil
+      - ./fixtures/create-personaldb-test-keyring.sh:/usr/local/share/anvil/create-personaldb-test-keyring.sh:ro
     networks: [anvilnet]
 
   anvil5:
@@ -208,11 +228,16 @@ services:
       - ENABLE_MDNS=false
       - BOOTSTRAP_ADDRS=/dns4/anvil1/udp/7443/quic-v1
       - STORAGE_PATH=/var/lib/anvil
+    command:
+      - /bin/sh
+      - /usr/local/share/anvil/create-personaldb-test-keyring.sh
+      - anvil-server
     ports:
       - "${ANVIL_TEST_API5_PORT:-55055}:50051"
       - "${ANVIL_TEST_ADMIN5_PORT:-56055}:50052"
     volumes:
       - anvil5_data:/var/lib/anvil
+      - ./fixtures/create-personaldb-test-keyring.sh:/usr/local/share/anvil/create-personaldb-test-keyring.sh:ro
     networks: [anvilnet]
 
   anvil6:
@@ -249,11 +274,16 @@ services:
       - ENABLE_MDNS=false
       - BOOTSTRAP_ADDRS=/dns4/anvil1/udp/7443/quic-v1
       - STORAGE_PATH=/var/lib/anvil
+    command:
+      - /bin/sh
+      - /usr/local/share/anvil/create-personaldb-test-keyring.sh
+      - anvil-server
     ports:
       - "${ANVIL_TEST_API6_PORT:-55056}:50051"
       - "${ANVIL_TEST_ADMIN6_PORT:-56056}:50052"
     volumes:
       - anvil6_data:/var/lib/anvil
+      - ./fixtures/create-personaldb-test-keyring.sh:/usr/local/share/anvil/create-personaldb-test-keyring.sh:ro
     networks: [anvilnet]
 
 volumes:

@@ -124,12 +124,12 @@ impl PersonalDbService for AppState {
             &resource,
         )
         .await?;
-        let signing_key = self.personaldb_signing_key();
+        let protocol_keyring = self.personaldb_protocol_keyring.as_ref();
         if read_personaldb_group_manifest(
             &self.storage,
             claims.tenant_id,
             &req.database_id,
-            signing_key,
+            protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -144,7 +144,7 @@ impl PersonalDbService for AppState {
 
         let now = now_rfc3339();
         let manifest = PersonalDbGroupManifest {
-            format_version: 1,
+            format_version: 2,
             tenant_id: claims.tenant_id.to_string(),
             database_id: req.database_id.clone(),
             schema_hash: req.schema_hash.clone(),
@@ -160,7 +160,7 @@ impl PersonalDbService for AppState {
             manifest_hash: None,
             manifest_signature: None,
         }
-        .seal(signing_key)
+        .seal(protocol_keyring)
         .map_err(internal_status)?;
         write_personaldb_schema_sql(
             &self.storage,
@@ -171,12 +171,17 @@ impl PersonalDbService for AppState {
         )
         .await
         .map_err(internal_status)?;
-        write_personaldb_group_manifest(&self.storage, claims.tenant_id, &manifest, signing_key)
-            .await
-            .map_err(internal_status)?;
+        write_personaldb_group_manifest(
+            &self.storage,
+            claims.tenant_id,
+            &manifest,
+            protocol_keyring.trust_store(),
+        )
+        .await
+        .map_err(internal_status)?;
 
         let committed_head = PersonalDbCommittedHead {
-            format_version: 1,
+            format_version: 2,
             tenant_id: claims.tenant_id.to_string(),
             database_id: req.database_id,
             log_index: 0,
@@ -191,14 +196,14 @@ impl PersonalDbService for AppState {
             head_hash: None,
             head_signature: None,
         }
-        .seal(signing_key)
+        .seal(protocol_keyring)
         .map_err(internal_status)?;
         write_personaldb_committed_head(
             &self.storage,
             claims.tenant_id,
             &committed_head.database_id,
             &committed_head,
-            signing_key,
+            protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?;
@@ -237,12 +242,11 @@ impl PersonalDbService for AppState {
         {
             return Err(Status::permission_denied("Permission denied"));
         }
-        let signing_key = self.personaldb_signing_key();
         let manifest = read_personaldb_group_manifest(
             &self.storage,
             claims.tenant_id,
             &req.database_id,
-            signing_key,
+            self.personaldb_protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -251,7 +255,7 @@ impl PersonalDbService for AppState {
             &self.storage,
             claims.tenant_id,
             &req.database_id,
-            signing_key,
+            self.personaldb_protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?;
@@ -288,12 +292,11 @@ impl PersonalDbService for AppState {
             &resource,
         )
         .await?;
-        let signing_key = self.personaldb_signing_key();
         read_personaldb_group_manifest(
             &self.storage,
             claims.tenant_id,
             &req.database_id,
-            signing_key,
+            self.personaldb_protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -304,7 +307,7 @@ impl PersonalDbService for AppState {
                 &self.storage,
                 claims.tenant_id,
                 source_database_id,
-                signing_key,
+                self.personaldb_protocol_keyring.trust_store(),
             )
             .await
             .map_err(internal_status)?
@@ -445,7 +448,8 @@ impl PersonalDbService for AppState {
                 have_log_hash: req.have_log_hash,
                 max_entries: nonzero_limit(req.max_entries),
             },
-            self.personaldb_signing_key(),
+            self.personaldb_snapshots_head_signing_key(),
+            self.personaldb_protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?;
@@ -596,7 +600,7 @@ impl PersonalDbService for AppState {
 }
 
 impl AppState {
-    fn personaldb_signing_key(&self) -> &[u8] {
+    fn personaldb_snapshots_head_signing_key(&self) -> &[u8] {
         self.config.anvil_secret_encryption_key.as_bytes()
     }
 
@@ -754,12 +758,11 @@ impl AppState {
         actor: PersonalDbCommitActor,
         definition: ProjectionDefinition,
     ) -> Result<Response<SubmitPersonalDbChangesetResponse>, Status> {
-        let signing_key = self.personaldb_signing_key();
         let projection_manifest = read_personaldb_group_manifest(
             &self.storage,
             actor.tenant_id,
             &definition.database_id,
-            signing_key,
+            self.personaldb_protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -768,7 +771,7 @@ impl AppState {
             &self.storage,
             actor.tenant_id,
             &definition.database_id,
-            signing_key,
+            self.personaldb_protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -794,7 +797,7 @@ impl AppState {
             &self.storage,
             actor.tenant_id,
             &source_database_id,
-            signing_key,
+            self.personaldb_protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -803,7 +806,7 @@ impl AppState {
             &self.storage,
             actor.tenant_id,
             &source_database_id,
-            signing_key,
+            self.personaldb_protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -903,12 +906,13 @@ impl AppState {
         let _commit_guard = self
             .personaldb_commit_guard(actor.tenant_id, &validated.request.database_id)
             .await;
-        let signing_key = self.personaldb_signing_key();
+        let snapshots_head_signing_key = self.personaldb_snapshots_head_signing_key();
+        let protocol_keyring = self.personaldb_protocol_keyring.as_ref();
         let manifest = read_personaldb_group_manifest(
             &self.storage,
             actor.tenant_id,
             &validated.request.database_id,
-            signing_key,
+            protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -917,7 +921,7 @@ impl AppState {
             &self.storage,
             actor.tenant_id,
             &validated.request.database_id,
-            signing_key,
+            protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -950,7 +954,7 @@ impl AppState {
             &self.storage,
             actor.tenant_id,
             &validated.request.database_id,
-            signing_key,
+            protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -1036,7 +1040,7 @@ impl AppState {
             Vec::new(),
         );
         let certificate = PersonalDbCommitCertificate {
-            format_version: 1,
+            format_version: 2,
             tenant_id: actor.tenant_id.to_string(),
             database_id: validated.request.database_id.clone(),
             log_index: proposed_log_index,
@@ -1055,14 +1059,14 @@ impl AppState {
             certificate_hash: None,
             witness_signature: None,
         }
-        .seal(signing_key)
+        .seal(protocol_keyring)
         .map_err(internal_status)?;
         let certificate_ref = write_personaldb_commit_certificate(
             &self.storage,
             actor.tenant_id,
             &validated.request.database_id,
             &certificate,
-            signing_key,
+            protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?;
@@ -1124,7 +1128,7 @@ impl AppState {
             &self.storage,
             actor.tenant_id,
             &validated.request.database_id,
-            signing_key,
+            protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -1138,12 +1142,12 @@ impl AppState {
             ));
         }
         let committed_head = PersonalDbCommittedHead {
-            format_version: 1,
+            format_version: 2,
             tenant_id: actor.tenant_id.to_string(),
             database_id: validated.request.database_id.clone(),
             log_index: proposed_log_index,
             log_hash: hex::encode(record.entry_hash),
-            segment_ref: segment_ref,
+            segment_ref,
             row_index_generation,
             policy_epoch: manifest.active_policy_epoch,
             membership_epoch: manifest.active_membership_epoch,
@@ -1153,14 +1157,14 @@ impl AppState {
             head_hash: None,
             head_signature: None,
         }
-        .seal(signing_key)
+        .seal(protocol_keyring)
         .map_err(internal_status)?;
         write_personaldb_committed_head_with_preconditions(
             &self.storage,
             actor.tenant_id,
             &validated.request.database_id,
             &committed_head,
-            signing_key,
+            protocol_keyring.trust_store(),
             vec![write_precondition],
         )
         .await
@@ -1196,7 +1200,8 @@ impl AppState {
                 created_by_node: &actor.principal,
                 policy: configured_personaldb_snapshot_policy(&self.config),
             },
-            signing_key,
+            snapshots_head_signing_key,
+            protocol_keyring,
         )
         .await
         .map_err(internal_status)?;
@@ -1245,12 +1250,11 @@ impl AppState {
         source_log_hash: &str,
         authz_revision: u64,
     ) -> Result<(), Status> {
-        let signing_key = self.personaldb_signing_key();
         let source_manifest = read_personaldb_group_manifest(
             &self.storage,
             tenant_id,
             source_database_id,
-            signing_key,
+            self.personaldb_protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -1300,12 +1304,11 @@ impl AppState {
                 "PersonalDB projection target database scope mismatch",
             ));
         }
-        let signing_key = self.personaldb_signing_key();
         let target_manifest = read_personaldb_group_manifest(
             &self.storage,
             tenant_id,
             &definition.database_id,
-            signing_key,
+            self.personaldb_protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -1314,7 +1317,7 @@ impl AppState {
             &self.storage,
             tenant_id,
             &definition.database_id,
-            signing_key,
+            self.personaldb_protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?

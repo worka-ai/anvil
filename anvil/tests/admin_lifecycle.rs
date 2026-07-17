@@ -1,7 +1,7 @@
 use anvil::anvil_api::admin_service_client::AdminServiceClient;
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::*;
-use anvil_test_utils::wait_for_port;
+use anvil_test_utils::{personaldb_test_protocol_keyring, wait_for_port};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
@@ -55,7 +55,9 @@ async fn spawn_admin_node() -> AdminNode {
         ..anvil::config::Config::default()
     };
 
-    let state = anvil::AppState::new(config, None).await.unwrap();
+    let state = anvil::AppState::new(config, None, personaldb_test_protocol_keyring())
+        .await
+        .unwrap();
     let swarm = anvil::cluster::create_swarm(state.config.clone())
         .await
         .unwrap();

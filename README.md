@@ -133,11 +133,13 @@ A single-node local run is useful for learning the planes before building a larg
 ```sh
 export ANVIL_IMAGE="ghcr.io/worka-ai/anvil:v0.3.0"
 export ANVIL_SECRET_ENCRYPTION_KEY="$(anvil-admin key generate-secret-encryption-key)"
+export PERSONALDB_PROTOCOL_KEYRING_DIR="/absolute/path/to/personaldb-keyring"
 
 docker run --rm \
   --name anvil-local \
   -p 127.0.0.1:50051:50051 \
   -v anvil-local-data:/var/lib/anvil \
+  -v "$PERSONALDB_PROTOCOL_KEYRING_DIR:/run/secrets/personaldb:ro" \
   -e STORAGE_PATH=/var/lib/anvil \
   -e REGION=local \
   -e API_LISTEN_ADDR=0.0.0.0:50051 \
@@ -145,11 +147,18 @@ docker run --rm \
   -e ADMIN_LISTEN_ADDR=127.0.0.1:50052 \
   -e JWT_SECRET="local-jwt-secret-change-me" \
   -e ANVIL_SECRET_ENCRYPTION_KEY="$ANVIL_SECRET_ENCRYPTION_KEY" \
+  -e PERSONALDB_PROTOCOL_KEYRING_PATH=/run/secrets/personaldb/keyring.json \
   -e CLUSTER_SECRET="local-cluster-secret-change-me" \
   -e BOOTSTRAP_SYSTEM_ADMIN_APP_NAME=ops-admin \
   -e BOOTSTRAP_SYSTEM_ADMIN_CREDENTIAL_OUTPUT_PATH=/var/lib/anvil/first-admin.json \
   "$ANVIL_IMAGE"
 ```
+
+The PersonalDB keyring directory contains the trust manifest and its three
+distinct group-control, snapshot, and witness PKCS#8 Ed25519 private keys.
+Private-key files must be mode `0600` and readable by container UID `10001`.
+See [Secrets and Key Management](documentation/content/operators/secrets-and-key-management.md#personaldb-protocol-signing-keys)
+for the manifest contract and rotation behavior.
 
 After the container is ready, the host can reach only the public plane at `http://127.0.0.1:50051`. The admin listener is bound to loopback inside the container and is deliberately not published to the host. For local admin smoke tests, run `anvil-admin` with `docker exec` so the command executes inside that private boundary; for example, pass `ANVIL_AUTH_TOKEN` into the container and let the in-container CLI call `http://127.0.0.1:50052`.
 

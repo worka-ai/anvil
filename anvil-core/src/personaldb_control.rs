@@ -1,15 +1,18 @@
-use crate::{core_store::encode_deterministic_proto, formats::hash32};
+use crate::{
+    core_store::encode_deterministic_proto,
+    formats::{Hash32, hash32},
+    personaldb_signing::PersonalDbProtocolKeyring,
+};
 use anyhow::{Result, anyhow};
-use base64::Engine;
-use hmac::{Hmac, Mac};
+use personaldb_protocol::{
+    DatabaseId, ProtocolSignable, PublicKeyTrustStore, SignatureDomain, SignatureEnvelopeV1,
+    SignatureMetadata, SignaturePurpose, SignatureScope, SigningPayload,
+};
 use prost::Message;
-use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 
-type HmacSha256 = Hmac<Sha256>;
 const PERSONALDB_SNAPSHOT_OBJECT_REF_PREFIX: &str = "personaldb_snapshot_object:";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersonalDbGroupManifest {
     pub format_version: u16,
     pub tenant_id: String,
@@ -25,10 +28,10 @@ pub struct PersonalDbGroupManifest {
     pub current_row_index_generation: u64,
     pub current_projection_generation: u64,
     pub manifest_hash: Option<String>,
-    pub manifest_signature: Option<String>,
+    pub manifest_signature: Option<SignatureEnvelopeV1>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersonalDbSnapshotManifest {
     pub format_version: u16,
     pub tenant_id: String,
@@ -45,10 +48,10 @@ pub struct PersonalDbSnapshotManifest {
     pub created_at: String,
     pub created_by_node: String,
     pub manifest_hash: Option<String>,
-    pub manifest_signature: Option<String>,
+    pub manifest_signature: Option<SignatureEnvelopeV1>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersonalDbCommitCertificate {
     pub format_version: u16,
     pub tenant_id: String,
@@ -67,7 +70,7 @@ pub struct PersonalDbCommitCertificate {
     pub witness_node_id: String,
     pub witnessed_at: String,
     pub certificate_hash: Option<String>,
-    pub witness_signature: Option<String>,
+    pub witness_signature: Option<SignatureEnvelopeV1>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -169,142 +172,194 @@ struct PersonalDbCommitCertificateHashProto {
 }
 
 impl PersonalDbGroupManifest {
-    pub fn seal(mut self, signing_key: &[u8]) -> Result<Self> {
+    pub fn seal(mut self, keyring: &PersonalDbProtocolKeyring) -> Result<Self> {
         validate_group_manifest_unsigned(&self)?;
-        let hash = hash_group_manifest(&self)?;
-        let signature = sign_control_hash(
-            signing_key,
-            "personaldb_group_manifest",
-            &hash,
-            &[&self.tenant_id, &self.database_id],
+        require_unsealed(
+            self.manifest_hash.as_ref(),
+            self.manifest_signature.as_ref(),
+            "personaldb group manifest",
         )?;
-        self.manifest_hash = Some(hash);
+        let hash = group_manifest_hash_bytes(&self)?;
+        let signature = keyring.sign(&self)?;
+        self.manifest_hash = Some(hex::encode(hash));
         self.manifest_signature = Some(signature);
         Ok(self)
     }
 
-    pub fn verify(&self, signing_key: &[u8]) -> Result<()> {
+    pub fn verify(&self, trust_store: &PublicKeyTrustStore) -> Result<()> {
         validate_group_manifest_unsigned(self)?;
-        let expected_hash = hash_group_manifest(self)?;
-        if self.manifest_hash.as_deref() != Some(expected_hash.as_str()) {
+        let expected_hash = group_manifest_hash_bytes(self)?;
+        if self.manifest_hash.as_deref() != Some(hex::encode(expected_hash).as_str()) {
             return Err(anyhow!("personaldb group manifest hash mismatch"));
         }
-        let expected_signature = sign_control_hash(
-            signing_key,
-            "personaldb_group_manifest",
-            &expected_hash,
-            &[&self.tenant_id, &self.database_id],
-        )?;
-        if self.manifest_signature.as_deref() != Some(expected_signature.as_str()) {
-            return Err(anyhow!("personaldb group manifest signature mismatch"));
-        }
+        let signature = self
+            .manifest_signature
+            .as_ref()
+            .ok_or_else(|| anyhow!("personaldb group manifest signature missing"))?;
+        trust_store.verify(self, signature)?;
         Ok(())
     }
 }
 
 impl PersonalDbSnapshotManifest {
-    pub fn seal(mut self, signing_key: &[u8]) -> Result<Self> {
+    pub fn seal(mut self, keyring: &PersonalDbProtocolKeyring) -> Result<Self> {
         validate_snapshot_manifest_unsigned(&self)?;
-        let hash = hash_snapshot_manifest(&self)?;
-        let signature = sign_control_hash(
-            signing_key,
-            "personaldb_snapshot_manifest",
-            &hash,
-            &[
-                &self.tenant_id,
-                &self.database_id,
-                &self.log_index.to_string(),
-            ],
+        require_unsealed(
+            self.manifest_hash.as_ref(),
+            self.manifest_signature.as_ref(),
+            "personaldb snapshot manifest",
         )?;
-        self.manifest_hash = Some(hash);
+        let hash = snapshot_manifest_hash_bytes(&self)?;
+        let signature = keyring.sign(&self)?;
+        self.manifest_hash = Some(hex::encode(hash));
         self.manifest_signature = Some(signature);
         Ok(self)
     }
 
-    pub fn verify(&self, signing_key: &[u8]) -> Result<()> {
+    pub fn verify(&self, trust_store: &PublicKeyTrustStore) -> Result<()> {
         validate_snapshot_manifest_unsigned(self)?;
-        let expected_hash = hash_snapshot_manifest(self)?;
-        if self.manifest_hash.as_deref() != Some(expected_hash.as_str()) {
+        let expected_hash = snapshot_manifest_hash_bytes(self)?;
+        if self.manifest_hash.as_deref() != Some(hex::encode(expected_hash).as_str()) {
             return Err(anyhow!("personaldb snapshot manifest hash mismatch"));
         }
-        let expected_signature = sign_control_hash(
-            signing_key,
-            "personaldb_snapshot_manifest",
-            &expected_hash,
-            &[
-                &self.tenant_id,
-                &self.database_id,
-                &self.log_index.to_string(),
-            ],
-        )?;
-        if self.manifest_signature.as_deref() != Some(expected_signature.as_str()) {
-            return Err(anyhow!("personaldb snapshot manifest signature mismatch"));
-        }
+        let signature = self
+            .manifest_signature
+            .as_ref()
+            .ok_or_else(|| anyhow!("personaldb snapshot manifest signature missing"))?;
+        trust_store.verify(self, signature)?;
         Ok(())
     }
 }
 
 impl PersonalDbCommitCertificate {
-    pub fn seal(mut self, signing_key: &[u8]) -> Result<Self> {
+    pub fn seal(mut self, keyring: &PersonalDbProtocolKeyring) -> Result<Self> {
         validate_commit_certificate_unsigned(&self)?;
-        let hash = hash_commit_certificate(&self)?;
-        let signature = sign_control_hash(
-            signing_key,
-            "personaldb_commit_certificate",
-            &hash,
-            &[
-                &self.tenant_id,
-                &self.database_id,
-                &self.log_index.to_string(),
-            ],
+        require_unsealed(
+            self.certificate_hash.as_ref(),
+            self.witness_signature.as_ref(),
+            "personaldb commit certificate",
         )?;
-        self.certificate_hash = Some(hash);
+        let hash = commit_certificate_hash_bytes(&self)?;
+        let signature = keyring.sign(&self)?;
+        self.certificate_hash = Some(hex::encode(hash));
         self.witness_signature = Some(signature);
         Ok(self)
     }
 
-    pub fn verify(&self, signing_key: &[u8]) -> Result<()> {
+    pub fn verify(&self, trust_store: &PublicKeyTrustStore) -> Result<()> {
         validate_commit_certificate_unsigned(self)?;
-        let expected_hash = hash_commit_certificate(self)?;
-        if self.certificate_hash.as_deref() != Some(expected_hash.as_str()) {
+        let expected_hash = commit_certificate_hash_bytes(self)?;
+        if self.certificate_hash.as_deref() != Some(hex::encode(expected_hash).as_str()) {
             return Err(anyhow!("personaldb commit certificate hash mismatch"));
         }
-        let expected_signature = sign_control_hash(
-            signing_key,
-            "personaldb_commit_certificate",
-            &expected_hash,
-            &[
-                &self.tenant_id,
-                &self.database_id,
-                &self.log_index.to_string(),
-            ],
-        )?;
-        if self.witness_signature.as_deref() != Some(expected_signature.as_str()) {
-            return Err(anyhow!("personaldb commit certificate signature mismatch"));
-        }
+        let signature = self
+            .witness_signature
+            .as_ref()
+            .ok_or_else(|| anyhow!("personaldb commit certificate signature missing"))?;
+        trust_store.verify(self, signature)?;
         Ok(())
     }
 }
 
+impl ProtocolSignable for PersonalDbGroupManifest {
+    fn signature_metadata(&self) -> SignatureMetadata {
+        signature_metadata(
+            SignaturePurpose::GroupControl,
+            SignatureDomain::GroupManifest,
+            &self.database_id,
+            0,
+        )
+    }
+
+    fn signing_payload(&self) -> SigningPayload<'_> {
+        SigningPayload::Sha256Digest(group_manifest_payload_hash(self))
+    }
+}
+
+impl ProtocolSignable for PersonalDbSnapshotManifest {
+    fn signature_metadata(&self) -> SignatureMetadata {
+        signature_metadata(
+            SignaturePurpose::Snapshot,
+            SignatureDomain::SnapshotManifest,
+            &self.database_id,
+            self.log_index,
+        )
+    }
+
+    fn signing_payload(&self) -> SigningPayload<'_> {
+        SigningPayload::Sha256Digest(snapshot_manifest_payload_hash(self))
+    }
+}
+
+impl ProtocolSignable for PersonalDbCommitCertificate {
+    fn signature_metadata(&self) -> SignatureMetadata {
+        signature_metadata(
+            SignaturePurpose::Witness,
+            SignatureDomain::CommitCertificate,
+            &self.database_id,
+            self.log_index,
+        )
+    }
+
+    fn signing_payload(&self) -> SigningPayload<'_> {
+        SigningPayload::Sha256Digest(commit_certificate_payload_hash(self))
+    }
+}
+
 pub fn hash_group_manifest(manifest: &PersonalDbGroupManifest) -> Result<String> {
-    validate_group_manifest_unsigned(manifest)?;
-    Ok(hex::encode(hash32(&encode_deterministic_proto(
-        &group_manifest_hash_proto(manifest),
-    ))))
+    Ok(hex::encode(group_manifest_hash_bytes(manifest)?))
 }
 
 pub fn hash_snapshot_manifest(manifest: &PersonalDbSnapshotManifest) -> Result<String> {
-    validate_snapshot_manifest_unsigned(manifest)?;
-    Ok(hex::encode(hash32(&encode_deterministic_proto(
-        &snapshot_manifest_hash_proto(manifest),
-    ))))
+    Ok(hex::encode(snapshot_manifest_hash_bytes(manifest)?))
 }
 
 pub fn hash_commit_certificate(certificate: &PersonalDbCommitCertificate) -> Result<String> {
+    Ok(hex::encode(commit_certificate_hash_bytes(certificate)?))
+}
+
+fn group_manifest_hash_bytes(manifest: &PersonalDbGroupManifest) -> Result<Hash32> {
+    validate_group_manifest_unsigned(manifest)?;
+    Ok(group_manifest_payload_hash(manifest))
+}
+
+fn snapshot_manifest_hash_bytes(manifest: &PersonalDbSnapshotManifest) -> Result<Hash32> {
+    validate_snapshot_manifest_unsigned(manifest)?;
+    Ok(snapshot_manifest_payload_hash(manifest))
+}
+
+fn commit_certificate_hash_bytes(certificate: &PersonalDbCommitCertificate) -> Result<Hash32> {
     validate_commit_certificate_unsigned(certificate)?;
-    Ok(hex::encode(hash32(&encode_deterministic_proto(
-        &commit_certificate_hash_proto(certificate),
-    ))))
+    Ok(commit_certificate_payload_hash(certificate))
+}
+
+fn group_manifest_payload_hash(manifest: &PersonalDbGroupManifest) -> Hash32 {
+    hash32(&encode_deterministic_proto(&group_manifest_hash_proto(
+        manifest,
+    )))
+}
+
+fn snapshot_manifest_payload_hash(manifest: &PersonalDbSnapshotManifest) -> Hash32 {
+    hash32(&encode_deterministic_proto(&snapshot_manifest_hash_proto(
+        manifest,
+    )))
+}
+
+fn commit_certificate_payload_hash(certificate: &PersonalDbCommitCertificate) -> Hash32 {
+    hash32(&encode_deterministic_proto(&commit_certificate_hash_proto(
+        certificate,
+    )))
+}
+
+fn signature_metadata(
+    purpose: SignaturePurpose,
+    domain: SignatureDomain,
+    database_id: &str,
+    log_index: u64,
+) -> SignatureMetadata {
+    SignatureMetadata::for_domain(purpose, domain, log_index).with_scope(
+        SignatureScope::for_database_group(DatabaseId::new(database_id), database_id.to_string()),
+    )
 }
 
 fn group_manifest_hash_proto(
@@ -372,7 +427,7 @@ fn commit_certificate_hash_proto(
 }
 
 fn validate_group_manifest_unsigned(manifest: &PersonalDbGroupManifest) -> Result<()> {
-    if manifest.format_version != 1 {
+    if manifest.format_version != 2 {
         return Err(anyhow!("unsupported personaldb group manifest version"));
     }
     if manifest.consistency_policy != "StrictWitnessed" {
@@ -409,7 +464,7 @@ fn validate_snapshot_manifest_unsigned(manifest: &PersonalDbSnapshotManifest) ->
 }
 
 fn validate_commit_certificate_unsigned(certificate: &PersonalDbCommitCertificate) -> Result<()> {
-    if certificate.format_version != 1 {
+    if certificate.format_version != 2 {
         return Err(anyhow!("unsupported personaldb commit certificate version"));
     }
     validate_hex32(&certificate.previous_log_hash, "previous_log_hash")?;
@@ -430,24 +485,15 @@ fn validate_commit_certificate_unsigned(certificate: &PersonalDbCommitCertificat
     Ok(())
 }
 
-fn sign_control_hash(
-    signing_key: &[u8],
-    domain: &str,
-    hash: &str,
-    scope_parts: &[&str],
-) -> Result<String> {
-    if signing_key.is_empty() {
-        return Err(anyhow!("personaldb signing key must not be empty"));
+fn require_unsealed<T>(
+    hash: Option<&String>,
+    signature: Option<&T>,
+    object_name: &'static str,
+) -> Result<()> {
+    if hash.is_some() || signature.is_some() {
+        return Err(anyhow!("{object_name} is already sealed"));
     }
-    let mut mac = HmacSha256::new_from_slice(signing_key)?;
-    mac.update(domain.as_bytes());
-    mac.update(b"\0");
-    mac.update(hash.as_bytes());
-    for part in scope_parts {
-        mac.update(b"\0");
-        mac.update(part.as_bytes());
-    }
-    Ok(base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
+    Ok(())
 }
 
 fn validate_hex32(value: &str, field: &'static str) -> Result<()> {
@@ -478,51 +524,117 @@ fn require_corestore_ref(value: &str, field: &'static str, prefix: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const KEY: &[u8] = b"personaldb control signing key";
+    use crate::test_support::personaldb_protocol_keyring;
+    use personaldb_protocol::signing_preimage;
 
     #[test]
     fn group_manifest_seal_verify_and_tamper_reject() {
-        let manifest = sample_group_manifest().seal(KEY).unwrap();
-        manifest.verify(KEY).unwrap();
+        let keyring = personaldb_protocol_keyring();
+        let manifest = sample_group_manifest().seal(&keyring).unwrap();
+        manifest.verify(keyring.trust_store()).unwrap();
         assert_eq!(manifest.manifest_hash.as_deref().unwrap().len(), 64);
-        assert!(!manifest.manifest_signature.as_deref().unwrap().is_empty());
+        assert_eq!(
+            manifest
+                .manifest_signature
+                .as_ref()
+                .unwrap()
+                .signature
+                .as_bytes()
+                .len(),
+            64
+        );
 
         let mut tampered = manifest;
         tampered.active_policy_epoch += 1;
-        assert!(tampered.verify(KEY).is_err());
+        assert!(tampered.verify(keyring.trust_store()).is_err());
     }
 
     #[test]
     fn snapshot_manifest_seal_verify_and_tamper_reject() {
-        let manifest = sample_snapshot_manifest().seal(KEY).unwrap();
-        manifest.verify(KEY).unwrap();
+        let keyring = personaldb_protocol_keyring();
+        let manifest = sample_snapshot_manifest().seal(&keyring).unwrap();
+        manifest.verify(keyring.trust_store()).unwrap();
         let mut tampered = manifest;
         tampered.snapshot_object_hash = hex::encode([7; 32]);
-        assert!(tampered.verify(KEY).is_err());
+        assert!(tampered.verify(keyring.trust_store()).is_err());
     }
 
     #[test]
     fn commit_certificate_seal_verify_and_tamper_reject() {
-        let certificate = sample_commit_certificate().seal(KEY).unwrap();
-        certificate.verify(KEY).unwrap();
+        let keyring = personaldb_protocol_keyring();
+        let certificate = sample_commit_certificate().seal(&keyring).unwrap();
+        certificate.verify(keyring.trust_store()).unwrap();
         assert_eq!(certificate.certificate_hash.as_deref().unwrap().len(), 64);
 
         let mut tampered = certificate;
         tampered.authz_revision += 1;
-        assert!(tampered.verify(KEY).is_err());
+        assert!(tampered.verify(keyring.trust_store()).is_err());
     }
 
     #[test]
     fn group_manifest_rejects_unsupported_policy() {
+        let keyring = personaldb_protocol_keyring();
         let mut manifest = sample_group_manifest();
         manifest.consistency_policy = "EventuallyAccepted".to_string();
-        assert!(manifest.seal(KEY).is_err());
+        assert!(manifest.seal(&keyring).is_err());
+    }
+
+    #[test]
+    fn signature_purpose_is_object_specific() {
+        let keyring = personaldb_protocol_keyring();
+        let manifest = sample_group_manifest().seal(&keyring).unwrap();
+        let mut certificate = sample_commit_certificate().seal(&keyring).unwrap();
+        certificate.witness_signature = manifest.manifest_signature;
+        assert!(certificate.verify(keyring.trust_store()).is_err());
+    }
+
+    #[test]
+    fn commit_certificate_ed25519_vector() {
+        let keyring = personaldb_protocol_keyring();
+        let unsigned = sample_commit_certificate();
+        let unsigned_bytes = encode_deterministic_proto(&commit_certificate_hash_proto(&unsigned));
+        let object_hash = commit_certificate_hash_bytes(&unsigned).unwrap();
+        let metadata = unsigned.signature_metadata();
+        let preimage = signing_preimage(
+            metadata.domain,
+            metadata.signed_payload_version,
+            SigningPayload::Sha256Digest(object_hash),
+        )
+        .unwrap();
+        let sealed = unsigned.seal(&keyring).unwrap();
+        let envelope = sealed.witness_signature.as_ref().unwrap();
+        let envelope_bytes = envelope.encode_deterministic().unwrap();
+
+        assert_eq!(
+            hex::encode(unsigned_bytes),
+            "0802120674656e616e741a02646220012a40303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303240303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313a403032303230323032303230323032303230323032303230323032303230323032303230323032303230323032303230323032303230323032303230323032303242403033303330333033303330333033303330333033303330333033303330333033303330333033303330333033303330333033303330333033303330333033303348015001580162077265706c6963616a403034303430343034303430343034303430343034303430343034303430343034303430343034303430343034303430343034303430343034303430343034303470017a046e6f646582011e323032362d30362d32305430303a30303a30302e3030303030303030305a"
+        );
+        assert_eq!(
+            hex::encode(object_hash),
+            "66ca6cbdd3c03c3da9bb67e259354f37756a781f98d7daafb33acaab89c74557"
+        );
+        assert_eq!(
+            hex::encode(preimage.as_bytes()),
+            "706572736f6e616c646200636f6d6d69742d6365727469666963617465000000000266ca6cbdd3c03c3da9bb67e259354f37756a781f98d7daafb33acaab89c74557"
+        );
+        assert_eq!(
+            envelope.key_id.as_str(),
+            "sha256:512ae918f6ee80cdfb87093abb416a47f64c01244b5a816a84e892825394f02e"
+        );
+        assert_eq!(
+            hex::encode(envelope.signature.as_bytes()),
+            "0bc12a16796f3dfb5a8516d6a3e7053a2448be3b7f1ed6ae75dfc15ecb48bb9707872556444d37aeb139fe8ac52af939347504ad876ccc9cfc6d87c917874109"
+        );
+        assert_eq!(
+            hex::encode(envelope_bytes),
+            "08011001180122477368613235363a353132616539313866366565383063646662383730393361626234313661343766363463303132343462356138313661383465383932383235333934663032652a400bc12a16796f3dfb5a8516d6a3e7053a2448be3b7f1ed6ae75dfc15ecb48bb9707872556444d37aeb139fe8ac52af939347504ad876ccc9cfc6d87c917874109"
+        );
+        sealed.verify(keyring.trust_store()).unwrap();
     }
 
     fn sample_group_manifest() -> PersonalDbGroupManifest {
         PersonalDbGroupManifest {
-            format_version: 1,
+            format_version: 2,
             tenant_id: "tenant".to_string(),
             database_id: "db".to_string(),
             schema_hash: hex::encode([1; 32]),
@@ -568,7 +680,7 @@ mod tests {
 
     fn sample_commit_certificate() -> PersonalDbCommitCertificate {
         PersonalDbCommitCertificate {
-            format_version: 1,
+            format_version: 2,
             tenant_id: "tenant".to_string(),
             database_id: "db".to_string(),
             log_index: 1,

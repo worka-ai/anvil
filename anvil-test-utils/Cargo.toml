@@ -26,6 +26,8 @@ enterprise = ["anvil/enterprise"]
 anvil = { package = "anvil-server", path = "../anvil", version = "0.3.0" }
 anvil-core = { package = "anvil-storage-core", path = "../anvil-core", version = "0.3.0" }
 anyhow = "1"
+base64 = "0.22"
+personaldb-protocol = { git = "ssh://git@github.com/worka-ai/personaldb.git", rev = "539cb9dfdcb10b3b83ac2333b2e07d47bffb58ae" }
 tokio = { version = "1.47.1", features = ["full"] }
 
 aws-config = "1.1.7"

@@ -11,6 +11,7 @@ use crate::{
         write_personaldb_snapshots_head,
     },
     personaldb_segment::{list_personaldb_log_segment_refs, read_personaldb_log_segment},
+    personaldb_signing::PersonalDbProtocolKeyring,
     personaldb_snapshot_store::{
         personaldb_snapshot_manifest_ref_name, personaldb_snapshot_object_ref_name,
         read_personaldb_snapshot_manifest_by_ref, read_personaldb_snapshot_object,
@@ -19,6 +20,7 @@ use crate::{
     storage::Storage,
 };
 use anyhow::{Context, Result, anyhow};
+use personaldb_protocol::PublicKeyTrustStore;
 use rusqlite::Connection;
 use std::{io::Cursor, path::Path};
 use tempfile::NamedTempFile;
@@ -60,14 +62,15 @@ pub struct PersonalDbSnapshotBuildResult {
 pub async fn maybe_build_personaldb_snapshot(
     storage: &Storage,
     request: PersonalDbSnapshotBuildRequest<'_>,
-    signing_key: &[u8],
+    snapshots_head_signing_key: &[u8],
+    protocol_keyring: &PersonalDbProtocolKeyring,
 ) -> Result<Option<PersonalDbSnapshotBuildResult>> {
     validate_request(&request)?;
     let manifest = read_personaldb_group_manifest(
         storage,
         request.tenant_id,
         request.database_id,
-        signing_key,
+        protocol_keyring.trust_store(),
     )
     .await?
     .ok_or_else(|| anyhow!("personaldb group manifest missing"))?;
@@ -75,7 +78,7 @@ pub async fn maybe_build_personaldb_snapshot(
         storage,
         request.tenant_id,
         request.database_id,
-        signing_key,
+        protocol_keyring.trust_store(),
     )
     .await?
     .ok_or_else(|| anyhow!("personaldb committed head missing"))?;
@@ -90,7 +93,7 @@ pub async fn maybe_build_personaldb_snapshot(
         storage,
         request.tenant_id,
         request.database_id,
-        signing_key,
+        snapshots_head_signing_key,
     )
     .await?;
     let base_log_index = previous_snapshot
@@ -124,20 +127,26 @@ pub async fn maybe_build_personaldb_snapshot(
     let result = build_snapshot(
         storage,
         request,
-        signing_key,
+        protocol_keyring,
         previous_snapshot.as_ref(),
         &committed_head,
         &new_records,
     )
     .await?;
-    publish_snapshots_head(storage, request, signing_key, &result.manifest).await?;
+    publish_snapshots_head(
+        storage,
+        request,
+        snapshots_head_signing_key,
+        &result.manifest,
+    )
+    .await?;
     Ok(Some(result))
 }
 
 async fn build_snapshot(
     storage: &Storage,
     request: PersonalDbSnapshotBuildRequest<'_>,
-    signing_key: &[u8],
+    protocol_keyring: &PersonalDbProtocolKeyring,
     previous_snapshot: Option<&PersonalDbSnapshotsHead>,
     committed_head: &PersonalDbCommittedHead,
     new_records: &[PersonalDbLogRecord],
@@ -148,8 +157,14 @@ async fn build_snapshot(
     drop(temp);
 
     if let Some(snapshot_head) = previous_snapshot {
-        restore_snapshot_database_scratch(storage, request, signing_key, snapshot_head, &temp_path)
-            .await?;
+        restore_snapshot_database_scratch(
+            storage,
+            request,
+            protocol_keyring.trust_store(),
+            snapshot_head,
+            &temp_path,
+        )
+        .await?;
     }
 
     {
@@ -200,7 +215,7 @@ async fn build_snapshot(
         manifest_hash: None,
         manifest_signature: None,
     }
-    .seal(signing_key)?;
+    .seal(protocol_keyring)?;
 
     write_personaldb_snapshot(
         storage,
@@ -208,7 +223,7 @@ async fn build_snapshot(
         request.database_id,
         &compressed_sqlite_bytes,
         &manifest,
-        signing_key,
+        protocol_keyring.trust_store(),
     )
     .await?;
     let _ = tokio::fs::remove_file(&temp_path).await;
@@ -222,14 +237,14 @@ async fn build_snapshot(
 async fn restore_snapshot_database_scratch(
     storage: &Storage,
     request: PersonalDbSnapshotBuildRequest<'_>,
-    signing_key: &[u8],
+    trust_store: &PublicKeyTrustStore,
     snapshot_head: &PersonalDbSnapshotsHead,
     target_path: &Path,
 ) -> Result<()> {
     let manifest = read_personaldb_snapshot_manifest_by_ref(
         storage,
         &snapshot_head.latest_snapshot_manifest_ref,
-        signing_key,
+        trust_store,
     )
     .await?
     .ok_or_else(|| anyhow!("personaldb snapshot manifest missing"))?;
@@ -245,7 +260,7 @@ async fn restore_snapshot_database_scratch(
         request.tenant_id,
         request.database_id,
         &manifest,
-        signing_key,
+        trust_store,
     )
     .await?
     .ok_or_else(|| anyhow!("personaldb snapshot object missing"))?;
@@ -428,6 +443,7 @@ mod tests {
             write_personaldb_committed_head, write_personaldb_group_manifest,
         },
         personaldb_segment::{PersonalDbLogSegmentWrite, write_personaldb_log_segment},
+        test_support::personaldb_protocol_keyring,
     };
     use rusqlite::{Connection, session::Session};
     use tempfile::{TempDir, tempdir};
@@ -442,6 +458,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_builder_thresholds_writes_zstd_sqlite_snapshot_and_head() {
         let fixture = Fixture::create(2).await;
+        let keyring = personaldb_protocol_keyring();
 
         let not_due = maybe_build_personaldb_snapshot(
             &fixture.storage,
@@ -450,6 +467,7 @@ mod tests {
                 payload_bytes_threshold: 1024 * 1024,
             }),
             KEY,
+            &keyring,
         )
         .await
         .unwrap();
@@ -462,6 +480,7 @@ mod tests {
                 payload_bytes_threshold: 1024 * 1024,
             }),
             KEY,
+            &keyring,
         )
         .await
         .unwrap()
@@ -517,6 +536,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_builder_rejects_schema_hash_mismatch() {
         let fixture = Fixture::create(1).await;
+        let keyring = personaldb_protocol_keyring();
         let err = maybe_build_personaldb_snapshot(
             &fixture.storage,
             PersonalDbSnapshotBuildRequest {
@@ -527,6 +547,7 @@ mod tests {
                 })
             },
             KEY,
+            &keyring,
         )
         .await
         .unwrap_err();
@@ -544,10 +565,11 @@ mod tests {
         async fn create(record_count: u64) -> Self {
             let temp = tempdir().unwrap();
             let storage = Storage::new_at(temp.path()).await.unwrap();
+            let keyring = personaldb_protocol_keyring();
             let schema_hash = hex::encode(hash32(SCHEMA_SQL.as_bytes()));
             let genesis_hash = hex::encode(hash32(b"snapshot-genesis"));
             let manifest = PersonalDbGroupManifest {
-                format_version: 1,
+                format_version: 2,
                 tenant_id: "9".to_string(),
                 database_id: "db-snapshot".to_string(),
                 schema_hash: schema_hash.clone(),
@@ -563,9 +585,9 @@ mod tests {
                 manifest_hash: None,
                 manifest_signature: None,
             }
-            .seal(KEY)
+            .seal(&keyring)
             .unwrap();
-            write_personaldb_group_manifest(&storage, 9, &manifest, KEY)
+            write_personaldb_group_manifest(&storage, 9, &manifest, keyring.trust_store())
                 .await
                 .unwrap();
 
@@ -599,7 +621,7 @@ mod tests {
                     Vec::new(),
                 );
                 let certificate = PersonalDbCommitCertificate {
-                    format_version: 1,
+                    format_version: 2,
                     tenant_id: "9".to_string(),
                     database_id: "db-snapshot".to_string(),
                     log_index,
@@ -618,14 +640,14 @@ mod tests {
                     certificate_hash: None,
                     witness_signature: None,
                 }
-                .seal(KEY)
+                .seal(&keyring)
                 .unwrap();
                 let certificate_ref = write_personaldb_commit_certificate(
                     &storage,
                     9,
                     "db-snapshot",
                     &certificate,
-                    KEY,
+                    keyring.trust_store(),
                 )
                 .await
                 .unwrap();
@@ -660,12 +682,12 @@ mod tests {
             .await
             .unwrap();
             let committed = PersonalDbCommittedHead {
-                format_version: 1,
+                format_version: 2,
                 tenant_id: "9".to_string(),
                 database_id: "db-snapshot".to_string(),
                 log_index: record_count,
                 log_hash: hex::encode(records.last().unwrap().entry_hash),
-                segment_ref: segment_ref,
+                segment_ref,
                 row_index_generation: record_count,
                 policy_epoch: 1,
                 membership_epoch: 1,
@@ -675,11 +697,17 @@ mod tests {
                 head_hash: None,
                 head_signature: None,
             }
-            .seal(KEY)
+            .seal(&keyring)
             .unwrap();
-            write_personaldb_committed_head(&storage, 9, "db-snapshot", &committed, KEY)
-                .await
-                .unwrap();
+            write_personaldb_committed_head(
+                &storage,
+                9,
+                "db-snapshot",
+                &committed,
+                keyring.trust_store(),
+            )
+            .await
+            .unwrap();
 
             Self {
                 temp,
