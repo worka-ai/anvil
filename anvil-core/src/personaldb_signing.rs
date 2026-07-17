@@ -505,8 +505,37 @@ mod tests {
     use super::*;
     use personaldb_protocol::{
         DatabaseId, Ed25519ProtocolSigner, KeyTrustPolicy, ProtocolSignable, ProtocolSigner,
-        SignatureDomain, SignatureError, SignatureMetadata, SignatureScope, SigningPayload,
+        PublicKeyEnvelopeV1, SignatureDomain, SignatureError, SignatureMetadata, SignatureScope,
+        SigningPayload, signing_preimage,
     };
+    use serde::Deserialize;
+    use sha2::{Digest as _, Sha256};
+    use std::str::FromStr as _;
+
+    const SHARED_SIGNING_VECTOR_JSON: &str =
+        include_str!("../tests/fixtures/protocol-signing-v1.json");
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SharedSigningVector {
+        schema: String,
+        id: String,
+        private_key_seed_hex: String,
+        public_key_hex: String,
+        public_key_envelope_hex: String,
+        key_id: String,
+        purpose: String,
+        domain: String,
+        signed_payload_version: u32,
+        key_generation: u64,
+        log_index: u64,
+        payload_utf8: String,
+        payload_hex: String,
+        payload_sha256_hex: String,
+        signing_preimage_hex: String,
+        signature_hex: String,
+        signature_envelope_hex: String,
+    }
 
     #[derive(Debug, Clone)]
     struct TestSignable {
@@ -550,6 +579,82 @@ mod tests {
         fn signing_payload(&self) -> SigningPayload<'_> {
             SigningPayload::ExactBytes(&self.payload)
         }
+    }
+
+    #[test]
+    fn shared_personaldb_signing_vector_crosses_anvil_wire_boundary() {
+        let vector: SharedSigningVector = serde_json::from_str(SHARED_SIGNING_VECTOR_JSON).unwrap();
+        assert_eq!(vector.schema, "personaldb.protocol-signing-vector.v1");
+        assert_eq!(vector.id, "rfc8032-witness-commit-certificate-exact-bytes");
+        let purpose = SignaturePurpose::from_str(&vector.purpose).unwrap();
+        let domain = SignatureDomain::from_str(&vector.domain).unwrap();
+        assert_eq!(
+            domain.signed_payload_version(),
+            vector.signed_payload_version
+        );
+
+        let payload = hex::decode(&vector.payload_hex).unwrap();
+        assert_eq!(payload, vector.payload_utf8.as_bytes());
+        assert_eq!(
+            hex::encode(Sha256::digest(&payload)),
+            vector.payload_sha256_hex
+        );
+        let preimage = signing_preimage(
+            domain,
+            vector.signed_payload_version,
+            SigningPayload::ExactBytes(&payload),
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(preimage.as_bytes()),
+            vector.signing_preimage_hex
+        );
+
+        let mut private_key = hex::decode("302e020100300506032b657004220420").unwrap();
+        private_key.extend(hex::decode(&vector.private_key_seed_hex).unwrap());
+        let signer = Ed25519ProtocolSigner::from_pkcs8_der(
+            &private_key,
+            KeyTrustPolicy::new(
+                KeyGeneration::new(vector.key_generation).unwrap(),
+                purpose,
+                vector.log_index,
+            ),
+        )
+        .unwrap();
+        assert_eq!(signer.trust_record().key_id.as_str(), vector.key_id);
+        assert_eq!(
+            hex::encode(signer.trust_record().public_key.as_bytes()),
+            vector.public_key_hex
+        );
+        assert_eq!(
+            hex::encode(
+                PublicKeyEnvelopeV1::for_ed25519(signer.trust_record().public_key)
+                    .encode_deterministic()
+                    .unwrap()
+            ),
+            vector.public_key_envelope_hex
+        );
+
+        let object = TestSignable {
+            metadata: SignatureMetadata::for_domain(purpose, domain, vector.log_index),
+            payload,
+        };
+        let envelope = signer.sign(&object).unwrap();
+        assert_eq!(
+            hex::encode(envelope.signature.as_bytes()),
+            vector.signature_hex
+        );
+        assert_eq!(
+            hex::encode(envelope.encode_deterministic().unwrap()),
+            vector.signature_envelope_hex
+        );
+
+        let wire = signature_envelope_to_proto(&envelope);
+        let decoded = signature_envelope_from_proto(wire).unwrap();
+        assert_eq!(decoded, envelope);
+        let trust_store =
+            PublicKeyTrustStore::from_records([signer.trust_record().clone()]).unwrap();
+        trust_store.verify(&object, &decoded).unwrap();
     }
 
     #[test]

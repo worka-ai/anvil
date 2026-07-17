@@ -51,7 +51,7 @@ anyhow = { version = "1" }
 async-trait = "0.1"
 base64 = "0.22"
 blake3 = "1.8.2"
-personaldb-protocol = { git = "ssh://git@github.com/worka-ai/personaldb.git", rev = "539cb9dfdcb10b3b83ac2333b2e07d47bffb58ae" }
+personaldb-protocol = { git = "ssh://git@github.com/worka-ai/personaldb.git", rev = "41295b43cd4634e77ab5b6bf411e5233217838b0" }
 thiserror = { version = "2.0.16" }
 tokio = { version = "1.47.1", features = ["full"] }
 

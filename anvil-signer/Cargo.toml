@@ -21,7 +21,7 @@ anvil-core = { package = "anvil-storage-core", path = "../anvil-core", version =
 anyhow = "1"
 clap = { version = "4.5.48", features = ["derive", "env"] }
 hex = "0.4.3"
-personaldb-protocol = { git = "ssh://git@github.com/worka-ai/personaldb.git", rev = "539cb9dfdcb10b3b83ac2333b2e07d47bffb58ae" }
+personaldb-protocol = { git = "ssh://git@github.com/worka-ai/personaldb.git", rev = "41295b43cd4634e77ab5b6bf411e5233217838b0" }
 tokio = { version = "1.47.1", features = ["macros", "net", "rt-multi-thread", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
