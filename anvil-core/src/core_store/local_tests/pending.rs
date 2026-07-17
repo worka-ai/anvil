@@ -979,6 +979,134 @@ async fn core_store_recovery_completes_partially_materialised_mutation_batch() {
 }
 
 #[tokio::test]
+async fn core_store_recovery_finalises_unapplied_batch_after_precondition_conflict() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let store = CoreStore::new(storage.clone()).await.unwrap();
+    let transaction_id = "recover-conflicted-unapplied-batch";
+    let scope_partition = "tenant:t/bucket:b";
+    let stream_id = "object_metadata:t:b:conflicted-unapplied";
+    let row_key = core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("conflicted-row")]).unwrap();
+    let intended_payload = encode_core_meta_inline_payload_row(
+        b"intended",
+        core_meta_committed_row_common(
+            scope_partition,
+            core_meta_root_key_hash("tenant:t/bucket:b/conflicted-row"),
+            1,
+            transaction_id,
+            1,
+        ),
+    )
+    .unwrap();
+    let conflicting_payload = encode_core_meta_inline_payload_row(
+        b"existing",
+        core_meta_committed_row_common(
+            scope_partition,
+            core_meta_root_key_hash("tenant:t/bucket:b/conflicted-row"),
+            2,
+            "other-transaction",
+            2,
+        ),
+    )
+    .unwrap();
+    let batch = CoreMutationBatch {
+        transaction_id: transaction_id.to_string(),
+        scope_partition: scope_partition.to_string(),
+        committed_by_principal: "principal:recovery".to_string(),
+        preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
+            cf: CF_INLINE_PAYLOADS.to_string(),
+            table_id: TABLE_INLINE_PAYLOAD_ROW,
+            tuple_key: row_key.clone(),
+            expected_payload_hash: None,
+            require_absent: true,
+            require_present: false,
+        }],
+        operations: vec![
+            CoreMutationOperation::StreamAppend {
+                partition_id: scope_partition.to_string(),
+                stream_id: stream_id.to_string(),
+                record_kind: "object.put".to_string(),
+                payload: br#"{"object":"must-not-append"}"#.to_vec(),
+                idempotency_key: Some("conflicted-stream-event".to_string()),
+            },
+            CoreMutationOperation::CoreMetaPut {
+                partition_id: scope_partition.to_string(),
+                cf: CF_INLINE_PAYLOADS.to_string(),
+                table_id: TABLE_INLINE_PAYLOAD_ROW,
+                tuple_key: row_key.clone(),
+                payload: intended_payload,
+            },
+        ],
+    };
+    store
+        .admit_core_mutation(
+            "mutation.batch",
+            "core_control",
+            CorePendingMutationTarget::MutationBatch {
+                transaction_id: batch.transaction_id.clone(),
+                scope_partition: batch.scope_partition.clone(),
+                operation_count: batch.operations.len() as u64,
+            },
+            batch.transaction_id.clone(),
+            Some(batch.transaction_id.clone()),
+            CorePendingMutationPayload::Inline(&encode_core_mutation_batch(&batch).unwrap()),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    store
+        .commit_coremeta_batch_by_embedded_roots(
+            "other-transaction",
+            &[CoreMetaBatchOp {
+                cf: CF_INLINE_PAYLOADS,
+                table_id: TABLE_INLINE_PAYLOAD_ROW,
+                tuple_key: &row_key,
+                common: None,
+                kind: CoreMetaBatchOpKind::Put(&conflicting_payload),
+            }],
+        )
+        .await
+        .unwrap();
+    store.unregister_process_instance_for_tests();
+    drop(store);
+
+    let recovered = CoreStore::new(storage).await.unwrap();
+    let transaction = recovered
+        .read_transaction(transaction_id)
+        .await
+        .unwrap()
+        .expect("failed recovery transaction");
+    assert_eq!(transaction.state, CoreTransactionState::FinalisationFailed);
+    assert!(transaction.visible_updates.is_empty());
+    assert!(transaction.finalisation_error.is_some());
+    assert!(
+        recovered
+            .read_stream(ReadStream {
+                stream_id: stream_id.to_string(),
+                after_sequence: 0,
+                limit: 10,
+            })
+            .await
+            .unwrap()
+            .is_empty(),
+        "a conflicted unapplied batch must not append its stream operation"
+    );
+    assert_eq!(
+        recovered
+            .meta
+            .get(CF_INLINE_PAYLOADS, TABLE_INLINE_PAYLOAD_ROW, &row_key)
+            .unwrap(),
+        Some(conflicting_payload)
+    );
+    assert!(
+        read_test_pending_mutation_records(&recovered)
+            .await
+            .is_empty(),
+        "failed recovery must checkpoint the stale pending mutation"
+    );
+}
+
+#[tokio::test]
 async fn core_store_recovery_finalises_a_materialised_batch_after_its_stream_advances() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = Storage::new_at(tmp.path()).await.unwrap();

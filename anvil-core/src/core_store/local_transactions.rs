@@ -347,13 +347,17 @@ impl CoreStore {
                 None,
             )
         } else {
-            self.validate_mutation_preconditions_unlocked(
-                &batch.preconditions,
-                &batch.committed_by_principal,
-                None,
-            )
-            .await?;
-            self.apply_mutation_batch_operations_unlocked(&batch).await
+            let precondition_result = self
+                .validate_mutation_preconditions_unlocked(
+                    &batch.preconditions,
+                    &batch.committed_by_principal,
+                    None,
+                )
+                .await;
+            match precondition_result {
+                Ok(()) => self.apply_mutation_batch_operations_unlocked(&batch).await,
+                Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+            }
         };
 
         let transaction_state = if finalisation_error.is_some() {
@@ -473,11 +477,21 @@ impl CoreStore {
                         updates.push(None);
                         continue;
                     };
+                    let common = core_meta_row_common_from_payload(&current_payload)?;
+                    if common.transaction_id == batch.transaction_id
+                        && current_payload.as_slice() != payload.as_slice()
+                    {
+                        bail!(
+                            "CoreStore recovered CoreMeta operation payload mismatch for transaction {} row {}/{}",
+                            batch.transaction_id,
+                            canonical_cf,
+                            table_id
+                        );
+                    }
                     if current_payload.as_slice() != payload.as_slice() {
                         updates.push(None);
                         continue;
                     }
-                    let common = core_meta_row_common_from_payload(&current_payload)?;
                     if common.transaction_id != batch.transaction_id {
                         bail!(
                             "CoreStore recovered CoreMeta operation identity mismatch for transaction {} row {}/{}",
