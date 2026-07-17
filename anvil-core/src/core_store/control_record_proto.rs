@@ -1126,7 +1126,7 @@ fn object_manifest_common(value: &CoreObjectManifest) -> Result<CoreMetaRowCommo
     Ok(core_meta_committed_row_common(
         format!("mesh/{}/region/{}", value.mesh_id, value.region_id),
         object_manifest_root_key_hash(&value.object_hash),
-        value.logical_size,
+        object_manifest_root_generation(value.logical_size),
         value.mutation_id.clone(),
         rfc3339_unix_nanos(&value.created_at)?,
     ))
@@ -1142,7 +1142,7 @@ fn validate_object_manifest_common(
     if common.root_key_hash != object_manifest_root_key_hash(&value.object_hash) {
         return Err(anyhow!("CoreStore object manifest CoreMeta root mismatch"));
     }
-    if common.root_generation != value.logical_size {
+    if common.root_generation != object_manifest_root_generation(value.logical_size) {
         return Err(anyhow!(
             "CoreStore object manifest CoreMeta generation mismatch"
         ));
@@ -1162,6 +1162,12 @@ fn validate_object_manifest_common(
 
 fn object_manifest_root_key_hash(object_hash: &str) -> String {
     core_meta_root_key_hash(&format!("object-manifest/{object_hash}"))
+}
+
+pub(in crate::core_store::local) fn object_manifest_root_generation(logical_size: u64) -> u64 {
+    // A content-addressed manifest owns one immutable root. Empty objects still
+    // need a positive CoreMeta generation so quorum preparation can advance.
+    logical_size.max(1)
 }
 
 fn rfc3339_unix_nanos(value: &str) -> Result<u64> {

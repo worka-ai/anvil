@@ -1893,7 +1893,13 @@ fn validate_coremeta_pending_batch_marker_row(payload: &[u8]) -> Result<()> {
         bail!("CoreMeta pending batch marker must reference at least one CoreMeta row");
     }
     if row.post_root_generation <= row.expected_root_generation {
-        bail!("CoreMeta pending batch marker root generation must advance");
+        bail!(
+            "CoreMeta pending batch marker root generation must advance: root_key_hash={}, transaction_id={}, expected_root_generation={}, post_root_generation={}",
+            row.root_key_hash,
+            row.transaction_id,
+            row.expected_root_generation,
+            row.post_root_generation
+        );
     }
     let common = row
         .common

@@ -1,4 +1,6 @@
-use super::local_stream_control::control_record_proto::encode_object_manifest_record;
+use super::local_stream_control::control_record_proto::{
+    encode_object_manifest_record, object_manifest_root_generation,
+};
 use super::local_tx_rows::{OwnedCoreMetaBatchOp, borrow_owned_coremeta_batch_ops};
 use super::*;
 use crate::formats::{
@@ -621,7 +623,7 @@ impl CoreStore {
         let common = core_meta_committed_row_common(
             format!("mesh/{}/region/{}", manifest.mesh_id, manifest.region_id),
             core_meta_root_key_hash(&format!("object-manifest/{}", manifest.object_hash)),
-            manifest.logical_size,
+            object_manifest_root_generation(manifest.logical_size),
             manifest.mutation_id.clone(),
             unix_timestamp_nanos(),
         );

@@ -1,6 +1,37 @@
 use super::*;
 
 #[tokio::test]
+async fn core_store_round_trips_an_empty_inline_blob() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let store = CoreStore::new(storage).await.unwrap();
+
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: "mesh:test/tenant:t/bucket:b/object:empty".to_string(),
+            bytes: Vec::new(),
+            boundary_values: Vec::new(),
+            region_id: "local".to_string(),
+            mutation_id: "empty-inline-blob".to_string(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(object_ref.logical_size, 0);
+    assert_eq!(
+        store
+            .get_blob(GetBlob {
+                object_ref: object_ref.clone(),
+            })
+            .await
+            .unwrap(),
+        Vec::<u8>::new()
+    );
+    let manifest = store.read_object_manifest(&object_ref).await.unwrap();
+    assert_eq!(manifest.logical_size, 0);
+}
+
+#[tokio::test]
 async fn core_store_deduplicates_large_content_across_logical_names_and_boundaries() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = Storage::new_at(tmp.path()).await.unwrap();
