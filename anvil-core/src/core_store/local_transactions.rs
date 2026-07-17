@@ -497,12 +497,22 @@ impl CoreStore {
         idempotency_key_hash: Option<&str>,
         transaction_id: Option<&str>,
     ) -> Result<Option<StreamAppendReceipt>> {
+        if let Some(idempotency_key_hash) = idempotency_key_hash {
+            return self
+                .stream_idempotent_replay_by_hash_unlocked(
+                    stream_id,
+                    payload,
+                    Some(idempotency_key_hash),
+                    transaction_id,
+                )
+                .await;
+        }
         let Some(head) = self.read_stream_head_from_meta(stream_id)? else {
             return Ok(None);
         };
         let payload_hash = format!("sha256:{}", sha256_hex(payload));
-        // Pending writes are normally near the tail; point reads avoid a full
-        // CoreMeta table scan while retaining exhaustive recovery semantics.
+        // Non-idempotent pending writes are identified by their transaction.
+        // Search from the tail because they are normally the latest record.
         for sequence in (1..=head.last_sequence).rev() {
             let bytes = self
                 .meta
@@ -516,21 +526,6 @@ impl CoreStore {
                 })?;
             let existing = decode_stream_record_index_row(&bytes)?;
             validate_stream_record_index_row_metadata(stream_id, &existing)?;
-            if let Some(idempotency_key_hash) = idempotency_key_hash {
-                if let Some(receipt) = self
-                    .stream_idempotent_receipt_from_index_row_unlocked(
-                        stream_id,
-                        &payload_hash,
-                        idempotency_key_hash,
-                        transaction_id,
-                        existing,
-                    )
-                    .await?
-                {
-                    return Ok(Some(receipt));
-                }
-                continue;
-            }
             if existing.transaction_id.as_deref() != transaction_id {
                 continue;
             }

@@ -544,7 +544,7 @@ impl CoreStore {
         Ok(None)
     }
 
-    pub(super) async fn stream_idempotent_receipt_from_index_row_unlocked(
+    async fn stream_idempotent_receipt_from_index_row_unlocked(
         &self,
         stream_id: &str,
         payload_hash: &str,
