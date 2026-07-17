@@ -63,6 +63,7 @@ impl CoreStore {
         pipeline_keyring: Option<Arc<CorePipelineKeyring>>,
         node_identity: CoreStoreNodeIdentity,
     ) -> Result<Self> {
+        clear_stale_process_locks_once(&storage)?;
         let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
         let node_signing_keypair = Arc::new(load_or_create_node_signing_keypair(&meta)?);
         store_node_receipt_signing_public_key(

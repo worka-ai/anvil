@@ -2,6 +2,25 @@ use super::*;
 use std::time::Duration;
 
 #[tokio::test]
+async fn core_store_startup_discards_stale_process_locks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let stale_lock = storage
+        .core_store_staging_path()
+        .join("locks")
+        .join("stream")
+        .join("stale.lock");
+    std::fs::create_dir_all(stale_lock.parent().unwrap()).unwrap();
+    std::fs::write(&stale_lock, []).unwrap();
+
+    let store = CoreStore::new(storage).await.unwrap();
+
+    assert!(!stale_lock.exists());
+    let live_lock = store.acquire_named_lock("stream", "live").await.unwrap();
+    drop(live_lock);
+}
+
+#[tokio::test]
 async fn admitted_mutation_finalisation_survives_caller_cancellation() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = Storage::new_at(tmp.path()).await.unwrap();

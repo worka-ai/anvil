@@ -147,6 +147,8 @@ type HmacSha256 = Hmac<Sha256>;
 
 static CORE_STORE_PROCESS_WRITE_LOCKS: LazyLock<StdMutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>> =
     LazyLock::new(|| StdMutex::new(BTreeMap::new()));
+static CORE_STORE_PROCESS_LOCKS_INITIALIZED: LazyLock<StdMutex<BTreeSet<PathBuf>>> =
+    LazyLock::new(|| StdMutex::new(BTreeSet::new()));
 static CORE_STORE_INSTANCE_REGISTRY: LazyLock<StdMutex<BTreeMap<PathBuf, CoreStore>>> =
     LazyLock::new(|| StdMutex::new(BTreeMap::new()));
 
@@ -494,6 +496,30 @@ fn process_write_lock(storage_root: PathBuf) -> Arc<Mutex<()>> {
     let lock = Arc::new(Mutex::new(()));
     locks.insert(storage_root, Arc::downgrade(&lock));
     lock
+}
+
+fn clear_stale_process_locks_once(storage: &Storage) -> Result<()> {
+    let storage_root = storage.core_store_root_path();
+    let mut initialized = CORE_STORE_PROCESS_LOCKS_INITIALIZED
+        .lock()
+        .expect("CoreStore process lock registry poisoned");
+    if initialized.contains(&storage_root) {
+        return Ok(());
+    }
+
+    // Process lock files are expendable Class C state. A crashed process cannot
+    // remove them through Drop, so discard them before recovery starts.
+    let lock_root = storage.core_store_staging_path().join("locks");
+    match std::fs::remove_dir_all(&lock_root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("remove stale CoreStore locks {}", lock_root.display()));
+        }
+    }
+    initialized.insert(storage_root);
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
