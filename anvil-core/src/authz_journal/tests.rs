@@ -94,6 +94,30 @@ async fn ready_authz_permit(
     .unwrap()
 }
 
+async fn append_authz_record_without_segment(
+    storage: &Storage,
+    record: &AuthzTupleRecord,
+) -> Result<()> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let partition_id = hex::encode(authz_partition_id(record.tenant_id));
+    core_store
+        .commit_mutation_batch(CoreMutationBatch {
+            transaction_id: format!("authz-tuple-unmaterialized:{}", record.mutation_id),
+            scope_partition: partition_id.clone(),
+            committed_by_principal: authz_partition_principal(record.tenant_id),
+            preconditions: Vec::new(),
+            operations: vec![CoreMutationOperation::StreamAppend {
+                partition_id,
+                stream_id: authz_tuple_stream_id(record.tenant_id),
+                record_kind: AUTHZ_TUPLE_RECORD_KIND.to_string(),
+                payload: encode_authz_tuple_journal_body(record, 0)?,
+                idempotency_key: Some(format!("authz-tuple-unmaterialized:{}", record.mutation_id)),
+            }],
+        })
+        .await?;
+    write_authz_tuple_records_to_current_rows(storage, std::slice::from_ref(record)).await
+}
+
 #[tokio::test]
 async fn authz_journal_recovers_latest_exact_and_watch_ranges() {
     let temp = tempdir().unwrap();
@@ -151,6 +175,48 @@ async fn latest_authz_revision_uses_the_journal_head_not_a_tuple_scan() {
     .unwrap();
 
     assert_eq!(latest_authz_revision(&storage, 42).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn missing_authz_segments_materialize_only_the_requested_revision() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    for revision in 1..=3 {
+        append_authz_record_without_segment(&storage, &record(revision, "add"))
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(latest_authz_revision(&storage, 42).await.unwrap(), 3);
+    for revision in 1..=3 {
+        assert!(
+            authz_segment::existing_authz_tuple_segment_ref(&storage, 42, revision)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    let segment = authz_segment::ensure_authz_tuple_segment_at_revision(&storage, 42, 3)
+        .await
+        .unwrap()
+        .expect("requested authorization segment");
+    assert_eq!(segment.header.generation, 3);
+    assert_eq!(segment.records.len(), 3);
+    assert!(
+        authz_segment::existing_authz_tuple_segment_ref(&storage, 42, 1)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        authz_segment::existing_authz_tuple_segment_ref(&storage, 42, 2)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        authz_segment::existing_authz_tuple_segment_ref(&storage, 42, 3)
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]
