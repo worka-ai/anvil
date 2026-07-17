@@ -858,6 +858,127 @@ async fn core_store_recovery_finalises_materialised_stream_without_operation_ide
 }
 
 #[tokio::test]
+async fn core_store_recovery_completes_partially_materialised_mutation_batch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let store = CoreStore::new(storage.clone()).await.unwrap();
+    let transaction_id = "recover-partially-materialised-batch";
+    let scope_partition = "tenant:t/bucket:b";
+    let stream_id = "object_metadata:t:b:partially-materialised";
+    let row_key = core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("partial-row")]).unwrap();
+    let row_payload = encode_core_meta_inline_payload_row(
+        b"partial-row",
+        core_meta_committed_row_common(
+            scope_partition,
+            core_meta_root_key_hash("tenant:t/bucket:b/partial-row"),
+            1,
+            transaction_id,
+            1,
+        ),
+    )
+    .unwrap();
+    let batch = CoreMutationBatch {
+        transaction_id: transaction_id.to_string(),
+        scope_partition: scope_partition.to_string(),
+        committed_by_principal: "principal:recovery".to_string(),
+        preconditions: vec![
+            CoreMutationPrecondition::StreamHead {
+                stream_id: stream_id.to_string(),
+                expected_last_sequence: 0,
+                expected_last_event_hash: ZERO_HASH.to_string(),
+            },
+            CoreMutationPrecondition::CoreMetaRow {
+                cf: CF_INLINE_PAYLOADS.to_string(),
+                table_id: TABLE_INLINE_PAYLOAD_ROW,
+                tuple_key: row_key.clone(),
+                expected_payload_hash: None,
+                require_absent: true,
+                require_present: false,
+            },
+        ],
+        operations: vec![
+            CoreMutationOperation::StreamAppend {
+                partition_id: scope_partition.to_string(),
+                stream_id: stream_id.to_string(),
+                record_kind: "object.put".to_string(),
+                payload: br#"{"object":"partial"}"#.to_vec(),
+                idempotency_key: Some("partial-stream-event".to_string()),
+            },
+            CoreMutationOperation::CoreMetaPut {
+                partition_id: scope_partition.to_string(),
+                cf: CF_INLINE_PAYLOADS.to_string(),
+                table_id: TABLE_INLINE_PAYLOAD_ROW,
+                tuple_key: row_key.clone(),
+                payload: row_payload.clone(),
+            },
+        ],
+    };
+    store
+        .admit_core_mutation(
+            "mutation.batch",
+            "core_control",
+            CorePendingMutationTarget::MutationBatch {
+                transaction_id: batch.transaction_id.clone(),
+                scope_partition: batch.scope_partition.clone(),
+                operation_count: batch.operations.len() as u64,
+            },
+            batch.transaction_id.clone(),
+            Some(batch.transaction_id.clone()),
+            CorePendingMutationPayload::Inline(&encode_core_mutation_batch(&batch).unwrap()),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    store
+        .commit_coremeta_batch_by_embedded_roots(
+            transaction_id,
+            &[CoreMetaBatchOp {
+                cf: CF_INLINE_PAYLOADS,
+                table_id: TABLE_INLINE_PAYLOAD_ROW,
+                tuple_key: &row_key,
+                common: None,
+                kind: CoreMetaBatchOpKind::Put(&row_payload),
+            }],
+        )
+        .await
+        .unwrap();
+    store.unregister_process_instance_for_tests();
+    drop(store);
+
+    let recovered = CoreStore::new(storage).await.unwrap();
+    let transaction = recovered
+        .read_transaction(transaction_id)
+        .await
+        .unwrap()
+        .expect("recovered partial transaction");
+    assert_eq!(transaction.state, CoreTransactionState::Committed);
+    assert_eq!(transaction.visible_updates.len(), 2);
+    let records = recovered
+        .read_stream(ReadStream {
+            stream_id: stream_id.to_string(),
+            after_sequence: 0,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].payload, br#"{"object":"partial"}"#);
+    assert_eq!(
+        recovered
+            .meta
+            .get(CF_INLINE_PAYLOADS, TABLE_INLINE_PAYLOAD_ROW, &row_key)
+            .unwrap(),
+        Some(row_payload)
+    );
+    assert!(
+        read_test_pending_mutation_records(&recovered)
+            .await
+            .is_empty(),
+        "startup recovery must checkpoint the partially materialised mutation"
+    );
+}
+
+#[tokio::test]
 async fn core_store_recovery_finalises_a_materialised_batch_after_its_stream_advances() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = Storage::new_at(tmp.path()).await.unwrap();

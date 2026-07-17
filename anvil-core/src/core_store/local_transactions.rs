@@ -326,10 +326,26 @@ impl CoreStore {
             );
         }
         let recovered_updates = self
-            .recover_fully_applied_mutation_batch_updates_unlocked(&batch)
+            .inspect_applied_mutation_batch_updates_unlocked(&batch)
             .await?;
-        let (visible_updates, finalisation_error) = if let Some(updates) = recovered_updates {
-            (updates, None)
+        let recovered_count = recovered_updates
+            .iter()
+            .filter(|update| update.is_some())
+            .count();
+        let (visible_updates, finalisation_error) = if recovered_count == batch.operations.len() {
+            (
+                recovered_updates
+                    .into_iter()
+                    .map(|update| update.expect("all mutation operations were recovered"))
+                    .collect(),
+                None,
+            )
+        } else if recovered_count > 0 {
+            (
+                self.complete_partially_applied_mutation_batch_unlocked(&batch, recovered_updates)
+                    .await?,
+                None,
+            )
         } else {
             self.validate_mutation_preconditions_unlocked(
                 &batch.preconditions,
@@ -386,10 +402,10 @@ impl CoreStore {
         })
     }
 
-    async fn recover_fully_applied_mutation_batch_updates_unlocked(
+    async fn inspect_applied_mutation_batch_updates_unlocked(
         &self,
         batch: &CoreMutationBatch,
-    ) -> Result<Option<Vec<CoreTransactionUpdate>>> {
+    ) -> Result<Vec<Option<CoreTransactionUpdate>>> {
         let mut updates = Vec::with_capacity(batch.operations.len());
         for operation in &batch.operations {
             match operation {
@@ -403,16 +419,17 @@ impl CoreStore {
                     let idempotency_key_hash = idempotency_key
                         .as_deref()
                         .map(|key| format!("sha256:{}", sha256_hex(key.as_bytes())));
-                    let Some(receipt) = self
+                    let receipt = self
                         .recover_stream_append_receipt_unlocked(
                             stream_id,
                             payload,
                             idempotency_key_hash.as_deref(),
                             Some(&batch.transaction_id),
                         )
-                        .await?
-                    else {
-                        return Ok(None);
+                        .await?;
+                    let Some(receipt) = receipt else {
+                        updates.push(None);
+                        continue;
                     };
                     let record = self
                         .read_stream_record_from_meta(stream_id, receipt.sequence)
@@ -435,13 +452,13 @@ impl CoreStore {
                             receipt.sequence
                         );
                     }
-                    updates.push(CoreTransactionUpdate::StreamAppend {
+                    updates.push(Some(CoreTransactionUpdate::StreamAppend {
                         stream_id: stream_id.clone(),
                         visible_sequence: receipt.sequence,
                         prepared_record_hash: receipt.event_hash,
-                    });
+                    }));
                 }
-                CoreMutationOperation::CoreMetaDelete { .. } => return Ok(None),
+                CoreMutationOperation::CoreMetaDelete { .. } => updates.push(None),
                 CoreMutationOperation::CoreMetaPut {
                     cf,
                     table_id,
@@ -453,10 +470,12 @@ impl CoreStore {
                     let Some(current_payload) =
                         self.read_coremeta_row(canonical_cf, *table_id, tuple_key)?
                     else {
-                        return Ok(None);
+                        updates.push(None);
+                        continue;
                     };
                     if current_payload.as_slice() != payload.as_slice() {
-                        return Ok(None);
+                        updates.push(None);
+                        continue;
                     }
                     let common = core_meta_row_common_from_payload(&current_payload)?;
                     if common.transaction_id != batch.transaction_id {
@@ -474,20 +493,68 @@ impl CoreStore {
                         tuple_key,
                     )?
                     else {
-                        return Ok(None);
+                        updates.push(None);
+                        continue;
                     };
-                    updates.push(CoreTransactionUpdate::CoreMetaPut {
+                    updates.push(Some(CoreTransactionUpdate::CoreMetaPut {
                         cf: canonical_cf.to_string(),
                         table_id: *table_id,
                         tuple_key: tuple_key.clone(),
                         previous_payload_hash,
                         payload: payload.clone(),
                         payload_hash: core_meta_payload_digest(*table_id, payload),
-                    });
+                    }));
                 }
             }
         }
-        Ok(Some(updates))
+        Ok(updates)
+    }
+
+    async fn complete_partially_applied_mutation_batch_unlocked(
+        &self,
+        batch: &CoreMutationBatch,
+        recovered_updates: Vec<Option<CoreTransactionUpdate>>,
+    ) -> Result<Vec<CoreTransactionUpdate>> {
+        let missing_operations = batch
+            .operations
+            .iter()
+            .zip(&recovered_updates)
+            .filter_map(|(operation, update)| update.is_none().then(|| operation.clone()))
+            .collect::<Vec<_>>();
+        let mut remaining_preconditions = Vec::new();
+        for precondition in &batch.preconditions {
+            if !precondition_is_satisfied_by_recovered_operation(
+                precondition,
+                &batch.operations,
+                &recovered_updates,
+            )? {
+                remaining_preconditions.push(precondition.clone());
+            }
+        }
+        self.validate_mutation_preconditions_unlocked(
+            &remaining_preconditions,
+            &batch.committed_by_principal,
+            None,
+        )
+        .await?;
+
+        let missing_batch = CoreMutationBatch {
+            transaction_id: batch.transaction_id.clone(),
+            scope_partition: batch.scope_partition.clone(),
+            committed_by_principal: batch.committed_by_principal.clone(),
+            preconditions: remaining_preconditions,
+            operations: missing_operations,
+        };
+        let (new_updates, finalisation_error) = self
+            .apply_mutation_batch_operations_unlocked(&missing_batch)
+            .await;
+        if let Some(error) = finalisation_error {
+            bail!(
+                "CoreStore could not complete partially applied mutation batch {}: {error}",
+                batch.transaction_id
+            );
+        }
+        combine_recovered_mutation_updates(recovered_updates, new_updates)
     }
 
     async fn recover_stream_append_receipt_unlocked(
@@ -1245,6 +1312,85 @@ impl CoreStore {
         self.read_transaction_from_rows_unlocked(transaction_id)
             .await
     }
+}
+
+fn precondition_is_satisfied_by_recovered_operation(
+    precondition: &CoreMutationPrecondition,
+    operations: &[CoreMutationOperation],
+    recovered_updates: &[Option<CoreTransactionUpdate>],
+) -> Result<bool> {
+    for (operation, recovered_update) in operations.iter().zip(recovered_updates) {
+        if recovered_update.is_none() {
+            continue;
+        }
+        let satisfied = match (precondition, operation) {
+            (
+                CoreMutationPrecondition::StreamHead { stream_id, .. },
+                CoreMutationOperation::StreamAppend {
+                    stream_id: operation_stream_id,
+                    ..
+                },
+            ) => stream_id == operation_stream_id,
+            (
+                CoreMutationPrecondition::CoreMetaRow {
+                    cf,
+                    table_id,
+                    tuple_key,
+                    ..
+                },
+                CoreMutationOperation::CoreMetaPut {
+                    cf: operation_cf,
+                    table_id: operation_table_id,
+                    tuple_key: operation_tuple_key,
+                    ..
+                }
+                | CoreMutationOperation::CoreMetaDelete {
+                    cf: operation_cf,
+                    table_id: operation_table_id,
+                    tuple_key: operation_tuple_key,
+                    ..
+                },
+            ) => {
+                canonical_coremeta_cf_name(cf)? == canonical_coremeta_cf_name(operation_cf)?
+                    && table_id == operation_table_id
+                    && tuple_key == operation_tuple_key
+            }
+            _ => false,
+        };
+        if satisfied {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn combine_recovered_mutation_updates(
+    recovered_updates: Vec<Option<CoreTransactionUpdate>>,
+    new_updates: Vec<CoreTransactionUpdate>,
+) -> Result<Vec<CoreTransactionUpdate>> {
+    let missing_count = recovered_updates
+        .iter()
+        .filter(|update| update.is_none())
+        .count();
+    if new_updates.len() != missing_count {
+        bail!(
+            "CoreStore partially applied mutation recovery produced {} updates for {missing_count} missing operations",
+            new_updates.len()
+        );
+    }
+    let mut new_updates = new_updates.into_iter();
+    let combined = recovered_updates
+        .into_iter()
+        .map(|update| {
+            update.unwrap_or_else(|| {
+                new_updates
+                    .next()
+                    .expect("missing update count was validated before combining")
+            })
+        })
+        .collect::<Vec<_>>();
+    debug_assert!(new_updates.next().is_none());
+    Ok(combined)
 }
 
 fn recovered_coremeta_previous_payload_hash(
