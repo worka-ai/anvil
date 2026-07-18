@@ -797,8 +797,7 @@ pub async fn resolve_current_permission(
     subject_id: &str,
     caveat_hash: &str,
 ) -> Result<bool> {
-    let revision = latest_authz_revision(storage, tenant_id).await?;
-    resolve_permission_at_revision(
+    resolve_permission_from_current_view_at_revision(
         storage,
         tenant_id,
         namespace,
@@ -807,7 +806,7 @@ pub async fn resolve_current_permission(
         subject_kind,
         subject_id,
         caveat_hash,
-        revision,
+        i64::MAX,
     )
     .await
 }
