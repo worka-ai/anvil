@@ -1019,8 +1019,11 @@ impl CoreStore {
         if batch.operations.is_empty() {
             bail!("CoreStore explicit transaction stage must include at least one operation");
         }
-        let _operation_guards = self.acquire_batch_locks(&batch).await?;
         let _guard = self.write_lock.lock().await;
+        // Explicit transaction operations always take the process write lock
+        // before named CoreStore locks. Commit already follows this order; the
+        // reverse order here allowed a concurrent stage and commit to deadlock.
+        let _operation_guards = self.acquire_batch_locks(&batch).await?;
         let mut transaction = self
             .read_transaction_unlocked(&batch.transaction_id)
             .await?
