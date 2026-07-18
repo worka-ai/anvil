@@ -1006,6 +1006,15 @@ fn authz_tuple_write_status(error: anyhow::Error) -> Status {
     }
 }
 
+fn userset_subject(namespace: &str, object_id: &str, relation: &str) -> String {
+    format!(
+        "{}/{}#{}",
+        system_realm_namespace(namespace),
+        object_id,
+        relation
+    )
+}
+
 pub async fn system_realm_relationship_allows(
     storage: &Storage,
     claims: &auth::Claims,
