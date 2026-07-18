@@ -333,7 +333,7 @@ impl Persistence {
             etag: Some(object.etag.clone()),
             size: object.size,
             is_delete_marker,
-            created_at: Utc::now(),
+            created_at: object.created_at,
         })
     }
 
