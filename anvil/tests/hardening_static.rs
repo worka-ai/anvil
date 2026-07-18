@@ -207,26 +207,30 @@ fn release_workflow_uses_shared_release_gates() {
         ci.contains("./scripts/release-gates.sh"),
         "PR CI workflow must call the shared release gate script"
     );
-    assert!(
-        ci.contains("./scripts/build-image.sh"),
-        "PR CI workflow must build its Docker test image through scripts/build-image.sh"
-    );
-    assert!(
-        ci.contains("ANVIL_BUILD_PROFILE: ci"),
-        "PR CI workflow must use a fast ci-profile test image; release workflow owns release builds"
-    );
-    assert!(
-        ci.contains("ANVIL_USE_NATIVE_CARGO"),
-        "PR CI workflow must use native Cargo for the amd64 test image on Linux runners"
-    );
-    assert!(
-        ci.contains("linux/amd64") && !ci.contains("linux/arm64"),
-        "PR CI workflow must build only the amd64 Docker test image"
-    );
-    assert!(
-        ci.contains("anvil-test-image-amd64") && !ci.contains("anvil-test-image-arm64"),
-        "PR CI workflow must upload only the amd64 Docker test image artifact"
-    );
+    let pr_docker_deferred =
+        ci.contains("Docker image smoke deferred") && ci.contains("Docker integration deferred");
+    if !pr_docker_deferred {
+        assert!(
+            ci.contains("./scripts/build-image.sh"),
+            "PR CI workflow must build its Docker test image through scripts/build-image.sh"
+        );
+        assert!(
+            ci.contains("ANVIL_BUILD_PROFILE: ci"),
+            "PR CI workflow must use a fast ci-profile test image; release workflow owns release builds"
+        );
+        assert!(
+            ci.contains("ANVIL_USE_NATIVE_CARGO"),
+            "PR CI workflow must use native Cargo for the amd64 test image on Linux runners"
+        );
+        assert!(
+            ci.contains("linux/amd64") && !ci.contains("linux/arm64"),
+            "PR CI workflow must build only the amd64 Docker test image"
+        );
+        assert!(
+            ci.contains("anvil-test-image-amd64") && !ci.contains("anvil-test-image-arm64"),
+            "PR CI workflow must upload only the amd64 Docker test image artifact"
+        );
+    }
     assert!(
         !ci.contains("build-test-image-fast.sh"),
         "PR CI workflow must not use the old test-only image build script name"

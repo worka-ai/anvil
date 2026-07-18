@@ -309,12 +309,12 @@ pub(super) fn validate_bound_record(
         bail!("bound {purpose} key is not active at the proposal boundary");
     }
     let database = DatabaseId::new(database_id);
-    if !record.database_scopes.is_empty() && !record.database_scopes.contains(&database) {
+    if !record.database_scopes.is_empty() && !record.database_scopes.as_slice().contains(&database)
+    {
         bail!("bound {purpose} key is outside the database scope");
     }
-    if !record.group_scopes.is_empty()
-        && !record.group_scopes.iter().any(|group| group == database_id)
-    {
+    let group_id = database_id.to_string();
+    if !record.group_scopes.is_empty() && !record.group_scopes.as_slice().contains(&group_id) {
         bail!("bound {purpose} key is outside the group scope");
     }
     Ok(())
