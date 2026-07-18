@@ -25,6 +25,18 @@ pub fn admin_rpc_relation_mapping() -> &'static [(&'static str, SystemAdminRelat
             "RotateSecretEncryptionKey",
             SystemAdminRelation::ManageSecretEncryptionKeys,
         ),
+        (
+            "ImportPersonalDbSigningKey",
+            SystemAdminRelation::ManagePersonalDbSigningKeys,
+        ),
+        (
+            "ListPersonalDbSigningKeys",
+            SystemAdminRelation::ManagePersonalDbSigningKeys,
+        ),
+        (
+            "SetPersonalDbSigningKeyStatus",
+            SystemAdminRelation::ManagePersonalDbSigningKeys,
+        ),
         ("CreateBucketAdmin", SystemAdminRelation::ManageBuckets),
         (
             "SetBucketPublicAccessAdmin",

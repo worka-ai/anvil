@@ -20,6 +20,8 @@ mod host_alias;
 mod mesh;
 #[path = "admin/node.rs"]
 mod node;
+#[path = "admin/personaldb_signing_key.rs"]
+mod personaldb_signing_key;
 #[path = "admin/policy.rs"]
 mod policy;
 #[path = "admin/region.rs"]
@@ -43,6 +45,7 @@ pub use self::diagnostics::DiagnosticsCommands;
 pub use self::host_alias::HostAliasCommands;
 pub use self::mesh::MeshCommands;
 pub use self::node::NodeCommands;
+pub use self::personaldb_signing_key::PersonalDbSigningKeyCommands;
 pub use self::policy::PolicyCommands;
 pub use self::region::RegionCommands;
 pub use self::repair::RepairCommands;
@@ -59,6 +62,7 @@ use self::diagnostics::handle_diagnostics_command;
 use self::host_alias::handle_host_alias_command;
 use self::mesh::handle_mesh_command;
 use self::node::handle_node_command;
+use self::personaldb_signing_key::handle_personaldb_signing_key_command;
 use self::policy::handle_policy_command;
 use self::region::handle_region_command;
 use self::repair::handle_repair_command;
@@ -88,6 +92,11 @@ pub enum AdminCommands {
     SecretEncryptionKey {
         #[clap(subcommand)]
         command: SecretEncryptionKeyCommands,
+    },
+    /// Manage Ed25519 PersonalDB protocol signing keys
+    PersonalDbSigningKey {
+        #[clap(subcommand)]
+        command: PersonalDbSigningKeyCommands,
     },
     /// Manage buckets through the administrative plane
     Bucket {
@@ -160,6 +169,9 @@ pub async fn handle_admin_command(command: &AdminCommands, ctx: &Context) -> any
         }
         AdminCommands::SecretEncryptionKey { command } => {
             handle_secret_encryption_key_command(command, &mut client, &token).await?
+        }
+        AdminCommands::PersonalDbSigningKey { command } => {
+            handle_personaldb_signing_key_command(command, &mut client, &token).await?
         }
         AdminCommands::Bucket { command } => {
             handle_bucket_command(command, &mut client, &token).await?

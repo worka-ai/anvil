@@ -24,9 +24,7 @@ pub async fn run(
 ) -> Result<()> {
     config.validate_admin_listener_bind()?;
     let personaldb_protocol_keyring =
-        anvil_core::personaldb_signing::PersonalDbProtocolKeyring::from_manifest_file(
-            &config.personaldb_protocol_signing_manifest_path,
-        )?;
+        anvil_core::personaldb_signing::PersonalDbProtocolKeyring::disabled();
     let (tx, rx) = tokio::sync::mpsc::channel(100);
     let state = AppState::new(config, Some(tx), personaldb_protocol_keyring).await?;
     let swarm = anvil_core::cluster::create_swarm(state.config.clone()).await?;

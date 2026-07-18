@@ -466,7 +466,6 @@ impl PersonalDbService for AppState {
                 have_log_hash: req.have_log_hash,
                 max_entries: nonzero_limit(req.max_entries),
             },
-            self.personaldb_snapshots_head_signing_key(),
             self.personaldb_protocol_keyring.trust_store(),
         )
         .await
@@ -618,10 +617,6 @@ impl PersonalDbService for AppState {
 }
 
 impl AppState {
-    fn personaldb_snapshots_head_signing_key(&self) -> &[u8] {
-        self.config.anvil_secret_encryption_key.as_bytes()
-    }
-
     fn personaldb_node_id(&self) -> String {
         if !self.config.node_id.is_empty() {
             return self.config.node_id.clone();
@@ -924,7 +919,6 @@ impl AppState {
         let _commit_guard = self
             .personaldb_commit_guard(actor.tenant_id, &validated.request.database_id)
             .await;
-        let snapshots_head_signing_key = self.personaldb_snapshots_head_signing_key();
         let protocol_keyring = self.personaldb_protocol_keyring.as_ref();
         let manifest = read_personaldb_group_manifest(
             &self.storage,
@@ -1482,7 +1476,6 @@ impl AppState {
                 created_by_node: &actor.principal,
                 policy: configured_personaldb_snapshot_policy(&self.config),
             },
-            snapshots_head_signing_key,
             protocol_keyring,
         )
         .await

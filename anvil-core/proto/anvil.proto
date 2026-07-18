@@ -11,6 +11,9 @@ service AdminService {
   rpc GrantApplicationPolicies(ApplicationPoliciesRequest) returns (ApplicationPoliciesResponse);
   rpc RevokeApplicationPolicies(ApplicationPoliciesRequest) returns (ApplicationPoliciesResponse);
   rpc RotateSecretEncryptionKey(RotateSecretEncryptionKeyRequest) returns (SecretEncryptionKeyRotationResponse);
+  rpc ImportPersonalDbSigningKey(ImportPersonalDbSigningKeyRequest) returns (PersonalDbSigningKeyResponse);
+  rpc ListPersonalDbSigningKeys(ListPersonalDbSigningKeysRequest) returns (ListPersonalDbSigningKeysResponse);
+  rpc SetPersonalDbSigningKeyStatus(SetPersonalDbSigningKeyStatusRequest) returns (PersonalDbSigningKeyResponse);
   rpc CreateBucketAdmin(CreateBucketAdminRequest) returns (BucketAdminResponse);
   rpc SetBucketPublicAccessAdmin(SetBucketPublicAccessAdminRequest) returns (BucketAdminResponse);
 
@@ -398,6 +401,56 @@ message SecretEncryptionKeyRotationResponse {
   uint64 hf_keys_rotated = 7;
   uint64 already_active = 10;
   string audit_event_id = 11;
+}
+
+message ImportPersonalDbSigningKeyRequest {
+  AdminRequestContext context = 1;
+  bytes private_key_pkcs8_der = 2;
+  bytes public_key = 3;
+  uint64 key_generation = 4;
+  string purpose = 5;
+  repeated string database_scopes = 6;
+  repeated string group_scopes = 7;
+  uint64 valid_from_log_index = 8;
+  optional uint64 valid_until_log_index = 9;
+  string status = 10;
+}
+
+message ListPersonalDbSigningKeysRequest {}
+
+message SetPersonalDbSigningKeyStatusRequest {
+  AdminRequestContext context = 1;
+  string key_id = 2;
+  string status = 3;
+  optional uint64 valid_until_log_index = 4;
+}
+
+message PersonalDbSigningKeyRecord {
+  string key_id = 1;
+  uint64 key_generation = 2;
+  string purpose = 3;
+  repeated string database_scopes = 4;
+  repeated string group_scopes = 5;
+  uint64 valid_from_log_index = 6;
+  optional uint64 valid_until_log_index = 7;
+  string status = 8;
+  bytes public_key = 9;
+  uint64 created_at_unix_nanos = 10;
+  uint64 updated_at_unix_nanos = 11;
+  string created_by = 12;
+  string updated_by = 13;
+  uint64 record_revision = 14;
+}
+
+message PersonalDbSigningKeyResponse {
+  string request_id = 1;
+  PersonalDbSigningKeyRecord key = 2;
+  string audit_event_id = 3;
+  bool runtime_reload_required = 4;
+}
+
+message ListPersonalDbSigningKeysResponse {
+  repeated PersonalDbSigningKeyRecord keys = 1;
 }
 
 message CreateBucketAdminRequest {
@@ -3468,7 +3521,7 @@ message PersonalDbSnapshotsHeadRecord {
     string updated_at = 8;
     string updated_by_node = 9;
     string head_hash = 10;
-    string head_signature = 11;
+    SignatureEnvelopeV1 head_signature = 11;
 }
 
 message PersonalDbVoterAck {

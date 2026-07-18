@@ -214,22 +214,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anvil-personaldb-signer"
-version = "0.3.0"
-dependencies = [
- "anvil-storage-core",
- "anyhow",
- "clap",
- "hex",
- "personaldb-protocol",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "zeroize",
-]
-
-[[package]]
 name = "anvil-server"
 version = "0.3.0"
 dependencies = [
@@ -278,6 +262,7 @@ dependencies = [
  "memchr",
  "once_cell",
  "openssl",
+ "personaldb-protocol",
  "prost",
  "prost-types",
  "quick-xml",
@@ -337,6 +322,7 @@ dependencies = [
  "clap",
  "confy",
  "dialoguer",
+ "personaldb-protocol",
  "prost",
  "serde",
  "serde_json",
@@ -4677,16 +4663,16 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "personaldb-protocol"
 version = "0.1.0"
-source = "git+ssh://git@github.com/worka-ai/personaldb.git?rev=41295b43cd4634e77ab5b6bf411e5233217838b0#41295b43cd4634e77ab5b6bf411e5233217838b0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f891f5c93c4ff47365446e19d26871acc65d360cea3c6ddaa2991cfa46ddc4b"
 dependencies = [
  "ed25519-dalek 3.0.0",
  "hex",
  "prost",
  "serde",
- "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.17",
- "uuid",
+ "unicode-normalization",
 ]
 
 [[package]]

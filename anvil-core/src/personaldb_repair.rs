@@ -62,7 +62,7 @@ pub async fn repair_personaldb_log_chain(
     database_id: &str,
     lease_fence_token: u64,
     personaldb_trust_store: &PublicKeyTrustStore,
-    repair_signing_key: &[u8],
+    repair_finding_signing_key: &[u8],
 ) -> Result<PersonalDbLogChainRepairReport> {
     if lease_fence_token == 0 {
         return Err(anyhow!(
@@ -81,7 +81,8 @@ pub async fn repair_personaldb_log_chain(
             &reason,
             lease_fence_token,
         )?;
-        report.finding = Some(write_repair_finding(storage, write, repair_signing_key).await?);
+        report.finding =
+            Some(write_repair_finding(storage, write, repair_finding_signing_key).await?);
     }
     Ok(report)
 }

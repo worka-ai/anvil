@@ -25,10 +25,10 @@ use crate::{
         personaldb_committed_head_precondition, read_personaldb_committed_head,
         validate_committed_head_unsigned,
     },
-    personaldb_signer_protocol::PersonalDbSigningObject,
     personaldb_signing::{
         PersonalDbProtocolKeyring, signature_envelope_from_proto, signature_envelope_to_proto,
     },
+    personaldb_signing_object::PersonalDbSigningObject,
     storage::Storage,
 };
 use anyhow::{Context, Result, anyhow, bail};

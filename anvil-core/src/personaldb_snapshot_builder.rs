@@ -62,7 +62,6 @@ pub struct PersonalDbSnapshotBuildResult {
 pub async fn maybe_build_personaldb_snapshot(
     storage: &Storage,
     request: PersonalDbSnapshotBuildRequest<'_>,
-    snapshots_head_signing_key: &[u8],
     protocol_keyring: &PersonalDbProtocolKeyring,
 ) -> Result<Option<PersonalDbSnapshotBuildResult>> {
     validate_request(&request)?;
@@ -93,7 +92,7 @@ pub async fn maybe_build_personaldb_snapshot(
         storage,
         request.tenant_id,
         request.database_id,
-        snapshots_head_signing_key,
+        protocol_keyring.trust_store(),
     )
     .await?;
     let base_log_index = previous_snapshot
@@ -133,13 +132,7 @@ pub async fn maybe_build_personaldb_snapshot(
         &new_records,
     )
     .await?;
-    publish_snapshots_head(
-        storage,
-        request,
-        snapshots_head_signing_key,
-        &result.manifest,
-    )
-    .await?;
+    publish_snapshots_head(storage, request, protocol_keyring, &result.manifest).await?;
     Ok(Some(result))
 }
 
@@ -275,7 +268,7 @@ async fn restore_snapshot_database_scratch(
 async fn publish_snapshots_head(
     storage: &Storage,
     request: PersonalDbSnapshotBuildRequest<'_>,
-    signing_key: &[u8],
+    protocol_keyring: &PersonalDbProtocolKeyring,
     manifest: &PersonalDbSnapshotManifest,
 ) -> Result<()> {
     let manifest_ref = personaldb_snapshot_manifest_ref_name(
@@ -285,7 +278,7 @@ async fn publish_snapshots_head(
         &manifest.state_hash,
     )?;
     let head = PersonalDbSnapshotsHead {
-        format_version: 1,
+        format_version: 2,
         tenant_id: request.tenant_id.to_string(),
         database_id: request.database_id.to_string(),
         latest_snapshot_log_index: manifest.log_index,
@@ -297,13 +290,14 @@ async fn publish_snapshots_head(
         head_hash: None,
         head_signature: None,
     }
-    .seal(signing_key)?;
+    .seal(protocol_keyring)
+    .await?;
     write_personaldb_snapshots_head(
         storage,
         request.tenant_id,
         request.database_id,
         &head,
-        signing_key,
+        protocol_keyring.trust_store(),
     )
     .await
 }
@@ -449,7 +443,6 @@ mod tests {
     use rusqlite::{Connection, session::Session};
     use tempfile::{TempDir, tempdir};
 
-    const KEY: &[u8] = b"personaldb snapshot builder signing key";
     const SCHEMA_SQL: &str = "CREATE TABLE items(
         id INTEGER PRIMARY KEY NOT NULL,
         name TEXT NOT NULL,
@@ -467,7 +460,6 @@ mod tests {
                 entry_threshold: 10,
                 payload_bytes_threshold: 1024 * 1024,
             }),
-            KEY,
             &keyring,
         )
         .await
@@ -480,7 +472,6 @@ mod tests {
                 entry_threshold: 2,
                 payload_bytes_threshold: 1024 * 1024,
             }),
-            KEY,
             &keyring,
         )
         .await
@@ -521,11 +512,15 @@ mod tests {
         assert_eq!(count, 2);
         assert_eq!(second_name, "item-2");
 
-        let snapshots_head =
-            read_personaldb_snapshots_head(&fixture.storage, 9, "db-snapshot", KEY)
-                .await
-                .unwrap()
-                .expect("snapshots head should be published");
+        let snapshots_head = read_personaldb_snapshots_head(
+            &fixture.storage,
+            9,
+            "db-snapshot",
+            keyring.trust_store(),
+        )
+        .await
+        .unwrap()
+        .expect("snapshots head should be published");
         assert_eq!(snapshots_head.latest_snapshot_log_index, 2);
         assert_eq!(
             snapshots_head.latest_snapshot_manifest_ref,
@@ -547,7 +542,6 @@ mod tests {
                     payload_bytes_threshold: 1024 * 1024,
                 })
             },
-            KEY,
             &keyring,
         )
         .await

@@ -19,10 +19,6 @@ pub struct Config {
     #[arg(long, env, default_value = "primary")]
     pub anvil_secret_encryption_key_id: String,
 
-    /// JSON manifest containing trusted PersonalDB Ed25519 keys and role-scoped Unix signers.
-    #[arg(long, env, default_value = "")]
-    pub personaldb_protocol_signing_manifest_path: String,
-
     /// Comma-delimited previous secret encryption keys as `key_id:hex`.
     #[arg(long, env, default_value = "")]
     pub anvil_secret_encryption_previous_keys: String,
@@ -299,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn production_config_has_no_personaldb_private_key_or_in_process_signer_input() {
+    fn production_config_has_no_personaldb_signer_process_or_private_key_input() {
         let command = Config::command();
         let exposed_inputs = command
             .get_arguments()
@@ -317,19 +313,17 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert!(
-            exposed_inputs
-                .iter()
-                .any(|input| input.contains("personaldb_protocol_signing_manifest_path")),
-            "the coordinator must expose only the public PersonalDB signing manifest"
-        );
         for forbidden in [
+            "personaldb_protocol_signing_manifest",
+            "personaldb-protocol-signing-manifest",
             "personaldb_private_key",
             "personaldb-private-key",
             "private_key_pkcs8",
             "private-key-pkcs8",
             "personaldb_in_process",
             "personaldb-in-process",
+            "personaldb_signer_socket",
+            "personaldb-signer-socket",
         ] {
             assert!(
                 exposed_inputs

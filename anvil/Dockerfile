@@ -17,7 +17,7 @@ WORKDIR /usr/src/anvil
 
 COPY . .
 
-# Build the server, local signer, public CLI, and admin CLI in release mode. BuildKit cache
+# Build the server, public CLI, and admin CLI in release mode. BuildKit cache
 # mounts keep Cargo's registry, git checkout cache, and target directory outside
 # the image layer so repeat local/CI Docker builds reuse compiled dependencies.
 RUN --mount=type=cache,id=anvil-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
@@ -25,12 +25,10 @@ RUN --mount=type=cache,id=anvil-cargo-registry,target=/usr/local/cargo/registry,
     --mount=type=cache,id=anvil-cargo-target-release,target=/usr/src/anvil/target,sharing=locked \
     cargo build --release --locked \
         -p anvil-server --bin anvil-server \
-        -p anvil-personaldb-signer --bin anvil-signer \
         -p anvil-storage-cli --bin anvil --bin anvil-admin \
     && mkdir -p /usr/local/anvil-build \
     && cp \
         target/release/anvil-server \
-        target/release/anvil-signer \
         target/release/anvil \
         target/release/anvil-admin \
         /usr/local/anvil-build/
@@ -48,7 +46,6 @@ RUN useradd --uid 10001 --create-home --home-dir /var/lib/anvil --shell /usr/sbi
 
 # Copy the compiled binaries from the builder stage.
 COPY --from=builder /usr/local/anvil-build/anvil-server /usr/local/bin/anvil-server
-COPY --from=builder /usr/local/anvil-build/anvil-signer /usr/local/bin/anvil-signer
 COPY --from=builder /usr/local/anvil-build/anvil /usr/local/bin/anvil
 COPY --from=builder /usr/local/anvil-build/anvil-admin /usr/local/bin/anvil-admin
 

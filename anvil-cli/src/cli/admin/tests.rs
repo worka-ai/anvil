@@ -1,6 +1,10 @@
 use super::bucket::BucketPublicAccessCommands;
 use super::common::{MutationOptions, with_auth};
 use super::node::NodeCapabilityArg;
+use super::personaldb_signing_key::{
+    PersonalDbSigningImportStatusArg, PersonalDbSigningPurposeArg,
+    PersonalDbSigningTerminalStatusArg, derive_public_key, read_private_key_file,
+};
 use super::region::BucketDrainOverrideArg;
 use super::repair::RepairKindArg;
 use super::*;
@@ -289,6 +293,205 @@ fn mutation_parse_allows_generated_request_ids() {
     assert_eq!(context.audit_reason, "bootstrap region");
     assert_eq!(context.expected_generation, Some(0));
     assert_eq!(region, "eu-west-1");
+}
+
+#[test]
+fn personaldb_signing_key_commands_parse_protocol_fields() {
+    let import = TestAdminCli::try_parse_from([
+        "admin",
+        "personal-db-signing-key",
+        "import",
+        "--audit-reason",
+        "install witness generation",
+        "--expected-generation",
+        "0",
+        "--private-key-pkcs8",
+        "/secure/witness.pk8",
+        "--key-generation",
+        "3",
+        "--purpose",
+        "witness",
+        "--database-scope",
+        "database-a",
+        "--database-scope",
+        "database-b",
+        "--group-scope",
+        "group-a",
+        "--valid-from-log-index",
+        "100",
+        "--valid-until-log-index",
+        "200",
+        "--status",
+        "retiring",
+    ])
+    .unwrap();
+
+    let AdminCommands::PersonalDbSigningKey {
+        command:
+            PersonalDbSigningKeyCommands::Import {
+                context,
+                private_key_pkcs8,
+                key_generation,
+                purpose,
+                database_scopes,
+                group_scopes,
+                valid_from_log_index,
+                valid_until_log_index,
+                status,
+            },
+    } = import.command
+    else {
+        panic!("expected PersonalDB signing key import command");
+    };
+    assert_eq!(context.expected_generation, Some(0));
+    assert_eq!(private_key_pkcs8, PathBuf::from("/secure/witness.pk8"));
+    assert_eq!(key_generation, 3);
+    assert!(matches!(purpose, PersonalDbSigningPurposeArg::Witness));
+    assert_eq!(database_scopes, ["database-a", "database-b"]);
+    assert_eq!(group_scopes, ["group-a"]);
+    assert_eq!(valid_from_log_index, 100);
+    assert_eq!(valid_until_log_index, Some(200));
+    assert!(matches!(status, PersonalDbSigningImportStatusArg::Retiring));
+
+    let set_status = TestAdminCli::try_parse_from([
+        "admin",
+        "personal-db-signing-key",
+        "set-status",
+        "--audit-reason",
+        "retire generation",
+        "--expected-generation",
+        "7",
+        "--key-id",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--status",
+        "revoked-future",
+        "--valid-until-log-index",
+        "250",
+    ])
+    .unwrap();
+
+    let AdminCommands::PersonalDbSigningKey {
+        command:
+            PersonalDbSigningKeyCommands::SetStatus {
+                context,
+                key_id,
+                status,
+                valid_until_log_index,
+            },
+    } = set_status.command
+    else {
+        panic!("expected PersonalDB signing key set-status command");
+    };
+    assert_eq!(context.to_update_context().unwrap().expected_generation, 7);
+    assert_eq!(
+        key_id,
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    assert!(matches!(
+        status,
+        PersonalDbSigningTerminalStatusArg::RevokedFuture
+    ));
+    assert_eq!(valid_until_log_index, 250);
+
+    let unsupported_purpose = TestAdminCli::try_parse_from([
+        "admin",
+        "personal-db-signing-key",
+        "import",
+        "--audit-reason",
+        "reject unsupported purpose",
+        "--private-key-pkcs8",
+        "/secure/source-proposer.pk8",
+        "--key-generation",
+        "1",
+        "--purpose",
+        "source-proposer",
+    ]);
+    let Err(unsupported_purpose) = unsupported_purpose else {
+        panic!("expected unsupported PersonalDB signing purpose to be rejected");
+    };
+    assert_eq!(
+        unsupported_purpose.kind(),
+        clap::error::ErrorKind::InvalidValue
+    );
+}
+
+#[test]
+fn personaldb_signing_key_derives_expected_raw_public_key() {
+    let private_key = base64::engine::general_purpose::STANDARD
+        .decode("MC4CAQAwBQYDK2VwBCIEIDMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMz")
+        .unwrap();
+    let expected_public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode("F8t5-ytBIPKx7GXkGY1uCLKOgT_rAeSkAIObheGAgM4")
+        .unwrap();
+
+    let public_key = derive_public_key(
+        &private_key,
+        4,
+        PersonalDbSigningPurposeArg::Witness,
+        &["database-a".to_string()],
+        &["group-a".to_string()],
+        0,
+        None,
+        PersonalDbSigningImportStatusArg::Active,
+    )
+    .unwrap();
+
+    assert_eq!(public_key, expected_public_key);
+}
+
+#[tokio::test]
+async fn personaldb_signing_key_file_is_regular_private_and_bounded() {
+    let temp = tempfile::tempdir().unwrap();
+    let key_path = temp.path().join("witness.pk8");
+    std::fs::write(&key_path, [1_u8, 2, 3]).unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    assert_eq!(read_private_key_file(&key_path).await.unwrap(), [1, 2, 3]);
+
+    let oversized_path = temp.path().join("oversized.pk8");
+    std::fs::write(&oversized_path, vec![0_u8; 16 * 1024 + 1]).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&oversized_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    assert!(
+        read_private_key_file(&oversized_path)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds the 16384 byte limit")
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(
+            read_private_key_file(&key_path)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("must not grant group or other permissions")
+        );
+
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let symlink_path = temp.path().join("witness-link.pk8");
+        symlink(&key_path, &symlink_path).unwrap();
+        assert!(
+            read_private_key_file(&symlink_path)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("must not be a symbolic link")
+        );
+    }
 }
 
 #[test]

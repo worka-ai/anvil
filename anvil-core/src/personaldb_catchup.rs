@@ -64,7 +64,6 @@ pub enum PersonalDbSnapshotRestoreReason {
 pub async fn personaldb_catch_up(
     storage: &Storage,
     request: PersonalDbCatchUpRequest,
-    snapshots_head_signing_key: &[u8],
     trust_store: &PublicKeyTrustStore,
 ) -> Result<PersonalDbCatchUpResponse> {
     validate_request(&request)?;
@@ -80,7 +79,7 @@ pub async fn personaldb_catch_up(
             storage,
             &request,
             None,
-            snapshots_head_signing_key,
+            trust_store,
             PersonalDbSnapshotRestoreReason::MissingCommittedHead,
         )
         .await?);
@@ -93,7 +92,7 @@ pub async fn personaldb_catch_up(
             storage,
             &request,
             Some(committed_head),
-            snapshots_head_signing_key,
+            trust_store,
             PersonalDbSnapshotRestoreReason::DivergentReplica,
         )
         .await?);
@@ -218,14 +217,14 @@ async fn snapshot_required(
     storage: &Storage,
     request: &PersonalDbCatchUpRequest,
     committed_head: Option<PersonalDbCommittedHead>,
-    signing_key: &[u8],
+    trust_store: &PublicKeyTrustStore,
     reason: PersonalDbSnapshotRestoreReason,
 ) -> Result<PersonalDbCatchUpResponse> {
     let snapshots_head = read_personaldb_snapshots_head(
         storage,
         request.tenant_id,
         &request.database_id,
-        signing_key,
+        trust_store,
     )
     .await?;
     Ok(PersonalDbCatchUpResponse::SnapshotRequired(
@@ -394,8 +393,6 @@ mod tests {
     };
     use tempfile::{TempDir, tempdir};
 
-    const KEY: &[u8] = b"personaldb catchup signing key";
-
     #[tokio::test]
     async fn catch_up_from_genesis_returns_entries_with_payloads_and_certificates() {
         let fixture = Fixture::create().await;
@@ -410,7 +407,6 @@ mod tests {
                 have_log_hash: fixture.genesis_hash.clone(),
                 max_entries: 2,
             },
-            KEY,
             fixture.protocol_keyring.trust_store(),
         )
         .await
@@ -447,7 +443,6 @@ mod tests {
                 have_log_hash: hex::encode(fixture.records[0].entry_hash),
                 max_entries: 10,
             },
-            KEY,
             fixture.protocol_keyring.trust_store(),
         )
         .await
@@ -481,7 +476,6 @@ mod tests {
                 have_log_hash: hex::encode([99; 32]),
                 max_entries: 10,
             },
-            KEY,
             fixture.protocol_keyring.trust_store(),
         )
         .await
@@ -517,7 +511,6 @@ mod tests {
                 have_log_hash: hex::encode([0; 32]),
                 max_entries: 10,
             },
-            KEY,
             protocol_keyring.trust_store(),
         )
         .await
@@ -693,7 +686,7 @@ mod tests {
             .unwrap();
 
             let snapshots = PersonalDbSnapshotsHead {
-                format_version: 1,
+                format_version: 2,
                 tenant_id: "3".to_string(),
                 database_id: "db-alpha".to_string(),
                 latest_snapshot_log_index: 2,
@@ -711,11 +704,18 @@ mod tests {
                 head_hash: None,
                 head_signature: None,
             }
-            .seal(KEY)
+            .seal(&protocol_keyring)
+            .await
             .unwrap();
-            write_personaldb_snapshots_head(&storage, 3, "db-alpha", &snapshots, KEY)
-                .await
-                .unwrap();
+            write_personaldb_snapshots_head(
+                &storage,
+                3,
+                "db-alpha",
+                &snapshots,
+                protocol_keyring.trust_store(),
+            )
+            .await
+            .unwrap();
 
             Self {
                 _temp: temp,

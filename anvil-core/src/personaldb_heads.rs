@@ -13,24 +13,19 @@ use crate::{
         read_personaldb_data_locator_row,
         write_personaldb_bytes_as_data_locator_with_preconditions,
     },
-    personaldb_signer_protocol::PersonalDbSigningObject,
     personaldb_signing::{
         PersonalDbProtocolKeyring, signature_envelope_from_proto, signature_envelope_to_proto,
     },
+    personaldb_signing_object::PersonalDbSigningObject,
     storage::Storage,
 };
 use anyhow::{Result, anyhow};
-use base64::Engine;
-use hmac::{Hmac, Mac};
 use personaldb_protocol::{
     DatabaseId, ProtocolSignable, PublicKeyTrustStore, SignatureDomain, SignatureEnvelopeV1,
     SignatureMetadata, SignaturePurpose, SignatureScope, SigningPayload,
 };
 use prost::Message;
-use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 
-type HmacSha256 = Hmac<Sha256>;
 const PERSONALDB_HEAD_DATA_PREFIX: &str = "personaldb_head:";
 const PERSONALDB_LOG_SEGMENT_REF_PREFIX: &str = "personaldb_log_segment:";
 const PERSONALDB_SNAPSHOT_MANIFEST_REF_PREFIX: &str = "personaldb_snapshot_manifest:";
@@ -53,7 +48,7 @@ pub struct PersonalDbCommittedHead {
     pub head_signature: Option<SignatureEnvelopeV1>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersonalDbSnapshotsHead {
     pub format_version: u16,
     pub tenant_id: String,
@@ -65,7 +60,7 @@ pub struct PersonalDbSnapshotsHead {
     pub updated_at: String,
     pub updated_by_node: String,
     pub head_hash: Option<String>,
-    pub head_signature: Option<String>,
+    pub head_signature: Option<SignatureEnvelopeV1>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -122,8 +117,8 @@ struct PersonalDbSnapshotsHeadProto {
     updated_by_node: String,
     #[prost(string, optional, tag = "10")]
     head_hash: Option<String>,
-    #[prost(string, optional, tag = "11")]
-    head_signature: Option<String>,
+    #[prost(message, optional, tag = "11")]
+    head_signature: Option<WireSignatureEnvelopeV1>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -211,44 +206,52 @@ impl ProtocolSignable for PersonalDbCommittedHead {
 }
 
 impl PersonalDbSnapshotsHead {
-    pub fn seal(mut self, signing_key: &[u8]) -> Result<Self> {
+    pub async fn seal(mut self, keyring: &PersonalDbProtocolKeyring) -> Result<Self> {
         validate_snapshots_head_unsigned(&self)?;
-        let hash = hash_snapshots_head(&self)?;
-        let signature = sign_head_hash(
-            signing_key,
-            "personaldb_snapshots_head",
-            &hash,
-            &[
-                &self.tenant_id,
-                &self.database_id,
-                &self.latest_snapshot_log_index.to_string(),
-            ],
+        require_unsealed(
+            self.head_hash.as_ref(),
+            self.head_signature.as_ref(),
+            "personaldb snapshots head",
         )?;
+        let hash = hash_snapshots_head(&self)?;
+        let signature = keyring
+            .sign(PersonalDbSigningObject::SnapshotsHead(self.clone()))
+            .await?;
         self.head_hash = Some(hash);
         self.head_signature = Some(signature);
         Ok(self)
     }
 
-    pub fn verify(&self, signing_key: &[u8]) -> Result<()> {
+    pub fn verify(&self, trust_store: &PublicKeyTrustStore) -> Result<()> {
         validate_snapshots_head_unsigned(self)?;
         let expected_hash = hash_snapshots_head(self)?;
         if self.head_hash.as_deref() != Some(expected_hash.as_str()) {
             return Err(anyhow!("personaldb snapshots head hash mismatch"));
         }
-        let expected_signature = sign_head_hash(
-            signing_key,
-            "personaldb_snapshots_head",
-            &expected_hash,
-            &[
-                &self.tenant_id,
-                &self.database_id,
-                &self.latest_snapshot_log_index.to_string(),
-            ],
-        )?;
-        if self.head_signature.as_deref() != Some(expected_signature.as_str()) {
-            return Err(anyhow!("personaldb snapshots head signature mismatch"));
-        }
+        let signature = self
+            .head_signature
+            .as_ref()
+            .ok_or_else(|| anyhow!("personaldb snapshots head signature missing"))?;
+        trust_store.verify(self, signature)?;
         Ok(())
+    }
+}
+
+impl ProtocolSignable for PersonalDbSnapshotsHead {
+    fn signature_metadata(&self) -> SignatureMetadata {
+        SignatureMetadata::for_domain(
+            SignaturePurpose::Snapshot,
+            SignatureDomain::SnapshotsHead,
+            self.latest_snapshot_log_index,
+        )
+        .with_scope(SignatureScope::for_database_group(
+            DatabaseId::new(&self.database_id),
+            self.database_id.clone(),
+        ))
+    }
+
+    fn signing_payload(&self) -> SigningPayload<'_> {
+        SigningPayload::Sha256Digest(snapshots_head_payload_hash(self))
     }
 }
 
@@ -258,10 +261,8 @@ pub fn hash_committed_head(head: &PersonalDbCommittedHead) -> Result<String> {
 }
 
 pub fn hash_snapshots_head(head: &PersonalDbSnapshotsHead) -> Result<String> {
-    let mut unsigned = head.clone();
-    unsigned.head_hash = None;
-    unsigned.head_signature = None;
-    Ok(hex::encode(hash32(&unsigned.encode_record()?)))
+    validate_snapshots_head_unsigned(head)?;
+    Ok(hex::encode(snapshots_head_payload_hash(head)))
 }
 
 pub async fn write_personaldb_group_manifest(
@@ -382,9 +383,9 @@ pub async fn write_personaldb_snapshots_head(
     tenant_id: i64,
     database_id: &str,
     head: &PersonalDbSnapshotsHead,
-    signing_key: &[u8],
+    trust_store: &PublicKeyTrustStore,
 ) -> Result<()> {
-    head.verify(signing_key)?;
+    head.verify(trust_store)?;
     ensure_head_scope(tenant_id, database_id, &head.tenant_id, &head.database_id)?;
     write_head_record(
         storage,
@@ -398,7 +399,7 @@ pub async fn read_personaldb_snapshots_head(
     storage: &Storage,
     tenant_id: i64,
     database_id: &str,
-    signing_key: &[u8],
+    trust_store: &PublicKeyTrustStore,
 ) -> Result<Option<PersonalDbSnapshotsHead>> {
     let Some(head) = read_head_record::<PersonalDbSnapshotsHead>(
         storage,
@@ -408,7 +409,7 @@ pub async fn read_personaldb_snapshots_head(
     else {
         return Ok(None);
     };
-    head.verify(signing_key)?;
+    head.verify(trust_store)?;
     ensure_head_scope(tenant_id, database_id, &head.tenant_id, &head.database_id)?;
     Ok(Some(head))
 }
@@ -439,8 +440,8 @@ pub(crate) fn validate_committed_head_unsigned(head: &PersonalDbCommittedHead) -
     Ok(())
 }
 
-fn validate_snapshots_head_unsigned(head: &PersonalDbSnapshotsHead) -> Result<()> {
-    if head.format_version != 1 {
+pub(crate) fn validate_snapshots_head_unsigned(head: &PersonalDbSnapshotsHead) -> Result<()> {
+    if head.format_version != 2 {
         return Err(anyhow!("unsupported personaldb snapshots head version"));
     }
     validate_hex32(&head.latest_snapshot_log_hash, "latest_snapshot_log_hash")?;
@@ -469,26 +470,6 @@ fn ensure_head_scope(
         return Err(anyhow!("personaldb head database scope mismatch"));
     }
     Ok(())
-}
-
-fn sign_head_hash(
-    signing_key: &[u8],
-    domain: &str,
-    hash: &str,
-    scope_parts: &[&str],
-) -> Result<String> {
-    if signing_key.is_empty() {
-        return Err(anyhow!("personaldb head signing key must not be empty"));
-    }
-    let mut mac = HmacSha256::new_from_slice(signing_key)?;
-    mac.update(domain.as_bytes());
-    mac.update(b"\0");
-    mac.update(hash.as_bytes());
-    for part in scope_parts {
-        mac.update(b"\0");
-        mac.update(part.as_bytes());
-    }
-    Ok(base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
 }
 
 fn require_unsealed<T>(
@@ -763,13 +744,19 @@ fn snapshots_head_to_proto(head: &PersonalDbSnapshotsHead) -> PersonalDbSnapshot
         updated_at: head.updated_at.clone(),
         updated_by_node: head.updated_by_node.clone(),
         head_hash: head.head_hash.clone(),
-        head_signature: head.head_signature.clone(),
+        head_signature: head
+            .head_signature
+            .as_ref()
+            .map(signature_envelope_to_proto),
     }
 }
 
 fn snapshots_head_from_proto(
     proto: PersonalDbSnapshotsHeadProto,
 ) -> Result<PersonalDbSnapshotsHead> {
+    if proto.format_version != 2 {
+        return Err(anyhow!("unsupported personaldb snapshots head version"));
+    }
     Ok(PersonalDbSnapshotsHead {
         format_version: u16::try_from(proto.format_version)
             .map_err(|_| anyhow!("personaldb snapshots head version exceeds u16"))?,
@@ -782,7 +769,10 @@ fn snapshots_head_from_proto(
         updated_at: proto.updated_at,
         updated_by_node: proto.updated_by_node,
         head_hash: proto.head_hash,
-        head_signature: proto.head_signature,
+        head_signature: proto
+            .head_signature
+            .map(signature_envelope_from_proto)
+            .transpose()?,
     })
 }
 
@@ -811,6 +801,13 @@ fn group_manifest_to_proto(manifest: &PersonalDbGroupManifest) -> PersonalDbGrou
 
 fn committed_head_payload_hash(head: &PersonalDbCommittedHead) -> [u8; 32] {
     let mut proto = committed_head_to_proto(head);
+    proto.head_hash = None;
+    proto.head_signature = None;
+    hash32(&encode_deterministic_proto(&proto))
+}
+
+fn snapshots_head_payload_hash(head: &PersonalDbSnapshotsHead) -> [u8; 32] {
+    let mut proto = snapshots_head_to_proto(head);
     proto.head_hash = None;
     proto.head_signature = None;
     hash32(&encode_deterministic_proto(&proto))
@@ -894,8 +891,6 @@ mod tests {
     use crate::test_support::personaldb_protocol_keyring;
     use tempfile::tempdir;
 
-    const KEY: &[u8] = b"personaldb head signing key";
-
     #[tokio::test]
     async fn committed_head_round_trips_via_coremeta_data_locator() {
         let temp = tempdir().unwrap();
@@ -941,9 +936,10 @@ mod tests {
     async fn snapshots_head_round_trips_via_coremeta_data_locator() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let head = sample_snapshots_head().seal(KEY).unwrap();
+        let keyring = personaldb_protocol_keyring();
+        let head = sample_snapshots_head().seal(&keyring).await.unwrap();
 
-        write_personaldb_snapshots_head(&storage, 7, "db-alpha", &head, KEY)
+        write_personaldb_snapshots_head(&storage, 7, "db-alpha", &head, keyring.trust_store())
             .await
             .unwrap();
 
@@ -954,12 +950,31 @@ mod tests {
         assert_eq!(row.data_kind, "snapshots_head");
         assert_eq!(row.generation, head.latest_snapshot_log_index);
 
-        let read = read_personaldb_snapshots_head(&storage, 7, "db-alpha", KEY)
+        let read = read_personaldb_snapshots_head(&storage, 7, "db-alpha", keyring.trust_store())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(read, head);
-        read.verify(KEY).unwrap();
+        let expected_hash = hash_snapshots_head(&read).unwrap();
+        assert_eq!(read.head_hash.as_deref(), Some(expected_hash.as_str()));
+        assert_eq!(
+            read.signature_metadata().purpose,
+            SignaturePurpose::Snapshot
+        );
+        assert_eq!(
+            read.signature_metadata().domain,
+            SignatureDomain::SnapshotsHead
+        );
+        assert_eq!(
+            read.head_signature
+                .as_ref()
+                .unwrap()
+                .signature
+                .as_bytes()
+                .len(),
+            64
+        );
+        read.verify(keyring.trust_store()).unwrap();
     }
 
     #[tokio::test]
@@ -1004,10 +1019,37 @@ mod tests {
                 .is_none()
         );
         assert!(
-            read_personaldb_snapshots_head(&storage, 7, "db-alpha", KEY)
+            read_personaldb_snapshots_head(&storage, 7, "db-alpha", keyring.trust_store(),)
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshots_head_rejects_format_version_one_and_missing_signature() {
+        let keyring = personaldb_protocol_keyring();
+        let unsupported = PersonalDbSnapshotsHead {
+            format_version: 1,
+            ..sample_snapshots_head()
+        };
+        assert!(
+            unsupported
+                .seal(&keyring)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported personaldb snapshots head version")
+        );
+
+        let mut unsigned = sample_snapshots_head();
+        unsigned.head_hash = Some(hash_snapshots_head(&unsigned).unwrap());
+        assert!(
+            unsigned
+                .verify(keyring.trust_store())
+                .unwrap_err()
+                .to_string()
+                .contains("signature missing")
         );
     }
 
@@ -1109,7 +1151,7 @@ mod tests {
 
     fn sample_snapshots_head() -> PersonalDbSnapshotsHead {
         PersonalDbSnapshotsHead {
-            format_version: 1,
+            format_version: 2,
             tenant_id: "7".to_string(),
             database_id: "db-alpha".to_string(),
             latest_snapshot_log_index: 1024,

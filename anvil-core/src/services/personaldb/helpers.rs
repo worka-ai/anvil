@@ -97,7 +97,7 @@ pub(super) fn snapshots_head_record(
         updated_at: head.updated_at,
         updated_by_node: head.updated_by_node,
         head_hash: head.head_hash.unwrap_or_default(),
-        head_signature: head.head_signature.unwrap_or_default(),
+        head_signature: head.head_signature.map(signature_envelope_record),
     }
 }
 

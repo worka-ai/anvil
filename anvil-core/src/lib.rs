@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, broadcast};
+use tracing::warn;
 
 pub(crate) fn emit_test_timing(label: impl AsRef<str>, elapsed: Duration) {
     let label = label.as_ref();
@@ -102,8 +103,9 @@ pub mod personaldb_repair;
 pub mod personaldb_row_index;
 pub mod personaldb_schema;
 pub mod personaldb_segment;
-pub mod personaldb_signer_protocol;
 pub mod personaldb_signing;
+pub mod personaldb_signing_object;
+pub mod personaldb_signing_store;
 pub mod personaldb_snapshot_builder;
 pub mod personaldb_snapshot_store;
 pub mod personaldb_submit;
@@ -158,6 +160,7 @@ pub struct AppState {
     pub object_manager: object_manager::ObjectManager,
     pub config: Arc<Config>,
     pub secret_keyring: Arc<crypto::EncryptionKeyring>,
+    pub personaldb_signing_key_store: Arc<personaldb_signing_store::PersonalDbSigningKeyStore>,
     pub personaldb_protocol_keyring: Arc<personaldb_signing::PersonalDbProtocolKeyring>,
     pub bucket_watch_tx: broadcast::Sender<persistence::BucketMetadataEvent>,
     pub authz_watch_tx: broadcast::Sender<persistence::AuthzTupleRecord>,
@@ -178,11 +181,32 @@ impl AppState {
     ) -> Result<Self> {
         let config = config.with_persisted_identity().await?;
         let secret_keyring = Arc::new(config.secret_keyring()?);
-        let personaldb_protocol_keyring = Arc::new(personaldb_protocol_keyring);
+        let has_personaldb_keyring_override = personaldb_protocol_keyring.is_enabled()
+            || !personaldb_protocol_keyring.trust_store().is_empty();
         let partition_signing_key = hex::decode(&config.anvil_secret_encryption_key)?;
         let arc_config = Arc::new(config);
         let jwt_manager = Arc::new(JwtManager::new(arc_config.jwt_secret.clone()));
         let storage = storage::Storage::new_at(&arc_config.storage_path).await?;
+        let personaldb_signing_key_store =
+            Arc::new(personaldb_signing_store::PersonalDbSigningKeyStore::new(
+                storage.clone(),
+                secret_keyring.clone(),
+            ));
+        let personaldb_protocol_keyring = if has_personaldb_keyring_override {
+            personaldb_protocol_keyring
+        } else {
+            match personaldb_signing_key_store.load_protocol_keyring() {
+                Ok(keyring) => keyring,
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "PersonalDB signing keys are unavailable; PersonalDB signing operations will fail closed"
+                    );
+                    personaldb_signing::PersonalDbProtocolKeyring::disabled()
+                }
+            }
+        };
+        let personaldb_protocol_keyring = Arc::new(personaldb_protocol_keyring);
         let core_store = core_store::CoreStore::new_with_pipeline_keyring_and_identity(
             storage.clone(),
             arc_config.core_pipeline_keyring()?,
@@ -248,6 +272,7 @@ impl AppState {
             object_manager,
             config: arc_config,
             secret_keyring,
+            personaldb_signing_key_store,
             personaldb_protocol_keyring,
             bucket_watch_tx,
             authz_watch_tx,
@@ -258,5 +283,53 @@ impl AppState {
             native_mutation_locks,
             observability,
         })
+    }
+}
+
+#[cfg(test)]
+mod app_state_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn starts_without_personaldb_signing_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            jwt_secret: "test-secret".to_string(),
+            anvil_secret_encryption_key:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            cluster_secret: Some("test-cluster-secret".to_string()),
+            cluster_listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".to_string(),
+            public_api_addr: "127.0.0.1:0".to_string(),
+            api_listen_addr: "127.0.0.1:0".to_string(),
+            region: "local".to_string(),
+            bootstrap_system_admin_subject_kind: "app".to_string(),
+            bootstrap_system_admin_subject_id: "admin-principal".to_string(),
+            bootstrap_addrs: Vec::new(),
+            init_cluster: false,
+            enable_mdns: false,
+            storage_path: directory
+                .path()
+                .join("storage")
+                .to_string_lossy()
+                .into_owned(),
+            ..Config::default()
+        };
+
+        let state = AppState::new(
+            config,
+            None,
+            personaldb_signing::PersonalDbProtocolKeyring::disabled(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!state.personaldb_protocol_keyring.is_enabled());
+        assert!(
+            state
+                .personaldb_signing_key_store
+                .list_public_records()
+                .unwrap()
+                .is_empty()
+        );
     }
 }

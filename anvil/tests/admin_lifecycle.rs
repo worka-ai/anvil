@@ -277,6 +277,8 @@ async fn prepare_active_region_dependencies(
 mod admin_auth;
 #[path = "admin_lifecycle/aliases_audit.rs"]
 mod aliases_audit;
+#[path = "admin_lifecycle/personaldb_signing_keys.rs"]
+mod personaldb_signing_keys;
 #[path = "admin_lifecycle/region_lifecycle.rs"]
 mod region_lifecycle;
 #[path = "admin_lifecycle/tenant_routing.rs"]

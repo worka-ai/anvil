@@ -1,8 +1,8 @@
 use crate::{
     core_store::encode_deterministic_proto,
     formats::{Hash32, hash32},
-    personaldb_signer_protocol::PersonalDbSigningObject,
     personaldb_signing::PersonalDbProtocolKeyring,
+    personaldb_signing_object::PersonalDbSigningObject,
 };
 use anyhow::{Result, anyhow};
 use personaldb_protocol::{
