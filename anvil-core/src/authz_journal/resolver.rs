@@ -26,6 +26,7 @@ pub(crate) struct UsersetRef {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SchemaRuleIndex {
     members_by_userset: BTreeMap<UsersetRuleKey, SchemaMember>,
+    schema_bound_namespaces: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +74,7 @@ impl SchemaRuleIndex {
         }
 
         let mut members_by_userset = BTreeMap::new();
+        let mut schema_bound_namespaces = BTreeSet::new();
         for namespace in namespaces {
             let (realm_id, local_namespace) = namespace_realm_parts(&namespace);
             let Some(schema) = authz_realm_schema::read_bound_namespace_schema(
@@ -85,6 +87,7 @@ impl SchemaRuleIndex {
             else {
                 continue;
             };
+            schema_bound_namespaces.insert(namespace.clone());
             for relation in schema.relations {
                 let direct_relation = crate::authz_schema_contract::is_direct_relation(&relation);
                 members_by_userset.insert(
@@ -99,7 +102,10 @@ impl SchemaRuleIndex {
                 );
             }
         }
-        Ok(Self { members_by_userset })
+        Ok(Self {
+            members_by_userset,
+            schema_bound_namespaces,
+        })
     }
 
     fn relation_rules(&self, userset: &UsersetRef) -> &[AuthzRelationRule] {
@@ -113,12 +119,13 @@ impl SchemaRuleIndex {
     }
 
     fn is_direct_relation(&self, userset: &UsersetRef) -> bool {
-        self.members_by_userset
-            .get(&UsersetRuleKey {
-                namespace: userset.namespace.clone(),
-                relation: userset.relation.clone(),
-            })
-            .is_some_and(|member| member.direct_relation)
+        if let Some(member) = self.members_by_userset.get(&UsersetRuleKey {
+            namespace: userset.namespace.clone(),
+            relation: userset.relation.clone(),
+        }) {
+            return member.direct_relation;
+        }
+        !self.schema_bound_namespaces.contains(&userset.namespace)
     }
 }
 

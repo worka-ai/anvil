@@ -283,23 +283,27 @@ async fn test_apply_authz_schema_persists_and_emits_namespace_watch() {
         .unwrap();
     let schema = AuthzNamespaceSchema {
         namespace: "document".to_string(),
-        relations: vec![AuthzRelationSchema {
-            relation: "viewer".to_string(),
-            rules: vec![
-                AuthzRelationRule {
-                    kind: "inherit".to_string(),
-                    relation: "editor".to_string(),
-                    tuple_relation: String::new(),
-                    target_relation: String::new(),
-                },
-                AuthzRelationRule {
-                    kind: "computed".to_string(),
-                    relation: String::new(),
-                    tuple_relation: "parent_folder".to_string(),
-                    target_relation: "viewer".to_string(),
-                },
-            ],
-        }],
+        relations: vec![
+            authz_direct_relation("editor", &["user"]),
+            authz_direct_relation("parent_folder", &["folder"]),
+            authz_permission(
+                "viewer",
+                vec![
+                    AuthzRelationRule {
+                        kind: "inherit".to_string(),
+                        relation: "editor".to_string(),
+                        tuple_relation: String::new(),
+                        target_relation: String::new(),
+                    },
+                    AuthzRelationRule {
+                        kind: "computed".to_string(),
+                        relation: String::new(),
+                        tuple_relation: "parent_folder".to_string(),
+                        target_relation: "viewer".to_string(),
+                    },
+                ],
+            ),
+        ],
         schema_json: r#"{"namespaces":{"document":{"rules":{"viewer":[{"Inherit":"editor"}]}}}}"#
             .to_string(),
         schema_hash: String::new(),
@@ -389,10 +393,7 @@ async fn test_authz_schema_put_bind_and_realm_scoped_tuples() {
     };
     let schema = AuthzNamespaceSchema {
         namespace: "document".to_string(),
-        relations: vec![AuthzRelationSchema {
-            relation: "viewer".to_string(),
-            rules: vec![],
-        }],
+        relations: vec![authz_direct_relation("viewer", &["user"])],
         schema_json: r#"{"namespaces":{"document":{"rules":{"viewer":[]}}}}"#.to_string(),
         schema_hash: String::new(),
         schema_version: 0,
@@ -525,19 +526,8 @@ async fn test_conditional_authz_batch_validates_bound_schema_coordinates() {
         AuthzNamespaceSchema {
             namespace: "document".to_string(),
             relations: vec![
-                AuthzRelationSchema {
-                    relation: "parent_folder".to_string(),
-                    rules: Vec::new(),
-                },
-                AuthzRelationSchema {
-                    relation: "viewer".to_string(),
-                    rules: vec![AuthzRelationRule {
-                        kind: "computed".to_string(),
-                        relation: String::new(),
-                        tuple_relation: "parent_folder".to_string(),
-                        target_relation: "viewer".to_string(),
-                    }],
-                },
+                authz_direct_relation("parent_folder", &["folder"]),
+                authz_direct_relation("viewer", &["user", "userset"]),
             ],
             schema_json: r#"{"namespace":"document"}"#.to_string(),
             schema_hash: String::new(),
@@ -547,10 +537,7 @@ async fn test_conditional_authz_batch_validates_bound_schema_coordinates() {
         },
         AuthzNamespaceSchema {
             namespace: "folder".to_string(),
-            relations: vec![AuthzRelationSchema {
-                relation: "viewer".to_string(),
-                rules: Vec::new(),
-            }],
+            relations: vec![authz_direct_relation("viewer", &["user"])],
             schema_json: r#"{"namespace":"folder"}"#.to_string(),
             schema_hash: String::new(),
             schema_version: 0,

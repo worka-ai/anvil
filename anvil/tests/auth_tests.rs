@@ -6,16 +6,16 @@ use anvil::anvil_api::index_service_client::IndexServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::repair_service_client::RepairServiceClient;
 use anvil::anvil_api::{
-    AcquireTaskLeaseRequest, ApplyAuthzSchemaRequest, AuthzNamespaceSchema, AuthzRelationRule,
-    AuthzRelationSchema, AuthzScope, AuthzTupleMutation, BindAuthzSchemaRequest,
-    CheckPermissionRequest, CheckPermissionsRequest, CheckpointTaskLeaseRequest,
-    CommitTaskLeaseRequest, CreateApplicationCredentialRequest, CreateBucketRequest,
-    CreateHostAliasRequest, CreateObjectLinkRequest, CreateTenantRequest,
-    DeleteApplicationCredentialRequest, DeleteHostAliasRequest, DeleteObjectLinkRequest,
-    ForceReleaseTaskLeaseRequest, GetAccessTokenRequest, GetAuthzSchemaBindingRequest,
-    GetAuthzSchemaRequest, GetObjectRequest, GrantAccessRequest, ListAccessGrantsRequest,
-    ListApplicationsRequest, ListAuditEventsRequest, ListAuthzObjectsRequest,
-    ListAuthzSubjectsRequest, ListBucketsRequest, ListHostAliasesRequest,
+    AcquireTaskLeaseRequest, ApplyAuthzSchemaRequest, AuthzAllowedSubject, AuthzNamespaceSchema,
+    AuthzRelationRule, AuthzRelationSchema, AuthzSchemaMemberKind, AuthzScope,
+    AuthzSubjectSelectorKind, AuthzTupleMutation, BindAuthzSchemaRequest, CheckPermissionRequest,
+    CheckPermissionsRequest, CheckpointTaskLeaseRequest, CommitTaskLeaseRequest,
+    CreateApplicationCredentialRequest, CreateBucketRequest, CreateHostAliasRequest,
+    CreateObjectLinkRequest, CreateTenantRequest, DeleteApplicationCredentialRequest,
+    DeleteHostAliasRequest, DeleteObjectLinkRequest, ForceReleaseTaskLeaseRequest,
+    GetAccessTokenRequest, GetAuthzSchemaBindingRequest, GetAuthzSchemaRequest, GetObjectRequest,
+    GrantAccessRequest, ListAccessGrantsRequest, ListApplicationsRequest, ListAuditEventsRequest,
+    ListAuthzObjectsRequest, ListAuthzSubjectsRequest, ListBucketsRequest, ListHostAliasesRequest,
     ListIndexDiagnosticsRequest, ListObjectLinksRequest, ListObjectVersionsRequest,
     ListObjectsRequest, ListRepairFindingsRequest, NativeMutationContext, ObjectMetadata,
     PageRequest, PutAuthzSchemaRequest, PutObjectRequest, ReadAuthzTuplesRequest,
@@ -40,6 +40,35 @@ use std::time::Duration;
 use tonic::Request;
 
 use anvil_test_utils::*;
+
+fn authz_any_subject(subject_kind: &str) -> AuthzAllowedSubject {
+    AuthzAllowedSubject {
+        selector_kind: AuthzSubjectSelectorKind::AnyCanonicalId as i32,
+        subject_kind: subject_kind.to_string(),
+        subject_id: String::new(),
+    }
+}
+
+fn authz_direct_relation(name: &str, subject_kinds: &[&str]) -> AuthzRelationSchema {
+    AuthzRelationSchema {
+        relation: name.to_string(),
+        rules: Vec::new(),
+        member_kind: AuthzSchemaMemberKind::DirectRelation as i32,
+        allowed_subjects: subject_kinds
+            .iter()
+            .map(|kind| authz_any_subject(kind))
+            .collect(),
+    }
+}
+
+fn authz_permission(name: &str, rules: Vec<AuthzRelationRule>) -> AuthzRelationSchema {
+    AuthzRelationSchema {
+        relation: name.to_string(),
+        rules,
+        member_kind: AuthzSchemaMemberKind::Permission as i32,
+        allowed_subjects: Vec::new(),
+    }
+}
 
 #[tokio::test]
 async fn grpc_error_responses_include_server_request_id() {

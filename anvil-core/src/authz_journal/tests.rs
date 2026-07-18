@@ -1,7 +1,7 @@
 use super::*;
 use crate::anvil_api::{
-    AuthzAllowedSubject, AuthzRelationRule, AuthzRelationSchema, AuthzSchemaMemberKind,
-    AuthzSubjectSelectorKind,
+    AuthzAllowedSubject, AuthzNamespaceSchema, AuthzRelationRule, AuthzRelationSchema,
+    AuthzSchemaMemberKind, AuthzSubjectSelectorKind,
 };
 use crate::core_store::TABLE_AUTHZ_IDEMPOTENCY_RECEIPT_ROW;
 use crate::partition_fence::{
@@ -125,6 +125,43 @@ async fn ready_authz_permit(
     .unwrap()
 }
 
+async fn bind_default_document_schema(storage: &Storage, tenant_id: i64) {
+    let schema = crate::authz_realm_schema::put_schema_revision(
+        storage,
+        tenant_id,
+        "test-authz",
+        vec![AuthzNamespaceSchema {
+            namespace: "document".to_string(),
+            relations: vec![
+                direct_relation("viewer", &["user"]),
+                direct_relation("editor", &["user"]),
+            ],
+            schema_json: String::new(),
+            schema_hash: String::new(),
+            schema_version: 0,
+            authz_revision: 0,
+            applied_at: String::new(),
+        }],
+        0,
+        "tester",
+        "test schema",
+    )
+    .await
+    .unwrap();
+    crate::authz_realm_schema::bind_schema(
+        storage,
+        tenant_id,
+        DEFAULT_AUTHZ_REALM_ID,
+        schema.schema_ref,
+        None,
+        0,
+        "tester",
+        "bind test schema",
+    )
+    .await
+    .unwrap();
+}
+
 async fn append_authz_record_without_segment(
     storage: &Storage,
     record: &AuthzTupleRecord,
@@ -209,7 +246,7 @@ async fn latest_authz_revision_uses_the_journal_head_not_a_tuple_scan() {
 }
 
 #[tokio::test]
-async fn current_permission_uses_the_materialized_userset_index() {
+async fn tuple_writes_defer_segments_but_current_checks_use_current_rows() {
     let temp = tempdir().unwrap();
     let storage = Storage::new_at(temp.path()).await.unwrap();
     let record = record(1, "add");
@@ -217,16 +254,11 @@ async fn current_permission_uses_the_materialized_userset_index() {
         .await
         .unwrap();
 
-    // Current rows are a rebuildable projection. Permission checks should use
-    // the revision-bound userset index rather than scanning that projection.
-    CoreMetaStore::open(storage.core_store_meta_path())
-        .unwrap()
-        .delete(
-            CF_AUTHZ,
-            TABLE_AUTHZ_TUPLE_PAGE_ROW,
-            &authz_tuple_current_row_key(&record).unwrap(),
-        )
-        .unwrap();
+    assert!(
+        authz_segment::existing_authz_tuple_segment_ref(&storage, 42, 1)
+            .unwrap()
+            .is_none()
+    );
 
     assert!(
         resolve_current_permission(
@@ -929,6 +961,7 @@ async fn authz_tuple_writes_materialize_userset_and_reverse_lookup_segments() {
 async fn authz_journal_permit_sets_payload_and_segment_fence() {
     let temp = tempdir().unwrap();
     let storage = Storage::new_at(temp.path()).await.unwrap();
+    bind_default_document_schema(&storage, 42).await;
     let permit = ready_authz_permit(&storage, 42, "node-a").await;
 
     append_authz_tuple_record_with_permit(
@@ -1092,6 +1125,7 @@ async fn authz_journal_rejects_wrong_partition_scope_before_write() {
 pub(crate) async fn authz_write_with_permit_allocates_revision_under_fence() {
     let temp = tempdir().unwrap();
     let storage = Storage::new_at(temp.path()).await.unwrap();
+    bind_default_document_schema(&storage, 42).await;
     let permit = ready_authz_permit(&storage, 42, "node-a").await;
 
     let written = write_authz_tuple_with_permit(
@@ -1124,6 +1158,7 @@ pub(crate) async fn authz_write_with_permit_allocates_revision_under_fence() {
 async fn conditional_authz_batch_receipt_replays_and_conflicts() {
     let temp = tempdir().unwrap();
     let storage = Storage::new_at(temp.path()).await.unwrap();
+    bind_default_document_schema(&storage, 42).await;
     let permit = ready_authz_permit(&storage, 42, "node-a").await;
     let schema_binding_key = core_meta_tuple_key(&[
         CoreMetaTuplePart::Utf8("schema_binding"),
@@ -1288,4 +1323,77 @@ async fn conditional_authz_batch_receipt_replays_and_conflicts() {
             )
         )
     }));
+}
+
+#[tokio::test]
+async fn authz_tuple_write_latency_with_retained_history_perf() {
+    if std::env::var_os("ANVIL_RUN_AUTHZ_PERF").is_none() {
+        return;
+    }
+    let retained: usize = std::env::var("ANVIL_AUTHZ_PERF_SEED")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(200);
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+
+    let seed_started = std::time::Instant::now();
+    for revision in 1..=retained {
+        append_authz_record_without_segment(
+            &storage,
+            &tuple(
+                revision as i64,
+                "document",
+                &format!("seed-{revision:06}"),
+                "viewer",
+                "user",
+                "alice",
+                "add",
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    let seed_elapsed = seed_started.elapsed();
+
+    let write_started = std::time::Instant::now();
+    test_append_authz_tuple_record_unfenced(
+        &storage,
+        &tuple(
+            retained as i64 + 1,
+            "document",
+            "measured",
+            "viewer",
+            "user",
+            "alice",
+            "add",
+        ),
+    )
+    .await
+    .unwrap();
+    let write_elapsed = write_started.elapsed();
+
+    let check_started = std::time::Instant::now();
+    let allowed = resolve_permission_at_revision(
+        &storage,
+        42,
+        "document",
+        "measured",
+        "viewer",
+        "user",
+        "alice",
+        "",
+        retained as i64 + 1,
+    )
+    .await
+    .unwrap();
+    let check_elapsed = check_started.elapsed();
+    assert!(allowed);
+
+    eprintln!(
+        "[authz-perf] retained={retained} seed_ms={} measured_write_ms={} check_ms={}",
+        seed_elapsed.as_millis(),
+        write_elapsed.as_millis(),
+        check_elapsed.as_millis()
+    );
 }

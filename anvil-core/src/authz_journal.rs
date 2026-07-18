@@ -562,13 +562,11 @@ async fn append_authz_tuple_record_inner(
         "authz_journal.append_record write_current_rows",
         step_started_at.elapsed(),
     );
-    advance_authz_materialization(
-        storage,
+    record_authz_materialization_deferred(
         record.tenant_id,
-        std::slice::from_ref(record),
-        fence_token,
-    )
-    .await?;
+        record.revision,
+        std::slice::from_ref(record).len(),
+    );
     Ok(())
 }
 
@@ -640,8 +638,22 @@ async fn append_authz_tuple_batch_inner(
         "authz_journal.append_batch write_current_rows",
         step_started_at.elapsed(),
     );
-    advance_authz_materialization(storage, tenant_id, records, fence_token).await?;
+    record_authz_materialization_deferred(tenant_id, revision, records.len());
     Ok(())
+}
+
+fn record_authz_materialization_deferred(tenant_id: i64, revision: i64, record_count: usize) {
+    let tenant_id = tenant_id.to_string();
+    let revision = revision.to_string();
+    crate::perf::record_counter(
+        "authz_materialization_deferred",
+        &[("tenant_id", &tenant_id), ("revision", &revision)],
+        record_count as u64,
+    );
+    crate::emit_test_timing(
+        "authz_journal.materialize_segment deferred",
+        std::time::Duration::ZERO,
+    );
 }
 
 pub(crate) async fn materialize_authz_tuple_segment(
@@ -790,6 +802,7 @@ async fn write_authz_tuple_segment_with_derived(
     }
 }
 
+#[allow(dead_code)]
 async fn advance_authz_materialization(
     storage: &Storage,
     tenant_id: i64,
