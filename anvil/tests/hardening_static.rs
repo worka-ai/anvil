@@ -686,74 +686,105 @@ fn suspicious_json_control_paths_are_proto_wrapped_or_operator_only() {
 }
 
 #[test]
-fn personaldb_coordinator_images_have_no_private_signing_key_inputs() {
+fn personaldb_signing_packaging_has_no_external_signer_sidecars() {
     let root = repo_root();
-    let compose = std::fs::read_to_string(root.join("anvil/docker-compose.yml")).unwrap();
     let forbidden = [
-        "ANVIL_SIGNER_PRIVATE_KEY",
-        "private_key_pkcs8_path",
-        "/run/secrets",
-        ".pk8",
-        ".pem",
-    ];
-    for value in forbidden {
-        assert!(
-            !compose.contains(value),
-            "production coordinator compose must not contain private signing-key input {value}"
-        );
-    }
-    for required in [
+        "anvil-personaldb-signer",
+        "anvil-signer",
         "PERSONALDB_PROTOCOL_SIGNING_MANIFEST_PATH",
         "PERSONALDB_GROUP_CONTROL_SIGNER_SOCKET_DIR",
         "PERSONALDB_SNAPSHOT_SIGNER_SOCKET_DIR",
         "PERSONALDB_WITNESS_SIGNER_SOCKET_DIR",
+        "start-personaldb-test-signers",
+        "/run/anvil-signers",
+    ];
+    for relative in [
+        "Cargo.toml",
+        "anvil/Dockerfile",
+        "anvil/Dockerfile.prebuilt",
+        "anvil/build-and-run.sh",
+        "anvil/docker-compose.yml",
+        "anvil/tests/docker-compose.test.yml",
+        "scripts/build-image.sh",
     ] {
-        assert!(
-            compose.contains(required),
-            "production coordinator compose must retain public manifest/socket input {required}"
-        );
-    }
-
-    for relative in ["anvil/Dockerfile", "anvil/Dockerfile.prebuilt"] {
-        let dockerfile = std::fs::read_to_string(root.join(relative)).unwrap();
+        let packaging = std::fs::read_to_string(root.join(relative)).unwrap();
         for value in forbidden {
             assert!(
-                !dockerfile.contains(value),
-                "{relative} must not bake private signing-key input {value} into the coordinator image"
+                !packaging.contains(value),
+                "{relative} must not package external PersonalDB signer sidecar input {value}"
             );
         }
     }
 }
 
 #[test]
-fn production_coordinator_cannot_enable_an_in_process_personaldb_signer() {
+fn personaldb_protocol_is_a_public_exact_dependency() {
     let root = repo_root();
-    let server_manifest = std::fs::read_to_string(root.join("anvil/Cargo.toml")).unwrap();
-    let core_dependency = server_manifest
-        .lines()
-        .find(|line| line.starts_with("anvil-core = "))
-        .expect("anvil-server must depend on anvil-core");
-    assert!(
-        !core_dependency.contains("test-in-process-personaldb-signers"),
-        "the production server dependency must not enable the test-only in-process signer"
-    );
-
-    for relative in ["anvil/src/main.rs", "anvil/src/lib.rs"] {
-        let source = strip_cfg_test_modules(
-            &std::fs::read_to_string(root.join(relative))
-                .unwrap_or_else(|error| panic!("read {relative}: {error}")),
+    for relative in ["anvil-core/Cargo.toml", "anvil-test-utils/Cargo.toml"] {
+        let manifest = std::fs::read_to_string(root.join(relative)).unwrap();
+        assert!(
+            manifest.contains("personaldb-protocol = \"=0.1.0\""),
+            "{relative} must pin the published PersonalDB protocol crate exactly"
         );
-        for forbidden in [
-            "new_test_only",
-            "Ed25519ProtocolSigner",
-            "from_pkcs8",
-            "private_key_pkcs8_path",
-            "test-in-process-personaldb-signers",
-        ] {
+        for forbidden in ["ssh://", "git@github.com", "git ="] {
             assert!(
-                !source.contains(forbidden),
-                "{relative} production coordinator path must not contain {forbidden}"
+                !manifest.contains(forbidden),
+                "{relative} must not require private Git access through {forbidden}"
             );
         }
     }
+}
+
+#[test]
+fn personaldb_signing_admin_responses_never_contain_private_key_material() {
+    let root = repo_root();
+    for relative in [
+        "anvil-core/proto/anvil.proto",
+        "clients/rust/proto/anvil.proto",
+        "clients/python/src/anvil_storage_client/proto/anvil.proto",
+        "clients/typescript/proto/anvil.proto",
+    ] {
+        let proto = std::fs::read_to_string(root.join(relative)).unwrap();
+        for message_name in [
+            "PersonalDbSigningKeyRecord",
+            "PersonalDbSigningKeyResponse",
+            "ListPersonalDbSigningKeysResponse",
+        ] {
+            let message = proto
+                .split(&format!("message {message_name} {{"))
+                .nth(1)
+                .and_then(|tail| tail.split("\n}").next())
+                .unwrap_or_else(|| panic!("{relative} missing {message_name}"));
+            assert!(
+                !message.contains("private_key"),
+                "{relative} {message_name} must not expose private signing material"
+            );
+        }
+    }
+}
+
+#[test]
+fn personaldb_signing_operator_docs_describe_optional_in_process_custody() {
+    let root = repo_root();
+    for relative in [
+        "README.md",
+        "documentation/content/operators/secrets-and-key-management.md",
+    ] {
+        let docs = std::fs::read_to_string(root.join(relative)).unwrap();
+        for required in ["optional", "in-process"] {
+            assert!(
+                docs.contains(required),
+                "{relative} must describe PersonalDB signing as {required}"
+            );
+        }
+    }
+
+    let operations = std::fs::read_to_string(
+        root.join("documentation/content/operators/secrets-and-key-management.md"),
+    )
+    .unwrap();
+    assert!(
+        operations.contains("not prevent server startup"),
+        "operator guidance must state that missing PersonalDB keys do not block startup"
+    );
 }

@@ -133,17 +133,11 @@ A single-node local run is useful for learning the planes before building a larg
 ```sh
 export ANVIL_IMAGE="ghcr.io/worka-ai/anvil:v0.3.0"
 export ANVIL_SECRET_ENCRYPTION_KEY="$(anvil-admin key generate-secret-encryption-key)"
-export PERSONALDB_PROTOCOL_SIGNING_MANIFEST="/absolute/path/to/personaldb-signing.json"
-export PERSONALDB_SIGNER_SOCKET_ROOT="/absolute/path/to/personaldb-signer-sockets"
 
 docker run --rm \
   --name anvil-local \
   -p 127.0.0.1:50051:50051 \
   -v anvil-local-data:/var/lib/anvil \
-  -v "$PERSONALDB_PROTOCOL_SIGNING_MANIFEST:/run/anvil/personaldb-signing.json:ro" \
-  -v "$PERSONALDB_SIGNER_SOCKET_ROOT/group-control:/run/anvil-signers/group-control" \
-  -v "$PERSONALDB_SIGNER_SOCKET_ROOT/snapshot:/run/anvil-signers/snapshot" \
-  -v "$PERSONALDB_SIGNER_SOCKET_ROOT/witness:/run/anvil-signers/witness" \
   -e STORAGE_PATH=/var/lib/anvil \
   -e REGION=local \
   -e API_LISTEN_ADDR=0.0.0.0:50051 \
@@ -151,19 +145,21 @@ docker run --rm \
   -e ADMIN_LISTEN_ADDR=127.0.0.1:50052 \
   -e JWT_SECRET="local-jwt-secret-change-me" \
   -e ANVIL_SECRET_ENCRYPTION_KEY="$ANVIL_SECRET_ENCRYPTION_KEY" \
-  -e PERSONALDB_PROTOCOL_SIGNING_MANIFEST_PATH=/run/anvil/personaldb-signing.json \
   -e CLUSTER_SECRET="local-cluster-secret-change-me" \
   -e BOOTSTRAP_SYSTEM_ADMIN_APP_NAME=ops-admin \
   -e BOOTSTRAP_SYSTEM_ADMIN_CREDENTIAL_OUTPUT_PATH=/var/lib/anvil/first-admin.json \
   "$ANVIL_IMAGE"
 ```
 
-Start one `anvil-signer` process for each of the `group-control`, `snapshot`,
-and `witness` socket paths before using PersonalDB control operations. Each
-signer receives only its own mode-`0600` PKCS#8 key. The coordinator receives
-the public trust manifest and socket directories, never a private-key mount.
+PersonalDB asymmetric signing is an optional in-process capability of the Anvil
+server. It requires no signer sidecars, socket mounts, or signing
+manifest. A server with no PersonalDB signing keys starts normally and retains
+its object, stream, and index behavior. PersonalDB uses Ed25519 evidence only;
+PersonalDB operations that need a signature require an active, purpose-scoped
+key provisioned through the authenticated admin plane with
+`anvil-admin personal-db-signing-key`.
 See [Secrets and Key Management](documentation/content/operators/secrets-and-key-management.md#personaldb-protocol-signing-keys)
-for the manifest contract and rotation behavior.
+for the custody and rotation model.
 
 After the container is ready, the host can reach only the public plane at `http://127.0.0.1:50051`. The admin listener is bound to loopback inside the container and is deliberately not published to the host. For local admin smoke tests, run `anvil-admin` with `docker exec` so the command executes inside that private boundary; for example, pass `ANVIL_AUTH_TOKEN` into the container and let the in-container CLI call `http://127.0.0.1:50052`.
 
