@@ -360,6 +360,7 @@ async fn test_authz_batch_read_and_list_operations() {
             authz_mutation("document", "alpha", "editor", "user", "bob", "add"),
         ],
         scope: None,
+        ..Default::default()
     });
     add_bearer(&mut write, &token);
     let written = auth_client
@@ -495,6 +496,7 @@ async fn test_authz_batch_watch_and_pagination_are_revision_bound() {
             authz_mutation("document", "gamma", "viewer", "user", "charlie", "add"),
         ],
         scope: None,
+        ..Default::default()
     });
     add_bearer(&mut first_batch, &token);
     let first_batch = auth_client
@@ -563,6 +565,7 @@ async fn test_authz_batch_watch_and_pagination_are_revision_bound() {
             "document", "delta", "viewer", "user", "dana", "add",
         )],
         scope: None,
+        ..Default::default()
     });
     add_bearer(&mut second_batch, &token);
     let second_batch = auth_client
@@ -647,6 +650,7 @@ async fn test_authz_tuple_batch_failure_is_atomic() {
             },
         ],
         scope: None,
+        ..Default::default()
     });
     add_bearer(&mut invalid_batch, &token);
     let err = auth_client
@@ -670,6 +674,7 @@ async fn test_authz_tuple_batch_failure_is_atomic() {
             authz_mutation("bad/slash", "beta", "viewer", "user", "alice", "add"),
         ],
         scope: None,
+        ..Default::default()
     });
     add_bearer(&mut unsafe_component_batch, &token);
     let err = auth_client
@@ -693,6 +698,7 @@ async fn test_authz_tuple_batch_failure_is_atomic() {
             authz_mutation("document", "beta", "viewer", "user", "alice", "add"),
         ],
         scope: None,
+        ..Default::default()
     });
     add_bearer(&mut valid_batch, &token);
     let valid = auth_client
@@ -702,6 +708,135 @@ async fn test_authz_tuple_batch_failure_is_atomic() {
         .into_inner();
     assert_eq!(valid.revision, 1);
     assert!(valid.results.iter().all(|result| result.revision == 1));
+}
+
+#[tokio::test]
+async fn test_conditional_authz_batch_idempotency_and_revision_conflicts() {
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_storage_test_actor(&cluster, "authz-batch-idempotency").await;
+    grant_docker_authz_realm(&cluster, &actor, "default").await;
+
+    let mut auth_client = AuthServiceClient::connect(actor.grpc_addr.clone())
+        .await
+        .unwrap();
+    let mutations = vec![
+        authz_mutation("document", "alpha", "viewer", "user", "alice", "add"),
+        authz_mutation("document", "beta", "editor", "user", "bob", "add"),
+    ];
+
+    let mut baseline_request = Request::new(WriteAuthzTuplesRequest {
+        mutations: vec![authz_mutation(
+            "document",
+            "baseline",
+            "viewer",
+            "user",
+            "baseline-user",
+            "add",
+        )],
+        scope: None,
+        operation_id: Some("establish-current-revision".to_string()),
+        expected_revision: None,
+    });
+    add_bearer(&mut baseline_request, &actor.token);
+    let baseline = auth_client
+        .write_authz_tuples(baseline_request)
+        .await
+        .unwrap()
+        .into_inner();
+
+    let mut first_request = Request::new(WriteAuthzTuplesRequest {
+        mutations: mutations.clone(),
+        scope: None,
+        operation_id: Some("grant-initial-access".to_string()),
+        expected_revision: Some(baseline.revision),
+    });
+    add_bearer(&mut first_request, &actor.token);
+    let first = auth_client
+        .write_authz_tuples(first_request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first.revision, baseline.revision + 1);
+
+    let mut advance_request = Request::new(WriteAuthzTuplesRequest {
+        mutations: vec![authz_mutation(
+            "document", "gamma", "viewer", "user", "carol", "add",
+        )],
+        scope: None,
+        operation_id: Some("grant-follow-up-access".to_string()),
+        expected_revision: Some(first.revision),
+    });
+    add_bearer(&mut advance_request, &actor.token);
+    let advanced = auth_client
+        .write_authz_tuples(advance_request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(advanced.revision, first.revision + 1);
+
+    let mut retry_request = Request::new(WriteAuthzTuplesRequest {
+        mutations: mutations.clone(),
+        scope: None,
+        operation_id: Some("grant-initial-access".to_string()),
+        expected_revision: Some(baseline.revision),
+    });
+    add_bearer(&mut retry_request, &actor.token);
+    let retry = auth_client
+        .write_authz_tuples(retry_request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        retry, first,
+        "an exact retry must return the first response"
+    );
+
+    let mut changed_mutations = mutations;
+    changed_mutations[0].object_id = "changed".to_string();
+    let mut changed_request = Request::new(WriteAuthzTuplesRequest {
+        mutations: changed_mutations,
+        scope: None,
+        operation_id: Some("grant-initial-access".to_string()),
+        expected_revision: Some(baseline.revision),
+    });
+    add_bearer(&mut changed_request, &actor.token);
+    let changed = auth_client
+        .write_authz_tuples(changed_request)
+        .await
+        .unwrap_err();
+    assert_eq!(changed.code(), tonic::Code::Aborted);
+    assert_eq!(changed.message(), "AuthzOperationConflict");
+
+    let mut stale_request = Request::new(WriteAuthzTuplesRequest {
+        mutations: vec![authz_mutation(
+            "document", "delta", "viewer", "user", "dana", "add",
+        )],
+        scope: None,
+        operation_id: Some("stale-grant".to_string()),
+        expected_revision: Some(first.revision),
+    });
+    add_bearer(&mut stale_request, &actor.token);
+    let stale = auth_client
+        .write_authz_tuples(stale_request)
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), tonic::Code::Aborted);
+    assert!(stale.message().contains("AuthzRevisionConflict"));
+
+    let mut oversized_id_request = Request::new(WriteAuthzTuplesRequest {
+        mutations: vec![authz_mutation(
+            "document", "epsilon", "viewer", "user", "erin", "add",
+        )],
+        scope: None,
+        operation_id: Some("x".repeat(129)),
+        expected_revision: None,
+    });
+    add_bearer(&mut oversized_id_request, &actor.token);
+    let oversized = auth_client
+        .write_authz_tuples(oversized_id_request)
+        .await
+        .unwrap_err();
+    assert_eq!(oversized.code(), tonic::Code::InvalidArgument);
 }
 
 #[tokio::test]
@@ -720,6 +855,7 @@ async fn test_authz_accepts_arbitrary_safe_subject_kind() {
             "document", "doc-1", "viewer", "folder", "folder-1", "add",
         )],
         scope: None,
+        ..Default::default()
     });
     add_bearer(&mut write, &token);
     let written = auth_client

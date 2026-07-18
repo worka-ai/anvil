@@ -396,6 +396,38 @@ pub struct AuthzTupleBatchMutation {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthzSchemaBindingPrecondition {
+    pub tuple_key: Vec<u8>,
+    pub expected_payload_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthzTupleBatchWriteOptions {
+    pub authz_realm_id: String,
+    pub operation_id: Option<String>,
+    pub expected_revision: Option<i64>,
+    pub schema_binding_precondition: Option<AuthzSchemaBindingPrecondition>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthzTupleBatchWriteOutcome {
+    pub records: Vec<AuthzTupleRecord>,
+    pub replayed: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AuthzTupleBatchWriteError {
+    #[error("authorization batch operation identity was already used for a different request")]
+    OperationConflict,
+    #[error(
+        "authorization revision conflict: expected revision {expected}, current revision is {actual}"
+    )]
+    RevisionConflict { expected: i64, actual: i64 },
+    #[error("authorization schema binding changed while validating the tuple batch")]
+    SchemaBindingChanged,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexDefinition {
     pub id: i64,

@@ -215,17 +215,8 @@ pub(super) async fn validate_authz_tuple_mutation<'a>(
     claims: &auth::Claims,
     req: &'a AuthzTupleMutation,
 ) -> Result<&'a str, Status> {
-    validate_public_authz_namespace(&req.namespace)?;
-    validate_tuple_field("object_id", &req.object_id)?;
-    validate_tuple_component("relation", &req.relation)?;
-    validate_tuple_component("subject_kind", &req.subject_kind)?;
-    validate_tuple_field("subject_id", &req.subject_id)?;
-    validate_caveat_hash(&req.caveat_hash)?;
+    let operation = validate_authz_tuple_mutation_shape(req)?;
     let scope = resolve_authz_scope(claims, req.scope.as_ref())?;
-    let operation = match req.operation.as_str() {
-        "add" | "remove" => req.operation.as_str(),
-        _ => return Err(Status::invalid_argument("operation must be add or remove")),
-    };
     crate::access_control::require_action(
         &state.storage,
         &state.persistence,
@@ -235,6 +226,162 @@ pub(super) async fn validate_authz_tuple_mutation<'a>(
     )
     .await?;
     Ok(operation)
+}
+
+pub(super) fn validate_authz_tuple_mutation_shape(
+    req: &AuthzTupleMutation,
+) -> Result<&str, Status> {
+    validate_public_authz_namespace(&req.namespace)?;
+    validate_tuple_field("object_id", &req.object_id)?;
+    validate_tuple_component("relation", &req.relation)?;
+    validate_tuple_component("subject_kind", &req.subject_kind)?;
+    validate_tuple_field("subject_id", &req.subject_id)?;
+    validate_caveat_hash(&req.caveat_hash)?;
+    let operation = match req.operation.as_str() {
+        "add" | "remove" => req.operation.as_str(),
+        _ => return Err(Status::invalid_argument("operation must be add or remove")),
+    };
+    if req.subject_kind == "userset" {
+        let subject = parse_userset_subject(&req.subject_id).ok_or_else(|| {
+            Status::invalid_argument(
+                "userset subject_id must use namespace/object_id#relation format",
+            )
+        })?;
+        validate_public_authz_namespace(subject.namespace)?;
+        validate_tuple_field("userset object_id", subject.object_id)?;
+        validate_tuple_component("userset relation", subject.relation)?;
+    }
+    Ok(operation)
+}
+
+pub(super) fn validate_authz_batch_operation_id(operation_id: Option<&str>) -> Result<(), Status> {
+    let Some(operation_id) = operation_id else {
+        return Ok(());
+    };
+    authz_journal::validate_authz_batch_operation_id(operation_id)
+        .map_err(|error| Status::invalid_argument(error.to_string()))
+}
+
+pub(super) fn optional_expected_authz_revision(
+    expected_revision: Option<u64>,
+) -> Result<Option<i64>, Status> {
+    expected_revision
+        .map(|revision| {
+            i64::try_from(revision)
+                .map_err(|_| Status::invalid_argument("expected_revision exceeds supported range"))
+        })
+        .transpose()
+}
+
+pub(super) async fn validate_authz_tuple_batch_against_bound_schema(
+    state: &AppState,
+    tenant_id: i64,
+    authz_realm_id: &str,
+    mutations: &[AuthzTupleMutation],
+) -> Result<authz_realm_schema::BoundAuthzSchemaSnapshot, Status> {
+    let snapshot =
+        authz_realm_schema::read_bound_schema_snapshot(&state.storage, tenant_id, authz_realm_id)
+            .await
+            .map_err(|error| Status::internal(format!("{error:#}")))?;
+    let Some(schema) = snapshot.schema.as_ref() else {
+        return Ok(snapshot);
+    };
+    let namespaces = schema
+        .namespaces
+        .iter()
+        .map(|namespace| (namespace.namespace.as_str(), namespace))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    for mutation in mutations {
+        let namespace = namespaces.get(mutation.namespace.as_str()).ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "namespace {} is not declared by the bound authorization schema",
+                mutation.namespace
+            ))
+        })?;
+        if !namespace
+            .relations
+            .iter()
+            .any(|relation| relation.relation == mutation.relation)
+        {
+            return Err(Status::invalid_argument(format!(
+                "relation {}#{} is not declared by the bound authorization schema",
+                mutation.namespace, mutation.relation
+            )));
+        }
+
+        let userset_subject = if mutation.subject_kind == "userset" {
+            let subject = parse_userset_subject(&mutation.subject_id).ok_or_else(|| {
+                Status::invalid_argument(
+                    "userset subject_id must use namespace/object_id#relation format",
+                )
+            })?;
+            require_bound_schema_relation(&namespaces, subject.namespace, subject.relation)?;
+            Some(subject)
+        } else {
+            None
+        };
+
+        for rule in namespace
+            .relations
+            .iter()
+            .flat_map(|relation| relation.rules.iter())
+            .filter(|rule| {
+                matches!(rule.kind.as_str(), "computed" | "tuple_to_userset")
+                    && rule.tuple_relation == mutation.relation
+            })
+        {
+            let subject_namespace = userset_subject
+                .as_ref()
+                .map(|subject| subject.namespace)
+                .unwrap_or(mutation.subject_kind.as_str());
+            require_bound_schema_relation(&namespaces, subject_namespace, &rule.target_relation)?;
+        }
+    }
+    Ok(snapshot)
+}
+
+fn require_bound_schema_relation(
+    namespaces: &std::collections::BTreeMap<&str, &AuthzNamespaceSchema>,
+    namespace: &str,
+    relation: &str,
+) -> Result<(), Status> {
+    let schema = namespaces.get(namespace).ok_or_else(|| {
+        Status::invalid_argument(format!(
+            "subject namespace {namespace} is not declared by the bound authorization schema"
+        ))
+    })?;
+    if !schema
+        .relations
+        .iter()
+        .any(|candidate| candidate.relation == relation)
+    {
+        return Err(Status::invalid_argument(format!(
+            "subject relation {namespace}#{relation} is not declared by the bound authorization schema"
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn authz_tuple_batch_write_status(error: anyhow::Error) -> Status {
+    let conflict = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::persistence::AuthzTupleBatchWriteError>());
+    match conflict {
+        Some(crate::persistence::AuthzTupleBatchWriteError::OperationConflict) => {
+            Status::aborted("AuthzOperationConflict")
+        }
+        Some(crate::persistence::AuthzTupleBatchWriteError::RevisionConflict {
+            expected,
+            actual,
+        }) => Status::aborted(format!(
+            "AuthzRevisionConflict: expected {expected}, current {actual}"
+        )),
+        Some(crate::persistence::AuthzTupleBatchWriteError::SchemaBindingChanged) => {
+            Status::aborted("AuthzSchemaBindingChanged")
+        }
+        None => Status::internal(format!("{error:#}")),
+    }
 }
 
 pub(super) async fn emit_authz_tuple_write_side_effects(
@@ -429,6 +576,24 @@ pub(super) fn write_authz_tuple_response(
         revision: revision_to_u64(record.revision)?,
         zookie: zookie(record.revision),
         record_hash: record.record_hash.clone(),
+    })
+}
+
+pub(super) fn write_authz_tuple_batch_response(
+    records: &[crate::persistence::AuthzTupleRecord],
+) -> Result<WriteAuthzTuplesResponse, Status> {
+    let revision = records
+        .iter()
+        .map(|record| record.revision)
+        .max()
+        .unwrap_or(0);
+    Ok(WriteAuthzTuplesResponse {
+        results: records
+            .iter()
+            .map(write_authz_tuple_response)
+            .collect::<Result<Vec<_>, _>>()?,
+        revision: revision_to_u64(revision)?,
+        zookie: zookie(revision),
     })
 }
 

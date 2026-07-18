@@ -3,10 +3,11 @@ use crate::authz_coremeta_payload::{decode_authz_payload_row, encode_authz_paylo
 use crate::core_store::{
     CF_AUTHZ, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaStore, CoreMetaTuplePart,
     TABLE_AUTHZ_SCHEMA_ROW, commit_coremeta_batch_for_storage, core_meta_committed_row_common,
-    core_meta_root_key_hash, core_meta_tuple_key, decode_deterministic_proto,
-    encode_deterministic_proto,
+    core_meta_payload_digest, core_meta_root_key_hash, core_meta_tuple_key,
+    decode_deterministic_proto, encode_deterministic_proto,
 };
 use crate::formats::hash32;
+use crate::persistence::AuthzSchemaBindingPrecondition;
 use crate::storage::Storage;
 use anyhow::{Result, anyhow};
 use prost::Message;
@@ -42,6 +43,12 @@ pub struct StoredAuthzSchemaBinding {
     pub written_by: String,
     pub reason: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoundAuthzSchemaSnapshot {
+    pub schema: Option<StoredAuthzSchemaRevision>,
+    pub binding_precondition: AuthzSchemaBindingPrecondition,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -296,6 +303,46 @@ pub async fn read_schema_binding(
         schema_binding_tuple_key(tenant_id, realm_id)?,
     )
     .await
+}
+
+pub async fn read_bound_schema_snapshot(
+    storage: &Storage,
+    tenant_id: i64,
+    realm_id: &str,
+) -> Result<BoundAuthzSchemaSnapshot> {
+    validate_realm_id(realm_id)?;
+    let tuple_key = schema_binding_tuple_key(tenant_id, realm_id)?;
+    let Some(payload) = CoreMetaStore::open(storage.core_store_meta_path())?.get(
+        CF_AUTHZ,
+        TABLE_AUTHZ_SCHEMA_ROW,
+        &tuple_key,
+    )?
+    else {
+        return Ok(BoundAuthzSchemaSnapshot {
+            schema: None,
+            binding_precondition: AuthzSchemaBindingPrecondition {
+                tuple_key,
+                expected_payload_hash: None,
+            },
+        });
+    };
+    let binding =
+        decode_schema_record_row::<StoredAuthzSchemaBinding>(storage, tenant_id, &payload).await?;
+    let schema = read_schema_revision(
+        storage,
+        tenant_id,
+        &binding.schema_ref.schema_id,
+        Some(binding.schema_ref.schema_revision),
+    )
+    .await?
+    .ok_or_else(|| anyhow!("bound authorization schema revision not found"))?;
+    Ok(BoundAuthzSchemaSnapshot {
+        schema: Some(schema),
+        binding_precondition: AuthzSchemaBindingPrecondition {
+            tuple_key,
+            expected_payload_hash: Some(core_meta_payload_digest(TABLE_AUTHZ_SCHEMA_ROW, &payload)),
+        },
+    })
 }
 
 pub async fn list_schema_revisions(

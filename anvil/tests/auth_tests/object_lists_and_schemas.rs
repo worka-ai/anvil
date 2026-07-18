@@ -505,6 +505,166 @@ async fn test_authz_schema_put_bind_and_realm_scoped_tuples() {
     );
 }
 
+#[tokio::test]
+async fn test_conditional_authz_batch_validates_bound_schema_coordinates() {
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_storage_test_actor(&cluster, "authz-batch-schema-validation").await;
+    let tenant_resource = format!("tenant:{}", actor.tenant_id);
+    grant_docker_actor_policy(&cluster, &actor, "tenant:manage", &tenant_resource).await;
+    grant_docker_actor_policy(&cluster, &actor, "authz:schema_write", "schema:typed").await;
+    grant_docker_authz_realm(&cluster, &actor, "typed").await;
+
+    let mut auth_client = AuthServiceClient::connect(actor.grpc_addr.clone())
+        .await
+        .unwrap();
+    let scope = AuthzScope {
+        anvil_storage_tenant_id: actor.tenant_id.to_string(),
+        authz_realm_id: "typed".to_string(),
+    };
+    let schema = vec![
+        AuthzNamespaceSchema {
+            namespace: "document".to_string(),
+            relations: vec![
+                AuthzRelationSchema {
+                    relation: "parent_folder".to_string(),
+                    rules: Vec::new(),
+                },
+                AuthzRelationSchema {
+                    relation: "viewer".to_string(),
+                    rules: vec![AuthzRelationRule {
+                        kind: "computed".to_string(),
+                        relation: String::new(),
+                        tuple_relation: "parent_folder".to_string(),
+                        target_relation: "viewer".to_string(),
+                    }],
+                },
+            ],
+            schema_json: r#"{"namespace":"document"}"#.to_string(),
+            schema_hash: String::new(),
+            schema_version: 0,
+            authz_revision: 0,
+            applied_at: String::new(),
+        },
+        AuthzNamespaceSchema {
+            namespace: "folder".to_string(),
+            relations: vec![AuthzRelationSchema {
+                relation: "viewer".to_string(),
+                rules: Vec::new(),
+            }],
+            schema_json: r#"{"namespace":"folder"}"#.to_string(),
+            schema_hash: String::new(),
+            schema_version: 0,
+            authz_revision: 0,
+            applied_at: String::new(),
+        },
+    ];
+    let mut put = Request::new(PutAuthzSchemaRequest {
+        anvil_storage_tenant_id: actor.tenant_id.to_string(),
+        schema_id: "typed".to_string(),
+        namespaces: schema,
+        reason: "typed batch validation".to_string(),
+    });
+    add_bearer(&mut put, &actor.token);
+    let schema_ref = auth_client
+        .put_authz_schema(put)
+        .await
+        .unwrap()
+        .into_inner()
+        .schema_ref;
+    let mut bind = Request::new(BindAuthzSchemaRequest {
+        scope: Some(scope.clone()),
+        schema_ref,
+        expected_binding_generation: None,
+        reason: "bind typed schema".to_string(),
+    });
+    add_bearer(&mut bind, &actor.token);
+    auth_client.bind_authz_schema(bind).await.unwrap();
+
+    let make_request = |mutation: AuthzTupleMutation, operation_id: &str| {
+        let mut request = Request::new(WriteAuthzTuplesRequest {
+            mutations: vec![mutation],
+            scope: Some(scope.clone()),
+            operation_id: Some(operation_id.to_string()),
+            expected_revision: None,
+        });
+        add_bearer(&mut request, &actor.token);
+        request
+    };
+
+    let direct = auth_client
+        .write_authz_tuples(make_request(
+            authz_mutation("document", "doc-1", "viewer", "user", "alice", "add"),
+            "valid-direct-subject",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    for (mutation, operation_id, expected_message) in [
+        (
+            authz_mutation("unknown", "doc-1", "viewer", "user", "alice", "add"),
+            "unknown-namespace",
+            "namespace unknown",
+        ),
+        (
+            authz_mutation("document", "doc-1", "owner", "user", "alice", "add"),
+            "unknown-relation",
+            "relation document#owner",
+        ),
+        (
+            authz_mutation(
+                "document",
+                "doc-1",
+                "viewer",
+                "userset",
+                "folder/folder-1#owner",
+                "add",
+            ),
+            "unknown-userset-relation",
+            "subject relation folder#owner",
+        ),
+        (
+            authz_mutation(
+                "document",
+                "doc-1",
+                "parent_folder",
+                "group",
+                "group-1",
+                "add",
+            ),
+            "unknown-edge-subject",
+            "subject namespace group",
+        ),
+    ] {
+        let error = auth_client
+            .write_authz_tuples(make_request(mutation, operation_id))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            error.message().contains(expected_message),
+            "unexpected schema validation error: {error:?}"
+        );
+    }
+
+    let edge = auth_client
+        .write_authz_tuples(make_request(
+            authz_mutation(
+                "document",
+                "doc-1",
+                "parent_folder",
+                "folder",
+                "folder-1",
+                "add",
+            ),
+            "valid-folder-edge",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(edge.revision, direct.revision + 1);
+}
+
 fn reserved_system_realm_scope(tenant_id: i64) -> AuthzScope {
     AuthzScope {
         anvil_storage_tenant_id: tenant_id.to_string(),
@@ -553,6 +713,7 @@ async fn test_public_authz_apis_reject_reserved_system_realm_scope() {
             "document", "alpha", "viewer", "user", "alice", "add",
         )],
         scope: Some(scope.clone()),
+        ..Default::default()
     });
     add_bearer(&mut write_batch, &actor.token);
     assert_reserved_authz_status(auth_client.write_authz_tuples(write_batch).await);

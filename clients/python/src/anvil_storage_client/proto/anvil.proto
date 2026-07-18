@@ -2866,6 +2866,8 @@ message AuthzTupleMutation {
 message WriteAuthzTuplesRequest {
     repeated AuthzTupleMutation mutations = 1;
     AuthzScope scope = 2;
+    optional string operation_id = 3;
+    optional uint64 expected_revision = 4;
 }
 
 message WriteAuthzTuplesResponse {

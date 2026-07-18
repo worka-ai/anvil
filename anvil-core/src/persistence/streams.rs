@@ -728,6 +728,36 @@ impl Persistence {
         .await
     }
 
+    pub async fn replay_authz_tuple_batch(
+        &self,
+        tenant_id: i64,
+        mutations: &[AuthzTupleBatchMutation],
+        written_by: &str,
+        options: &AuthzTupleBatchWriteOptions,
+    ) -> Result<Option<AuthzTupleBatchWriteOutcome>> {
+        let writes = authz_tuple_batch_writes(tenant_id, mutations, written_by);
+        authz_journal::replay_authz_tuple_batch(&self.storage, &writes, options).await
+    }
+
+    pub async fn write_authz_tuple_batch_conditionally(
+        &self,
+        tenant_id: i64,
+        mutations: Vec<AuthzTupleBatchMutation>,
+        written_by: &str,
+        options: &AuthzTupleBatchWriteOptions,
+    ) -> Result<AuthzTupleBatchWriteOutcome> {
+        let permit = self.authz_write_permit(tenant_id).await?;
+        let writes = authz_tuple_batch_writes(tenant_id, &mutations, written_by);
+        authz_journal::write_authz_tuple_batch_conditionally_with_permit(
+            &self.storage,
+            writes,
+            options,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
     pub async fn check_authz_tuple(
         &self,
         tenant_id: i64,
@@ -796,4 +826,26 @@ impl Persistence {
         )
         .await
     }
+}
+
+fn authz_tuple_batch_writes<'a>(
+    tenant_id: i64,
+    mutations: &'a [AuthzTupleBatchMutation],
+    written_by: &'a str,
+) -> Vec<authz_journal::AuthzTupleWrite<'a>> {
+    mutations
+        .iter()
+        .map(|mutation| authz_journal::AuthzTupleWrite {
+            tenant_id,
+            namespace: mutation.namespace.as_str(),
+            object_id: mutation.object_id.as_str(),
+            relation: mutation.relation.as_str(),
+            subject_kind: mutation.subject_kind.as_str(),
+            subject_id: mutation.subject_id.as_str(),
+            caveat_hash: mutation.caveat_hash.as_str(),
+            operation: mutation.operation.as_str(),
+            written_by,
+            reason: mutation.reason.as_str(),
+        })
+        .collect()
 }
