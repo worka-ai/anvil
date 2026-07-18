@@ -1259,13 +1259,26 @@ impl CoreStore {
         transaction_id: &str,
         principal: &str,
     ) -> Result<CoreTransaction> {
+        let total_started_at = std::time::Instant::now();
         validate_logical_id(transaction_id, "transaction id")?;
         validate_logical_id(principal, "transaction principal")?;
+        let step_started_at = std::time::Instant::now();
         let _guard = self.write_lock.lock().await;
+        crate::emit_test_timing(
+            format!(
+                "core_store.commit_explicit_transaction acquire_write_lock tx={transaction_id}"
+            ),
+            step_started_at.elapsed(),
+        );
+        let step_started_at = std::time::Instant::now();
         let transaction = self
             .read_transaction_unlocked(transaction_id)
             .await?
             .ok_or_else(|| anyhow!("TransactionNotFound"))?;
+        crate::emit_test_timing(
+            format!("core_store.commit_explicit_transaction read_transaction tx={transaction_id}"),
+            step_started_at.elapsed(),
+        );
         if transaction.committed_by_principal != principal {
             bail!("TransactionPrincipalMismatch");
         }
@@ -1290,12 +1303,26 @@ impl CoreStore {
             bail!("TransactionExpired");
         }
         validate_transaction_root_scope(&transaction)?;
+        let step_started_at = std::time::Instant::now();
         self.validate_explicit_transaction_commit_unlocked(&transaction)
             .await?;
+        crate::emit_test_timing(
+            format!("core_store.commit_explicit_transaction validate_commit tx={transaction_id}"),
+            step_started_at.elapsed(),
+        );
+        let step_started_at = std::time::Instant::now();
         let committed = transaction_with_state(transaction, CoreTransactionState::Committed, None)?;
         let committed_transaction = self
             .commit_explicit_transaction_rows_and_coremeta_updates_unlocked(&committed)
             .await?;
+        crate::emit_test_timing(
+            format!("core_store.commit_explicit_transaction commit_rows tx={transaction_id}"),
+            step_started_at.elapsed(),
+        );
+        crate::emit_test_timing(
+            format!("core_store.commit_explicit_transaction total tx={transaction_id}"),
+            total_started_at.elapsed(),
+        );
         Ok(committed_transaction)
     }
 

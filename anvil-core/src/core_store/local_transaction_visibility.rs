@@ -5,6 +5,12 @@ use super::local_transactions::{
 use super::local_tx_rows::OwnedCoreMetaBatchOp;
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamPredecessorVisibility {
+    Visible,
+    TerminalInvisible,
+}
+
 impl CoreStore {
     pub(super) async fn transaction_makes_stream_record_visible(
         &self,
@@ -184,10 +190,27 @@ impl CoreStore {
         &self,
         transaction: &CoreTransaction,
     ) -> Result<()> {
+        let step_started_at = std::time::Instant::now();
         self.validate_explicit_transaction_stream_commits_unlocked(transaction)
             .await?;
+        crate::emit_test_timing(
+            format!(
+                "core_store.commit_explicit_transaction validate_streams tx={}",
+                transaction.transaction_id
+            ),
+            step_started_at.elapsed(),
+        );
+        let step_started_at = std::time::Instant::now();
         self.validate_explicit_transaction_coremeta_commits_unlocked(transaction)
-            .await
+            .await?;
+        crate::emit_test_timing(
+            format!(
+                "core_store.commit_explicit_transaction validate_coremeta tx={}",
+                transaction.transaction_id
+            ),
+            step_started_at.elapsed(),
+        );
+        Ok(())
     }
 
     pub(super) fn prepare_coremeta_put_update_unlocked(
@@ -268,7 +291,7 @@ impl CoreStore {
         &self,
         transaction: &CoreTransaction,
     ) -> Result<()> {
-        let mut updates_by_stream = BTreeMap::<&str, Vec<(u64, &str)>>::new();
+        let mut updates_by_stream = BTreeMap::<&str, BTreeMap<u64, &str>>::new();
         for update in &transaction.visible_updates {
             let CoreTransactionUpdate::StreamAppend {
                 stream_id,
@@ -278,87 +301,149 @@ impl CoreStore {
             else {
                 continue;
             };
-            updates_by_stream
+            let previous = updates_by_stream
                 .entry(stream_id.as_str())
                 .or_default()
-                .push((*visible_sequence, prepared_record_hash.as_str()));
+                .insert(*visible_sequence, prepared_record_hash.as_str());
+            if previous.is_some() {
+                bail!("TransactionConflict: transaction lists a stream sequence more than once");
+            }
         }
 
         let mut predecessor_transactions = BTreeMap::<String, CoreTransaction>::new();
         for (stream_id, updates) in updates_by_stream {
-            let records = self.read_all_stream_records(stream_id).await?;
-            let records_by_sequence = records
-                .iter()
-                .map(|record| (record.sequence, record))
-                .collect::<BTreeMap<_, _>>();
-            let mut last_staged_sequence = 0;
-            for (visible_sequence, prepared_record_hash) in updates {
-                let Some(record) = records_by_sequence.get(&visible_sequence) else {
-                    bail!("TransactionConflict: transaction is missing a staged stream record");
-                };
-                if record.event_hash != prepared_record_hash
-                    || record.transaction_id.as_deref() != Some(transaction.transaction_id.as_str())
-                {
-                    bail!("TransactionConflict: transaction is missing a staged stream record");
+            let read_started_at = std::time::Instant::now();
+            let first_staged_sequence = *updates
+                .first_key_value()
+                .map(|(sequence, _)| sequence)
+                .ok_or_else(|| anyhow!("TransactionConflict: empty stream update group"))?;
+            let last_staged_sequence = *updates
+                .last_key_value()
+                .map(|(sequence, _)| sequence)
+                .ok_or_else(|| anyhow!("TransactionConflict: empty stream update group"))?;
+            let rows = self.read_stream_record_index_rows_from_meta_range(
+                stream_id,
+                first_staged_sequence.saturating_sub(1),
+                last_staged_sequence,
+                0,
+            )?;
+            crate::emit_test_timing(
+                format!(
+                    "core_store.commit_explicit_transaction read_staged_stream_window tx={} stream={stream_id} records={}",
+                    transaction.transaction_id,
+                    rows.len()
+                ),
+                read_started_at.elapsed(),
+            );
+
+            for row in rows {
+                if let Some(prepared_record_hash) = updates.get(&row.sequence) {
+                    if row.event_hash != *prepared_record_hash
+                        || row.transaction_id.as_deref()
+                            != Some(transaction.transaction_id.as_str())
+                    {
+                        bail!("TransactionConflict: transaction is missing a staged stream record");
+                    }
+                    continue;
                 }
-                last_staged_sequence = last_staged_sequence.max(visible_sequence);
+                self.classify_stream_predecessor_unlocked(
+                    transaction,
+                    &row,
+                    &mut predecessor_transactions,
+                )
+                .await?;
             }
 
-            for prior in records.iter().filter(|prior| {
-                prior.sequence < last_staged_sequence
-                    && prior.transaction_id.as_deref() != Some(transaction.transaction_id.as_str())
-            }) {
-                let Some(prior_transaction_id) = prior.transaction_id.as_deref() else {
-                    continue;
-                };
-                if !predecessor_transactions.contains_key(prior_transaction_id) {
-                    let Some(prior_transaction) =
-                        self.read_transaction_unlocked(prior_transaction_id).await?
-                    else {
-                        bail!(
-                            "TransactionConflict: transaction has a staged stream predecessor without transaction metadata"
-                        );
-                    };
-                    predecessor_transactions
-                        .insert(prior_transaction_id.to_string(), prior_transaction);
-                }
-                let prior_transaction = predecessor_transactions
-                    .get(prior_transaction_id)
-                    .expect("predecessor transaction was inserted");
-                match prior_transaction.state {
-                    CoreTransactionState::Committed => {
-                        if !transaction_lists_stream_record(&prior_transaction, prior)? {
-                            bail!(
-                                "TransactionConflict: committed predecessor does not include its staged stream record"
-                            );
-                        }
-                    }
-                    CoreTransactionState::Open
-                        if prior_transaction.expires_at_unix_nanos != 0
-                            && current_unix_nanos_u64()?
-                                >= prior_transaction.expires_at_unix_nanos =>
-                    {
-                        // Expiry is authoritative even before a later read persists the
-                        // derived Expired state. A crashed writer must not poison the
-                        // stream indefinitely with an invisible staged predecessor.
-                    }
-                    CoreTransactionState::Open | CoreTransactionState::Prepared => {
-                        bail!(
-                            "TransactionConflict: transaction would expose a stream record before an uncommitted predecessor"
-                        );
-                    }
-                    CoreTransactionState::FinalisationFailed
-                    | CoreTransactionState::Aborted
-                    | CoreTransactionState::RolledBack
-                    | CoreTransactionState::Expired
-                    | CoreTransactionState::Failed => {
-                        // Terminal invisible records cannot later become visible, so they do
-                        // not impose commit ordering on subsequent transactions.
+            // A visible record is a validated commit-order barrier: its commit
+            // already established that every earlier staged predecessor was
+            // terminal or visible. Only the invisible suffix immediately before
+            // this transaction can still prevent it from committing.
+            let mut predecessor_sequence = first_staged_sequence.saturating_sub(1);
+            while predecessor_sequence > 0 {
+                let row = self
+                    .read_stream_record_index_row_from_meta(stream_id, predecessor_sequence)?
+                    .ok_or_else(|| {
+                        anyhow!("TransactionConflict: stream predecessor record is missing")
+                    })?;
+                match self
+                    .classify_stream_predecessor_unlocked(
+                        transaction,
+                        &row,
+                        &mut predecessor_transactions,
+                    )
+                    .await?
+                {
+                    StreamPredecessorVisibility::Visible => break,
+                    StreamPredecessorVisibility::TerminalInvisible => {
+                        predecessor_sequence = predecessor_sequence.saturating_sub(1);
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    async fn classify_stream_predecessor_unlocked(
+        &self,
+        transaction: &CoreTransaction,
+        row: &StoredStreamRecordIndexRow,
+        predecessor_transactions: &mut BTreeMap<String, CoreTransaction>,
+    ) -> Result<StreamPredecessorVisibility> {
+        let Some(predecessor_transaction_id) = row.transaction_id.as_deref() else {
+            return Ok(StreamPredecessorVisibility::Visible);
+        };
+        if predecessor_transaction_id == transaction.transaction_id {
+            bail!("TransactionConflict: transaction has an unlisted staged stream record");
+        }
+        if !predecessor_transactions.contains_key(predecessor_transaction_id) {
+            let Some(predecessor_transaction) = self
+                .read_transaction_unlocked(predecessor_transaction_id)
+                .await?
+            else {
+                bail!(
+                    "TransactionConflict: transaction has a staged stream predecessor without transaction metadata"
+                );
+            };
+            predecessor_transactions.insert(
+                predecessor_transaction_id.to_string(),
+                predecessor_transaction,
+            );
+        }
+        let predecessor_transaction = predecessor_transactions
+            .get(predecessor_transaction_id)
+            .expect("predecessor transaction was inserted");
+        match predecessor_transaction.state {
+            CoreTransactionState::Committed => {
+                if !transaction_lists_stream_record_identity(
+                    predecessor_transaction,
+                    &row.stream_id,
+                    row.sequence,
+                    &row.event_hash,
+                ) {
+                    bail!(
+                        "TransactionConflict: committed predecessor does not include its staged stream record"
+                    );
+                }
+                Ok(StreamPredecessorVisibility::Visible)
+            }
+            CoreTransactionState::Open
+                if predecessor_transaction.expires_at_unix_nanos != 0
+                    && current_unix_nanos_u64()?
+                        >= predecessor_transaction.expires_at_unix_nanos =>
+            {
+                Ok(StreamPredecessorVisibility::TerminalInvisible)
+            }
+            CoreTransactionState::Open | CoreTransactionState::Prepared => {
+                bail!(
+                    "TransactionConflict: transaction would expose a stream record before an uncommitted predecessor"
+                );
+            }
+            CoreTransactionState::FinalisationFailed
+            | CoreTransactionState::Aborted
+            | CoreTransactionState::RolledBack
+            | CoreTransactionState::Expired
+            | CoreTransactionState::Failed => Ok(StreamPredecessorVisibility::TerminalInvisible),
+        }
     }
 
     async fn validate_explicit_transaction_coremeta_commits_unlocked(
@@ -463,9 +548,18 @@ impl CoreStore {
         &self,
         transaction: &CoreTransaction,
     ) -> Result<CoreTransaction> {
+        let step_started_at = std::time::Instant::now();
         let committed_root_generation = self
             .infer_explicit_transaction_commit_root_generation_unlocked(transaction)
             .await?;
+        crate::emit_test_timing(
+            format!(
+                "core_store.commit_explicit_transaction infer_root_generation tx={}",
+                transaction.transaction_id
+            ),
+            step_started_at.elapsed(),
+        );
+        let step_started_at = std::time::Instant::now();
         let mut committed_transaction = transaction.clone();
         committed_transaction.committed_root_generation = Some(committed_root_generation);
         let mut owned_ops =
@@ -530,6 +624,15 @@ impl CoreStore {
             }
         }
         let ops = borrow_owned_coremeta_batch_ops(&owned_ops);
+        crate::emit_test_timing(
+            format!(
+                "core_store.commit_explicit_transaction prepare_coremeta_ops tx={} ops={}",
+                transaction.transaction_id,
+                owned_ops.len()
+            ),
+            step_started_at.elapsed(),
+        );
+        let step_started_at = std::time::Instant::now();
         self.commit_coremeta_batch_for_root(
             &committed_transaction.root_key_hash,
             committed_root_generation.saturating_sub(1),
@@ -538,6 +641,13 @@ impl CoreStore {
             &ops,
         )
         .await?;
+        crate::emit_test_timing(
+            format!(
+                "core_store.commit_explicit_transaction commit_coremeta tx={}",
+                transaction.transaction_id
+            ),
+            step_started_at.elapsed(),
+        );
         Ok(committed_transaction)
     }
 
