@@ -21,7 +21,7 @@ async fn core_store_startup_discards_stale_process_locks() {
 }
 
 #[tokio::test]
-async fn explicit_transaction_stage_waits_for_write_lock_before_named_locks() {
+async fn explicit_transaction_stage_waits_for_named_locks_before_write_lock() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = Storage::new_at(tmp.path()).await.unwrap();
     let store = CoreStore::new(storage.clone()).await.unwrap();
@@ -41,7 +41,10 @@ async fn explicit_transaction_stage_waits_for_write_lock_before_named_locks() {
         .await
         .unwrap();
 
-    let write_guard = store.write_lock.lock().await;
+    let named_guard = store
+        .acquire_named_lock("stream", "explicit-lock-order-stream")
+        .await
+        .unwrap();
     let stage_store = store.clone();
     let transaction_id = transaction.transaction_id.clone();
     let stage = tokio::spawn(async move {
@@ -63,16 +66,15 @@ async fn explicit_transaction_stage_waits_for_write_lock_before_named_locks() {
     });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(
-        count_files_with_extension(&storage.core_store_staging_path().join("locks"), "lock"),
-        0,
-        "a stage waiting for the process write lock must not hold named locks"
-    );
+    let write_guard = tokio::time::timeout(Duration::from_secs(1), store.write_lock.lock())
+        .await
+        .expect("a stage waiting for a named lock must not hold the process write lock");
 
     drop(write_guard);
+    drop(named_guard);
     tokio::time::timeout(Duration::from_secs(5), stage)
         .await
-        .expect("stage should continue after the process write lock is released")
+        .expect("stage should continue after the named lock is released")
         .expect("stage task should not panic")
         .expect("stage should succeed");
 }
