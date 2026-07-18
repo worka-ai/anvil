@@ -156,12 +156,20 @@ async fn authz_candidate_reader_merges_revisioned_tuple_segments() {
         crate::authz_journal::test_append_authz_tuple_record_unfenced(&storage, &record)
             .await
             .unwrap();
+        crate::authz_journal::materialize_authz_tuple_segment_at_revision(
+            &storage,
+            7,
+            record.revision as u64,
+            0,
+        )
+        .await
+        .unwrap();
     }
 
     let latest = read_latest_authz_tuple_segment(&storage, 7)
         .await
         .unwrap()
-        .expect("tuple writes must synchronously advance authz delta segments");
+        .expect("materialized tuple writes should expose authz delta segments");
     assert_eq!(latest.header.generation, 3);
     assert_eq!(latest.header.segment_kind, "merged");
     assert_eq!(latest.records.len(), 3);

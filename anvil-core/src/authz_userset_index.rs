@@ -1143,6 +1143,73 @@ mod tests {
         .unwrap()
     }
 
+    async fn bind_userset_test_schema(storage: &Storage, tenant_id: i64) {
+        let schema = crate::authz_realm_schema::put_schema_revision(
+            storage,
+            tenant_id,
+            "userset-index-test-authz",
+            vec![
+                test_namespace("document", &["viewer"]),
+                test_namespace("group", &["member"]),
+            ],
+            0,
+            "tester",
+            "bind userset index test schema",
+        )
+        .await
+        .unwrap();
+        crate::authz_realm_schema::bind_schema(
+            storage,
+            tenant_id,
+            crate::authz_scope::DEFAULT_AUTHZ_REALM_ID,
+            schema.schema_ref,
+            None,
+            0,
+            "tester",
+            "bind userset index test schema",
+        )
+        .await
+        .unwrap();
+    }
+
+    fn test_namespace(
+        namespace: &str,
+        relations: &[&str],
+    ) -> crate::anvil_api::AuthzNamespaceSchema {
+        crate::anvil_api::AuthzNamespaceSchema {
+            namespace: namespace.to_string(),
+            relations: relations
+                .iter()
+                .map(|relation| test_direct_relation(relation))
+                .collect(),
+            schema_json: String::new(),
+            schema_hash: String::new(),
+            schema_version: 0,
+            authz_revision: 0,
+            applied_at: String::new(),
+        }
+    }
+
+    fn test_direct_relation(relation: &str) -> crate::anvil_api::AuthzRelationSchema {
+        crate::anvil_api::AuthzRelationSchema {
+            relation: relation.to_string(),
+            rules: Vec::new(),
+            member_kind: crate::anvil_api::AuthzSchemaMemberKind::DirectRelation as i32,
+            allowed_subjects: vec![
+                test_allowed_subject("user"),
+                test_allowed_subject("userset"),
+            ],
+        }
+    }
+
+    fn test_allowed_subject(subject_kind: &str) -> crate::anvil_api::AuthzAllowedSubject {
+        crate::anvil_api::AuthzAllowedSubject {
+            selector_kind: crate::anvil_api::AuthzSubjectSelectorKind::AnyCanonicalId as i32,
+            subject_kind: subject_kind.to_string(),
+            subject_id: String::new(),
+        }
+    }
+
     async fn write_tuple(
         storage: &Storage,
         permit: &PartitionWritePermit,
@@ -1221,6 +1288,7 @@ mod tests {
     async fn derived_userset_index_persists_and_serves_exact_processed_revision() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
+        bind_userset_test_schema(&storage, 42).await;
         let permit = ready_authz_permit(&storage, 42).await;
         write_tuple(
             &storage,
@@ -1306,6 +1374,7 @@ mod tests {
     async fn derived_userset_index_advances_from_watch_batch_without_full_rebuild() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
+        bind_userset_test_schema(&storage, 42).await;
         let permit = ready_authz_permit(&storage, 42).await;
 
         let group_member = write_tuple(
