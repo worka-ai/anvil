@@ -1,4 +1,6 @@
 use super::*;
+mod helpers;
+use helpers::*;
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -956,83 +958,6 @@ async fn mesh_routing_projection_diagnostics_detect_bucket_locator_mismatch() {
         .await
         .unwrap();
     assert!(clean.is_empty(), "{clean:#?}");
-}
-
-async fn register_active_mesh_placement(
-    persistence: &Persistence,
-) -> (
-    crate::mesh_lifecycle::RegionDescriptor,
-    crate::mesh_lifecycle::CellDescriptor,
-    crate::mesh_lifecycle::NodeDescriptor,
-) {
-    let region = persistence
-        .create_region_descriptor(crate::mesh_lifecycle::CreateRegionDescriptor {
-            mesh_id: "default".to_string(),
-            region: "test-region".to_string(),
-            public_base_url: "https://test-region.anvil-storage.test".to_string(),
-            virtual_host_suffix: "test-region.anvil-storage.test".to_string(),
-            placement_weight: 100,
-            default_cell: Some("default".to_string()),
-        })
-        .await
-        .unwrap();
-    let cell = persistence
-        .register_cell_descriptor(crate::mesh_lifecycle::RegisterCellDescriptor {
-            mesh_id: "default".to_string(),
-            region: "test-region".to_string(),
-            cell_id: "default".to_string(),
-            placement_weight: 100,
-            failure_domain: "rack-a".to_string(),
-        })
-        .await
-        .unwrap();
-    let cell = persistence
-        .transition_cell_descriptor(
-            "test-region",
-            "default",
-            cell.generation,
-            crate::mesh_lifecycle::LifecycleState::Active,
-        )
-        .await
-        .unwrap();
-    let region = persistence
-        .transition_region_descriptor(
-            "test-region",
-            region.generation,
-            crate::mesh_lifecycle::LifecycleState::Active,
-        )
-        .await
-        .unwrap();
-    let node = persistence
-        .register_node_descriptor(crate::mesh_lifecycle::RegisterNodeDescriptor {
-            mesh_id: "default".to_string(),
-            node_id: "test-node".to_string(),
-            region: "test-region".to_string(),
-            cell_id: "default".to_string(),
-            libp2p_peer_id: "peer-test-node".to_string(),
-            receipt_signing_public_key_proto: libp2p::identity::Keypair::generate_ed25519()
-                .public()
-                .encode_protobuf(),
-            public_api_addr: "test-node".to_string(),
-            public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
-            capabilities: vec![
-                crate::mesh_lifecycle::NodeCapability::Object,
-                crate::mesh_lifecycle::NodeCapability::Admin,
-            ],
-            capacity_json: "{}".to_string(),
-        })
-        .await
-        .unwrap();
-    let node = persistence
-        .transition_node_descriptor(
-            "test-node",
-            node.generation,
-            crate::mesh_lifecycle::LifecycleState::Active,
-            None,
-        )
-        .await
-        .unwrap();
-    (region, cell, node)
 }
 
 #[test]
@@ -2025,14 +1950,4 @@ async fn persistence_global_journal_writes_use_current_fence_tokens() {
         assert!(authz_fences.iter().all(|fence| *fence > 0));
     })
     .await
-}
-fn payload_ref(label: &str, logical_size: u64) -> crate::core_store::CoreObjectRef {
-    crate::core_store::CoreObjectRef::test_unlocated(
-        format!(
-            "sha256:{}",
-            hex::encode(blake3::hash(label.as_bytes()).as_bytes())
-        ),
-        logical_size,
-        format!("manifest:{label}"),
-    )
 }
