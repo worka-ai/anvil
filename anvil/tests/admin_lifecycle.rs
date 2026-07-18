@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use anvil::anvil_api::admin_service_client::AdminServiceClient;
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::*;

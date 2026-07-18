@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::{fs, path::PathBuf};
 
 fn workspace_file(path: &str) -> String {

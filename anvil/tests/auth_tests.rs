@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use anvil::anvil_api::audit_service_client::AuditServiceClient;
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;

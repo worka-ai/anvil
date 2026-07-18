@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
