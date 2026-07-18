@@ -245,6 +245,66 @@ async fn core_store_put_blob_writes_erasure_shards_and_reconstructs_missing_data
 }
 
 #[tokio::test]
+async fn core_store_object_ref_chunking_reads_each_data_shard_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let store = CoreStore::new(storage).await.unwrap();
+    let payload = (0..256 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: "mesh:test/tenant:t/bucket:b/object:chunked-read".to_string(),
+            bytes: payload.clone(),
+            boundary_values: Vec::new(),
+            region_id: "local".to_string(),
+            mutation_id: "chunked-read-mut-1".to_string(),
+        })
+        .await
+        .unwrap();
+    let manifest = store.read_object_manifest(&object_ref).await.unwrap();
+    let range = CoreByteRange {
+        start: 4096,
+        end_exclusive: 68 * 1024,
+    };
+    let shard_paths = manifest
+        .placements
+        .iter()
+        .map(|placement| {
+            store.shard_path(
+                &placement.node_id,
+                &object_ref.encoding.block_id,
+                placement.shard_index,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut received = Vec::new();
+    let mut callbacks = 0usize;
+
+    store
+        .read_object_ref_chunks(object_ref, Some(range), 1024, |chunk| {
+            callbacks += 1;
+            received.extend_from_slice(&chunk);
+            let shard_paths = if callbacks == 1 {
+                shard_paths.clone()
+            } else {
+                Vec::new()
+            };
+            async move {
+                for path in shard_paths {
+                    tokio::fs::remove_file(path).await?;
+                }
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+    assert!(callbacks > 1);
+    assert_eq!(received, payload[4096..68 * 1024]);
+}
+
+#[tokio::test]
 async fn core_store_get_blob_fails_when_too_many_erasure_shards_are_missing() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = Storage::new_at(tmp.path()).await.unwrap();
