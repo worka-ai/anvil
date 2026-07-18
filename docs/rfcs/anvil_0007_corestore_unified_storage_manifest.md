@@ -32,6 +32,13 @@ state, transaction state, leases, fences, and materialisation cursors are
 committed to RocksDB. Recent RocksDB state is mirrored in memory so hot reads do
 not rescan metadata tables or blob files.
 
+CoreMeta keys are order-preserving physical database keys, not merely canonical
+serialized tuples. Point reads, prefixes, ranges, and cursor continuation map
+directly to RocksDB seeks and bounded iterators. Every mutable collection has an
+authoritative point-readable current head, while retained history remains
+separately addressable. No ordinary request reconstructs current state by
+scanning history.
+
 Anvil tenants may store data for many application tenants, organisations,
 customers, projects, or legal realms inside one bucket. Anvil therefore exposes a
 user-defined boundary schema. Boundary dimensions tell Anvil which object or
@@ -65,6 +72,12 @@ implementation artifacts with explicit recovery semantics.
   coding, block placement, reads, and fsync.
 - Define a repeatable performance baseline comparable to MinIO, S3-compatible
   object systems, and specialised systems used for logs/search where applicable.
+- Make point reads `O(1)` at the CoreMeta key layer and bounded prefix/range
+  pages `O(log N + page/candidate window)`, independent of unrelated history.
+- Compile each public mutation into the minimum root-grouped RocksDB/quorum
+  batches and keep derived maintenance off the foreground path.
+- Make every growing public collection cursor-bounded and every watch gap-free
+  without per-subscriber durable polling.
 
 ## 3. Non-Goals
 
@@ -388,37 +401,120 @@ CoreMeta records use this key shape:
 
 ```text
 CoreMetaKey =
-  version                u8          # initial value 1
-  table_id               u16-le      # globally assigned table id
-  partition_id           u64-le      # CoreStore partition id, 0 when unpartitioned
-  tuple_key_len          u16-le
-  tuple_key              tuple_key_len bytes, CoreMetaTupleKey
+  version                u8          # initial and only development format value 1
+  table_id               u16-be      # globally assigned table id
+  partition_id           u64-be      # CoreStore partition id, 0 when unpartitioned
+  tuple_key              CoreMetaTupleKey, consumes the remainder of the key
 
 CoreMetaTupleKey =
-  part_count             u16-le
-  part*                  CoreMetaTupleKeyPart, in table-declared order
+  part*                  CoreMetaTupleKeyPart, in table-declared order; no part count
 
 CoreMetaTupleKeyPart =
   kind                   u8
-  flags                  u8          # initial value 0; non-zero rejected unless defined by a later RFC
-  value_len              u16-le
-  value                  value_len bytes
+  value                  kind-specific order-preserving bytes
 
 kind =
-  0x01 utf8_nfc_string   # UTF-8 NFC bytes, no embedded NUL
-  0x02 u64_sortable      # u64 big-endian, 8 bytes
-  0x03 i64_sortable      # i64 mapped with sign-bit flip, then big-endian, 8 bytes
-  0x04 hash_string       # ASCII "algorithm:hex"
-  0x05 raw_bytes         # uninterpreted bytes
-  0x06 bool              # one byte 0x00 or 0x01
+  0x01 utf8_nfc_string   # escaped UTF-8 NFC bytes followed by 0x00 0x00
+  0x02 u64_sortable      # u64 big-endian, exactly 8 bytes
+  0x03 i64_sortable      # sign-bit flip followed by u64 big-endian, exactly 8 bytes
+  0x04 hash_string       # escaped ASCII "algorithm:hex" followed by 0x00 0x00
+  0x05 raw_bytes         # escaped uninterpreted bytes followed by 0x00 0x00
+  0x06 bool              # exactly one byte: 0x00 false or 0x01 true
 ```
 
+Variable-width values use the following byte escaping. Every source `0x00` byte
+is encoded as `0x00 0xff`; the value terminator is `0x00 0x00`. Any other byte is
+encoded unchanged. The decoder rejects a lone trailing `0x00`, an escape other
+than `0x00 0xff`, and bytes after a malformed terminator. UTF-8 strings reject
+embedded NUL before escaping and MUST be NFC-normalised. Hash strings use the
+same escaping but remain restricted to their canonical ASCII grammar.
+
 The tuple-key type is intentionally independent of protobuf because it is the
-RocksDB ordering key. Table definitions below list tuple-key parts by name; the
-encoded key MUST contain those parts in exactly that order with the kind implied
-by the field type. Unknown kinds, overlong values, non-NFC strings, and tuple
-keys with extra or missing parts are corrupt and MUST be rejected before any row
-is visible to readers.
+RocksDB ordering key. It MUST therefore satisfy all of these properties, which
+are release-blocking invariants rather than implementation suggestions:
+
+1. The encoding of a complete logical tuple prefix is the exact byte prefix of
+   every descendant tuple.
+2. RocksDB bytewise comparison produces the table-declared logical order for
+   every component type.
+3. Shorter variable-width values sort before a longer value sharing the shorter
+   value as a prefix.
+4. Signed integers sort from `i64::MIN` through `i64::MAX`; unsigned integers
+   sort from zero through `u64::MAX`.
+5. Encoding is injective and canonical: one logical tuple has exactly one byte
+   representation.
+6. A tuple can be decoded to the end of the RocksDB key without an external
+   length or part count.
+
+Table definitions below list tuple-key parts by name. A complete row key MUST
+contain exactly those parts in that order with the implied kind. A scan prefix
+MAY contain any complete leading subset of those parts, including zero parts.
+Unknown kinds, malformed escapes, overlong values, non-NFC strings, and complete
+row keys with extra or missing parts are corrupt and MUST be rejected before a
+row is visible to readers.
+
+`CoreMetaPrefix(table_id, partition_id, tuple_prefix)` is the fixed 11-byte key
+header followed by the encoded tuple prefix. A prefix scan MUST seek directly to
+that byte string and MUST stop at its exclusive upper bound. The upper bound is
+computed by copying the prefix, incrementing the rightmost byte that is not
+`0xff`, and truncating all following bytes. When every byte is `0xff`, the scan
+has no finite upper bound and MUST stop on the first key that does not start with
+the prefix. Implementations MUST configure RocksDB iterator lower/upper bounds;
+they MUST NOT start at the table prefix and filter unrelated rows in application
+code.
+
+Range scans use the physical encoding of their complete logical lower and upper
+bounds. Unless an API explicitly states otherwise, ranges are half-open:
+`[lower_bound, upper_bound)`. Reverse scans seek immediately below the exclusive
+upper bound. Cursor tokens carry the last physical key and committed root/index
+generation, allowing the next page to seek rather than rescan.
+
+This document defines the initial development format, not a compatibility
+migration. Pre-release stores written with the superseded length-prefixed key
+encoding are invalid and MUST be deleted and recreated. Anvil MUST NOT ship a
+dual reader, fallback table scan, lazy conversion, or legacy compatibility path.
+
+The following lowercase hexadecimal vectors are normative. They use table
+`0x8501` and partition zero where a full CoreMeta key is shown:
+
+```text
+header
+  0185010000000000000000
+
+tuple utf8("")
+  010000
+tuple utf8("a")
+  01610000
+tuple utf8("aa")
+  0161610000
+tuple raw([0x41, 0x00, 0x42])
+  054100ff420000
+
+tuple i64(MIN)
+  030000000000000000
+tuple i64(-1)
+  037fffffffffffffff
+tuple i64(0)
+  038000000000000000
+tuple i64(MAX)
+  03ffffffffffffffff
+
+CoreMetaPrefix(0x8501, 0, [utf8("schema_revision"), i64(2)])
+  018501000000000000000001736368656d615f7265766973696f6e0000038000000000000002
+
+CoreMetaKey(0x8501, 0,
+  [utf8("schema_revision"), i64(2), utf8("system"), u64(100)])
+  018501000000000000000001736368656d615f7265766973696f6e00000380000000000000020173797374656d0000020000000000000064
+
+exclusive successor of the schema/tenant prefix above
+  018501000000000000000001736368656d615f7265766973696f6e0000038000000000000003
+```
+
+Conformance tests MUST prove the prefix is a byte prefix of the complete key,
+the complete key is inside the half-open prefix range, round trips are canonical,
+malformed escapes are rejected, and generated value pairs preserve logical
+ordering. Property tests cover random values and tuples in addition to these
+fixed vectors.
 
 CoreMeta values use this deterministic protobuf envelope:
 
@@ -504,6 +600,7 @@ Initial CoreMeta table registry:
 | `0x8501` | `cf_authz` | `realm / schema_generation` | `AuthzSchemaRow` | committed authz root generation only |
 | `0x8502` | `cf_authz` | `realm / revision / tuple_hash` | `AuthzTuplePageRow` | committed authz root generation only |
 | `0x8503` | `cf_authz` | `tenant / principal / operation_hash` | `AuthzIdempotencyReceiptRow` | committed atomically with the tuple batch revision |
+| `0x8504` | `cf_authz` | `tenant` | `AuthzHeadRow` | committed atomically with every schema, binding, or tuple mutation |
 | `0x8601` | `cf_personaldb` | `realm / group_id / generation` | `PersonalDbGroupRow` | committed root generation only |
 | `0x8602` | `cf_personaldb` | `realm / group_id / snapshot_or_changeset_id` | `PersonalDbDataLocatorRow` | committed root generation only |
 | `0x8701` | `cf_registry` | `realm / registry_kind / namespace / package / version` | `RegistryVersionRow` | committed root generation only |
@@ -513,6 +610,9 @@ Initial CoreMeta table registry:
 | `0x8d01` | `cf_mesh` | `principal_or_node_id / key_id` | `NodeSigningKeyRow` | committed mesh root generation only |
 | `0x8901` | `cf_leases_fences` | `realm / lease_id` | `LeaseFenceRow` | committed root generation only |
 | `0x8a01` | `cf_materialisation` | `node_id / materialisation_epoch` | `MaterialisationCursorRow` | local committed metadata |
+| `0x8a02` | `cf_materialisation` | `writer_family / scope_hash / generation` | `WriterSegmentRow` | immutable historical segment catalogue row |
+| `0x8a03` | `cf_materialisation` | `watch_family / scope_hash / consumer_id` | `WatchCheckpointRow` | durable consumer checkpoint where the protocol defines one |
+| `0x8a04` | `cf_materialisation` | `writer_family / scope_hash` | `WriterHeadRow` | current writer generation point lookup |
 | `0x8b02` | `cf_materialisation` | `landing_id` | `LandedByteRefRow` | local committed metadata |
 | `0x8b01` | `cf_refcounts` | `ref_kind / ref_id` | `RefCountRow` | committed root generation only |
 | `0x8c01` | `cf_observability` | `stream / cursor_id` | `ObservabilityCursorRow` | local committed metadata |
@@ -693,14 +793,12 @@ message StreamIdempotencyRow {
   string created_at = 11;            // RFC 3339
 }
 
-For streams whose `idempotency_index_complete` flag is true, every append with
-an idempotency key MUST commit the compact `StreamIdempotencyRow`, stream record,
-and stream head in the same root generation. A repeated key is therefore a
-single CoreMeta point lookup rather than a replay of stream history. Streams
-created by an older binary have the flag unset and MUST retain the historical
-lookup behavior until an explicit migration has indexed their complete history;
-a writer MUST NOT claim completeness merely because it appended a new tail
-record.
+Every stream is created with `idempotency_index_complete = true`. Every append
+with an idempotency key MUST commit the compact `StreamIdempotencyRow`, stream
+record, and stream head in the same root generation. A repeated key is therefore
+a single CoreMeta point lookup rather than a replay of stream history. A missing
+or false completeness marker is corrupt pre-release state and the store must be
+recreated; Anvil does not retain a historical-replay compatibility path.
 
 message IndexDefinitionRow {
   CoreMetaRowCommon common = 1;
@@ -759,6 +857,29 @@ message AuthzTuplePageRow {
   repeated string caveat_hashes = 5;
   repeated string derived_index_keys = 6;
 }
+
+message AuthzHeadRow {
+  CoreMetaRowCommon common = 1;
+  int64 tenant_id = 2;
+  uint64 committed_revision = 3;
+  uint64 tuple_revision = 4;
+  uint64 schema_revision = 5;
+  uint64 derived_through_revision = 6;
+  string tuple_stream_head_hash = 7;
+  string active_schema_bindings_hash = 8;
+  uint64 updated_at_unix_nanos = 9;
+}
+
+`AuthzHeadRow` is the sole allocator and current-revision source for one storage
+tenant's authorization domain. Every tuple batch, schema revision, and schema
+binding mutation MUST compare-and-swap `committed_revision`, allocate exactly
+`committed_revision + 1`, and publish the domain mutation plus the new head in
+one authz-root transaction. Readers MUST obtain the current revision with one
+point lookup. Scanning schema rows, tuple history, bindings, or segment catalogues
+to infer the current revision is forbidden. `derived_through_revision` may lag,
+but permission evaluation at a newer committed revision MUST apply the complete
+delta from that watermark through `committed_revision` or wait for catch-up; it
+must never answer from stale derived state.
 
 message PersonalDbGroupRow {
   CoreMetaRowCommon common = 1;
@@ -850,6 +971,47 @@ message MaterialisationCursorRow {
   uint64 last_root_generation = 6;
   string lag_metrics = 7;
 }
+
+message WriterSegmentRow {
+  CoreMetaRowCommon common = 1;
+  string writer_family = 2;
+  string scope_hash = 3;
+  uint64 generation = 4;
+  uint64 source_cursor = 5;
+  CoreMetaLocator segment_locator = 6;
+  string segment_hash = 7;
+  uint64 record_count = 8;
+  uint64 created_at_unix_nanos = 9;
+}
+
+message WriterHeadRow {
+  CoreMetaRowCommon common = 1;
+  string writer_family = 2;
+  string scope_hash = 3;
+  uint64 current_generation = 4;
+  uint64 source_cursor = 5;
+  CoreMetaLocator segment_locator = 6;
+  string segment_hash = 7;
+  uint64 compacted_through_cursor = 8;
+  uint64 updated_at_unix_nanos = 9;
+}
+
+message WatchCheckpointRow {
+  CoreMetaRowCommon common = 1;
+  string watch_family = 2;
+  string scope_hash = 3;
+  string consumer_id = 4;
+  uint64 durable_cursor = 5;
+  uint64 root_generation = 6;
+  uint64 updated_at_unix_nanos = 7;
+}
+
+A writer publishes its immutable `WriterSegmentRow` and replacement
+`WriterHeadRow` in the same root transaction. Resolving the current segment is a
+single point read of `WriterHeadRow`; listing all historical segments to compute
+the maximum generation is forbidden. Historical segment scans are permitted
+only for explicit history, repair, or diagnostics APIs and must themselves be
+bounded and paginated.
 
 message LandedByteRefRow {
   CoreMetaRowCommon common = 1;
@@ -987,6 +1149,88 @@ A write is admitted only when:
 
 If any of those fail, the write is not admitted. Partial landed bytes are garbage
 collectable because no durable pending mutation row can reference them.
+
+### 8.2a Canonical Mutation Plan and Batching
+
+Every public mutation is compiled exactly once into a `CoreMutationPlan` before
+durable admission. Feature services and writers MUST describe their mutation to
+CoreStore; they MUST NOT perform a sequence of independent CoreMeta commits.
+
+```rust
+pub struct CoreMutationPlan {
+    pub mutation_id: MutationId,
+    pub idempotency_key_hash: Option<Hash32>,
+    pub root_groups: Vec<RootMutationGroup>,
+    pub landed_bytes: Vec<LandedByteIntent>,
+    pub watch_records: Vec<WatchRecordIntent>,
+    pub deferred_tasks: Vec<DeferredTaskIntent>,
+}
+
+pub struct RootMutationGroup {
+    pub root_key: RootAnchorKey,
+    pub expected_generation: u64,
+    pub rows: Vec<CoreMetaMutation>,
+}
+```
+
+For each affected root, the plan MUST batch all compact state belonging to the
+logical mutation, including where applicable:
+
+- the authoritative history/journal record;
+- the current head or current-value projection;
+- idempotency/claim state;
+- watch-log record;
+- immutable segment and current writer-head publication;
+- bounded durable task descriptors for derived work;
+- transaction outcome and commit evidence.
+
+CoreStore performs one prepare/certificate/publication sequence per affected
+root group, not one sequence per row or per feature helper. Local replicas apply
+each root group's rows with one RocksDB `WriteBatch` and one WAL durability
+decision. Multiple logical mutations MAY use group commit when each mutation's
+individual certificate, ordering, idempotency, and acknowledgement boundary
+remain independently provable.
+
+A mutation spanning multiple roots uses the explicit transaction protocol when
+atomic visibility is required, or the Saga protocol when the operation is
+intentionally compensatable. It MUST NOT approximate multi-root atomicity with a
+series of unrelated commits in a service method.
+
+Foreground code may durably enqueue deferred work, but it MUST NOT execute index
+builds, compaction, broad repair, snapshot generation, full-history replay, media
+extraction, embedding, or other derived maintenance before acknowledging an
+otherwise committed mutation. The response states in section 8.5 distinguish
+admission, committed authoritative state, and optional derived-materialisation
+catch-up.
+
+### 8.2b Lock Scope and Concurrency
+
+Locking follows the narrowest authoritative ownership boundary:
+
+1. root/partition ownership fence;
+2. root publication lock;
+3. stream, object-key, task, or other feature-specific row lock where required;
+4. local RocksDB batch application.
+
+Locks at the same level are acquired in canonical bytewise key order. A caller
+MUST acquire all required named locks before taking a root publication lock.
+CoreStore MUST NOT hold a process-wide data-plane write lock while performing
+network calls, quorum collection, filesystem IO, hashing, compression, erasure
+coding, index construction, authorization graph expansion, or any other awaited
+or unbounded work. A process-wide lock is permitted only for startup, shutdown,
+or an offline metadata-format operation; it is forbidden on normal public read
+and write paths.
+
+The root publication lock is held only for the bounded operation that validates
+the expected generation and publishes the already-prepared local metadata
+batch. Expensive bytes and deterministic row payloads are prepared before it is
+acquired. Independent roots and partitions MUST make progress concurrently.
+
+Optimistic conflicts may retry only the minimal CAS/publication operation. A
+retry MUST NOT repeat payload ingestion, authorization, extraction, logical-file
+construction, or unrelated CoreMeta commits. Every retry loop has a bounded
+attempt count, exponential jitter, conflict metrics, and a test proving work is
+proportional to actual contention rather than retained history.
 
 ### 8.3 RocksDB Does Not Store Large Bytes
 
@@ -1319,6 +1563,14 @@ It MUST include, when useful for latency:
 It MUST be rebuildable from RocksDB CoreMeta rows, root anchors, and committed
 manifests. It MUST NOT be the only copy of committed state.
 
+Every mutable logical collection also has an authoritative compact current row
+or current head in CoreMeta. The cache is populated with point reads of those
+rows; it is never rebuilt on the request path by scanning historical records.
+Cache keys include the committed root generation or immutable revision. Cached
+negative results are valid only at that same generation/revision. A process may
+discard the complete cache without changing correctness or forcing a replay of
+unbounded history before serving a point read.
+
 ## 12. Materialisation Engine
 
 The materialiser converts RocksDB pending mutation rows into final CoreStore
@@ -1336,6 +1588,66 @@ mutation id/content hash.
 Materialisation MUST expose backpressure to admission. If final storage cannot
 keep up, admission must slow down or reject writes before pending CoreMeta or
 landed-byte capacity is exhausted.
+
+Materialisation is incremental. A materialiser starts from its durable
+`WriterHeadRow`/watermark, reads only source records after the recorded cursor,
+and emits immutable delta output plus a replacement head. It MUST NOT rebuild a
+complete current projection, authorization graph, directory, search index,
+PersonalDB chain, Git index, or other derived structure from genesis for an
+ordinary incremental update.
+
+Full reconstruction is restricted to explicit repair, bootstrap of a genuinely
+missing projection, or an offline format operation. Those paths are separately
+leased, observable, rate-limited, and cannot hold a foreground root/partition
+lock while reading or constructing state.
+
+Deferred tasks are coalesced by `(task_kind, scope, target_source_cursor)`. A
+newer target supersedes older unclaimed targets for the same scope. A worker
+checks for supersession before expensive extraction and immediately before
+publication. One source mutation schedules each affected derived index at most
+once; selectors exclude unrelated indexes before task creation.
+
+Compaction consumes immutable deltas asynchronously under a fenced partition
+lease. It publishes a replacement segment set with CAS against the source and
+writer generations. Foreground requests may observe compaction debt, but they
+must not execute compaction or wait for it unless an explicitly requested
+consistency level requires a particular derived generation.
+
+Worker execution uses bounded CPU, IO, memory, and concurrency classes. Repair,
+compaction, embedding, media extraction, and full reconstruction run below
+foreground admission/read priority. A background workload must not monopolise
+all Tokio workers or the process-wide blocking pool.
+
+### 12.1 Durable Watch Delivery
+
+Every watch is backed by an ordered durable watch/event stream and a shared
+in-process notifier per `(watch_family, scope_hash)`. The durable stream is the
+source of truth; the notifier is only a wake-up optimization.
+
+A watch starts by capturing the committed source cursor, emits any requested
+bounded snapshot at that cursor, replays durable events after the cursor, and
+then subscribes to the shared notifier. After subscription it rechecks the
+durable head before waiting, closing the snapshot/live race. On notification it
+range-reads events after its own cursor. On notifier lag, process restart, or
+temporary disconnect it performs the same durable catch-up and does not report
+data loss merely because an in-memory broadcast buffer overflowed.
+
+One notifier task may serve any number of local subscribers. An idle watch MUST
+NOT poll RocksDB, list a complete event collection, or create a timer per
+subscriber. Where the underlying platform cannot provide a change signal, one
+bounded poller per durable scope is permitted and fans out wake-ups to all local
+subscribers.
+
+Watch responses carry monotonically increasing opaque cursors bound to source
+generation and authorization revision. Slow consumers use bounded buffers and
+backpressure. Protocols that support durable consumer identity checkpoint the
+acknowledged cursor in `WatchCheckpointRow`; anonymous watches keep only local
+ephemeral cursor state and resume from a client-supplied cursor. Authorization
+is checked at admission and whenever a new source/authz generation requires it.
+
+Release tests MUST prove snapshot/live gap freedom, ordered replay, restart
+recovery, lag recovery, bounded idle IO, and that adding subscribers does not
+multiply durable polling or collection scans.
 
 ## 13. CoreStore Root, Transactions, and Atomic Publication
 
@@ -3423,10 +3735,13 @@ mesh_control
   body encoding: table directory only
 ```
 
-Version rule: table ids are never reused. A backward-compatible row extension may
-append optional fields only after adding a row-version byte inside `value_bytes`
-and documenting the default. A required field change, key tuple change, or sort
-order change requires a new table id and a migration writer.
+Development format rule: until the first stable storage-format release, this RFC
+defines the only supported format and corrective row/key changes replace their
+earlier development definition in place. Existing development stores are
+recreated; no migration writer or dual decoder is added. After a stable format is
+declared, a new RFC must define the future compatibility/versioning policy before
+any incompatible change ships. Table ids remain unique within the current
+format and are never assigned to two different row meanings.
 
 ### 15.21 Writer Table Row Registry
 
@@ -4855,6 +5170,53 @@ service MeshControlService {
 }
 ```
 
+### 20.0a Bounded Collection and Pagination Contract
+
+Every public RPC that can return a collection whose cardinality may grow after
+deployment MUST accept `page_size` and `page_token` and MUST return
+`next_page_token`. This includes administrative collections, buckets, indexes,
+applications, credentials, policies, Git trees, object links, host aliases,
+diagnostics, audit events, repair findings, registry versions, tensors,
+authorization objects/subjects/tuples, PersonalDB keys/projections, and any
+future collection. A `limit` field is equivalent to `page_size` only when the
+response also provides a continuation token.
+
+Defaults and bounds are normative unless a protocol such as S3 defines a lower
+maximum:
+
+```text
+default page_size = 100
+minimum page_size = 1
+maximum page_size = 1000
+```
+
+The server rejects zero only when the individual protocol does not define zero
+as "use default"; it always rejects values above the maximum. An RPC with an
+unbounded repeated response and no continuation mechanism is forbidden.
+
+Page tokens use the signed contract in section 22.5 and bind at least:
+
+- service and method;
+- canonical filter/predicate/order hash;
+- last physical CoreMeta or writer-index key;
+- committed root/index generation;
+- authorization revision and principal scope hash;
+- page-size ceiling and token expiry.
+
+The next page seeks immediately after the stored physical key. It MUST NOT load
+the preceding collection, recompute a full sort, or use an offset. Collection
+implementations stop after obtaining `page_size + 1` eligible rows, except that
+authorization may require bounded candidate windows until a full authorized
+page is assembled. Every response records rows visited and bytes decoded so a
+release test can prove work is proportional to the page and selectivity rather
+than total collection cardinality.
+
+The protobuf in `anvil-core/proto/anvil.proto` is the shipped public contract and
+MUST be changed to satisfy this section before the corresponding API is declared
+release-ready. Because Anvil is still in development, existing unbounded request
+messages are replaced directly; no parallel legacy RPCs or compatibility fields
+are retained.
+
 Required request and response shapes for this RFC. Implementations may add optional fields in later versions, but must not omit these fields or weaken their semantics:
 
 ```protobuf
@@ -6254,6 +6616,20 @@ field fetch. Index predicate pruning may run before or after authz candidate
 retrieval, but the first payload read MUST operate on the intersection of all
 available pruning sets.
 
+Steps 2 through 4 create one immutable `QuerySnapshot` containing the root,
+index, boundary, and authorization generations. Every later planner and final
+verification call receives that snapshot. A query MUST NOT rediscover "latest"
+state, scan a head catalogue, or select a newer authorization revision per hit.
+Final verification remains mandatory but reuses revision-keyed memoized graph
+subresults and calls `verify_page` once per bounded candidate window; issuing an
+independent full authorization resolution for every result is forbidden.
+
+Index definition and segment selection begins with point reads of the current
+definition and `WriterHeadRow`. Historical catalogue scans are not part of query
+planning. Segment min/max keys, term/value statistics, path fences, boundary
+summaries, tombstone generations, and authorization scope hashes are used to
+discard impossible segments before opening their payloads.
+
 ### 22.4 Reader Interfaces
 
 The planner talks to writers through these interfaces. Implementations may expose
@@ -6356,6 +6732,14 @@ payload_ranges_planned
 payload_bytes_planned
 payload_bytes_read
 full_scan_forbidden_count
+coremeta_rows_visited
+coremeta_bytes_decoded
+segments_considered
+segments_opened
+authz_head_point_reads
+authz_graph_nodes_visited
+authz_decisions_computed
+authz_decisions_memoized
 ```
 
 If authz candidate retrieval fails, the query fails closed. If an index candidate
@@ -6364,6 +6748,13 @@ watch-driven catch-up. If catch-up cannot reach the required generation within
 the request deadline, it fails with `IndexLagNotCaughtUp` unless the request
 explicitly accepts stale results. Stale results are never allowed for authz
 checks.
+
+For fixed page size and selectivity, current-state query work MUST be independent
+of unrelated retained history. Focused performance tests populate identical
+current state with increasing historical revisions and fail when rows visited,
+bytes decoded, graph nodes visited, or latency grows with that history. Prefix
+and range tests likewise fail when RocksDB rows visited exceed the bounded key
+range plus documented authorization candidate-window overhead.
 
 ## 23. Compaction, Tombstones, and Deletes
 
@@ -6795,6 +7186,18 @@ corestore_fulltext_query_uses_postings_ranges
 corestore_vector_query_uses_vector_segment
 corestore_typed_due_query_uses_typed_index
 corestore_authz_prunes_before_payload_fetch
+corestore_key_encoding_preserves_tuple_prefixes
+corestore_key_encoding_preserves_component_order
+corestore_prefix_scan_seeks_bounded_physical_range
+corestore_current_heads_are_point_lookups
+corestore_authz_current_revision_is_point_lookup
+corestore_current_reads_are_history_independent
+corestore_public_collections_are_cursor_bounded
+corestore_public_mutation_uses_one_plan_per_root
+corestore_foreground_path_excludes_derived_maintenance
+corestore_independent_roots_progress_concurrently
+corestore_watch_idle_io_is_subscriber_independent
+corestore_watch_restart_and_lag_replay_are_gap_free
 corestore_reserved_authz_paths_external_read_write_denied
 corestore_boundary_schema_migration_matrix
 corestore_metrics_required_series_present
@@ -6814,6 +7217,53 @@ end-to-end performance baseline. Baselines must run against Anvil and at least
 one reference object store on the same machine/network. MinIO is the required
 local reference. S3 or another cloud object store is an optional external
 reference because internet and region latency vary.
+
+### 26.0 Public API and Feature Matrix
+
+`ops/perf/public-api-matrix.json` enumerates every public RPC and gateway
+operation compiled into the server. A generation check parses
+`anvil-core/proto/anvil.proto` plus registered HTTP/S3/registry routes and fails
+when an operation is absent from the matrix or the matrix names an operation no
+longer shipped. Internal replication RPCs have a separate primitive matrix
+because they are not customer APIs but directly determine public latency.
+
+Every public operation has at least:
+
+- an empty/minimal-state correctness and latency scenario;
+- a representative populated-state scenario;
+- a retained-history scale scenario where history exists;
+- a concurrency/contention scenario where mutation is supported;
+- an authorization-allowed and authorization-denied scenario;
+- a cold-cache and warm-cache run where meaningful;
+- a failure/precondition/idempotent-retry scenario where meaningful.
+
+The matrix records expected complexity in machine-readable form, for example
+`O(1)`, `O(log N)`, `O(page)`, `O(changed + affected)`, or
+`O(requested byte ranges)`. A benchmark fails on work amplification even when
+wall-clock time happens to pass. Required counters include CoreMeta keys sought,
+rows visited, bytes decoded, RocksDB blocks read, logical ranges read, payload
+bytes read/written, fsyncs, root publications, lock wait, retries, segments
+opened, graph nodes visited, durable watch reads, and deferred tasks created.
+
+The release suite publishes one row per operation and scenario containing p50,
+p95, p99, throughput, error rate, expected/observed complexity, and all work
+counters. Unsupported or intentionally unimplemented RPCs are explicit failing
+or release-excluded rows with an owner and reason; silently skipping an API is
+forbidden.
+
+Diagnostic profiles supplement, but never replace, portable benchmark metrics:
+
+- macOS: Instruments Time Profiler, Allocations, File Activity, and System Trace;
+- Linux: `perf`, allocator profiling, block IO statistics, and scheduler traces;
+- RocksDB: statistics, per-level/table properties, block-cache metrics, iterator
+  seek/next counts, bytes read/written, compaction counters, and `PerfContext`;
+- Tokio: task poll duration, queue depth, blocking-pool saturation, and lock-wait
+  spans.
+
+Profiles and benchmark outputs are retained under
+`target/anvil/perf/<run-id>/`; CI summaries link their hashes. Before/after
+reports use the same seed, corpus, hardware power state, server configuration,
+durability profile, warm-up, and sample count.
 
 ### 26.1 Baseline Dataset
 
@@ -7146,7 +7596,17 @@ Forbidden temporary shortcuts:
 - feature-specific durable directories with their own replication;
 - query indexes stored outside CoreMeta or CoreStore final manifests/blocks;
 - authz tuple stores outside CoreStore;
-- hidden compatibility paths that bypass the byte pipeline.
+- hidden compatibility paths that bypass the byte pipeline;
+- dual CoreMeta key encodings, legacy table readers, lazy key migration, or
+  full-table fallback scans for stores created by superseded development builds;
+- process-wide data-plane locks;
+- foreground execution of derived maintenance;
+- unbounded collection responses or offset-based pagination.
+
+This corrective development phase intentionally breaks pre-release persisted
+stores and public request shapes. Tests and development deployments recreate
+their Anvil storage after the key/protobuf changes. Implementation MUST delete
+superseded code rather than preserving compatibility branches.
 
 ## 28. Acceptance Criteria
 
@@ -7157,6 +7617,12 @@ Forbidden temporary shortcuts:
   store outside CoreMeta.
 - CoreMeta column families match section 7.1 or the RFC has been updated before
   implementation.
+- CoreMeta tuple encoding is physically prefix-preserving and order-preserving
+  for every supported component type.
+- Prefix/range iterators use RocksDB lower/upper bounds and never visit rows
+  outside the encoded range except documented LSM block-level read overhead.
+- No runtime fallback scans a complete table to implement a logical prefix,
+  current-head lookup, uniqueness check, or cursor continuation.
 - CoreMeta values reject payloads larger than 64 KiB.
 - Stream record and high-cardinality index rows reject payloads larger than
   16 KiB.
@@ -7192,6 +7658,13 @@ The RFC is implemented only when all criteria are met.
   satisfied.
 - `wait_for_finalization=true` proves the write reached final CoreStore blocks
   and a committed root anchor generation.
+- One public mutation compiles into one canonical mutation plan and performs at
+  most one publication sequence per affected root.
+- Foreground acknowledgement never waits for index building, compaction,
+  repair, or other derived maintenance unless the caller explicitly requests a
+  derived-generation consistency barrier.
+- Independent roots continue to admit and publish while another root performs
+  expensive materialisation or repair.
 
 ### 28.3 Atomic Publication
 
@@ -7248,9 +7721,17 @@ The RFC is implemented only when all criteria are met.
 ### 28.9 Performance
 
 - Fixed baseline dataset exists.
+- The generated public API matrix covers every shipped public RPC and gateway
+  operation and fails when source and matrix differ.
 - MinIO comparison suite exists for object operations.
 - Release gates fail when Anvil is outside accepted thresholds.
 - Performance reports include slow spans and fsync counts.
+- Performance reports include work-amplification counters and expected versus
+  observed complexity for every scenario.
+- Current point reads and bounded pages remain independent of unrelated
+  retained history at all tested history sizes.
+- Watch idle IO is proportional to watched scopes, not subscriber count.
+- Before/after diagnostic profiles are retained for every corrected hot path.
 - Non-object workloads have numeric thresholds and fixed seeds.
 - Release artifacts include the full baseline summary JSON.
 
@@ -7268,3 +7749,12 @@ Before writing code for a CoreStore feature, answer these questions in the PR:
 8. What metrics and spans prove request-to-fsync behaviour?
 9. Which performance baseline scenario covers it?
 10. Which tests prove no sidecar durable storage was introduced?
+11. What is the exact CoreMeta point/prefix/range access pattern, and why is it
+    bounded by the requested result rather than total retained state?
+12. Which current-head row avoids reconstructing current state from history?
+13. Which compact rows and deferred tasks are batched into the public mutation's
+    canonical plan?
+14. What locks are acquired, in what order, and what maximum bounded work occurs
+    while each lock is held?
+15. Which public API matrix scenarios prove latency, complexity, contention,
+    authorization, retry, and history independence?
