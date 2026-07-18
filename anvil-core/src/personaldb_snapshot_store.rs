@@ -1,4 +1,5 @@
 use crate::{
+    anvil_api::SignatureEnvelopeV1 as WireSignatureEnvelopeV1,
     core_store::{decode_deterministic_proto, encode_deterministic_proto},
     formats::{Hash32, hash32},
     personaldb_control::PersonalDbSnapshotManifest,
@@ -6,9 +7,11 @@ use crate::{
         read_personaldb_data_locator_bytes, read_personaldb_data_locator_row,
         write_personaldb_bytes_as_data_locator,
     },
+    personaldb_signing::{signature_envelope_from_proto, signature_envelope_to_proto},
     storage::Storage,
 };
 use anyhow::{Result, anyhow};
+use personaldb_protocol::PublicKeyTrustStore;
 use prost::Message;
 
 const PERSONALDB_SNAPSHOT_OBJECT_REF_PREFIX: &str = "personaldb_snapshot_object:";
@@ -52,8 +55,8 @@ struct PersonalDbSnapshotManifestProto {
     created_by_node: String,
     #[prost(string, optional, tag = "15")]
     manifest_hash: Option<String>,
-    #[prost(string, optional, tag = "16")]
-    manifest_signature: Option<String>,
+    #[prost(message, optional, tag = "16")]
+    manifest_signature: Option<WireSignatureEnvelopeV1>,
 }
 
 pub async fn write_personaldb_snapshot(
@@ -62,9 +65,9 @@ pub async fn write_personaldb_snapshot(
     database_id: &str,
     compressed_sqlite_bytes: &[u8],
     manifest: &PersonalDbSnapshotManifest,
-    signing_key: &[u8],
+    trust_store: &PublicKeyTrustStore,
 ) -> Result<PersonalDbSnapshotWriteResult> {
-    manifest.verify(signing_key)?;
+    manifest.verify(trust_store)?;
     ensure_manifest_scope(tenant_id, database_id, manifest)?;
     let state_hash = decode_hex32(&manifest.state_hash, "state_hash")?;
     let snapshot_object_hash =
@@ -139,12 +142,12 @@ pub async fn read_personaldb_snapshot_manifest(
     database_id: &str,
     log_index: u64,
     state_hash: &str,
-    signing_key: &[u8],
+    trust_store: &PublicKeyTrustStore,
 ) -> Result<Option<PersonalDbSnapshotManifest>> {
     let manifest_ref =
         personaldb_snapshot_manifest_ref_name(tenant_id, database_id, log_index, state_hash)?;
     let Some(manifest) =
-        read_personaldb_snapshot_manifest_by_ref(storage, &manifest_ref, signing_key).await?
+        read_personaldb_snapshot_manifest_by_ref(storage, &manifest_ref, trust_store).await?
     else {
         return Ok(None);
     };
@@ -158,7 +161,7 @@ pub async fn read_personaldb_snapshot_manifest(
 pub async fn read_personaldb_snapshot_manifest_by_ref(
     storage: &Storage,
     manifest_ref: &str,
-    signing_key: &[u8],
+    trust_store: &PublicKeyTrustStore,
 ) -> Result<Option<PersonalDbSnapshotManifest>> {
     let (tenant_id, database_id) = personaldb_ref_scope(manifest_ref)?;
     let Some(row) =
@@ -173,7 +176,7 @@ pub async fn read_personaldb_snapshot_manifest_by_ref(
     }
     let bytes = read_personaldb_data_locator_bytes(storage, &row).await?;
     let manifest = decode_snapshot_manifest(&bytes)?;
-    manifest.verify(signing_key)?;
+    manifest.verify(trust_store)?;
     Ok(Some(manifest))
 }
 
@@ -182,9 +185,9 @@ pub async fn read_personaldb_snapshot_object(
     tenant_id: i64,
     database_id: &str,
     manifest: &PersonalDbSnapshotManifest,
-    signing_key: &[u8],
+    trust_store: &PublicKeyTrustStore,
 ) -> Result<Option<Vec<u8>>> {
-    manifest.verify(signing_key)?;
+    manifest.verify(trust_store)?;
     ensure_manifest_scope(tenant_id, database_id, manifest)?;
     let expected_object_ref = personaldb_snapshot_object_ref_name(
         tenant_id,
@@ -252,7 +255,10 @@ fn snapshot_manifest_to_proto(
         created_at: manifest.created_at.clone(),
         created_by_node: manifest.created_by_node.clone(),
         manifest_hash: manifest.manifest_hash.clone(),
-        manifest_signature: manifest.manifest_signature.clone(),
+        manifest_signature: manifest
+            .manifest_signature
+            .as_ref()
+            .map(signature_envelope_to_proto),
     }
 }
 
@@ -276,7 +282,10 @@ fn snapshot_manifest_from_proto(
         created_at: proto.created_at,
         created_by_node: proto.created_by_node,
         manifest_hash: proto.manifest_hash,
-        manifest_signature: proto.manifest_signature,
+        manifest_signature: proto
+            .manifest_signature
+            .map(signature_envelope_from_proto)
+            .transpose()?,
     })
 }
 
@@ -399,20 +408,30 @@ fn decode_core_object_ref_target(target: &str) -> Result<crate::core_store::Core
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::personaldb_protocol_keyring;
     use tempfile::tempdir;
-
-    const KEY: &[u8] = b"personaldb snapshot signing key";
 
     #[tokio::test]
     async fn snapshot_object_and_manifest_round_trip_through_corestore_refs() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let bytes = b"zstd sqlite snapshot bytes";
-        let manifest = sample_manifest(&storage, bytes).seal(KEY).unwrap();
-
-        let result = write_personaldb_snapshot(&storage, 6, "db-alpha", bytes, &manifest, KEY)
+        let keyring = personaldb_protocol_keyring();
+        let manifest = sample_manifest(&storage, bytes)
+            .seal(&keyring)
             .await
             .unwrap();
+
+        let result = write_personaldb_snapshot(
+            &storage,
+            6,
+            "db-alpha",
+            bytes,
+            &manifest,
+            keyring.trust_store(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.object_ref, manifest.snapshot_object_key);
         assert!(
             result
@@ -431,16 +450,31 @@ mod tests {
             "db-alpha",
             1024,
             &manifest.state_hash,
-            KEY,
+            keyring.trust_store(),
         )
         .await
         .unwrap()
         .unwrap();
         assert_eq!(read_manifest, manifest);
-        let read_bytes = read_personaldb_snapshot_object(&storage, 6, "db-alpha", &manifest, KEY)
-            .await
-            .unwrap()
-            .unwrap();
+        assert_eq!(
+            read_manifest
+                .manifest_signature
+                .unwrap()
+                .signature
+                .as_bytes()
+                .len(),
+            64
+        );
+        let read_bytes = read_personaldb_snapshot_object(
+            &storage,
+            6,
+            "db-alpha",
+            &manifest,
+            keyring.trust_store(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(read_bytes, bytes);
     }
 
@@ -449,35 +483,62 @@ mod tests {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let bytes = b"zstd sqlite snapshot bytes";
-        let manifest = sample_manifest(&storage, bytes).seal(KEY).unwrap();
+        let keyring = personaldb_protocol_keyring();
+        let manifest = sample_manifest(&storage, bytes)
+            .seal(&keyring)
+            .await
+            .unwrap();
         assert!(
-            write_personaldb_snapshot(&storage, 6, "db-alpha", b"wrong", &manifest, KEY)
-                .await
-                .is_err()
+            write_personaldb_snapshot(
+                &storage,
+                6,
+                "db-alpha",
+                b"wrong",
+                &manifest,
+                keyring.trust_store(),
+            )
+            .await
+            .is_err()
         );
 
         let wrong_scope = PersonalDbSnapshotManifest {
             database_id: "db-beta".to_string(),
             ..sample_manifest(&storage, bytes)
         }
-        .seal(KEY)
+        .seal(&keyring)
+        .await
         .unwrap();
         assert!(
-            write_personaldb_snapshot(&storage, 6, "db-alpha", bytes, &wrong_scope, KEY)
-                .await
-                .is_err()
+            write_personaldb_snapshot(
+                &storage,
+                6,
+                "db-alpha",
+                bytes,
+                &wrong_scope,
+                keyring.trust_store(),
+            )
+            .await
+            .is_err()
         );
 
         let wrong_path = PersonalDbSnapshotManifest {
             snapshot_object_key: "personaldb_snapshot_object:wrong".to_string(),
             ..sample_manifest(&storage, bytes)
         }
-        .seal(KEY)
+        .seal(&keyring)
+        .await
         .unwrap();
         assert!(
-            write_personaldb_snapshot(&storage, 6, "db-alpha", bytes, &wrong_path, KEY)
-                .await
-                .is_err()
+            write_personaldb_snapshot(
+                &storage,
+                6,
+                "db-alpha",
+                bytes,
+                &wrong_path,
+                keyring.trust_store(),
+            )
+            .await
+            .is_err()
         );
     }
 
@@ -486,10 +547,21 @@ mod tests {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let bytes = b"zstd sqlite snapshot bytes";
-        let manifest = sample_manifest(&storage, bytes).seal(KEY).unwrap();
-        write_personaldb_snapshot(&storage, 6, "db-alpha", bytes, &manifest, KEY)
+        let keyring = personaldb_protocol_keyring();
+        let manifest = sample_manifest(&storage, bytes)
+            .seal(&keyring)
             .await
             .unwrap();
+        write_personaldb_snapshot(
+            &storage,
+            6,
+            "db-alpha",
+            bytes,
+            &manifest,
+            keyring.trust_store(),
+        )
+        .await
+        .unwrap();
         write_personaldb_bytes_as_data_locator(
             &storage,
             6,
@@ -505,9 +577,15 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            read_personaldb_snapshot_object(&storage, 6, "db-alpha", &manifest, KEY)
-                .await
-                .is_err()
+            read_personaldb_snapshot_object(
+                &storage,
+                6,
+                "db-alpha",
+                &manifest,
+                keyring.trust_store(),
+            )
+            .await
+            .is_err()
         );
     }
 

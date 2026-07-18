@@ -22,6 +22,7 @@ path = "src/lib.rs"
 [features]
 #Declare an enterprise feature, doesn't activate any depdendencies so leave it with an empty array
 enterprise = []
+test-in-process-personaldb-signers = []
 gcp = ["dep:prost-types", "tonic/tls-ring"]
 routeguide = ["dep:async-stream", "dep:tokio-stream", "dep:rand"]
 reflection = ["dep:tonic-reflection"]
@@ -47,8 +48,10 @@ tonic-prost = ["dep:tonic-prost"]
 
 [dependencies]
 anyhow = { version = "1" }
+async-trait = "0.1"
 base64 = "0.22"
 blake3 = "1.8.2"
+personaldb-protocol = "=0.1.0"
 thiserror = { version = "2.0.16" }
 tokio = { version = "1.47.1", features = ["full"] }
 

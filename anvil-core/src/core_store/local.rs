@@ -542,6 +542,8 @@ struct StoredStreamRecord {
     payload: Vec<u8>,
     content_type: Option<String>,
     user_metadata_json: String,
+    #[serde(default)]
+    authenticated_principal: String,
     transaction_id: Option<String>,
     idempotency_key_hash: Option<String>,
     created_at: String,
@@ -561,6 +563,8 @@ struct StoredStreamRecordIndexRow {
     payload_len: u64,
     content_type: Option<String>,
     user_metadata_json: String,
+    #[serde(default)]
+    authenticated_principal: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     inline_payload: Option<Vec<u8>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -579,6 +583,7 @@ struct StoredStreamIdempotencyRow {
     event_hash: String,
     record_kind: String,
     payload_hash: String,
+    authenticated_principal: String,
     transaction_id: Option<String>,
     idempotency_key_hash: String,
     created_at: String,
@@ -701,6 +706,7 @@ impl From<StoredStreamRecord> for StreamRecord {
             payload: record.payload,
             content_type: record.content_type,
             user_metadata_json: record.user_metadata_json,
+            authenticated_principal: record.authenticated_principal,
             transaction_id: record.transaction_id,
             idempotency_key_hash: record.idempotency_key_hash,
             created_at: record.created_at,
@@ -723,6 +729,7 @@ impl From<&StreamRecord> for StoredStreamRecord {
             payload: record.payload.clone(),
             content_type: record.content_type.clone(),
             user_metadata_json: record.user_metadata_json.clone(),
+            authenticated_principal: record.authenticated_principal.clone(),
             transaction_id: record.transaction_id.clone(),
             idempotency_key_hash: record.idempotency_key_hash.clone(),
             created_at: record.created_at.clone(),
@@ -749,6 +756,7 @@ impl StoredStreamRecordIndexRow {
             payload_len: record.payload.len() as u64,
             content_type: record.content_type.clone(),
             user_metadata_json: record.user_metadata_json.clone(),
+            authenticated_principal: record.authenticated_principal.clone(),
             inline_payload,
             payload_locator,
             transaction_id: record.transaction_id.clone(),
@@ -768,6 +776,7 @@ impl StoredStreamIdempotencyRow {
             event_hash: row.event_hash.clone(),
             record_kind: row.record_kind.clone(),
             payload_hash: row.payload_hash.clone(),
+            authenticated_principal: row.authenticated_principal.clone(),
             transaction_id: row.transaction_id.clone(),
             idempotency_key_hash: row.idempotency_key_hash.clone()?,
             created_at: row.created_at.clone(),

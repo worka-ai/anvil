@@ -50,6 +50,7 @@ pub enum SystemAdminRelation {
     ManageApps,
     ManagePolicies,
     ManageSecretEncryptionKeys,
+    ManagePersonalDbSigningKeys,
     ManageBuckets,
     ManageNodes,
     ManageCells,
@@ -72,6 +73,7 @@ impl SystemAdminRelation {
             Self::ViewSystem => "view_system",
             Self::ManageAdminPrincipals => "manage_admin_principals",
             Self::RotateSecretKeys | Self::ManageSecretEncryptionKeys => "rotate_secret_keys",
+            Self::ManagePersonalDbSigningKeys => "manage_personaldb_signing_keys",
             Self::ManageTenants => "manage_tenants",
             Self::ManageApps => "manage_apps",
             Self::ManagePolicies => "manage_policies",
@@ -293,6 +295,7 @@ fn all_admin_relations() -> &'static [SystemAdminRelation] {
         SystemAdminRelation::ViewSystem,
         SystemAdminRelation::ManageAdminPrincipals,
         SystemAdminRelation::RotateSecretKeys,
+        SystemAdminRelation::ManagePersonalDbSigningKeys,
         SystemAdminRelation::ManageTenants,
         SystemAdminRelation::ManageApps,
         SystemAdminRelation::ManagePolicies,
@@ -588,6 +591,10 @@ fn system_namespace_schema() -> AuthzNamespaceSchema {
             ),
             relation(
                 "rotate_secret_keys",
+                &[inherit_rule("bootstrap_admin"), inherit_rule("admin")],
+            ),
+            relation(
+                "manage_personaldb_signing_keys",
                 &[inherit_rule("bootstrap_admin"), inherit_rule("admin")],
             ),
             relation(
@@ -1408,7 +1415,13 @@ mod tests {
         config.bootstrap_system_admin_subject_kind.clear();
         config.bootstrap_system_admin_subject_id.clear();
 
-        let err = crate::AppState::new(config, None).await.unwrap_err();
+        let err = crate::AppState::new(
+            config,
+            None,
+            crate::test_support::personaldb_protocol_keyring(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("system realm is missing"));
     }
 
@@ -1470,20 +1483,25 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let allowed = check_admin_relation(
-            &storage,
-            &config.mesh_id,
-            &auth::Claims {
-                sub: "admin-principal".to_string(),
-                exp: usize::MAX,
-                tenant_id: 0,
-                jti: None,
-            },
+        for relation in [
             SystemAdminRelation::ManageSecretEncryptionKeys,
-        )
-        .await
-        .unwrap();
-        assert!(allowed);
+            SystemAdminRelation::ManagePersonalDbSigningKeys,
+        ] {
+            let allowed = check_admin_relation(
+                &storage,
+                &config.mesh_id,
+                &auth::Claims {
+                    sub: "admin-principal".to_string(),
+                    exp: usize::MAX,
+                    tenant_id: 0,
+                    jti: None,
+                },
+                relation,
+            )
+            .await
+            .unwrap();
+            assert!(allowed, "bootstrap admin is missing {}", relation.as_str());
+        }
     }
 
     #[tokio::test]

@@ -33,7 +33,9 @@ async fn personaldb_group_create_get_and_catch_up_are_native_api_backed() {
     assert_eq!(manifest.genesis_hash, genesis_hash);
     assert_eq!(manifest.consistency_policy, "StrictWitnessed");
     assert!(!manifest.manifest_hash.is_empty());
-    assert!(!manifest.manifest_signature.is_empty());
+    let signature = manifest.manifest_signature.expect("manifest signature");
+    assert_eq!(signature.signature.len(), 64);
+    assert!(signature.key_id.starts_with("sha256:"));
 
     let head = created.committed_head.expect("committed head");
     assert_eq!(head.log_index, 0);
@@ -42,7 +44,13 @@ async fn personaldb_group_create_get_and_catch_up_are_native_api_backed() {
     assert_eq!(head.policy_epoch, 1);
     assert_eq!(head.membership_epoch, 1);
     assert!(!head.head_hash.is_empty());
-    assert!(!head.head_signature.is_empty());
+    assert_eq!(
+        head.head_signature
+            .expect("committed head signature")
+            .signature
+            .len(),
+        64
+    );
 
     let fetched = client
         .get_personal_db_group(authorized(
@@ -781,10 +789,7 @@ async fn personaldb_submit_builds_snapshot_when_threshold_is_reached() {
     let snapshot_manifest = read_personaldb_snapshot_manifest_by_ref(
         &cluster.states[0].storage,
         &snapshots_head.latest_snapshot_manifest_ref,
-        cluster.states[0]
-            .config
-            .anvil_secret_encryption_key
-            .as_bytes(),
+        cluster.states[0].personaldb_protocol_keyring.trust_store(),
     )
     .await
     .unwrap()
@@ -804,10 +809,7 @@ async fn personaldb_submit_builds_snapshot_when_threshold_is_reached() {
         1,
         &database_id,
         &snapshot_manifest,
-        cluster.states[0]
-            .config
-            .anvil_secret_encryption_key
-            .as_bytes(),
+        cluster.states[0].personaldb_protocol_keyring.trust_store(),
     )
     .await
     .unwrap()

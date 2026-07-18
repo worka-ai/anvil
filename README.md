@@ -151,6 +151,16 @@ docker run --rm \
   "$ANVIL_IMAGE"
 ```
 
+PersonalDB asymmetric signing is an optional in-process capability of the Anvil
+server. It requires no signer sidecars, socket mounts, or signing
+manifest. A server with no PersonalDB signing keys starts normally and retains
+its object, stream, and index behavior. PersonalDB uses Ed25519 evidence only;
+PersonalDB operations that need a signature require an active, purpose-scoped
+key provisioned through the authenticated admin plane with
+`anvil-admin personal-db-signing-key`.
+See [Secrets and Key Management](documentation/content/operators/secrets-and-key-management.md#personaldb-protocol-signing-keys)
+for the custody and rotation model.
+
 After the container is ready, the host can reach only the public plane at `http://127.0.0.1:50051`. The admin listener is bound to loopback inside the container and is deliberately not published to the host. For local admin smoke tests, run `anvil-admin` with `docker exec` so the command executes inside that private boundary; for example, pass `ANVIL_AUTH_TOKEN` into the container and let the in-container CLI call `http://127.0.0.1:50052`.
 
 Tenant applications should use only the public endpoint and the `anvil` CLI or Rust client. If a README example requires the admin CLI to read or write tenant objects, treat that as a documentation bug.

@@ -154,6 +154,26 @@ pub async fn write_personaldb_log_segment(
     Ok(ref_name)
 }
 
+pub fn preview_personaldb_log_segment_ref(input: PersonalDbLogSegmentWrite<'_>) -> Result<String> {
+    if input.source_fence_token == 0 {
+        return Err(anyhow!(
+            "personaldb log segment source fence token must be nonzero"
+        ));
+    }
+    validate_log_segment_records(input.records)?;
+    let start_log_index = input.records.first().expect("validated nonempty").log_index;
+    let end_log_index = input.records.last().expect("validated nonempty").log_index;
+    let body = encode_log_segment_body(input.records)?;
+    let segment_hash = hash32(&body);
+    personaldb_log_segment_ref_name(
+        input.tenant_id,
+        input.database_id,
+        start_log_index,
+        end_log_index,
+        &hex::encode(segment_hash),
+    )
+}
+
 pub async fn read_personaldb_log_segment(
     storage: &Storage,
     segment_ref: &str,

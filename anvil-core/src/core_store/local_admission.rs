@@ -898,6 +898,7 @@ impl CoreStore {
                     idempotency_key: Some(finalisation_idempotency_key),
                 },
                 Some(finalisation_idempotency_hash),
+                String::new(),
             ),
         )
         .await?;

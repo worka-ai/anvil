@@ -475,6 +475,7 @@ impl CoreStore {
                             payload,
                             idempotency_key_hash.as_deref(),
                             Some(&batch.transaction_id),
+                            &batch.committed_by_principal,
                         )
                         .await?;
                     let Some(receipt) = receipt else {
@@ -623,6 +624,7 @@ impl CoreStore {
         payload: &[u8],
         idempotency_key_hash: Option<&str>,
         transaction_id: Option<&str>,
+        authenticated_principal: &str,
     ) -> Result<Option<StreamAppendReceipt>> {
         if let Some(idempotency_key_hash) = idempotency_key_hash {
             return self
@@ -631,6 +633,7 @@ impl CoreStore {
                     payload,
                     Some(idempotency_key_hash),
                     transaction_id,
+                    authenticated_principal,
                 )
                 .await;
         }
@@ -701,17 +704,20 @@ impl CoreStore {
                     {
                         return (visible_updates, Some(format!("{error:#}")));
                     }
-                    self.append_stream_unlocked(AppendStreamRecord {
-                        stream_id: stream_id.clone(),
-                        partition_id: partition_id.clone(),
-                        record_kind: record_kind.clone(),
-                        payload: payload.clone(),
-                        content_type: None,
-                        user_metadata_json: "{}".to_string(),
-                        fence: None,
-                        transaction_id: Some(batch.transaction_id.clone()),
-                        idempotency_key: idempotency_key.clone(),
-                    })
+                    self.append_stream_unlocked_for_principal(
+                        AppendStreamRecord {
+                            stream_id: stream_id.clone(),
+                            partition_id: partition_id.clone(),
+                            record_kind: record_kind.clone(),
+                            payload: payload.clone(),
+                            content_type: None,
+                            user_metadata_json: "{}".to_string(),
+                            fence: None,
+                            transaction_id: Some(batch.transaction_id.clone()),
+                            idempotency_key: idempotency_key.clone(),
+                        },
+                        batch.committed_by_principal.clone(),
+                    )
                     .await
                     .map(|outcome| CoreTransactionUpdate::StreamAppend {
                         stream_id: stream_id.clone(),
@@ -1060,17 +1066,20 @@ impl CoreStore {
                     payload,
                     idempotency_key,
                 } => self
-                    .append_stream_unlocked(AppendStreamRecord {
-                        stream_id: stream_id.clone(),
-                        partition_id: partition_id.clone(),
-                        record_kind: record_kind.clone(),
-                        payload: payload.clone(),
-                        content_type: None,
-                        user_metadata_json: "{}".to_string(),
-                        fence: None,
-                        transaction_id: Some(batch.transaction_id.clone()),
-                        idempotency_key: idempotency_key.clone(),
-                    })
+                    .append_stream_unlocked_for_principal(
+                        AppendStreamRecord {
+                            stream_id: stream_id.clone(),
+                            partition_id: partition_id.clone(),
+                            record_kind: record_kind.clone(),
+                            payload: payload.clone(),
+                            content_type: None,
+                            user_metadata_json: "{}".to_string(),
+                            fence: None,
+                            transaction_id: Some(batch.transaction_id.clone()),
+                            idempotency_key: idempotency_key.clone(),
+                        },
+                        batch.committed_by_principal.clone(),
+                    )
                     .await
                     .map(|outcome| CoreTransactionUpdate::StreamAppend {
                         stream_id: stream_id.clone(),

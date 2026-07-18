@@ -899,6 +899,7 @@ async fn persistence_replays_anvil_owned_state_after_fresh_instance_body() {
             42,
             None,
             None,
+            "tenant/1/principal/test",
         )
         .await
         .unwrap();
@@ -1611,6 +1612,7 @@ async fn persistence_global_journal_writes_use_current_fence_tokens() {
                 13,
                 None,
                 None,
+                "tenant/1/principal/test",
             )
             .await
             .unwrap();

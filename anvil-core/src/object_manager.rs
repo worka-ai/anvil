@@ -135,6 +135,7 @@ pub struct AppendStreamRecordRead {
     pub payload_size: i64,
     pub content_type: Option<String>,
     pub user_metadata: Option<JsonValue>,
+    pub authenticated_principal: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub payload: Option<Vec<u8>>,
 }
@@ -1176,7 +1177,6 @@ impl ObjectManager {
         content_type: Option<String>,
         user_metadata: Option<JsonValue>,
         transaction_id: Option<&str>,
-        transaction_principal: Option<&str>,
     ) -> Result<AppendStreamRecordResult, Status> {
         self.validate_object_path_only(bucket_name, stream_key)?;
         access_control::require_action(
@@ -1188,13 +1188,9 @@ impl ObjectManager {
         )
         .await?;
         let tenant_id = claims.tenant_id;
+        let authenticated_principal = transaction_principal_from_claims(claims);
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
         let stream = if let Some(transaction_id) = transaction_id {
-            let transaction_principal = transaction_principal.ok_or_else(|| {
-                Status::invalid_argument(
-                    "transaction principal is required for append stream append",
-                )
-            })?;
             self.persistence
                 .get_active_append_stream_in_transaction(
                     tenant_id,
@@ -1202,7 +1198,7 @@ impl ObjectManager {
                     stream_key,
                     stream_id,
                     transaction_id,
-                    transaction_principal,
+                    &authenticated_principal,
                 )
                 .await
         } else {
@@ -1237,31 +1233,29 @@ impl ObjectManager {
             .map_err(|e| Status::internal(e.to_string()))?;
         let payload_hash = object_ref.hash.clone();
         self.core_store
-            .append_stream(CoreAppendStreamRecord {
-                stream_id: core_append_stream_id(tenant_id, bucket.id, stream_id),
-                partition_id: core_append_stream_partition_id(tenant_id, bucket.id),
-                record_kind: "append_stream.record".to_string(),
-                payload: core_stream_payload,
-                content_type: content_type.clone(),
-                user_metadata_json: user_metadata
-                    .as_ref()
-                    .map(serde_json::Value::to_string)
-                    .unwrap_or_else(|| "{}".to_string()),
-                fence: None,
-                transaction_id: transaction_id.map(ToOwned::to_owned),
-                idempotency_key: Some(format!(
-                    "append-stream:{tenant_id}:{}:{stream_id}:{}",
-                    bucket.id, stream_payload_mutation_id
-                )),
-            })
+            .append_stream_authenticated(
+                CoreAppendStreamRecord {
+                    stream_id: core_append_stream_id(tenant_id, bucket.id, stream_id),
+                    partition_id: core_append_stream_partition_id(tenant_id, bucket.id),
+                    record_kind: "append_stream.record".to_string(),
+                    payload: core_stream_payload,
+                    content_type: content_type.clone(),
+                    user_metadata_json: user_metadata
+                        .as_ref()
+                        .map(serde_json::Value::to_string)
+                        .unwrap_or_else(|| "{}".to_string()),
+                    fence: None,
+                    transaction_id: transaction_id.map(ToOwned::to_owned),
+                    idempotency_key: Some(format!(
+                        "append-stream:{tenant_id}:{}:{stream_id}:{}",
+                        bucket.id, stream_payload_mutation_id
+                    )),
+                },
+                &authenticated_principal,
+            )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         let mutation = if let Some(transaction_id) = transaction_id {
-            let transaction_principal = transaction_principal.ok_or_else(|| {
-                Status::invalid_argument(
-                    "transaction principal is required for append stream append",
-                )
-            })?;
             self.persistence
                 .append_stream_record_in_transaction(
                     tenant_id,
@@ -1272,7 +1266,7 @@ impl ObjectManager {
                     content_type.clone(),
                     user_metadata.clone(),
                     transaction_id,
-                    transaction_principal,
+                    &authenticated_principal,
                 )
                 .await
         } else {
@@ -1285,6 +1279,7 @@ impl ObjectManager {
                     payload_size,
                     content_type.clone(),
                     user_metadata.clone(),
+                    &authenticated_principal,
                 )
                 .await
         }
@@ -1475,6 +1470,7 @@ impl ObjectManager {
                     .map_err(|_| Status::internal("Append record payload exceeds i64"))?,
                 content_type: record.content_type,
                 user_metadata,
+                authenticated_principal: record.authenticated_principal,
                 created_at: chrono::DateTime::parse_from_rfc3339(&record.created_at)
                     .map_err(|_| Status::internal("Invalid append record timestamp"))?
                     .with_timezone(&chrono::Utc),

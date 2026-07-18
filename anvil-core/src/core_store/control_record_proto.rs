@@ -135,6 +135,8 @@ struct StreamRecordIndexRowProto {
     content_type: Option<String>,
     #[prost(string, tag = "18")]
     user_metadata_json: String,
+    #[prost(string, tag = "19")]
+    authenticated_principal: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -161,6 +163,8 @@ struct StreamIdempotencyRowProto {
     idempotency_key_hash: String,
     #[prost(string, tag = "11")]
     created_at: String,
+    #[prost(string, tag = "12")]
+    authenticated_principal: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -635,6 +639,7 @@ pub(in crate::core_store::local) fn decode_stream_idempotency_row(
         event_hash: proto.event_hash,
         record_kind: proto.record_kind,
         payload_hash: proto.payload_hash,
+        authenticated_principal: proto.authenticated_principal,
         transaction_id: proto.transaction_id,
         idempotency_key_hash: proto.idempotency_key_hash,
         created_at: proto.created_at,
@@ -951,6 +956,7 @@ fn stream_record_index_row_to_proto(
         created_at: value.created_at.clone(),
         content_type: value.content_type.clone(),
         user_metadata_json: value.user_metadata_json.clone(),
+        authenticated_principal: value.authenticated_principal.clone(),
     }
 }
 
@@ -975,6 +981,7 @@ fn stream_idempotency_row_to_proto(
         transaction_id: value.transaction_id.clone(),
         idempotency_key_hash: value.idempotency_key_hash.clone(),
         created_at: value.created_at.clone(),
+        authenticated_principal: value.authenticated_principal.clone(),
     }
 }
 
@@ -1002,6 +1009,7 @@ fn stream_record_index_row_from_proto(
         } else {
             value.user_metadata_json
         },
+        authenticated_principal: value.authenticated_principal,
         inline_payload: value.inline_payload,
         payload_locator: value
             .payload_locator

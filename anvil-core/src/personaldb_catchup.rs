@@ -14,6 +14,7 @@ use crate::{
     storage::Storage,
 };
 use anyhow::{Context, Result, anyhow};
+use personaldb_protocol::PublicKeyTrustStore;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersonalDbCatchUpRequest {
@@ -63,14 +64,14 @@ pub enum PersonalDbSnapshotRestoreReason {
 pub async fn personaldb_catch_up(
     storage: &Storage,
     request: PersonalDbCatchUpRequest,
-    signing_key: &[u8],
+    trust_store: &PublicKeyTrustStore,
 ) -> Result<PersonalDbCatchUpResponse> {
     validate_request(&request)?;
     let Some(committed_head) = read_personaldb_committed_head(
         storage,
         request.tenant_id,
         &request.database_id,
-        signing_key,
+        trust_store,
     )
     .await?
     else {
@@ -78,7 +79,7 @@ pub async fn personaldb_catch_up(
             storage,
             &request,
             None,
-            signing_key,
+            trust_store,
             PersonalDbSnapshotRestoreReason::MissingCommittedHead,
         )
         .await?);
@@ -86,12 +87,12 @@ pub async fn personaldb_catch_up(
 
     let records = read_canonical_records(storage, &request.database_id, &committed_head).await?;
     ensure_head_matches_records(&committed_head, &records)?;
-    if !is_replica_position_on_chain(storage, &request, signing_key, &records).await? {
+    if !is_replica_position_on_chain(storage, &request, trust_store, &records).await? {
         return Ok(snapshot_required(
             storage,
             &request,
             Some(committed_head),
-            signing_key,
+            trust_store,
             PersonalDbSnapshotRestoreReason::DivergentReplica,
         )
         .await?);
@@ -112,7 +113,7 @@ pub async fn personaldb_catch_up(
                 request.tenant_id,
                 &request.database_id,
                 record,
-                signing_key,
+                trust_store,
             )
             .await?,
         );
@@ -190,7 +191,7 @@ fn ensure_head_matches_records(
 async fn is_replica_position_on_chain(
     storage: &Storage,
     request: &PersonalDbCatchUpRequest,
-    signing_key: &[u8],
+    trust_store: &PublicKeyTrustStore,
     records: &[PersonalDbLogRecord],
 ) -> Result<bool> {
     if request.have_log_index == 0 {
@@ -198,7 +199,7 @@ async fn is_replica_position_on_chain(
             storage,
             request.tenant_id,
             &request.database_id,
-            signing_key,
+            trust_store,
         )
         .await?
         else {
@@ -216,14 +217,14 @@ async fn snapshot_required(
     storage: &Storage,
     request: &PersonalDbCatchUpRequest,
     committed_head: Option<PersonalDbCommittedHead>,
-    signing_key: &[u8],
+    trust_store: &PublicKeyTrustStore,
     reason: PersonalDbSnapshotRestoreReason,
 ) -> Result<PersonalDbCatchUpResponse> {
     let snapshots_head = read_personaldb_snapshots_head(
         storage,
         request.tenant_id,
         &request.database_id,
-        signing_key,
+        trust_store,
     )
     .await?;
     Ok(PersonalDbCatchUpResponse::SnapshotRequired(
@@ -240,11 +241,11 @@ async fn load_catch_up_entry(
     tenant_id: i64,
     database_id: &str,
     record: PersonalDbLogRecord,
-    signing_key: &[u8],
+    trust_store: &PublicKeyTrustStore,
 ) -> Result<PersonalDbCatchUpEntry> {
     let changeset_bytes = load_changeset_bytes(storage, tenant_id, database_id, &record).await?;
     let (certificate, certificate_bytes) =
-        load_certificate(storage, tenant_id, database_id, &record, signing_key).await?;
+        load_certificate(storage, tenant_id, database_id, &record, trust_store).await?;
     Ok(PersonalDbCatchUpEntry {
         record,
         changeset_bytes,
@@ -285,14 +286,14 @@ async fn load_certificate(
     tenant_id: i64,
     database_id: &str,
     record: &PersonalDbLogRecord,
-    signing_key: &[u8],
+    trust_store: &PublicKeyTrustStore,
 ) -> Result<(PersonalDbCommitCertificate, Vec<u8>)> {
     let certificate_bytes = if !record.inline_certificate_bytes.is_empty() {
         record.inline_certificate_bytes.clone()
     } else if !record.certificate_ref.is_empty() {
         let certificate_ref = std::str::from_utf8(&record.certificate_ref)?;
         let certificate =
-            read_personaldb_commit_certificate_ref(storage, certificate_ref, signing_key)
+            read_personaldb_commit_certificate_ref(storage, certificate_ref, trust_store)
                 .await?
                 .ok_or_else(|| anyhow!("personaldb commit certificate is missing"))?;
         encode_commit_certificate(&certificate)?
@@ -304,14 +305,14 @@ async fn load_certificate(
             database_id,
             record.log_index,
             &entry_hash,
-            signing_key,
+            trust_store,
         )
         .await?
         .ok_or_else(|| anyhow!("personaldb commit certificate is missing"))?;
         encode_commit_certificate(&certificate)?
     };
     let certificate = decode_commit_certificate(&certificate_bytes)?;
-    certificate.verify(signing_key)?;
+    certificate.verify(trust_store)?;
     let certificate_hash = certificate
         .certificate_hash
         .as_deref()
@@ -386,11 +387,11 @@ mod tests {
             write_personaldb_group_manifest, write_personaldb_snapshots_head,
         },
         personaldb_segment::{PersonalDbLogSegmentWrite, write_personaldb_log_segment},
+        personaldb_signing::PersonalDbProtocolKeyring,
         personaldb_snapshot_store::personaldb_snapshot_manifest_ref_name,
+        test_support::personaldb_protocol_keyring,
     };
     use tempfile::{TempDir, tempdir};
-
-    const KEY: &[u8] = b"personaldb catchup signing key";
 
     #[tokio::test]
     async fn catch_up_from_genesis_returns_entries_with_payloads_and_certificates() {
@@ -406,7 +407,7 @@ mod tests {
                 have_log_hash: fixture.genesis_hash.clone(),
                 max_entries: 2,
             },
-            KEY,
+            fixture.protocol_keyring.trust_store(),
         )
         .await
         .unwrap();
@@ -422,7 +423,10 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&entries.entries[0].certificate_bytes)
                 .is_err()
         );
-        entries.entries[0].certificate.verify(KEY).unwrap();
+        entries.entries[0]
+            .certificate
+            .verify(fixture.protocol_keyring.trust_store())
+            .unwrap();
     }
 
     #[tokio::test]
@@ -439,7 +443,7 @@ mod tests {
                 have_log_hash: hex::encode(fixture.records[0].entry_hash),
                 max_entries: 10,
             },
-            KEY,
+            fixture.protocol_keyring.trust_store(),
         )
         .await
         .unwrap();
@@ -472,7 +476,7 @@ mod tests {
                 have_log_hash: hex::encode([99; 32]),
                 max_entries: 10,
             },
-            KEY,
+            fixture.protocol_keyring.trust_store(),
         )
         .await
         .unwrap();
@@ -495,6 +499,7 @@ mod tests {
     async fn missing_head_gets_snapshot_restore_instruction() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
+        let protocol_keyring = personaldb_protocol_keyring();
         let response = personaldb_catch_up(
             &storage,
             PersonalDbCatchUpRequest {
@@ -506,7 +511,7 @@ mod tests {
                 have_log_hash: hex::encode([0; 32]),
                 max_entries: 10,
             },
-            KEY,
+            protocol_keyring.trust_store(),
         )
         .await
         .unwrap();
@@ -525,15 +530,17 @@ mod tests {
         storage: Storage,
         genesis_hash: String,
         records: Vec<PersonalDbLogRecord>,
+        protocol_keyring: PersonalDbProtocolKeyring,
     }
 
     impl Fixture {
         async fn create() -> Self {
             let temp = tempdir().unwrap();
             let storage = Storage::new_at(temp.path()).await.unwrap();
+            let protocol_keyring = personaldb_protocol_keyring();
             let genesis_hash = hex::encode([0; 32]);
             let manifest = PersonalDbGroupManifest {
-                format_version: 1,
+                format_version: 2,
                 tenant_id: "3".to_string(),
                 database_id: "db-alpha".to_string(),
                 schema_hash: hex::encode([7; 32]),
@@ -549,9 +556,10 @@ mod tests {
                 manifest_hash: None,
                 manifest_signature: None,
             }
-            .seal(KEY)
+            .seal(&protocol_keyring)
+            .await
             .unwrap();
-            write_personaldb_group_manifest(&storage, 3, &manifest, KEY)
+            write_personaldb_group_manifest(&storage, 3, &manifest, protocol_keyring.trust_store())
                 .await
                 .unwrap();
 
@@ -586,7 +594,7 @@ mod tests {
                     Vec::new(),
                 );
                 let certificate = PersonalDbCommitCertificate {
-                    format_version: 1,
+                    format_version: 2,
                     tenant_id: "3".to_string(),
                     database_id: "db-alpha".to_string(),
                     log_index,
@@ -605,12 +613,18 @@ mod tests {
                     certificate_hash: None,
                     witness_signature: None,
                 }
-                .seal(KEY)
+                .seal(&protocol_keyring)
+                .await
                 .unwrap();
-                let certificate_ref =
-                    write_personaldb_commit_certificate(&storage, 3, "db-alpha", &certificate, KEY)
-                        .await
-                        .unwrap();
+                let certificate_ref = write_personaldb_commit_certificate(
+                    &storage,
+                    3,
+                    "db-alpha",
+                    &certificate,
+                    protocol_keyring.trust_store(),
+                )
+                .await
+                .unwrap();
                 let certificate_hash =
                     hex_to_hash(certificate.certificate_hash.as_deref().unwrap());
                 let record = PersonalDbLogRecord::new(
@@ -643,12 +657,12 @@ mod tests {
             .await
             .unwrap();
             let committed = PersonalDbCommittedHead {
-                format_version: 1,
+                format_version: 2,
                 tenant_id: "3".to_string(),
                 database_id: "db-alpha".to_string(),
                 log_index: 3,
                 log_hash: hex::encode(records.last().unwrap().entry_hash),
-                segment_ref: segment_ref,
+                segment_ref,
                 row_index_generation: 0,
                 policy_epoch: 1,
                 membership_epoch: 1,
@@ -658,14 +672,21 @@ mod tests {
                 head_hash: None,
                 head_signature: None,
             }
-            .seal(KEY)
+            .seal(&protocol_keyring)
+            .await
             .unwrap();
-            write_personaldb_committed_head(&storage, 3, "db-alpha", &committed, KEY)
-                .await
-                .unwrap();
+            write_personaldb_committed_head(
+                &storage,
+                3,
+                "db-alpha",
+                &committed,
+                protocol_keyring.trust_store(),
+            )
+            .await
+            .unwrap();
 
             let snapshots = PersonalDbSnapshotsHead {
-                format_version: 1,
+                format_version: 2,
                 tenant_id: "3".to_string(),
                 database_id: "db-alpha".to_string(),
                 latest_snapshot_log_index: 2,
@@ -683,17 +704,25 @@ mod tests {
                 head_hash: None,
                 head_signature: None,
             }
-            .seal(KEY)
+            .seal(&protocol_keyring)
+            .await
             .unwrap();
-            write_personaldb_snapshots_head(&storage, 3, "db-alpha", &snapshots, KEY)
-                .await
-                .unwrap();
+            write_personaldb_snapshots_head(
+                &storage,
+                3,
+                "db-alpha",
+                &snapshots,
+                protocol_keyring.trust_store(),
+            )
+            .await
+            .unwrap();
 
             Self {
                 _temp: temp,
                 storage,
                 genesis_hash,
                 records,
+                protocol_keyring,
             }
         }
     }

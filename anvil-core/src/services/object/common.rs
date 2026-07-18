@@ -31,6 +31,7 @@ pub(super) fn append_stream_record_info(
         content_type: record.content_type.unwrap_or_default(),
         user_metadata_json: json_object_string(record.user_metadata.as_ref()),
         payload: record.payload.unwrap_or_default(),
+        authenticated_principal: record.authenticated_principal,
     }
 }
 

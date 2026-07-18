@@ -19,6 +19,7 @@ Operators should be able to name every secret in a running deployment and answer
 | `ANVIL_SECRET_ENCRYPTION_KEY` | Anvil server processes only | Losing it can make encrypted server-side secrets unrecoverable; leaking it exposes encrypted secret envelopes if storage is also available. |
 | `ANVIL_SECRET_ENCRYPTION_KEY_ID` | Anvil server configuration and operator records | Labels new encrypted envelopes; changing it without changing the key mostly changes metadata, but it must remain consistent and meaningful. |
 | `ANVIL_SECRET_ENCRYPTION_PREVIOUS_KEYS` | Anvil server processes during rotation | Allows old envelopes to decrypt while rotation rewrites them to the active key id. |
+| Purpose-scoped PersonalDB Ed25519 key | The in-process PersonalDB signing provider | Signs one allowed class of PersonalDB control evidence. Private material is held in encrypted System Realm records and is never returned by the admin plane. Loss prevents new signatures for the affected scope; leakage can forge evidence within that key's purpose, generation, scope, and log boundaries. |
 | `CLUSTER_SECRET` | Anvil server processes in the same mesh | Protects cluster gossip metadata; a mismatch can make peers reject each other's signed cluster messages. |
 | Bootstrap first-admin credential | Initial system administrators or provisioning automation | Can mint a token for a powerful system principal until rotated, deleted, or access is otherwise removed. |
 | Tenant/app client secrets | The service or automation that owns the app credential | Can mint short-lived bearer tokens with that app's delegated public policy scopes. |
@@ -47,6 +48,100 @@ anvil-admin key generate-secret-encryption-key
 This command does not contact a server. It prints one random hex value suitable for `ANVIL_SECRET_ENCRYPTION_KEY`. The explanatory warning is printed separately so operators understand that losing the key can make encrypted secrets unrecoverable. Generate one active key for a storage cluster, store it in a secret manager, and inject it only into Anvil server processes. Do not hand it to tenant applications, CI jobs that only call APIs, public CLIs, or operators running network-only admin commands.
 
 The recovery implication is severe: a backup of `STORAGE_PATH` without the key history needed to decrypt its envelopes may be incomplete. A key without the matching storage is also not useful. Backup plans must protect both durable storage and the relevant secret key history.
+
+## PersonalDB Protocol Signing Keys
+
+PersonalDB asymmetric signing is optional and runs inside the Anvil server
+process. It does not require a signer binary, Unix socket, signing manifest, or
+external key-management service. The absence of PersonalDB signing keys must
+not prevent server startup or affect object, stream, or index operations.
+PersonalDB makes a clean break to Ed25519 evidence: an operation that needs a
+PersonalDB signature fails closed when no active key matches its purpose and
+scope, while unrelated Anvil operations remain available.
+
+Provision and rotate keys through authenticated, authorised, and audited admin
+operations. Anvil stores each private key as an encrypted System Realm/CoreStore
+record using the normal server-side secret-encryption keyring. The in-process
+provider decrypts private material only while producing a signature and does not
+return it through admin responses or audit records. Public trust metadata stays
+available for verification without exposing the private key. The admin principal
+must hold the System Realm `manage_personaldb_signing_keys` Zanzibar relation;
+ordinary secret rotation and PersonalDB signing-key custody are separate
+capabilities.
+
+Each key record binds its canonical key ID and generation to one signature
+purpose, tenant/database scopes, validity boundaries in the PersonalDB log,
+status, public key, encrypted PKCS#8 private key, and audit metadata. Keep these
+scopes narrow. A key selected for one purpose must never sign an object for
+another purpose, even when both objects belong to the same database or group.
+
+Anvil signs four classes of PersonalDB server evidence, each with an independent
+key: `group-control`, `proposal-admission`, `snapshot`, and `witness`. Generate
+PKCS#8 DER keys outside the repository with owner-only permissions, then import
+them over the private admin listener. For example:
+
+```bash
+umask 077
+for purpose in group-control proposal-admission snapshot witness; do
+  openssl genpkey -algorithm ED25519 -outform DER -out "$purpose.pk8"
+  anvil-admin personal-db-signing-key import \
+    --private-key-pkcs8 "$purpose.pk8" \
+    --key-generation 1 \
+    --purpose "$purpose" \
+    --status active \
+    --audit-reason "initial PersonalDB signing key provision"
+done
+```
+
+The CLI validates the input file and derives the public key locally; the admin
+response contains only public trust metadata. Delete or move the import files
+into the deployment's approved secret backup after provisioning. Restart Anvil
+when an import or trust-status response reports `runtime_reload_required: true`.
+The server continues to reject new PersonalDB signing work until the required
+purpose is active after that reload.
+
+Inspect public key state with:
+
+```bash
+anvil-admin personal-db-signing-key list
+```
+
+Status transitions are one-way. Use the record revision returned by `list` as
+the expected generation and set an exclusive log boundary when retiring or
+revoking a key:
+
+```bash
+anvil-admin personal-db-signing-key set-status \
+  --key-id 'sha256:<canonical-public-key-id>' \
+  --status retiring \
+  --valid-until-log-index 250000 \
+  --expected-generation 1 \
+  --audit-reason "rotate PersonalDB witness generation"
+```
+
+The storage-backed provider checks current status on every signing operation,
+so a non-active transition stops new signatures immediately. Restart promptly
+when requested so the in-memory verification trust view also reflects the new
+historical boundary.
+
+Key IDs are SHA-256 over `personaldb-protocol`'s canonical deterministic
+protobuf public-key envelope, not over a PEM file or textual public key. The
+provider derives generation, purpose, scopes, status, and log boundaries from
+the durable key record and verifies those constraints before signing. Anvil
+verifies every produced canonical envelope before accepting it. In the current
+Anvil PersonalDB model, the database ID is also the protocol group ID, so a
+non-empty `group_scopes` entry must use that same value. Leave either scope list
+empty only when the key is intentionally unrestricted on that dimension.
+
+For rotation, retain old public keys as `retiring` with an exclusive
+`valid_until_log_index` so historical evidence below that boundary remains
+verifiable, and install a new `active` generation for new signatures.
+`revoked_future` and `compromised` records also require an exclusive
+`valid_until_log_index`; evidence at or after that boundary fails closed.
+Removing an old public key also removes the ability to verify retained history
+that it signed. Include encrypted PersonalDB key records and the server-side
+secret-encryption key history needed to decrypt them in the same backup and
+recovery boundary.
 
 ## Key IDs And Previous Keys
 
