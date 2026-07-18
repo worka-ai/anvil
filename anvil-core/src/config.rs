@@ -19,6 +19,10 @@ pub struct Config {
     #[arg(long, env, default_value = "primary")]
     pub anvil_secret_encryption_key_id: String,
 
+    /// JSON manifest containing trusted PersonalDB Ed25519 keys and role-scoped Unix signers.
+    #[arg(long, env, default_value = "")]
+    pub personaldb_protocol_signing_manifest_path: String,
+
     /// Comma-delimited previous secret encryption keys as `key_id:hex`.
     #[arg(long, env, default_value = "")]
     pub anvil_secret_encryption_previous_keys: String,
@@ -240,6 +244,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use tempfile::tempdir;
 
     fn required_args() -> [&'static str; 9] {
@@ -291,6 +296,60 @@ mod tests {
         let mut invalid_args = required_args().to_vec();
         invalid_args.extend(["--background-worker-concurrency", "0"]);
         assert!(Config::try_parse_from(invalid_args).is_err());
+    }
+
+    #[test]
+    fn production_config_has_no_personaldb_private_key_or_in_process_signer_input() {
+        let command = Config::command();
+        let exposed_inputs = command
+            .get_arguments()
+            .map(|argument| {
+                let mut input = argument.get_id().as_str().to_string();
+                if let Some(long) = argument.get_long() {
+                    input.push(' ');
+                    input.push_str(long);
+                }
+                if let Some(env) = argument.get_env() {
+                    input.push(' ');
+                    input.push_str(&env.to_string_lossy());
+                }
+                input.to_ascii_lowercase()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            exposed_inputs
+                .iter()
+                .any(|input| input.contains("personaldb_protocol_signing_manifest_path")),
+            "the coordinator must expose only the public PersonalDB signing manifest"
+        );
+        for forbidden in [
+            "personaldb_private_key",
+            "personaldb-private-key",
+            "private_key_pkcs8",
+            "private-key-pkcs8",
+            "personaldb_in_process",
+            "personaldb-in-process",
+        ] {
+            assert!(
+                exposed_inputs
+                    .iter()
+                    .all(|input| !input.contains(forbidden)),
+                "production coordinator config unexpectedly exposes {forbidden}"
+            );
+        }
+
+        for forbidden_option in [
+            "--personaldb-private-key-pkcs8-path",
+            "--personaldb-in-process-signer",
+        ] {
+            let mut args = required_args().to_vec();
+            args.extend([forbidden_option, "forbidden"]);
+            assert!(
+                Config::try_parse_from(args).is_err(),
+                "production coordinator accepted {forbidden_option}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@ use super::repair::RepairKindArg;
 use super::*;
 use anvil::anvil_api as api;
 use anvil::anvil_api::admin_service_client::AdminServiceClient;
+use anvil_test_utils::personaldb_test_protocol_keyring;
 use base64::Engine;
 use clap::Parser;
 use std::net::SocketAddr;
@@ -68,7 +69,9 @@ async fn spawn_admin_cli_node() -> AdminCliNode {
         ..anvil::config::Config::default()
     };
 
-    let state = anvil::AppState::new(config, None).await.unwrap();
+    let state = anvil::AppState::new(config, None, personaldb_test_protocol_keyring())
+        .await
+        .unwrap();
     let swarm = anvil::cluster::create_swarm(state.config.clone())
         .await
         .unwrap();

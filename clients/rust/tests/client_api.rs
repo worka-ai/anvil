@@ -92,6 +92,15 @@ fn generated_proto_exports_core_service_types() {
         execution_policy: None,
     };
     assert_eq!(start.purpose, "client-test");
+
+    let append_record = proto::AppendStreamRecordInfo {
+        authenticated_principal: "tenant/7/principal/app-1".to_string(),
+        ..Default::default()
+    };
+    assert_eq!(
+        append_record.authenticated_principal,
+        "tenant/7/principal/app-1"
+    );
 }
 
 #[test]

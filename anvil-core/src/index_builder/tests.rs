@@ -369,6 +369,7 @@ fn typed_json_append_row_extracts_payload_and_metadata() {
         payload_size: 64,
         content_type: Some("application/json".to_string()),
         user_meta: Some(serde_json::json!({"actor": "alice"})),
+        authenticated_principal: "tenant/7/principal/alice".to_string(),
         created_at: Utc::now(),
     };
     let index = index_definition(serde_json::json!({

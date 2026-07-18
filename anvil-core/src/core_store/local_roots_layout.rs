@@ -520,6 +520,7 @@ impl CoreStore {
             payload,
             content_type: row.content_type,
             user_metadata_json: row.user_metadata_json,
+            authenticated_principal: row.authenticated_principal,
             transaction_id: row.transaction_id,
             idempotency_key_hash: row.idempotency_key_hash,
             created_at: row.created_at,

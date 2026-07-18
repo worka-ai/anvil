@@ -15,6 +15,9 @@ pub(super) fn validate_stream_record_index_row_metadata(
     if row.stream_id != stream_id {
         bail!("CoreStore stream record metadata row has invalid scope");
     }
+    if row.authenticated_principal.len() > 4 * 1024 || row.authenticated_principal.contains('\0') {
+        bail!("CoreStore stream record authenticated principal is invalid");
+    }
     Ok(())
 }
 

@@ -46,6 +46,59 @@ const SHARED_CLUSTER_REGIONS: [&str; 6] = [
     DEFAULT_TEST_REGION,
 ];
 
+pub fn personaldb_test_protocol_keyring()
+-> anvil_core::personaldb_signing::PersonalDbProtocolKeyring {
+    use anvil_core::personaldb_signing::PersonalDbProtocolKeyring;
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use personaldb_protocol::{
+        Ed25519ProtocolSigner, Ed25519PublicKey, KeyGeneration, KeyTrustPolicy, ProtocolSigner,
+        PublicKeyTrustRecord, PublicKeyTrustStore, SignaturePurpose,
+    };
+
+    let signer = |private_key_b64: &str,
+                  public_key_b64u: &str,
+                  purpose: SignaturePurpose|
+     -> Arc<dyn ProtocolSigner> {
+        let private_key = STANDARD.decode(private_key_b64).unwrap();
+        let public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(public_key_b64u)
+            .unwrap();
+        let public_key = Ed25519PublicKey::try_from(public_key.as_slice()).unwrap();
+        let policy = KeyTrustPolicy::new(KeyGeneration::new(1).unwrap(), purpose, 0);
+        let record = PublicKeyTrustRecord::new(public_key, policy);
+        Arc::new(
+            Ed25519ProtocolSigner::from_pkcs8_der_with_trust_record(&private_key, record).unwrap(),
+        )
+    };
+    let signers = [
+        signer(
+            "MC4CAQAwBQYDK2VwBCIEIBERERERERERERERERERERERERERERERERERERERERER",
+            "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc",
+            SignaturePurpose::GroupControl,
+        ),
+        signer(
+            "MC4CAQAwBQYDK2VwBCIEIDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8",
+            "VSb3QpQXEbO8UwukT_b22rDwq3Gvgy9Bp_47n9rtnGA",
+            SignaturePurpose::ProposalAdmission,
+        ),
+        signer(
+            "MC4CAQAwBQYDK2VwBCIEICIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIi",
+            "oJql9HpnWYAv-VX43C0qFKXJnSO-l_hkEn_5ODRVpPA",
+            SignaturePurpose::Snapshot,
+        ),
+        signer(
+            "MC4CAQAwBQYDK2VwBCIEIDMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMz",
+            "F8t5-ytBIPKx7GXkGY1uCLKOgT_rAeSkAIObheGAgM4",
+            SignaturePurpose::Witness,
+        ),
+    ];
+    let trust_store = PublicKeyTrustStore::from_records(
+        signers.iter().map(|signer| signer.trust_record().clone()),
+    )
+    .unwrap();
+    PersonalDbProtocolKeyring::new_test_only(trust_store, signers).unwrap()
+}
+
 async fn connect_docker_admin(addr: &str) -> AdminServiceClient<Channel> {
     let mut last_error = None;
     let deadline = Instant::now() + Duration::from_secs(90);
@@ -1244,7 +1297,9 @@ impl TestCluster {
                 .join(format!("node-{node_index:03}-{region_name}"))
                 .to_string_lossy()
                 .into_owned();
-            let state = AppState::new(node_config, None).await.unwrap();
+            let state = AppState::new(node_config, None, personaldb_test_protocol_keyring())
+                .await
+                .unwrap();
             state.persistence.create_region(region_name).await.unwrap();
             let tenant = if let Some(existing) = state
                 .persistence
@@ -1389,7 +1444,9 @@ impl TestCluster {
                 .jwt_manager
                 .mint_token(cfg.node_id.clone(), 0)
                 .unwrap();
-            self.states[i] = AppState::new(cfg, None).await.unwrap();
+            self.states[i] = AppState::new(cfg, None, personaldb_test_protocol_keyring())
+                .await
+                .unwrap();
         }
 
         for i in 0..self.states.len() {

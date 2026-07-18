@@ -516,7 +516,13 @@ mod tests {
             storage_path: temp.path().join("storage").to_string_lossy().into_owned(),
             ..Config::default()
         };
-        let state = AppState::new(config, None).await.unwrap();
+        let state = AppState::new(
+            config,
+            None,
+            crate::test_support::personaldb_protocol_keyring(),
+        )
+        .await
+        .unwrap();
         (temp, state)
     }
 

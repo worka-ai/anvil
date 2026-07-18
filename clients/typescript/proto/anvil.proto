@@ -1818,6 +1818,7 @@ message AppendStreamRecordInfo {
     string content_type = 5;
     string user_metadata_json = 6;
     bytes payload = 7;
+    string authenticated_principal = 8;
 }
 
 message ReadAppendStreamResponse {
@@ -3325,6 +3326,24 @@ message PersonalDbProjectionResponse {
     string projection_definition_json = 1;
 }
 
+enum HashAlgorithmV1 {
+    HASH_ALGORITHM_UNSPECIFIED = 0;
+    HASH_ALGORITHM_SHA256 = 1;
+}
+
+enum SignatureAlgorithmV1 {
+    SIGNATURE_ALGORITHM_UNSPECIFIED = 0;
+    SIGNATURE_ALGORITHM_ED25519 = 1;
+}
+
+message SignatureEnvelopeV1 {
+    uint32 format_version = 1;
+    HashAlgorithmV1 hash_algorithm = 2;
+    SignatureAlgorithmV1 signature_algorithm = 3;
+    string key_id = 4;
+    bytes signature = 5;
+}
+
 message PersonalDbGroupManifestRecord {
     uint32 format_version = 1;
     string tenant_id = 2;
@@ -3340,7 +3359,7 @@ message PersonalDbGroupManifestRecord {
     uint64 current_row_index_generation = 12;
     uint64 current_projection_generation = 13;
     string manifest_hash = 14;
-    string manifest_signature = 15;
+    SignatureEnvelopeV1 manifest_signature = 15;
 }
 
 message PersonalDbCommittedHeadRecord {
@@ -3357,7 +3376,7 @@ message PersonalDbCommittedHeadRecord {
     string updated_at = 11;
     string updated_by_node = 12;
     string head_hash = 13;
-    string head_signature = 14;
+    SignatureEnvelopeV1 head_signature = 14;
 }
 
 message PersonalDbSnapshotsHeadRecord {
@@ -3430,7 +3449,7 @@ message PersonalDbCommitCertificateRecord {
     string witness_node_id = 15;
     string witnessed_at = 16;
     string certificate_hash = 17;
-    string witness_signature = 18;
+    SignatureEnvelopeV1 witness_signature = 18;
 }
 
 message PersonalDbCatchUpRequest {

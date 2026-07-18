@@ -1,4 +1,5 @@
 use crate::{
+    anvil_api::SignatureEnvelopeV1 as WireSignatureEnvelopeV1,
     core_store::{decode_deterministic_proto, encode_deterministic_proto},
     formats::{Hash32, hash32},
     personaldb_control::PersonalDbCommitCertificate,
@@ -7,9 +8,11 @@ use crate::{
         read_personaldb_data_locator_bytes, read_personaldb_data_locator_row,
         write_personaldb_bytes_as_data_locator, write_personaldb_data_locator_row,
     },
+    personaldb_signing::{signature_envelope_from_proto, signature_envelope_to_proto},
     storage::Storage,
 };
 use anyhow::{Result, anyhow};
+use personaldb_protocol::PublicKeyTrustStore;
 use prost::Message;
 
 const PERSONALDB_CHANGESET_BY_INDEX_REF_PREFIX: &str = "personaldb_changeset_payload_by_index:";
@@ -58,8 +61,8 @@ struct PersonalDbCommitCertificateProto {
     witnessed_at: String,
     #[prost(string, optional, tag = "17")]
     certificate_hash: Option<String>,
-    #[prost(string, optional, tag = "18")]
-    witness_signature: Option<String>,
+    #[prost(message, optional, tag = "18")]
+    witness_signature: Option<WireSignatureEnvelopeV1>,
 }
 
 pub async fn write_personaldb_changeset_payload(
@@ -178,9 +181,9 @@ pub async fn write_personaldb_commit_certificate(
     tenant_id: i64,
     database_id: &str,
     certificate: &PersonalDbCommitCertificate,
-    signing_key: &[u8],
+    trust_store: &PublicKeyTrustStore,
 ) -> Result<String> {
-    certificate.verify(signing_key)?;
+    certificate.verify(trust_store)?;
     ensure_scope(
         tenant_id,
         database_id,
@@ -219,17 +222,17 @@ pub async fn read_personaldb_commit_certificate(
     database_id: &str,
     log_index: u64,
     entry_hash: &str,
-    signing_key: &[u8],
+    trust_store: &PublicKeyTrustStore,
 ) -> Result<Option<PersonalDbCommitCertificate>> {
     let ref_name =
         personaldb_commit_certificate_ref_name(tenant_id, database_id, log_index, entry_hash)?;
-    read_personaldb_commit_certificate_ref(storage, &ref_name, signing_key).await
+    read_personaldb_commit_certificate_ref(storage, &ref_name, trust_store).await
 }
 
 pub async fn read_personaldb_commit_certificate_ref(
     storage: &Storage,
     ref_name: &str,
-    signing_key: &[u8],
+    trust_store: &PublicKeyTrustStore,
 ) -> Result<Option<PersonalDbCommitCertificate>> {
     let (tenant_id, database_id) = personaldb_ref_scope(ref_name)?;
     let Some(row) = read_personaldb_data_locator_row(storage, tenant_id, &database_id, ref_name)?
@@ -243,7 +246,7 @@ pub async fn read_personaldb_commit_certificate_ref(
     }
     let bytes = read_personaldb_data_locator_bytes(storage, &row).await?;
     let certificate = decode_commit_certificate(&bytes)?;
-    certificate.verify(signing_key)?;
+    certificate.verify(trust_store)?;
     Ok(Some(certificate))
 }
 
@@ -282,7 +285,10 @@ fn commit_certificate_to_proto(
         witness_node_id: certificate.witness_node_id.clone(),
         witnessed_at: certificate.witnessed_at.clone(),
         certificate_hash: certificate.certificate_hash.clone(),
-        witness_signature: certificate.witness_signature.clone(),
+        witness_signature: certificate
+            .witness_signature
+            .as_ref()
+            .map(signature_envelope_to_proto),
     }
 }
 
@@ -308,7 +314,10 @@ fn commit_certificate_from_proto(
         witness_node_id: proto.witness_node_id,
         witnessed_at: proto.witnessed_at,
         certificate_hash: proto.certificate_hash,
-        witness_signature: proto.witness_signature,
+        witness_signature: proto
+            .witness_signature
+            .map(signature_envelope_from_proto)
+            .transpose()?,
     })
 }
 
@@ -445,9 +454,8 @@ fn decode_core_object_ref_target(target: &str) -> Result<crate::core_store::Core
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::personaldb_protocol_keyring;
     use tempfile::tempdir;
-
-    const KEY: &[u8] = b"personaldb commit signing key";
 
     #[tokio::test]
     async fn changeset_payload_is_written_by_hash_and_index() {
@@ -525,12 +533,18 @@ mod tests {
     async fn commit_certificate_round_trips_through_corestore_ref() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let certificate = sample_certificate().seal(KEY).unwrap();
+        let keyring = personaldb_protocol_keyring();
+        let certificate = sample_certificate().seal(&keyring).await.unwrap();
 
-        let ref_name =
-            write_personaldb_commit_certificate(&storage, 9, "db-alpha", &certificate, KEY)
-                .await
-                .unwrap();
+        let ref_name = write_personaldb_commit_certificate(
+            &storage,
+            9,
+            "db-alpha",
+            &certificate,
+            keyring.trust_store(),
+        )
+        .await
+        .unwrap();
 
         assert!(ref_name.starts_with(
             "personaldb_commit_certificate:tenant:9:database:db-alpha:log:00000000000000000042:"
@@ -542,23 +556,33 @@ mod tests {
             "db-alpha",
             42,
             &certificate.entry_hash,
-            KEY,
+            keyring.trust_store(),
         )
         .await
         .unwrap()
         .unwrap();
         assert_eq!(read, certificate);
+        assert_eq!(
+            read.witness_signature.unwrap().signature.as_bytes().len(),
+            64
+        );
     }
 
     #[tokio::test]
     async fn commit_certificate_tamper_and_scope_mismatch_are_rejected() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let certificate = sample_certificate().seal(KEY).unwrap();
-        let ref_name =
-            write_personaldb_commit_certificate(&storage, 9, "db-alpha", &certificate, KEY)
-                .await
-                .unwrap();
+        let keyring = personaldb_protocol_keyring();
+        let certificate = sample_certificate().seal(&keyring).await.unwrap();
+        let ref_name = write_personaldb_commit_certificate(
+            &storage,
+            9,
+            "db-alpha",
+            &certificate,
+            keyring.trust_store(),
+        )
+        .await
+        .unwrap();
 
         let row = read_personaldb_data_locator_row(&storage, 9, "db-alpha", &ref_name)
             .unwrap()
@@ -590,7 +614,7 @@ mod tests {
                 "db-alpha",
                 42,
                 &certificate.entry_hash,
-                KEY,
+                keyring.trust_store(),
             )
             .await
             .is_err()
@@ -600,18 +624,25 @@ mod tests {
             database_id: "db-beta".to_string(),
             ..sample_certificate()
         }
-        .seal(KEY)
+        .seal(&keyring)
+        .await
         .unwrap();
         assert!(
-            write_personaldb_commit_certificate(&storage, 9, "db-alpha", &wrong_scope, KEY)
-                .await
-                .is_err()
+            write_personaldb_commit_certificate(
+                &storage,
+                9,
+                "db-alpha",
+                &wrong_scope,
+                keyring.trust_store(),
+            )
+            .await
+            .is_err()
         );
     }
 
     fn sample_certificate() -> PersonalDbCommitCertificate {
         PersonalDbCommitCertificate {
-            format_version: 1,
+            format_version: 2,
             tenant_id: "9".to_string(),
             database_id: "db-alpha".to_string(),
             log_index: 42,

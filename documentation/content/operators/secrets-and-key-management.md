@@ -19,6 +19,8 @@ Operators should be able to name every secret in a running deployment and answer
 | `ANVIL_SECRET_ENCRYPTION_KEY` | Anvil server processes only | Losing it can make encrypted server-side secrets unrecoverable; leaking it exposes encrypted secret envelopes if storage is also available. |
 | `ANVIL_SECRET_ENCRYPTION_KEY_ID` | Anvil server configuration and operator records | Labels new encrypted envelopes; changing it without changing the key mostly changes metadata, but it must remain consistent and meaningful. |
 | `ANVIL_SECRET_ENCRYPTION_PREVIOUS_KEYS` | Anvil server processes during rotation | Allows old envelopes to decrypt while rotation rewrites them to the active key id. |
+| `PERSONALDB_PROTOCOL_SIGNING_MANIFEST_PATH` | Anvil coordinators and role-scoped signer processes | Supplies public trust records and distinct Unix signer endpoints. It contains no private key. |
+| Purpose-scoped PersonalDB PKCS#8 key | Only the matching `anvil-signer` process | Signs one allowed class of PersonalDB control evidence; loss prevents new signatures for that purpose, while leakage can forge evidence within the key's scope, generation, and log boundaries. |
 | `CLUSTER_SECRET` | Anvil server processes in the same mesh | Protects cluster gossip metadata; a mismatch can make peers reject each other's signed cluster messages. |
 | Bootstrap first-admin credential | Initial system administrators or provisioning automation | Can mint a token for a powerful system principal until rotated, deleted, or access is otherwise removed. |
 | Tenant/app client secrets | The service or automation that owns the app credential | Can mint short-lived bearer tokens with that app's delegated public policy scopes. |
@@ -47,6 +49,94 @@ anvil-admin key generate-secret-encryption-key
 This command does not contact a server. It prints one random hex value suitable for `ANVIL_SECRET_ENCRYPTION_KEY`. The explanatory warning is printed separately so operators understand that losing the key can make encrypted secrets unrecoverable. Generate one active key for a storage cluster, store it in a secret manager, and inject it only into Anvil server processes. Do not hand it to tenant applications, CI jobs that only call APIs, public CLIs, or operators running network-only admin commands.
 
 The recovery implication is severe: a backup of `STORAGE_PATH` without the key history needed to decrypt its envelopes may be incomplete. A key without the matching storage is also not useful. Backup plans must protect both durable storage and the relevant secret key history.
+
+## PersonalDB Protocol Signing Keys
+
+`PERSONALDB_PROTOCOL_SIGNING_MANIFEST_PATH` is mandatory at coordinator
+startup. It names a JSON manifest containing trusted Ed25519 public keys and
+three purpose-separated Unix-domain signer endpoints. The coordinator does not
+load private keys and has no file-backed signing mode. These four protocol
+objects have no production HMAC or unsigned fallback.
+
+Run one `anvil-signer` process for each purpose: `group-control`, `snapshot`,
+and `witness`. Use a separate Unix account or container boundary and a separate
+PKCS#8 Ed25519 private key for every process. Private-key files must be regular,
+non-symlink files and must not be accessible by group or other users. Create
+each socket parent as a mode-`0700` directory. The signer creates a mode-`0600`
+socket, verifies the connecting process UID against its explicit allowlist, and
+accepts only the bounded typed PersonalDB objects allowed for its purpose.
+
+The version-1 manifest has this shape:
+
+```json
+{
+  "format_version": 1,
+  "trusted_keys": [
+    {
+      "format_version": 1,
+      "signature_algorithm": "ed25519",
+      "key_id": "sha256:<64 lowercase hex>",
+      "key_generation": 1,
+      "purpose": "witness",
+      "public_key_b64u": "<32 raw bytes as unpadded base64url>",
+      "database_scopes": ["pdb_example"],
+      "group_scopes": ["pdb_example"],
+      "valid_from_log_index": 0,
+      "valid_until_log_index": null,
+      "status": "active"
+    }
+  ],
+  "signer_endpoints": [
+    {
+      "purpose": "witness",
+      "key_id": "sha256:<same canonical public-key ID>",
+      "socket_path": "/run/anvil-signers/witness/sign.sock"
+    }
+  ]
+}
+```
+
+Provide exactly one endpoint for each of the three purposes. Socket paths and
+active key IDs must be distinct. Every endpoint key must exist as an active
+trust record for the exact same purpose; missing, overlapping, or
+wrong-purpose bindings stop coordinator startup. Legacy `signers` entries with
+`private_key_pkcs8_path` are rejected.
+
+Start a witness signer with configuration equivalent to:
+
+```bash
+anvil-signer \
+  --trust-manifest-path /run/anvil/personaldb-signing.json \
+  --purpose witness \
+  --key-id 'sha256:<canonical public-key ID>' \
+  --socket-path /run/anvil-signers/witness/sign.sock \
+  --private-key-pkcs8-path /run/secrets/witness/key.pk8 \
+  --allowed-peer-uid 10001
+```
+
+Repeat with independent directories, keys, key IDs, and processes for
+`group-control` and `snapshot`. Never mount `/run/secrets/witness` or another
+signer key directory into an `anvil-server` container.
+
+Key IDs are SHA-256 over `personaldb-protocol`'s canonical deterministic
+protobuf public-key envelope, not over a PEM file or textual public key. The
+signer derives generation, purpose, scopes, status, and log boundaries from the
+matching trusted-key record; none of those values are duplicated in a signature
+envelope. The signer checks that its private key, configured purpose, endpoint,
+key ID, peer allowlist, and active trust record agree before binding its socket.
+The coordinator verifies every returned canonical envelope against its own
+trust store before accepting it. In the current Anvil PersonalDB model, the
+database ID is also the protocol group ID, so a non-empty `group_scopes` entry
+must use that same value. Leave either scope list empty only when the key is
+intentionally unrestricted on that dimension.
+
+For rotation, retain old public keys as `retiring` with an exclusive
+`valid_until_log_index` so historical evidence below that boundary remains
+verifiable, and install a new `active` generation for new signatures.
+`revoked_future` and `compromised` records also require an exclusive
+`valid_until_log_index`; evidence at or after that boundary fails closed.
+Removing an old public key also removes the ability to verify retained history
+that it signed.
 
 ## Key IDs And Previous Keys
 

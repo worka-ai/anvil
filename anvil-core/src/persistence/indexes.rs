@@ -669,6 +669,7 @@ impl Persistence {
         &self,
         tenant_id: i64,
         database_id: &str,
+        trust_store: &personaldb_protocol::PublicKeyTrustStore,
     ) -> Result<personaldb_repair::PersonalDbLogChainRepairReport> {
         let scope_id = format!("tenant-{tenant_id}-database-{database_id}");
         let permit = self.repair_write_permit("personaldb", &scope_id).await?;
@@ -677,7 +678,7 @@ impl Persistence {
             tenant_id,
             database_id,
             permit.fence_token,
-            &self.personaldb_signing_key,
+            trust_store,
             &self.partition_owner_signing_key,
         )
         .await

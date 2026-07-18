@@ -1,0 +1,31 @@
+[package]
+name = "anvil-personaldb-signer"
+version.workspace = true
+edition.workspace = true
+description = "Purpose-scoped Unix signer for typed Anvil PersonalDB protocol objects"
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+readme.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "anvil-signer"
+path = "src/main.rs"
+
+[dependencies]
+anvil-core = { package = "anvil-storage-core", path = "../anvil-core", version = "0.3.0" }
+anyhow = "1"
+clap = { version = "4.5.48", features = ["derive", "env"] }
+hex = "0.4.3"
+personaldb-protocol = { git = "ssh://git@github.com/worka-ai/personaldb.git", rev = "41295b43cd4634e77ab5b6bf411e5233217838b0" }
+tokio = { version = "1.47.1", features = ["macros", "net", "rt-multi-thread", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3.10.1"

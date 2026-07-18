@@ -58,7 +58,7 @@ pub(super) fn group_manifest_record(
         current_row_index_generation: manifest.current_row_index_generation,
         current_projection_generation: manifest.current_projection_generation,
         manifest_hash: manifest.manifest_hash.unwrap_or_default(),
-        manifest_signature: manifest.manifest_signature.unwrap_or_default(),
+        manifest_signature: manifest.manifest_signature.map(signature_envelope_record),
     }
 }
 
@@ -79,7 +79,7 @@ pub(super) fn committed_head_record(
         updated_at: head.updated_at,
         updated_by_node: head.updated_by_node,
         head_hash: head.head_hash.unwrap_or_default(),
-        head_signature: head.head_signature.unwrap_or_default(),
+        head_signature: head.head_signature.map(signature_envelope_record),
     }
 }
 
@@ -122,8 +122,14 @@ pub(super) fn certificate_record(
         witness_node_id: certificate.witness_node_id,
         witnessed_at: certificate.witnessed_at,
         certificate_hash: certificate.certificate_hash.unwrap_or_default(),
-        witness_signature: certificate.witness_signature.unwrap_or_default(),
+        witness_signature: certificate.witness_signature.map(signature_envelope_record),
     }
+}
+
+fn signature_envelope_record(
+    envelope: personaldb_protocol::SignatureEnvelopeV1,
+) -> SignatureEnvelopeV1 {
+    crate::personaldb_signing::signature_envelope_to_proto(&envelope)
 }
 
 pub(super) fn log_record(

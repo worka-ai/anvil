@@ -11,6 +11,7 @@ use crate::{
     partition_fence::{
         PartitionOwnerStatus, PartitionRecoveryAcquire, PartitionWritePermit,
         acquire_partition_recovery, partition_write_precondition, publish_partition_ready,
+        read_partition_owner,
     },
     permissions::AnvilAction,
     personaldb_catchup::{
@@ -19,6 +20,7 @@ use crate::{
         personaldb_catch_up,
     },
     personaldb_commit_store::{
+        decode_commit_certificate, personaldb_commit_certificate_ref_name,
         write_personaldb_changeset_payload, write_personaldb_commit_certificate,
     },
     personaldb_control::{PersonalDbCommitCertificate, PersonalDbGroupManifest},
@@ -27,9 +29,10 @@ use crate::{
         derive_verified_mutation_envelope,
     },
     personaldb_heads::{
-        PersonalDbCommittedHead, PersonalDbSnapshotsHead, read_personaldb_committed_head,
-        read_personaldb_group_manifest, write_personaldb_committed_head,
-        write_personaldb_committed_head_with_preconditions, write_personaldb_group_manifest,
+        PersonalDbCommittedHead, PersonalDbSnapshotsHead, decode_committed_head,
+        read_personaldb_committed_head, read_personaldb_group_manifest,
+        write_personaldb_committed_head, write_personaldb_committed_head_with_preconditions,
+        write_personaldb_group_manifest,
     },
     personaldb_projection::{
         ProjectionDefinition, WriteBackPolicy, list_projection_definitions_for_database,
@@ -43,18 +46,28 @@ use crate::{
     personaldb_projection_writeback::{
         ProjectionWriteBackInput, build_projection_writeback_changeset,
     },
+    personaldb_proposal_admission::{
+        BeginWitnessSigningV1, PersonalDbAdmissionAuthority,
+        ProposalAdmissionReservationIdentityV1, ProposalIdempotencyClaimIdentityV1,
+        SignCertificateAndHeadV1, acknowledge_personaldb_witness_receipt,
+        begin_personaldb_witness_signing, commit_personaldb_witnessed_proposal,
+        derive_reservation_id, personaldb_group_leader_lease_id, reserve_personaldb_proposal,
+        sign_personaldb_certificate_and_head_with_keyring,
+    },
     personaldb_row_index::{PersonalDbRowIndexWrite, write_personaldb_row_index},
     personaldb_schema::{
         read_personaldb_schema_sql, validate_changeset_tables_registered, validate_schema_sql,
         write_personaldb_schema_sql,
     },
-    personaldb_segment::{PersonalDbLogSegmentWrite, write_personaldb_log_segment},
+    personaldb_segment::{
+        PersonalDbLogSegmentWrite, preview_personaldb_log_segment_ref, write_personaldb_log_segment,
+    },
     personaldb_snapshot_builder::{
         PersonalDbSnapshotBuildRequest, PersonalDbSnapshotPolicy, maybe_build_personaldb_snapshot,
     },
     personaldb_submit::{
-        SubmitPersonalDbChangeset as CoreSubmitChangeset, default_max_changeset_size,
-        validate_submit_personaldb_changeset,
+        SubmitPersonalDbChangeset as CoreSubmitChangeset, client_proposal_hash,
+        default_max_changeset_size, validate_submit_personaldb_changeset,
     },
     personaldb_watch::{
         PersonalDbGroupWatchEvent, PersonalDbGroupWatchPayload, PersonalDbProjectionWatchEvent,
@@ -65,6 +78,7 @@ use crate::{
     },
     services::watch_envelope::{self, WatchEnvelopeParts},
 };
+use personaldb_protocol::SignaturePurpose;
 use tokio::sync::OwnedMutexGuard;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -76,6 +90,7 @@ struct PersonalDbCommitActor {
     principal: String,
     bearer_token: Option<String>,
     require_public_commit_authorization: bool,
+    require_admission_protocol: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -124,12 +139,12 @@ impl PersonalDbService for AppState {
             &resource,
         )
         .await?;
-        let signing_key = self.personaldb_signing_key();
+        let protocol_keyring = self.personaldb_protocol_keyring.as_ref();
         if read_personaldb_group_manifest(
             &self.storage,
             claims.tenant_id,
             &req.database_id,
-            signing_key,
+            protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -144,7 +159,7 @@ impl PersonalDbService for AppState {
 
         let now = now_rfc3339();
         let manifest = PersonalDbGroupManifest {
-            format_version: 1,
+            format_version: 2,
             tenant_id: claims.tenant_id.to_string(),
             database_id: req.database_id.clone(),
             schema_hash: req.schema_hash.clone(),
@@ -160,7 +175,8 @@ impl PersonalDbService for AppState {
             manifest_hash: None,
             manifest_signature: None,
         }
-        .seal(signing_key)
+        .seal(protocol_keyring)
+        .await
         .map_err(internal_status)?;
         write_personaldb_schema_sql(
             &self.storage,
@@ -171,12 +187,17 @@ impl PersonalDbService for AppState {
         )
         .await
         .map_err(internal_status)?;
-        write_personaldb_group_manifest(&self.storage, claims.tenant_id, &manifest, signing_key)
-            .await
-            .map_err(internal_status)?;
+        write_personaldb_group_manifest(
+            &self.storage,
+            claims.tenant_id,
+            &manifest,
+            protocol_keyring.trust_store(),
+        )
+        .await
+        .map_err(internal_status)?;
 
         let committed_head = PersonalDbCommittedHead {
-            format_version: 1,
+            format_version: 2,
             tenant_id: claims.tenant_id.to_string(),
             database_id: req.database_id,
             log_index: 0,
@@ -191,14 +212,15 @@ impl PersonalDbService for AppState {
             head_hash: None,
             head_signature: None,
         }
-        .seal(signing_key)
+        .seal(protocol_keyring)
+        .await
         .map_err(internal_status)?;
         write_personaldb_committed_head(
             &self.storage,
             claims.tenant_id,
             &committed_head.database_id,
             &committed_head,
-            signing_key,
+            protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?;
@@ -237,12 +259,11 @@ impl PersonalDbService for AppState {
         {
             return Err(Status::permission_denied("Permission denied"));
         }
-        let signing_key = self.personaldb_signing_key();
         let manifest = read_personaldb_group_manifest(
             &self.storage,
             claims.tenant_id,
             &req.database_id,
-            signing_key,
+            self.personaldb_protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -251,7 +272,7 @@ impl PersonalDbService for AppState {
             &self.storage,
             claims.tenant_id,
             &req.database_id,
-            signing_key,
+            self.personaldb_protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?;
@@ -288,12 +309,11 @@ impl PersonalDbService for AppState {
             &resource,
         )
         .await?;
-        let signing_key = self.personaldb_signing_key();
         read_personaldb_group_manifest(
             &self.storage,
             claims.tenant_id,
             &req.database_id,
-            signing_key,
+            self.personaldb_protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -304,7 +324,7 @@ impl PersonalDbService for AppState {
                 &self.storage,
                 claims.tenant_id,
                 source_database_id,
-                signing_key,
+                self.personaldb_protocol_keyring.trust_store(),
             )
             .await
             .map_err(internal_status)?
@@ -386,6 +406,7 @@ impl PersonalDbService for AppState {
             principal: claims.sub.clone(),
             bearer_token: Some(bearer_token),
             require_public_commit_authorization: true,
+            require_admission_protocol: true,
         };
         let projection_definitions = list_projection_definitions_for_database(
             &self.storage,
@@ -445,7 +466,8 @@ impl PersonalDbService for AppState {
                 have_log_hash: req.have_log_hash,
                 max_entries: nonzero_limit(req.max_entries),
             },
-            self.personaldb_signing_key(),
+            self.personaldb_snapshots_head_signing_key(),
+            self.personaldb_protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?;
@@ -596,7 +618,7 @@ impl PersonalDbService for AppState {
 }
 
 impl AppState {
-    fn personaldb_signing_key(&self) -> &[u8] {
+    fn personaldb_snapshots_head_signing_key(&self) -> &[u8] {
         self.config.anvil_secret_encryption_key.as_bytes()
     }
 
@@ -754,12 +776,11 @@ impl AppState {
         actor: PersonalDbCommitActor,
         definition: ProjectionDefinition,
     ) -> Result<Response<SubmitPersonalDbChangesetResponse>, Status> {
-        let signing_key = self.personaldb_signing_key();
         let projection_manifest = read_personaldb_group_manifest(
             &self.storage,
             actor.tenant_id,
             &definition.database_id,
-            signing_key,
+            self.personaldb_protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -768,7 +789,7 @@ impl AppState {
             &self.storage,
             actor.tenant_id,
             &definition.database_id,
-            signing_key,
+            self.personaldb_protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -794,7 +815,7 @@ impl AppState {
             &self.storage,
             actor.tenant_id,
             &source_database_id,
-            signing_key,
+            self.personaldb_protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -803,7 +824,7 @@ impl AppState {
             &self.storage,
             actor.tenant_id,
             &source_database_id,
-            signing_key,
+            self.personaldb_protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -903,12 +924,13 @@ impl AppState {
         let _commit_guard = self
             .personaldb_commit_guard(actor.tenant_id, &validated.request.database_id)
             .await;
-        let signing_key = self.personaldb_signing_key();
+        let snapshots_head_signing_key = self.personaldb_snapshots_head_signing_key();
+        let protocol_keyring = self.personaldb_protocol_keyring.as_ref();
         let manifest = read_personaldb_group_manifest(
             &self.storage,
             actor.tenant_id,
             &validated.request.database_id,
-            signing_key,
+            protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -917,7 +939,7 @@ impl AppState {
             &self.storage,
             actor.tenant_id,
             &validated.request.database_id,
-            signing_key,
+            protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -950,7 +972,7 @@ impl AppState {
             &self.storage,
             actor.tenant_id,
             &validated.request.database_id,
-            signing_key,
+            protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -963,6 +985,21 @@ impl AppState {
                 "PersonalDB committed head changed during partition handoff",
             ));
         }
+        let partition_owner = if actor.require_admission_protocol {
+            Some(
+                read_partition_owner(
+                    &self.storage,
+                    &write_permit.partition_family,
+                    &write_permit.partition_id,
+                    self.persistence.partition_owner_signing_key(),
+                )
+                .await
+                .map_err(internal_status)?
+                .ok_or_else(|| Status::failed_precondition("PersonalDB partition owner missing"))?,
+            )
+        } else {
+            None
+        };
 
         let changes = iterate_changeset(&validated.request.changeset_bytes)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
@@ -1010,6 +1047,94 @@ impl AppState {
         let envelope_hash = envelope.envelope_hash32().map_err(internal_status)?;
         let previous_log_hash = hex32_status(&previous_head.log_hash, "committed head log hash")?;
         let schema_hash = hex32_status(&manifest.schema_hash, "schema hash")?;
+        let admission_reservation = if actor.require_admission_protocol {
+            let partition_owner = partition_owner
+                .as_ref()
+                .ok_or_else(|| Status::internal("PersonalDB partition owner not loaded"))?;
+            let proposal_record = protocol_keyring
+                .trust_record_for_purpose(SignaturePurpose::ProposalAdmission)
+                .map_err(internal_status)?;
+            let witness_record = protocol_keyring
+                .trust_record_for_purpose(SignaturePurpose::Witness)
+                .map_err(internal_status)?;
+            let now_unix_seconds = updated_at.timestamp();
+            let workflow_id = format!(
+                "personaldb-submit:{}:{}",
+                validated.request.database_id, validated.request.idempotency_key
+            );
+            let claim = ProposalIdempotencyClaimIdentityV1 {
+                format_version: 1,
+                tenant_id: actor.tenant_id.to_string(),
+                application_id: actor.principal.clone(),
+                operation_id: "personaldb.submit_changeset.v1".to_string(),
+                request_id: validated.request.request_id.clone(),
+                database_id: validated.request.database_id.clone(),
+                client_proposal_hash_sha256: client_proposal_hash(&validated),
+                changeset_payload_hash_sha256: validated.changeset_payload_hash,
+                workflow_id: workflow_id.clone(),
+                fencing_generation: write_permit.fence_token,
+            };
+            let claim_hash = claim.hash_sha256().map_err(internal_status)?;
+            let authorization_receipt_sha256 = hash32(
+                format!(
+                    "anvil-personaldb-authorization-receipt-v1\0{}\0{}\0{}\0{}",
+                    actor.tenant_id,
+                    validated.request.database_id,
+                    authz_revision,
+                    hex::encode(envelope_hash)
+                )
+                .as_bytes(),
+            );
+            let identity = ProposalAdmissionReservationIdentityV1 {
+                format_version: 1,
+                reservation_id: derive_reservation_id(&validated.request.database_id, claim_hash)
+                    .map_err(internal_status)?,
+                database_id: validated.request.database_id.clone(),
+                group_kind: "source".to_string(),
+                proposer_id: actor.principal.clone(),
+                client_proposal_hash_sha256: claim.client_proposal_hash_sha256,
+                changeset_payload_hash_sha256: claim.changeset_payload_hash_sha256,
+                expected_previous_log_index: previous_head.log_index,
+                expected_previous_log_hash_sha256: previous_log_hash,
+                membership_revision: manifest.active_membership_epoch,
+                placement_epoch: u64::from(manifest.object_layout_version).max(1),
+                client_log_epoch: validated.request.client_log_epoch,
+                workflow_id,
+                fencing_generation: write_permit.fence_token,
+                leader_lease_id: personaldb_group_leader_lease_id(partition_owner),
+                leader_lease_revision: partition_owner.recovery_epoch,
+                authorization_receipt_sha256,
+                authorization_revision: authz_revision,
+                idempotency_claim_sha256: claim_hash,
+                issued_at_unix_seconds: now_unix_seconds,
+                expires_at_unix_seconds: now_unix_seconds + 300,
+                selected_voter_ids: validated
+                    .request
+                    .voter_acks
+                    .iter()
+                    .map(|ack| ack.replica_id.clone())
+                    .collect(),
+                primary_server_id: write_permit.owner_node_id.clone(),
+                proposal_admission_key_id: proposal_record.key_id.to_string(),
+                proposal_admission_generation: proposal_record.key_generation.get(),
+                witness_key_id: witness_record.key_id.to_string(),
+                witness_key_generation: witness_record.key_generation.get(),
+            };
+            let authority = PersonalDbAdmissionAuthority {
+                storage: &self.storage,
+                trust_store: protocol_keyring.trust_store(),
+                write_permit: &write_permit,
+                partition_owner_signing_key: self.persistence.partition_owner_signing_key(),
+                now_unix_seconds,
+            };
+            Some(
+                reserve_personaldb_proposal(&authority, claim, identity)
+                    .await
+                    .map_err(internal_status)?,
+            )
+        } else {
+            None
+        };
         let payload_paths = write_personaldb_changeset_payload(
             &self.storage,
             actor.tenant_id,
@@ -1035,8 +1160,18 @@ impl AppState {
             Vec::new(),
             Vec::new(),
         );
-        let certificate = PersonalDbCommitCertificate {
-            format_version: 1,
+        let leader_replica_id = if actor.require_admission_protocol {
+            write_permit.owner_node_id.clone()
+        } else {
+            validated.request.leader_replica_id.clone()
+        };
+        let witness_node_id = if actor.require_admission_protocol {
+            write_permit.owner_node_id.clone()
+        } else {
+            actor.principal.clone()
+        };
+        let unsigned_certificate = PersonalDbCommitCertificate {
+            format_version: 2,
             tenant_id: actor.tenant_id.to_string(),
             database_id: validated.request.database_id.clone(),
             log_index: proposed_log_index,
@@ -1047,25 +1182,212 @@ impl AppState {
             client_log_epoch: validated.request.client_log_epoch,
             membership_epoch: validated.request.membership_epoch,
             policy_epoch: validated.request.policy_epoch,
-            leader_replica_id: validated.request.leader_replica_id.clone(),
+            leader_replica_id,
             voter_acks_hash: hex::encode(validated.voter_acks_hash),
             authz_revision,
-            witness_node_id: actor.principal.clone(),
+            witness_node_id,
             witnessed_at: now_rfc3339(),
             certificate_hash: None,
             witness_signature: None,
-        }
-        .seal(signing_key)
-        .map_err(internal_status)?;
-        let certificate_ref = write_personaldb_commit_certificate(
-            &self.storage,
-            actor.tenant_id,
-            &validated.request.database_id,
-            &certificate,
-            signing_key,
-        )
-        .await
-        .map_err(internal_status)?;
+        };
+        let row_index_records = envelope.row_index_upserts().map_err(internal_status)?;
+        let row_index_generation = if row_index_records.is_empty() {
+            previous_head.row_index_generation
+        } else {
+            previous_head
+                .row_index_generation
+                .checked_add(1)
+                .ok_or_else(|| Status::failed_precondition("PersonalDB row index overflow"))?
+        };
+        let mut admission_terminal_request = None;
+        let (certificate, record, committed_head) =
+            if let Some(reservation) = admission_reservation.as_ref() {
+                let certificate_hash_hex =
+                    crate::personaldb_control::hash_commit_certificate(&unsigned_certificate)
+                        .map_err(internal_status)?;
+                let certificate_hash = hex32_status(&certificate_hash_hex, "certificate hash")?;
+                let certificate_ref = personaldb_commit_certificate_ref_name(
+                    actor.tenant_id,
+                    &validated.request.database_id,
+                    proposed_log_index,
+                    &unsigned_certificate.entry_hash,
+                )
+                .map_err(internal_status)?;
+                let record = CorePersonalDbLogRecord::new(
+                    proposed_log_index,
+                    validated.request.client_log_epoch,
+                    validated.request.membership_epoch,
+                    validated.request.policy_epoch,
+                    previous_log_hash,
+                    validated.changeset_payload_hash,
+                    envelope_hash,
+                    certificate_hash,
+                    payload_ref.clone(),
+                    certificate_ref.clone().into_bytes(),
+                    Vec::new(),
+                );
+                let segment_ref = preview_personaldb_log_segment_ref(PersonalDbLogSegmentWrite {
+                    tenant_id: actor.tenant_id,
+                    database_id: &validated.request.database_id,
+                    schema_hash,
+                    source_fence_token: write_permit.fence_token,
+                    records: std::slice::from_ref(&record),
+                })
+                .map_err(internal_status)?;
+                let head_template = PersonalDbCommittedHead {
+                    format_version: 2,
+                    tenant_id: actor.tenant_id.to_string(),
+                    database_id: validated.request.database_id.clone(),
+                    log_index: proposed_log_index,
+                    log_hash: hex::encode(record.entry_hash),
+                    segment_ref: segment_ref.clone(),
+                    row_index_generation,
+                    policy_epoch: manifest.active_policy_epoch,
+                    membership_epoch: manifest.active_membership_epoch,
+                    schema_hash: manifest.schema_hash.clone(),
+                    updated_at: now_rfc3339(),
+                    updated_by_node: write_permit.owner_node_id.clone(),
+                    head_hash: None,
+                    head_signature: None,
+                };
+                let authority = PersonalDbAdmissionAuthority {
+                    storage: &self.storage,
+                    trust_store: protocol_keyring.trust_store(),
+                    write_permit: &write_permit,
+                    partition_owner_signing_key: self.persistence.partition_owner_signing_key(),
+                    now_unix_seconds: updated_at.timestamp(),
+                };
+                let candidate = begin_personaldb_witness_signing(
+                    &authority,
+                    BeginWitnessSigningV1 {
+                        tenant_id: actor.tenant_id,
+                        reservation_id: reservation.identity.reservation_id.clone(),
+                        expected_reservation_revision: reservation.reservation_revision,
+                        unsigned_commit_certificate: unsigned_certificate,
+                        head_template,
+                        created_at_unix_seconds: updated_at.timestamp(),
+                    },
+                )
+                .await
+                .map_err(internal_status)?;
+                let signing_request = SignCertificateAndHeadV1 {
+                    reservation_id: candidate.reservation_id.clone(),
+                    signing_reservation_revision: candidate.signing_reservation_revision,
+                };
+                admission_terminal_request = Some(signing_request.clone());
+                let receipt = sign_personaldb_certificate_and_head_with_keyring(
+                    &authority,
+                    &signing_request,
+                    protocol_keyring,
+                )
+                .await
+                .map_err(internal_status)?;
+                acknowledge_personaldb_witness_receipt(&authority, &signing_request)
+                    .await
+                    .map_err(internal_status)?;
+                let certificate = decode_commit_certificate(&receipt.signed_commit_certificate)
+                    .map_err(internal_status)?;
+                let committed_head = decode_committed_head(&receipt.signed_committed_head)
+                    .map_err(internal_status)?;
+                let written_certificate_ref = write_personaldb_commit_certificate(
+                    &self.storage,
+                    actor.tenant_id,
+                    &validated.request.database_id,
+                    &certificate,
+                    protocol_keyring.trust_store(),
+                )
+                .await
+                .map_err(internal_status)?;
+                if written_certificate_ref != certificate_ref {
+                    return Err(Status::internal(
+                        "PersonalDB witness certificate ref changed after signing",
+                    ));
+                }
+                let written_segment_ref = write_personaldb_log_segment(
+                    &self.storage,
+                    PersonalDbLogSegmentWrite {
+                        tenant_id: actor.tenant_id,
+                        database_id: &validated.request.database_id,
+                        schema_hash,
+                        source_fence_token: write_permit.fence_token,
+                        records: std::slice::from_ref(&record),
+                    },
+                )
+                .await
+                .map_err(internal_status)?;
+                if written_segment_ref != segment_ref {
+                    return Err(Status::internal(
+                        "PersonalDB log segment ref changed after witness signing",
+                    ));
+                }
+                (certificate, record, committed_head)
+            } else {
+                let certificate = unsigned_certificate
+                    .seal(protocol_keyring)
+                    .await
+                    .map_err(internal_status)?;
+                let certificate_ref = write_personaldb_commit_certificate(
+                    &self.storage,
+                    actor.tenant_id,
+                    &validated.request.database_id,
+                    &certificate,
+                    protocol_keyring.trust_store(),
+                )
+                .await
+                .map_err(internal_status)?;
+                let certificate_hash = hex32_status(
+                    certificate
+                        .certificate_hash
+                        .as_deref()
+                        .ok_or_else(|| Status::internal("PersonalDB certificate hash missing"))?,
+                    "certificate hash",
+                )?;
+                let record = CorePersonalDbLogRecord::new(
+                    proposed_log_index,
+                    validated.request.client_log_epoch,
+                    validated.request.membership_epoch,
+                    validated.request.policy_epoch,
+                    previous_log_hash,
+                    validated.changeset_payload_hash,
+                    envelope_hash,
+                    certificate_hash,
+                    payload_ref,
+                    certificate_ref.into_bytes(),
+                    Vec::new(),
+                );
+                let segment_ref = write_personaldb_log_segment(
+                    &self.storage,
+                    PersonalDbLogSegmentWrite {
+                        tenant_id: actor.tenant_id,
+                        database_id: &validated.request.database_id,
+                        schema_hash,
+                        source_fence_token: write_permit.fence_token,
+                        records: std::slice::from_ref(&record),
+                    },
+                )
+                .await
+                .map_err(internal_status)?;
+                let committed_head = PersonalDbCommittedHead {
+                    format_version: 2,
+                    tenant_id: actor.tenant_id.to_string(),
+                    database_id: validated.request.database_id.clone(),
+                    log_index: proposed_log_index,
+                    log_hash: hex::encode(record.entry_hash),
+                    segment_ref: segment_ref.clone(),
+                    row_index_generation,
+                    policy_epoch: manifest.active_policy_epoch,
+                    membership_epoch: manifest.active_membership_epoch,
+                    schema_hash: manifest.schema_hash.clone(),
+                    updated_at: now_rfc3339(),
+                    updated_by_node: actor.principal.clone(),
+                    head_hash: None,
+                    head_signature: None,
+                }
+                .seal(protocol_keyring)
+                .await
+                .map_err(internal_status)?;
+                (certificate, record, committed_head)
+            };
         let certificate_hash = hex32_status(
             certificate
                 .certificate_hash
@@ -1073,37 +1395,7 @@ impl AppState {
                 .ok_or_else(|| Status::internal("PersonalDB certificate hash missing"))?,
             "certificate hash",
         )?;
-        let record = CorePersonalDbLogRecord::new(
-            proposed_log_index,
-            validated.request.client_log_epoch,
-            validated.request.membership_epoch,
-            validated.request.policy_epoch,
-            previous_log_hash,
-            validated.changeset_payload_hash,
-            envelope_hash,
-            certificate_hash,
-            payload_ref,
-            certificate_ref.into_bytes(),
-            Vec::new(),
-        );
-        let segment_ref = write_personaldb_log_segment(
-            &self.storage,
-            PersonalDbLogSegmentWrite {
-                tenant_id: actor.tenant_id,
-                database_id: &validated.request.database_id,
-                schema_hash,
-                source_fence_token: write_permit.fence_token,
-                records: std::slice::from_ref(&record),
-            },
-        )
-        .await
-        .map_err(internal_status)?;
-        let mut row_index_generation = previous_head.row_index_generation;
-        let row_index_records = envelope.row_index_upserts().map_err(internal_status)?;
         if !row_index_records.is_empty() {
-            row_index_generation = row_index_generation
-                .checked_add(1)
-                .ok_or_else(|| Status::failed_precondition("PersonalDB row index overflow"))?;
             write_personaldb_row_index(
                 &self.storage,
                 PersonalDbRowIndexWrite {
@@ -1124,7 +1416,7 @@ impl AppState {
             &self.storage,
             actor.tenant_id,
             &validated.request.database_id,
-            signing_key,
+            protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -1137,34 +1429,28 @@ impl AppState {
                 "PersonalDB committed head changed before publish",
             ));
         }
-        let committed_head = PersonalDbCommittedHead {
-            format_version: 1,
-            tenant_id: actor.tenant_id.to_string(),
-            database_id: validated.request.database_id.clone(),
-            log_index: proposed_log_index,
-            log_hash: hex::encode(record.entry_hash),
-            segment_ref: segment_ref,
-            row_index_generation,
-            policy_epoch: manifest.active_policy_epoch,
-            membership_epoch: manifest.active_membership_epoch,
-            schema_hash: manifest.schema_hash.clone(),
-            updated_at: now_rfc3339(),
-            updated_by_node: actor.principal.clone(),
-            head_hash: None,
-            head_signature: None,
-        }
-        .seal(signing_key)
-        .map_err(internal_status)?;
         write_personaldb_committed_head_with_preconditions(
             &self.storage,
             actor.tenant_id,
             &validated.request.database_id,
             &committed_head,
-            signing_key,
+            protocol_keyring.trust_store(),
             vec![write_precondition],
         )
         .await
         .map_err(internal_status)?;
+        if let Some(signing_request) = admission_terminal_request.as_ref() {
+            let authority = PersonalDbAdmissionAuthority {
+                storage: &self.storage,
+                trust_store: protocol_keyring.trust_store(),
+                write_permit: &write_permit,
+                partition_owner_signing_key: self.persistence.partition_owner_signing_key(),
+                now_unix_seconds: updated_at.timestamp(),
+            };
+            commit_personaldb_witnessed_proposal(&authority, signing_request)
+                .await
+                .map_err(internal_status)?;
+        }
 
         let watch_cursor = latest_personaldb_group_watch_cursor(
             &self.storage,
@@ -1196,7 +1482,8 @@ impl AppState {
                 created_by_node: &actor.principal,
                 policy: configured_personaldb_snapshot_policy(&self.config),
             },
-            signing_key,
+            snapshots_head_signing_key,
+            protocol_keyring,
         )
         .await
         .map_err(internal_status)?;
@@ -1245,12 +1532,11 @@ impl AppState {
         source_log_hash: &str,
         authz_revision: u64,
     ) -> Result<(), Status> {
-        let signing_key = self.personaldb_signing_key();
         let source_manifest = read_personaldb_group_manifest(
             &self.storage,
             tenant_id,
             source_database_id,
-            signing_key,
+            self.personaldb_protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -1300,12 +1586,11 @@ impl AppState {
                 "PersonalDB projection target database scope mismatch",
             ));
         }
-        let signing_key = self.personaldb_signing_key();
         let target_manifest = read_personaldb_group_manifest(
             &self.storage,
             tenant_id,
             &definition.database_id,
-            signing_key,
+            self.personaldb_protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -1314,7 +1599,7 @@ impl AppState {
             &self.storage,
             tenant_id,
             &definition.database_id,
-            signing_key,
+            self.personaldb_protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
@@ -1392,6 +1677,7 @@ impl AppState {
                     principal: internal_actor,
                     bearer_token: None,
                     require_public_commit_authorization: false,
+                    require_admission_protocol: false,
                 },
             )
             .await?;

@@ -1408,7 +1408,13 @@ mod tests {
         config.bootstrap_system_admin_subject_kind.clear();
         config.bootstrap_system_admin_subject_id.clear();
 
-        let err = crate::AppState::new(config, None).await.unwrap_err();
+        let err = crate::AppState::new(
+            config,
+            None,
+            crate::test_support::personaldb_protocol_keyring(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("system realm is missing"));
     }
 
