@@ -157,13 +157,21 @@ fn authz_writer_segments_are_live_query_candidate_sources() {
     let segment = repo_file("anvil-core/src/authz_segment.rs");
 
     for expected in [
-        "advance_authz_materialization(\n        storage,\n        record.tenant_id",
-        "advance_authz_materialization(storage, tenant_id, records",
+        "record_authz_materialization_deferred(",
         "advance_derived_userset_index_from_batch",
         "read_all_authz_tuple_records_from_journal(storage, tenant_id)",
         "write_authz_tuple_segment_with_derived",
     ] {
         assert!(journal.contains(expected), "missing {expected}");
+    }
+    for forbidden in [
+        "advance_authz_materialization(\n        storage,\n        record.tenant_id",
+        "advance_authz_materialization(storage, tenant_id, records",
+    ] {
+        assert!(
+            !journal.contains(forbidden),
+            "tuple writes must not synchronously materialize authz segments: {forbidden}"
+        );
     }
 
     for expected in [
