@@ -1,4 +1,8 @@
 use super::*;
+use crate::anvil_api::{
+    AuthzAllowedSubject, AuthzRelationRule, AuthzRelationSchema, AuthzSchemaMemberKind,
+    AuthzSubjectSelectorKind,
+};
 use crate::core_store::TABLE_AUTHZ_IDEMPOTENCY_RECEIPT_ROW;
 use crate::partition_fence::{
     PartitionRecoveryAcquire, acquire_partition_recovery, force_expire_partition_owner_for_node,
@@ -8,6 +12,35 @@ use chrono::Utc;
 use tempfile::tempdir;
 
 const PARTITION_OWNER_KEY: &[u8] = b"authorization tuple partition owner signing key";
+
+fn any_subject(subject_kind: &str) -> AuthzAllowedSubject {
+    AuthzAllowedSubject {
+        selector_kind: AuthzSubjectSelectorKind::AnyCanonicalId as i32,
+        subject_kind: subject_kind.to_string(),
+        subject_id: String::new(),
+    }
+}
+
+fn direct_relation(name: &str, subject_kinds: &[&str]) -> AuthzRelationSchema {
+    AuthzRelationSchema {
+        relation: name.to_string(),
+        rules: Vec::new(),
+        member_kind: AuthzSchemaMemberKind::DirectRelation as i32,
+        allowed_subjects: subject_kinds
+            .iter()
+            .map(|kind| any_subject(kind))
+            .collect(),
+    }
+}
+
+fn permission(name: &str, rules: Vec<AuthzRelationRule>) -> AuthzRelationSchema {
+    AuthzRelationSchema {
+        relation: name.to_string(),
+        rules,
+        member_kind: AuthzSchemaMemberKind::Permission as i32,
+        allowed_subjects: Vec::new(),
+    }
+}
 
 fn record(revision: i64, operation: &str) -> AuthzTupleRecord {
     AuthzTupleRecord {
@@ -291,7 +324,7 @@ async fn authz_userset_removal_and_cycles_do_not_grant_access() {
 
 #[tokio::test]
 async fn authz_bound_schema_inherit_computed_and_tuple_to_userset_rules_are_enforced() {
-    use crate::anvil_api::{AuthzNamespaceSchema, AuthzRelationRule, AuthzRelationSchema};
+    use crate::anvil_api::AuthzNamespaceSchema;
     use crate::authz_scope::encode_realm_namespace;
 
     let temp = tempdir().unwrap();
@@ -309,9 +342,9 @@ async fn authz_bound_schema_inherit_computed_and_tuple_to_userset_rules_are_enfo
             AuthzNamespaceSchema {
                 namespace: "document".to_string(),
                 relations: vec![
-                    AuthzRelationSchema {
-                        relation: "viewer".to_string(),
-                        rules: vec![
+                    permission(
+                        "viewer",
+                        vec![
                             AuthzRelationRule {
                                 kind: "inherit".to_string(),
                                 relation: "editor".to_string(),
@@ -331,11 +364,10 @@ async fn authz_bound_schema_inherit_computed_and_tuple_to_userset_rules_are_enfo
                                 target_relation: "member".to_string(),
                             },
                         ],
-                    },
-                    AuthzRelationSchema {
-                        relation: "editor".to_string(),
-                        rules: vec![],
-                    },
+                    ),
+                    direct_relation("editor", &["user"]),
+                    direct_relation("parent_folder", &["folder"]),
+                    direct_relation("shared_group", &["group"]),
                 ],
                 schema_json: String::new(),
                 schema_hash: String::new(),
@@ -345,15 +377,18 @@ async fn authz_bound_schema_inherit_computed_and_tuple_to_userset_rules_are_enfo
             },
             AuthzNamespaceSchema {
                 namespace: "folder".to_string(),
-                relations: vec![AuthzRelationSchema {
-                    relation: "viewer".to_string(),
-                    rules: vec![AuthzRelationRule {
-                        kind: "computed".to_string(),
-                        relation: String::new(),
-                        tuple_relation: "parent_tenant".to_string(),
-                        target_relation: "member".to_string(),
-                    }],
-                }],
+                relations: vec![
+                    permission(
+                        "viewer",
+                        vec![AuthzRelationRule {
+                            kind: "computed".to_string(),
+                            relation: String::new(),
+                            tuple_relation: "parent_tenant".to_string(),
+                            target_relation: "member".to_string(),
+                        }],
+                    ),
+                    direct_relation("parent_tenant", &["tenant"]),
+                ],
                 schema_json: String::new(),
                 schema_hash: String::new(),
                 schema_version: 0,
@@ -362,10 +397,7 @@ async fn authz_bound_schema_inherit_computed_and_tuple_to_userset_rules_are_enfo
             },
             AuthzNamespaceSchema {
                 namespace: "tenant".to_string(),
-                relations: vec![AuthzRelationSchema {
-                    relation: "member".to_string(),
-                    rules: vec![],
-                }],
+                relations: vec![direct_relation("member", &["user"])],
                 schema_json: String::new(),
                 schema_hash: String::new(),
                 schema_version: 0,
@@ -374,10 +406,7 @@ async fn authz_bound_schema_inherit_computed_and_tuple_to_userset_rules_are_enfo
             },
             AuthzNamespaceSchema {
                 namespace: "group".to_string(),
-                relations: vec![AuthzRelationSchema {
-                    relation: "member".to_string(),
-                    rules: vec![],
-                }],
+                relations: vec![direct_relation("member", &["user"])],
                 schema_json: String::new(),
                 schema_hash: String::new(),
                 schema_version: 0,
@@ -532,7 +561,7 @@ async fn authz_bound_schema_inherit_computed_and_tuple_to_userset_rules_are_enfo
 
 #[tokio::test]
 async fn authz_schema_writes_materialize_segment_schema_tables() {
-    use crate::anvil_api::{AuthzNamespaceSchema, AuthzRelationRule, AuthzRelationSchema};
+    use crate::anvil_api::AuthzNamespaceSchema;
     use crate::authz_scope::encode_realm_namespace;
 
     let temp = tempdir().unwrap();
@@ -543,15 +572,18 @@ async fn authz_schema_writes_materialize_segment_schema_tables() {
         "workspace-authz",
         vec![AuthzNamespaceSchema {
             namespace: "document".to_string(),
-            relations: vec![AuthzRelationSchema {
-                relation: "viewer".to_string(),
-                rules: vec![AuthzRelationRule {
-                    kind: "inherit".to_string(),
-                    relation: "editor".to_string(),
-                    tuple_relation: String::new(),
-                    target_relation: String::new(),
-                }],
-            }],
+            relations: vec![
+                permission(
+                    "viewer",
+                    vec![AuthzRelationRule {
+                        kind: "inherit".to_string(),
+                        relation: "editor".to_string(),
+                        tuple_relation: String::new(),
+                        target_relation: String::new(),
+                    }],
+                ),
+                direct_relation("editor", &["user"]),
+            ],
             schema_json: String::new(),
             schema_hash: String::new(),
             schema_version: 0,
@@ -879,6 +911,7 @@ async fn authz_journal_batch_rejects_stale_partition_precondition() {
         &record(1, "add"),
         stale.fence_token,
         Some(stale_precondition),
+        None,
     )
     .await
     .unwrap_err();

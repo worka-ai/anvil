@@ -25,7 +25,13 @@ pub(crate) struct UsersetRef {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SchemaRuleIndex {
-    rules_by_userset: BTreeMap<UsersetRuleKey, Vec<AuthzRelationRule>>,
+    members_by_userset: BTreeMap<UsersetRuleKey, SchemaMember>,
+}
+
+#[derive(Debug, Clone)]
+struct SchemaMember {
+    direct_relation: bool,
+    rules: Vec<AuthzRelationRule>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -66,7 +72,7 @@ impl SchemaRuleIndex {
             }
         }
 
-        let mut rules_by_userset = BTreeMap::new();
+        let mut members_by_userset = BTreeMap::new();
         for namespace in namespaces {
             let (realm_id, local_namespace) = namespace_realm_parts(&namespace);
             let Some(schema) = authz_realm_schema::read_bound_namespace_schema(
@@ -80,26 +86,40 @@ impl SchemaRuleIndex {
                 continue;
             };
             for relation in schema.relations {
-                rules_by_userset.insert(
+                let direct_relation =
+                    crate::authz_schema_contract::is_direct_relation(&relation);
+                members_by_userset.insert(
                     UsersetRuleKey {
                         namespace: namespace.clone(),
                         relation: relation.relation,
                     },
-                    relation.rules,
+                    SchemaMember {
+                        direct_relation,
+                        rules: relation.rules,
+                    },
                 );
             }
         }
-        Ok(Self { rules_by_userset })
+        Ok(Self { members_by_userset })
     }
 
     fn relation_rules(&self, userset: &UsersetRef) -> &[AuthzRelationRule] {
-        self.rules_by_userset
+        self.members_by_userset
             .get(&UsersetRuleKey {
                 namespace: userset.namespace.clone(),
                 relation: userset.relation.clone(),
             })
-            .map(Vec::as_slice)
+            .map(|member| member.rules.as_slice())
             .unwrap_or(&[])
+    }
+
+    fn is_direct_relation(&self, userset: &UsersetRef) -> bool {
+        self.members_by_userset
+            .get(&UsersetRuleKey {
+                namespace: userset.namespace.clone(),
+                relation: userset.relation.clone(),
+            })
+            .is_some_and(|member| member.direct_relation)
     }
 }
 
@@ -135,14 +155,16 @@ fn resolve_userset_inner(
         return Ok(false);
     }
 
-    if direct_tuple_grants(current, userset, subject) {
-        visited.remove(userset);
-        return Ok(true);
-    }
+    if schema_index.is_direct_relation(userset) {
+        if direct_tuple_grants(current, userset, subject) {
+            visited.remove(userset);
+            return Ok(true);
+        }
 
-    if explicit_userset_tuple_grants(current, schema_index, userset, subject, visited)? {
-        visited.remove(userset);
-        return Ok(true);
+        if explicit_userset_tuple_grants(current, schema_index, userset, subject, visited)? {
+            visited.remove(userset);
+            return Ok(true);
+        }
     }
 
     for rule in schema_index.relation_rules(userset) {
@@ -193,20 +215,22 @@ fn collect_subjects_inner(
         return Ok(());
     }
 
-    for record in direct_relation_records(current, userset, &userset.relation) {
-        if record.subject_kind == "userset" {
-            if record.caveat_hash.is_empty()
-                && let Some(next) =
-                    userset_from_userset_subject(&record.subject_id, &userset.namespace, None)?
-            {
-                collect_subjects_inner(current, schema_index, &next, visited, subjects)?;
+    if schema_index.is_direct_relation(userset) {
+        for record in direct_relation_records(current, userset, &userset.relation) {
+            if record.subject_kind == "userset" {
+                if record.caveat_hash.is_empty()
+                    && let Some(next) =
+                        userset_from_userset_subject(&record.subject_id, &userset.namespace, None)?
+                {
+                    collect_subjects_inner(current, schema_index, &next, visited, subjects)?;
+                }
+            } else {
+                subjects.insert(SubjectRef {
+                    kind: record.subject_kind.clone(),
+                    id: record.subject_id.clone(),
+                    caveat_hash: record.caveat_hash.clone(),
+                });
             }
-        } else {
-            subjects.insert(SubjectRef {
-                kind: record.subject_kind.clone(),
-                id: record.subject_id.clone(),
-                caveat_hash: record.caveat_hash.clone(),
-            });
         }
     }
 

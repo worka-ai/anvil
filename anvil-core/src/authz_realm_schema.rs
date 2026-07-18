@@ -129,6 +129,20 @@ struct AuthzRelationSchemaProto {
     relation: String,
     #[prost(message, repeated, tag = "2")]
     rules: Vec<AuthzRelationRuleProto>,
+    #[prost(int32, tag = "3")]
+    member_kind: i32,
+    #[prost(message, repeated, tag = "4")]
+    allowed_subjects: Vec<AuthzAllowedSubjectProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct AuthzAllowedSubjectProto {
+    #[prost(int32, tag = "1")]
+    selector_kind: i32,
+    #[prost(string, tag = "2")]
+    subject_kind: String,
+    #[prost(string, tag = "3")]
+    subject_id: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -153,12 +167,8 @@ pub async fn put_schema_revision(
     reason: &str,
 ) -> Result<StoredAuthzSchemaRevision> {
     validate_schema_id(schema_id)?;
-    if namespaces.is_empty() {
-        return Err(anyhow!(
-            "authorization schema must contain at least one namespace"
-        ));
-    }
-    namespaces.sort_by(|left, right| left.namespace.cmp(&right.namespace));
+    crate::authz_schema_contract::validate_schema_set(&namespaces)?;
+    crate::authz_schema_contract::canonicalize_schema_set(&mut namespaces);
     let schema_digest = schema_digest(&namespaces)?;
     if let Some(existing) =
         find_schema_by_digest(storage, tenant_id, schema_id, &schema_digest).await?
@@ -245,16 +255,17 @@ pub async fn bind_schema(
     reason: &str,
 ) -> Result<StoredAuthzSchemaBinding> {
     validate_realm_id(realm_id)?;
-    if read_schema_revision(
+    let schema = read_schema_revision(
         storage,
         tenant_id,
         &schema_ref.schema_id,
         Some(schema_ref.schema_revision),
     )
     .await?
-    .is_none()
-    {
-        return Err(anyhow!("authorization schema revision not found"));
+    .ok_or_else(|| anyhow!("authorization schema revision not found"))?;
+    validate_stored_schema_revision(&schema)?;
+    if schema.schema_ref != schema_ref {
+        return Err(anyhow!("authorization schema reference digest mismatch"));
     }
     let current = read_proto_row::<StoredAuthzSchemaBinding>(
         storage,
@@ -336,6 +347,10 @@ pub async fn read_bound_schema_snapshot(
     )
     .await?
     .ok_or_else(|| anyhow!("bound authorization schema revision not found"))?;
+    validate_stored_schema_revision(&schema)?;
+    if schema.schema_ref != binding.schema_ref {
+        return Err(anyhow!("bound authorization schema reference mismatch"));
+    }
     Ok(BoundAuthzSchemaSnapshot {
         schema: Some(schema),
         binding_precondition: AuthzSchemaBindingPrecondition {
@@ -419,6 +434,10 @@ pub async fn read_bound_namespace_schema(
     else {
         return Err(anyhow!("bound authorization schema revision not found"));
     };
+    validate_stored_schema_revision(&revision)?;
+    if revision.schema_ref != binding.schema_ref {
+        return Err(anyhow!("bound authorization schema reference mismatch"));
+    }
     Ok(revision
         .namespaces
         .into_iter()
@@ -770,6 +789,12 @@ fn relation_to_proto(relation: &crate::anvil_api::AuthzRelationSchema) -> AuthzR
     AuthzRelationSchemaProto {
         relation: relation.relation.clone(),
         rules: relation.rules.iter().map(rule_to_proto).collect(),
+        member_kind: relation.member_kind,
+        allowed_subjects: relation
+            .allowed_subjects
+            .iter()
+            .map(allowed_subject_to_proto)
+            .collect(),
     }
 }
 
@@ -777,6 +802,32 @@ fn relation_from_proto(proto: AuthzRelationSchemaProto) -> crate::anvil_api::Aut
     crate::anvil_api::AuthzRelationSchema {
         relation: proto.relation,
         rules: proto.rules.into_iter().map(rule_from_proto).collect(),
+        member_kind: proto.member_kind,
+        allowed_subjects: proto
+            .allowed_subjects
+            .into_iter()
+            .map(allowed_subject_from_proto)
+            .collect(),
+    }
+}
+
+fn allowed_subject_to_proto(
+    selector: &crate::anvil_api::AuthzAllowedSubject,
+) -> AuthzAllowedSubjectProto {
+    AuthzAllowedSubjectProto {
+        selector_kind: selector.selector_kind,
+        subject_kind: selector.subject_kind.clone(),
+        subject_id: selector.subject_id.clone(),
+    }
+}
+
+fn allowed_subject_from_proto(
+    proto: AuthzAllowedSubjectProto,
+) -> crate::anvil_api::AuthzAllowedSubject {
+    crate::anvil_api::AuthzAllowedSubject {
+        selector_kind: proto.selector_kind,
+        subject_kind: proto.subject_kind,
+        subject_id: proto.subject_id,
     }
 }
 
@@ -800,11 +851,23 @@ fn rule_from_proto(proto: AuthzRelationRuleProto) -> crate::anvil_api::AuthzRela
 
 fn schema_digest(namespaces: &[AuthzNamespaceSchema]) -> Result<String> {
     let mut namespaces = namespaces.to_vec();
-    namespaces.sort_by(|left, right| left.namespace.cmp(&right.namespace));
+    crate::authz_schema_contract::canonicalize_schema_set(&mut namespaces);
     let bytes = encode_deterministic_proto(&AuthzNamespaceSetProto {
         namespaces: namespaces.iter().map(namespace_to_proto).collect(),
     });
     Ok(hex::encode(hash32(&bytes)))
+}
+
+fn validate_stored_schema_revision(record: &StoredAuthzSchemaRevision) -> Result<()> {
+    if record.schema_ref.schema_revision == 0 {
+        return Err(anyhow!("authorization schema revision must be nonzero"));
+    }
+    crate::authz_schema_contract::validate_schema_set(&record.namespaces)?;
+    let digest = schema_digest(&record.namespaces)?;
+    if digest != record.schema_ref.schema_digest {
+        return Err(anyhow!("authorization schema revision digest mismatch"));
+    }
+    Ok(())
 }
 
 fn validate_schema_id(value: &str) -> Result<()> {

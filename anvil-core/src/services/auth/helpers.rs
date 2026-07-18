@@ -205,7 +205,7 @@ pub(super) async fn write_authz_tuple_record(
             &req.reason,
         )
         .await
-        .map_err(|e| Status::internal(format!("{e:#}")))?;
+        .map_err(authz_tuple_write_status)?;
     emit_authz_tuple_write_side_effects(state, claims.tenant_id, &record).await?;
     Ok(record)
 }
@@ -273,97 +273,12 @@ pub(super) fn optional_expected_authz_revision(
         .transpose()
 }
 
-pub(super) async fn validate_authz_tuple_batch_against_bound_schema(
-    state: &AppState,
-    tenant_id: i64,
-    authz_realm_id: &str,
-    mutations: &[AuthzTupleMutation],
-) -> Result<authz_realm_schema::BoundAuthzSchemaSnapshot, Status> {
-    let snapshot =
-        authz_realm_schema::read_bound_schema_snapshot(&state.storage, tenant_id, authz_realm_id)
-            .await
-            .map_err(|error| Status::internal(format!("{error:#}")))?;
-    let Some(schema) = snapshot.schema.as_ref() else {
-        return Ok(snapshot);
-    };
-    let namespaces = schema
-        .namespaces
-        .iter()
-        .map(|namespace| (namespace.namespace.as_str(), namespace))
-        .collect::<std::collections::BTreeMap<_, _>>();
-
-    for mutation in mutations {
-        let namespace = namespaces.get(mutation.namespace.as_str()).ok_or_else(|| {
-            Status::invalid_argument(format!(
-                "namespace {} is not declared by the bound authorization schema",
-                mutation.namespace
-            ))
-        })?;
-        if !namespace
-            .relations
-            .iter()
-            .any(|relation| relation.relation == mutation.relation)
-        {
-            return Err(Status::invalid_argument(format!(
-                "relation {}#{} is not declared by the bound authorization schema",
-                mutation.namespace, mutation.relation
-            )));
-        }
-
-        let userset_subject = if mutation.subject_kind == "userset" {
-            let subject = parse_userset_subject(&mutation.subject_id).ok_or_else(|| {
-                Status::invalid_argument(
-                    "userset subject_id must use namespace/object_id#relation format",
-                )
-            })?;
-            require_bound_schema_relation(&namespaces, subject.namespace, subject.relation)?;
-            Some(subject)
-        } else {
-            None
-        };
-
-        for rule in namespace
-            .relations
-            .iter()
-            .flat_map(|relation| relation.rules.iter())
-            .filter(|rule| {
-                matches!(rule.kind.as_str(), "computed" | "tuple_to_userset")
-                    && rule.tuple_relation == mutation.relation
-            })
-        {
-            let subject_namespace = userset_subject
-                .as_ref()
-                .map(|subject| subject.namespace)
-                .unwrap_or(mutation.subject_kind.as_str());
-            require_bound_schema_relation(&namespaces, subject_namespace, &rule.target_relation)?;
-        }
-    }
-    Ok(snapshot)
-}
-
-fn require_bound_schema_relation(
-    namespaces: &std::collections::BTreeMap<&str, &AuthzNamespaceSchema>,
-    namespace: &str,
-    relation: &str,
-) -> Result<(), Status> {
-    let schema = namespaces.get(namespace).ok_or_else(|| {
-        Status::invalid_argument(format!(
-            "subject namespace {namespace} is not declared by the bound authorization schema"
-        ))
-    })?;
-    if !schema
-        .relations
-        .iter()
-        .any(|candidate| candidate.relation == relation)
-    {
-        return Err(Status::invalid_argument(format!(
-            "subject relation {namespace}#{relation} is not declared by the bound authorization schema"
-        )));
-    }
-    Ok(())
-}
-
 pub(super) fn authz_tuple_batch_write_status(error: anyhow::Error) -> Status {
+    if let Some(contract) = error.chain().find_map(|cause| {
+        cause.downcast_ref::<crate::authz_schema_contract::AuthzSchemaContractError>()
+    }) {
+        return Status::invalid_argument(contract.to_string());
+    }
     let conflict = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<crate::persistence::AuthzTupleBatchWriteError>());
@@ -382,6 +297,10 @@ pub(super) fn authz_tuple_batch_write_status(error: anyhow::Error) -> Status {
         }
         None => Status::internal(format!("{error:#}")),
     }
+}
+
+pub(super) fn authz_tuple_write_status(error: anyhow::Error) -> Status {
+    authz_tuple_batch_write_status(error)
 }
 
 pub(super) async fn emit_authz_tuple_write_side_effects(

@@ -65,6 +65,18 @@ fn generated_proto_exports_core_service_types() {
     };
     assert_eq!(bind.expected_binding_generation, Some(1));
 
+    let member = proto::AuthzRelationSchema {
+        relation: "viewer".to_string(),
+        rules: Vec::new(),
+        member_kind: proto::AuthzSchemaMemberKind::DirectRelation as i32,
+        allowed_subjects: vec![proto::AuthzAllowedSubject {
+            selector_kind: proto::AuthzSubjectSelectorKind::AnyCanonicalId as i32,
+            subject_kind: "user".to_string(),
+            subject_id: String::new(),
+        }],
+    };
+    assert_eq!(member.allowed_subjects.len(), 1);
+
     let batch = proto::WriteAuthzTuplesRequest {
         mutations: vec![proto::AuthzTupleMutation {
             namespace: "document".to_string(),

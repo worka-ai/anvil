@@ -1429,6 +1429,46 @@ message PutObjectRequest {
     }
 }
 
+enum IndexMaintenanceMode {
+    INDEX_MAINTENANCE_DEFERRED = 0;
+    INDEX_MAINTENANCE_ENQUEUED = 1;
+    INDEX_MAINTENANCE_CAUGHT_UP = 2;
+}
+
+enum WatchVisibilityMode {
+    WATCH_VISIBILITY_DEFERRED = 0;
+    WATCH_VISIBILITY_PUBLISHED = 1;
+}
+
+enum AuthzMaterializationMode {
+    AUTHZ_MATERIALIZATION_INHERITED_OK = 0;
+    AUTHZ_MATERIALIZATION_MATERIALIZED = 1;
+}
+
+enum BoundaryExtractionMode {
+    BOUNDARY_EXTRACTION_HINTS_ONLY = 0;
+    BOUNDARY_EXTRACTION_PAYLOAD_NOW = 1;
+}
+
+enum IndexPolicySnapshotMode {
+    INDEX_POLICY_SNAPSHOT_CACHED = 0;
+    INDEX_POLICY_SNAPSHOT_EXACT = 1;
+}
+
+enum AuthzRevisionMode {
+    AUTHZ_REVISION_CURRENT_KNOWN = 0;
+    AUTHZ_REVISION_FENCE_EXACT = 1;
+}
+
+message WriteVisibilityOptions {
+    IndexMaintenanceMode indexes = 1;
+    WatchVisibilityMode watches = 2;
+    AuthzMaterializationMode authz_materialization = 3;
+    BoundaryExtractionMode boundary_extraction = 4;
+    IndexPolicySnapshotMode index_policy_snapshot = 5;
+    AuthzRevisionMode authz_revision = 6;
+}
+
 message NativeMutationContext {
     int64 tenant_id = 1;
     int64 bucket_id = 2;
@@ -1440,6 +1480,7 @@ message NativeMutationContext {
     optional string transaction_id = 8;
     optional SagaOperationContext saga_operation = 9;
     optional SagaCompensationOperationContext saga_compensation_operation = 10;
+    optional WriteVisibilityOptions write_visibility = 11;
 }
 
 message ObjectMetadata {
@@ -2979,9 +3020,31 @@ message AuthzRelationRule {
     string target_relation = 4;  // target relation for computed / tuple_to_userset
 }
 
+enum AuthzSchemaMemberKind {
+    AUTHZ_SCHEMA_MEMBER_KIND_UNSPECIFIED = 0;
+    AUTHZ_SCHEMA_MEMBER_KIND_DIRECT_RELATION = 1;
+    AUTHZ_SCHEMA_MEMBER_KIND_PERMISSION = 2;
+}
+
+enum AuthzSubjectSelectorKind {
+    AUTHZ_SUBJECT_SELECTOR_KIND_UNSPECIFIED = 0;
+    AUTHZ_SUBJECT_SELECTOR_KIND_ANY_CANONICAL_ID = 1;
+    AUTHZ_SUBJECT_SELECTOR_KIND_EXACT = 2;
+    AUTHZ_SUBJECT_SELECTOR_KIND_SAME_RESOURCE_ID = 3;
+    AUTHZ_SUBJECT_SELECTOR_KIND_PUBLIC = 4;
+}
+
+message AuthzAllowedSubject {
+    AuthzSubjectSelectorKind selector_kind = 1;
+    string subject_kind = 2;
+    string subject_id = 3;
+}
+
 message AuthzRelationSchema {
     string relation = 1;
     repeated AuthzRelationRule rules = 2;
+    AuthzSchemaMemberKind member_kind = 3;
+    repeated AuthzAllowedSubject allowed_subjects = 4;
 }
 
 message AuthzNamespaceSchema {

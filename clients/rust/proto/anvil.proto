@@ -3020,9 +3020,31 @@ message AuthzRelationRule {
     string target_relation = 4;  // target relation for computed / tuple_to_userset
 }
 
+enum AuthzSchemaMemberKind {
+    AUTHZ_SCHEMA_MEMBER_KIND_UNSPECIFIED = 0;
+    AUTHZ_SCHEMA_MEMBER_KIND_DIRECT_RELATION = 1;
+    AUTHZ_SCHEMA_MEMBER_KIND_PERMISSION = 2;
+}
+
+enum AuthzSubjectSelectorKind {
+    AUTHZ_SUBJECT_SELECTOR_KIND_UNSPECIFIED = 0;
+    AUTHZ_SUBJECT_SELECTOR_KIND_ANY_CANONICAL_ID = 1;
+    AUTHZ_SUBJECT_SELECTOR_KIND_EXACT = 2;
+    AUTHZ_SUBJECT_SELECTOR_KIND_SAME_RESOURCE_ID = 3;
+    AUTHZ_SUBJECT_SELECTOR_KIND_PUBLIC = 4;
+}
+
+message AuthzAllowedSubject {
+    AuthzSubjectSelectorKind selector_kind = 1;
+    string subject_kind = 2;
+    string subject_id = 3;
+}
+
 message AuthzRelationSchema {
     string relation = 1;
     repeated AuthzRelationRule rules = 2;
+    AuthzSchemaMemberKind member_kind = 3;
+    repeated AuthzAllowedSubject allowed_subjects = 4;
 }
 
 message AuthzNamespaceSchema {
