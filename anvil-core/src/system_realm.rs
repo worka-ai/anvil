@@ -1,7 +1,10 @@
 use crate::{
-    anvil_api::{AuthzNamespaceSchema, AuthzRelationRule, AuthzRelationSchema},
+    anvil_api::{
+        AuthzAllowedSubject, AuthzNamespaceSchema, AuthzRelationRule, AuthzRelationSchema,
+        AuthzSchemaMemberKind, AuthzSubjectSelectorKind,
+    },
     auth, authz_journal, authz_realm_schema,
-    authz_scope::encode_realm_namespace,
+    authz_scope::{decode_realm_namespace, encode_realm_namespace, parse_userset_subject},
     config::Config,
     core_store::{
         AcquireFence, CF_MESH, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaStore,
@@ -191,6 +194,9 @@ pub async fn ensure_bootstrapped(
     let mesh_id = normalized_mesh_id(&config.mesh_id);
     if bootstrap_marker_exists(storage, &mesh_id).await? {
         reject_stale_bootstrap_config(config)?;
+        install_system_schema(storage, persistence)
+            .await
+            .context("upgrade system authz schema")?;
         return Ok(());
     }
 
@@ -207,7 +213,7 @@ pub async fn ensure_bootstrapped(
     let (subject_kind, subject_id) =
         resolve_bootstrap_subject(config, persistence, secret_keyring).await?;
 
-    install_system_schema(storage)
+    install_system_schema(storage, persistence)
         .await
         .context("install system authz schema")?;
     write_system_relation_tuples(
@@ -482,14 +488,22 @@ fn write_bootstrap_credential(path: &Path, credential: &BootstrapCredentialFile<
     Ok(())
 }
 
-async fn install_system_schema(storage: &Storage) -> Result<()> {
+async fn install_system_schema(storage: &Storage, persistence: &Persistence) -> Result<()> {
     let latest_revision =
         authz_journal::latest_authz_revision(storage, SYSTEM_STORAGE_TENANT_ID).await?;
+    let active_tuples = authz_journal::read_current_authz_tuples_at_revision(
+        storage,
+        SYSTEM_STORAGE_TENANT_ID,
+        authz_journal::AuthzTupleFilter::default(),
+        latest_revision,
+    )
+    .await?;
+    let namespaces = system_mesh_schema();
     let revision = authz_realm_schema::put_schema_revision(
         storage,
         SYSTEM_STORAGE_TENANT_ID,
         SYSTEM_SCHEMA_ID,
-        system_mesh_schema(),
+        namespaces.clone(),
         u64::try_from(latest_revision.max(0)).unwrap_or(0),
         "system-realm-bootstrap",
         "install built-in system realm schema",
@@ -502,7 +516,7 @@ async fn install_system_schema(storage: &Storage) -> Result<()> {
     )
     .await?
     {
-        Some(binding) if binding.schema_ref == revision.schema_ref => return Ok(()),
+        Some(binding) if binding.schema_ref == revision.schema_ref => {}
         Some(binding) => {
             authz_realm_schema::bind_schema(
                 storage,
@@ -547,6 +561,105 @@ async fn install_system_schema(storage: &Storage) -> Result<()> {
             }
         }
     }
+    migrate_system_schema_tuples(persistence, &namespaces, active_tuples).await?;
+    Ok(())
+}
+
+async fn migrate_system_schema_tuples(
+    persistence: &Persistence,
+    namespaces: &[AuthzNamespaceSchema],
+    active_tuples: Vec<crate::persistence::AuthzTupleRecord>,
+) -> Result<()> {
+    let members = namespaces
+        .iter()
+        .flat_map(|namespace| {
+            namespace.relations.iter().map(move |member| {
+                (
+                    (namespace.namespace.as_str(), member.relation.as_str()),
+                    member,
+                )
+            })
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let existing = active_tuples
+        .iter()
+        .map(|record| {
+            (
+                record.namespace.as_str(),
+                record.object_id.as_str(),
+                record.relation.as_str(),
+                record.subject_kind.as_str(),
+                record.subject_id.as_str(),
+                record.caveat_hash.as_str(),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut migrations = Vec::new();
+
+    for record in &active_tuples {
+        let Some(local_namespace) = decode_realm_namespace(SYSTEM_REALM_ID, &record.namespace)
+        else {
+            continue;
+        };
+        let Some(member) = members.get(&(local_namespace, record.relation.as_str())) else {
+            continue;
+        };
+
+        let (relation, subject_kind, subject_id) =
+            if member.member_kind == AuthzSchemaMemberKind::Permission as i32 {
+                (
+                    format!("{}_grant", record.relation),
+                    record.subject_kind.clone(),
+                    record.subject_id.clone(),
+                )
+            } else if record.subject_kind == crate::access_control::USERSET_SUBJECT_KIND {
+                let Some(subject) = parse_userset_subject(&record.subject_id) else {
+                    continue;
+                };
+                let Some(subject_namespace) =
+                    decode_realm_namespace(SYSTEM_REALM_ID, subject.namespace)
+                else {
+                    continue;
+                };
+                (
+                    record.relation.clone(),
+                    subject_namespace.to_string(),
+                    subject.object_id.to_string(),
+                )
+            } else {
+                continue;
+            };
+        if existing.contains(&(
+            record.namespace.as_str(),
+            record.object_id.as_str(),
+            relation.as_str(),
+            subject_kind.as_str(),
+            subject_id.as_str(),
+            record.caveat_hash.as_str(),
+        )) {
+            continue;
+        }
+        migrations.push(AuthzTupleBatchMutation {
+            namespace: record.namespace.clone(),
+            object_id: record.object_id.clone(),
+            relation,
+            subject_kind,
+            subject_id,
+            caveat_hash: record.caveat_hash.clone(),
+            operation: "add".to_string(),
+            reason: "migrate tuple to typed system schema".to_string(),
+        });
+    }
+
+    for chunk in migrations.chunks(1000) {
+        persistence
+            .write_authz_tuple_batch(
+                SYSTEM_STORAGE_TENANT_ID,
+                chunk.to_vec(),
+                "system-schema-migration",
+            )
+            .await?;
+    }
     Ok(())
 }
 
@@ -571,71 +684,74 @@ fn system_mesh_schema() -> Vec<AuthzNamespaceSchema> {
 fn system_namespace_schema() -> AuthzNamespaceSchema {
     AuthzNamespaceSchema {
         namespace: SYSTEM_NAMESPACE.to_string(),
-        relations: relations(&[
-            relation("bootstrap_admin", &[]),
-            relation("admin", &[inherit_rule("bootstrap_admin")]),
-            relation("auditor", &[]),
-            relation("operator", &[]),
-            relation("support", &[]),
-            relation(
-                "manage_system",
-                &[inherit_rule("bootstrap_admin"), inherit_rule("admin")],
-            ),
-            relation(
-                "view_system",
-                &[inherit_rule("manage_system"), inherit_rule("auditor")],
-            ),
-            relation(
-                "manage_admin_principals",
-                &[inherit_rule("bootstrap_admin")],
-            ),
-            relation(
-                "rotate_secret_keys",
-                &[inherit_rule("bootstrap_admin"), inherit_rule("admin")],
-            ),
-            relation(
-                "manage_personaldb_signing_keys",
-                &[inherit_rule("bootstrap_admin"), inherit_rule("admin")],
-            ),
-            relation(
-                "manage_regions",
-                &[inherit_rule("admin"), inherit_rule("operator")],
-            ),
-            relation(
-                "manage_cells",
-                &[inherit_rule("admin"), inherit_rule("operator")],
-            ),
-            relation(
-                "manage_nodes",
-                &[inherit_rule("admin"), inherit_rule("operator")],
-            ),
-            relation(
-                "manage_partitions",
-                &[inherit_rule("admin"), inherit_rule("operator")],
-            ),
-            relation("manage_tenants", &[inherit_rule("manage_system")]),
-            relation("manage_apps", &[inherit_rule("manage_system")]),
-            relation("manage_policies", &[inherit_rule("manage_system")]),
-            relation("manage_buckets", &[inherit_rule("manage_system")]),
-            relation("manage_host_aliases", &[inherit_rule("manage_system")]),
-            relation("manage_links", &[inherit_rule("manage_system")]),
-            relation(
-                "run_repair",
-                &[inherit_rule("manage_system"), inherit_rule("operator")],
-            ),
-            relation(
-                "view_diagnostics",
-                &[
-                    inherit_rule("view_system"),
-                    inherit_rule("operator"),
-                    inherit_rule("support"),
-                ],
-            ),
-            relation(
-                "view_audit_log",
-                &[inherit_rule("view_system"), inherit_rule("auditor")],
-            ),
-        ]),
+        relations: relations(
+            SYSTEM_NAMESPACE,
+            &[
+                relation("bootstrap_admin", &[]),
+                relation("admin", &[inherit_rule("bootstrap_admin")]),
+                relation("auditor", &[]),
+                relation("operator", &[]),
+                relation("support", &[]),
+                relation(
+                    "manage_system",
+                    &[inherit_rule("bootstrap_admin"), inherit_rule("admin")],
+                ),
+                relation(
+                    "view_system",
+                    &[inherit_rule("manage_system"), inherit_rule("auditor")],
+                ),
+                relation(
+                    "manage_admin_principals",
+                    &[inherit_rule("bootstrap_admin")],
+                ),
+                relation(
+                    "rotate_secret_keys",
+                    &[inherit_rule("bootstrap_admin"), inherit_rule("admin")],
+                ),
+                relation(
+                    "manage_personaldb_signing_keys",
+                    &[inherit_rule("bootstrap_admin"), inherit_rule("admin")],
+                ),
+                relation(
+                    "manage_regions",
+                    &[inherit_rule("admin"), inherit_rule("operator")],
+                ),
+                relation(
+                    "manage_cells",
+                    &[inherit_rule("admin"), inherit_rule("operator")],
+                ),
+                relation(
+                    "manage_nodes",
+                    &[inherit_rule("admin"), inherit_rule("operator")],
+                ),
+                relation(
+                    "manage_partitions",
+                    &[inherit_rule("admin"), inherit_rule("operator")],
+                ),
+                relation("manage_tenants", &[inherit_rule("manage_system")]),
+                relation("manage_apps", &[inherit_rule("manage_system")]),
+                relation("manage_policies", &[inherit_rule("manage_system")]),
+                relation("manage_buckets", &[inherit_rule("manage_system")]),
+                relation("manage_host_aliases", &[inherit_rule("manage_system")]),
+                relation("manage_links", &[inherit_rule("manage_system")]),
+                relation(
+                    "run_repair",
+                    &[inherit_rule("manage_system"), inherit_rule("operator")],
+                ),
+                relation(
+                    "view_diagnostics",
+                    &[
+                        inherit_rule("view_system"),
+                        inherit_rule("operator"),
+                        inherit_rule("support"),
+                    ],
+                ),
+                relation(
+                    "view_audit_log",
+                    &[inherit_rule("view_system"), inherit_rule("auditor")],
+                ),
+            ],
+        ),
         schema_json: system_schema_json(SYSTEM_NAMESPACE),
         schema_hash: String::new(),
         schema_version: 0,
@@ -647,38 +763,41 @@ fn system_namespace_schema() -> AuthzNamespaceSchema {
 fn storage_tenant_namespace_schema() -> AuthzNamespaceSchema {
     AuthzNamespaceSchema {
         namespace: SYSTEM_STORAGE_TENANT_NAMESPACE.to_string(),
-        relations: relations(&[
-            relation("owner", &[]),
-            relation("admin", &[]),
-            relation("writer", &[]),
-            relation("reader", &[]),
-            relation("auditor", &[]),
-            relation(
-                "manage_tenant",
-                &[inherit_rule("owner"), inherit_rule("admin")],
-            ),
-            relation("create_bucket", &[inherit_rule("manage_tenant")]),
-            relation(
-                "list_buckets",
-                &[inherit_rule("manage_tenant"), inherit_rule("auditor")],
-            ),
-            relation(
-                "read_tenant",
-                &[inherit_rule("manage_tenant"), inherit_rule("auditor")],
-            ),
-            relation("grant_access", &[inherit_rule("manage_tenant")]),
-            relation("revoke_access", &[inherit_rule("manage_tenant")]),
-            relation(
-                "read_access_grants",
-                &[inherit_rule("manage_tenant"), inherit_rule("auditor")],
-            ),
-            relation(
-                "lease_read",
-                &[inherit_rule("manage_tenant"), inherit_rule("auditor")],
-            ),
-            relation("lease_write", &[inherit_rule("manage_tenant")]),
-            relation("lease_admin", &[inherit_rule("manage_tenant")]),
-        ]),
+        relations: relations(
+            SYSTEM_STORAGE_TENANT_NAMESPACE,
+            &[
+                relation("owner", &[]),
+                relation("admin", &[]),
+                relation("writer", &[]),
+                relation("reader", &[]),
+                relation("auditor", &[]),
+                relation(
+                    "manage_tenant",
+                    &[inherit_rule("owner"), inherit_rule("admin")],
+                ),
+                relation("create_bucket", &[inherit_rule("manage_tenant")]),
+                relation(
+                    "list_buckets",
+                    &[inherit_rule("manage_tenant"), inherit_rule("auditor")],
+                ),
+                relation(
+                    "read_tenant",
+                    &[inherit_rule("manage_tenant"), inherit_rule("auditor")],
+                ),
+                relation("grant_access", &[inherit_rule("manage_tenant")]),
+                relation("revoke_access", &[inherit_rule("manage_tenant")]),
+                relation(
+                    "read_access_grants",
+                    &[inherit_rule("manage_tenant"), inherit_rule("auditor")],
+                ),
+                relation(
+                    "lease_read",
+                    &[inherit_rule("manage_tenant"), inherit_rule("auditor")],
+                ),
+                relation("lease_write", &[inherit_rule("manage_tenant")]),
+                relation("lease_admin", &[inherit_rule("manage_tenant")]),
+            ],
+        ),
         schema_json: system_schema_json(SYSTEM_STORAGE_TENANT_NAMESPACE),
         schema_hash: String::new(),
         schema_version: 0,
@@ -690,58 +809,61 @@ fn storage_tenant_namespace_schema() -> AuthzNamespaceSchema {
 fn bucket_namespace_schema() -> AuthzNamespaceSchema {
     AuthzNamespaceSchema {
         namespace: SYSTEM_BUCKET_NAMESPACE.to_string(),
-        relations: relations(&[
-            relation("parent_tenant", &[]),
-            relation("owner", &[]),
-            relation("admin", &[]),
-            relation("writer", &[]),
-            relation("reader", &[]),
-            relation("auditor", &[]),
-            relation(
-                "manage_bucket",
-                &[
-                    inherit_rule("owner"),
-                    inherit_rule("admin"),
-                    computed_rule("parent_tenant", "manage_tenant"),
-                ],
-            ),
-            relation(
-                "put_object",
-                &[inherit_rule("manage_bucket"), inherit_rule("writer")],
-            ),
-            relation(
-                "get_object",
-                &[inherit_rule("manage_bucket"), inherit_rule("reader")],
-            ),
-            relation(
-                "list_objects",
-                &[
-                    inherit_rule("manage_bucket"),
-                    inherit_rule("reader"),
-                    inherit_rule("auditor"),
-                ],
-            ),
-            relation(
-                "delete_object",
-                &[inherit_rule("manage_bucket"), inherit_rule("writer")],
-            ),
-            relation(
-                "manage_links",
-                &[inherit_rule("manage_bucket"), inherit_rule("writer")],
-            ),
-            relation(
-                "manage_indexes",
-                &[inherit_rule("manage_bucket"), inherit_rule("admin")],
-            ),
-            relation(
-                "query_indexes",
-                &[inherit_rule("manage_bucket"), inherit_rule("reader")],
-            ),
-            relation(
-                "manage_boundary_schema",
-                &[inherit_rule("manage_bucket"), inherit_rule("admin")],
-            ),
-        ]),
+        relations: relations(
+            SYSTEM_BUCKET_NAMESPACE,
+            &[
+                relation("parent_tenant", &[]),
+                relation("owner", &[]),
+                relation("admin", &[]),
+                relation("writer", &[]),
+                relation("reader", &[]),
+                relation("auditor", &[]),
+                relation(
+                    "manage_bucket",
+                    &[
+                        inherit_rule("owner"),
+                        inherit_rule("admin"),
+                        computed_rule("parent_tenant", "manage_tenant"),
+                    ],
+                ),
+                relation(
+                    "put_object",
+                    &[inherit_rule("manage_bucket"), inherit_rule("writer")],
+                ),
+                relation(
+                    "get_object",
+                    &[inherit_rule("manage_bucket"), inherit_rule("reader")],
+                ),
+                relation(
+                    "list_objects",
+                    &[
+                        inherit_rule("manage_bucket"),
+                        inherit_rule("reader"),
+                        inherit_rule("auditor"),
+                    ],
+                ),
+                relation(
+                    "delete_object",
+                    &[inherit_rule("manage_bucket"), inherit_rule("writer")],
+                ),
+                relation(
+                    "manage_links",
+                    &[inherit_rule("manage_bucket"), inherit_rule("writer")],
+                ),
+                relation(
+                    "manage_indexes",
+                    &[inherit_rule("manage_bucket"), inherit_rule("admin")],
+                ),
+                relation(
+                    "query_indexes",
+                    &[inherit_rule("manage_bucket"), inherit_rule("reader")],
+                ),
+                relation(
+                    "manage_boundary_schema",
+                    &[inherit_rule("manage_bucket"), inherit_rule("admin")],
+                ),
+            ],
+        ),
         schema_json: system_schema_json(SYSTEM_BUCKET_NAMESPACE),
         schema_hash: String::new(),
         schema_version: 0,
@@ -753,44 +875,47 @@ fn bucket_namespace_schema() -> AuthzNamespaceSchema {
 fn object_namespace_schema() -> AuthzNamespaceSchema {
     AuthzNamespaceSchema {
         namespace: SYSTEM_OBJECT_NAMESPACE.to_string(),
-        relations: relations(&[
-            relation("parent_bucket", &[]),
-            relation("owner", &[]),
-            relation("reader", &[]),
-            relation("writer", &[]),
-            relation(
-                "get",
-                &[
-                    inherit_rule("owner"),
-                    inherit_rule("reader"),
-                    computed_rule("parent_bucket", "get_object"),
-                ],
-            ),
-            relation(
-                "put",
-                &[
-                    inherit_rule("owner"),
-                    inherit_rule("writer"),
-                    computed_rule("parent_bucket", "put_object"),
-                ],
-            ),
-            relation(
-                "delete",
-                &[
-                    inherit_rule("owner"),
-                    inherit_rule("writer"),
-                    computed_rule("parent_bucket", "delete_object"),
-                ],
-            ),
-            relation(
-                "link",
-                &[
-                    inherit_rule("owner"),
-                    inherit_rule("writer"),
-                    computed_rule("parent_bucket", "manage_links"),
-                ],
-            ),
-        ]),
+        relations: relations(
+            SYSTEM_OBJECT_NAMESPACE,
+            &[
+                relation("parent_bucket", &[]),
+                relation("owner", &[]),
+                relation("reader", &[]),
+                relation("writer", &[]),
+                relation(
+                    "get",
+                    &[
+                        inherit_rule("owner"),
+                        inherit_rule("reader"),
+                        computed_rule("parent_bucket", "get_object"),
+                    ],
+                ),
+                relation(
+                    "put",
+                    &[
+                        inherit_rule("owner"),
+                        inherit_rule("writer"),
+                        computed_rule("parent_bucket", "put_object"),
+                    ],
+                ),
+                relation(
+                    "delete",
+                    &[
+                        inherit_rule("owner"),
+                        inherit_rule("writer"),
+                        computed_rule("parent_bucket", "delete_object"),
+                    ],
+                ),
+                relation(
+                    "link",
+                    &[
+                        inherit_rule("owner"),
+                        inherit_rule("writer"),
+                        computed_rule("parent_bucket", "manage_links"),
+                    ],
+                ),
+            ],
+        ),
         schema_json: system_schema_json(SYSTEM_OBJECT_NAMESPACE),
         schema_hash: String::new(),
         schema_version: 0,
@@ -802,35 +927,38 @@ fn object_namespace_schema() -> AuthzNamespaceSchema {
 fn stream_namespace_schema() -> AuthzNamespaceSchema {
     AuthzNamespaceSchema {
         namespace: SYSTEM_STREAM_NAMESPACE.to_string(),
-        relations: relations(&[
-            relation("parent_bucket", &[]),
-            relation("owner", &[]),
-            relation("producer", &[]),
-            relation("consumer", &[]),
-            relation(
-                "append",
-                &[
-                    inherit_rule("owner"),
-                    inherit_rule("producer"),
-                    computed_rule("parent_bucket", "put_object"),
-                ],
-            ),
-            relation(
-                "read",
-                &[
-                    inherit_rule("owner"),
-                    inherit_rule("consumer"),
-                    computed_rule("parent_bucket", "get_object"),
-                ],
-            ),
-            relation(
-                "seal_segment",
-                &[
-                    inherit_rule("owner"),
-                    computed_rule("parent_bucket", "manage_bucket"),
-                ],
-            ),
-        ]),
+        relations: relations(
+            SYSTEM_STREAM_NAMESPACE,
+            &[
+                relation("parent_bucket", &[]),
+                relation("owner", &[]),
+                relation("producer", &[]),
+                relation("consumer", &[]),
+                relation(
+                    "append",
+                    &[
+                        inherit_rule("owner"),
+                        inherit_rule("producer"),
+                        computed_rule("parent_bucket", "put_object"),
+                    ],
+                ),
+                relation(
+                    "read",
+                    &[
+                        inherit_rule("owner"),
+                        inherit_rule("consumer"),
+                        computed_rule("parent_bucket", "get_object"),
+                    ],
+                ),
+                relation(
+                    "seal_segment",
+                    &[
+                        inherit_rule("owner"),
+                        computed_rule("parent_bucket", "manage_bucket"),
+                    ],
+                ),
+            ],
+        ),
         schema_json: system_schema_json(SYSTEM_STREAM_NAMESPACE),
         schema_hash: String::new(),
         schema_version: 0,
@@ -842,34 +970,37 @@ fn stream_namespace_schema() -> AuthzNamespaceSchema {
 fn index_namespace_schema() -> AuthzNamespaceSchema {
     AuthzNamespaceSchema {
         namespace: SYSTEM_INDEX_NAMESPACE.to_string(),
-        relations: relations(&[
-            relation("parent_bucket", &[]),
-            relation("owner", &[]),
-            relation("reader", &[]),
-            relation("writer", &[]),
-            relation(
-                "define",
-                &[
-                    inherit_rule("owner"),
-                    computed_rule("parent_bucket", "manage_indexes"),
-                ],
-            ),
-            relation(
-                "query",
-                &[
-                    inherit_rule("owner"),
-                    inherit_rule("reader"),
-                    computed_rule("parent_bucket", "query_indexes"),
-                ],
-            ),
-            relation(
-                "repair",
-                &[
-                    inherit_rule("owner"),
-                    computed_rule("parent_bucket", "manage_indexes"),
-                ],
-            ),
-        ]),
+        relations: relations(
+            SYSTEM_INDEX_NAMESPACE,
+            &[
+                relation("parent_bucket", &[]),
+                relation("owner", &[]),
+                relation("reader", &[]),
+                relation("writer", &[]),
+                relation(
+                    "define",
+                    &[
+                        inherit_rule("owner"),
+                        computed_rule("parent_bucket", "manage_indexes"),
+                    ],
+                ),
+                relation(
+                    "query",
+                    &[
+                        inherit_rule("owner"),
+                        inherit_rule("reader"),
+                        computed_rule("parent_bucket", "query_indexes"),
+                    ],
+                ),
+                relation(
+                    "repair",
+                    &[
+                        inherit_rule("owner"),
+                        computed_rule("parent_bucket", "manage_indexes"),
+                    ],
+                ),
+            ],
+        ),
         schema_json: system_schema_json(SYSTEM_INDEX_NAMESPACE),
         schema_hash: String::new(),
         schema_version: 0,
@@ -881,55 +1012,58 @@ fn index_namespace_schema() -> AuthzNamespaceSchema {
 fn authz_realm_namespace_schema() -> AuthzNamespaceSchema {
     AuthzNamespaceSchema {
         namespace: SYSTEM_AUTHZ_REALM_NAMESPACE.to_string(),
-        relations: relations(&[
-            relation("parent_tenant", &[]),
-            relation("owner", &[]),
-            relation("schema_admin", &[]),
-            relation("tuple_writer", &[]),
-            relation("checker", &[]),
-            relation("auditor", &[]),
-            relation(
-                "put_schema",
-                &[
-                    inherit_rule("owner"),
-                    inherit_rule("schema_admin"),
-                    computed_rule("parent_tenant", "manage_tenant"),
-                ],
-            ),
-            relation(
-                "bind_schema",
-                &[
-                    inherit_rule("owner"),
-                    inherit_rule("schema_admin"),
-                    computed_rule("parent_tenant", "manage_tenant"),
-                ],
-            ),
-            relation(
-                "write_tuples",
-                &[
-                    inherit_rule("owner"),
-                    inherit_rule("tuple_writer"),
-                    computed_rule("parent_tenant", "manage_tenant"),
-                ],
-            ),
-            relation(
-                "check",
-                &[
-                    inherit_rule("owner"),
-                    inherit_rule("checker"),
-                    inherit_rule("auditor"),
-                    computed_rule("parent_tenant", "read_tenant"),
-                ],
-            ),
-            relation(
-                "list",
-                &[
-                    inherit_rule("owner"),
-                    inherit_rule("auditor"),
-                    computed_rule("parent_tenant", "read_tenant"),
-                ],
-            ),
-        ]),
+        relations: relations(
+            SYSTEM_AUTHZ_REALM_NAMESPACE,
+            &[
+                relation("parent_tenant", &[]),
+                relation("owner", &[]),
+                relation("schema_admin", &[]),
+                relation("tuple_writer", &[]),
+                relation("checker", &[]),
+                relation("auditor", &[]),
+                relation(
+                    "put_schema",
+                    &[
+                        inherit_rule("owner"),
+                        inherit_rule("schema_admin"),
+                        computed_rule("parent_tenant", "manage_tenant"),
+                    ],
+                ),
+                relation(
+                    "bind_schema",
+                    &[
+                        inherit_rule("owner"),
+                        inherit_rule("schema_admin"),
+                        computed_rule("parent_tenant", "manage_tenant"),
+                    ],
+                ),
+                relation(
+                    "write_tuples",
+                    &[
+                        inherit_rule("owner"),
+                        inherit_rule("tuple_writer"),
+                        computed_rule("parent_tenant", "manage_tenant"),
+                    ],
+                ),
+                relation(
+                    "check",
+                    &[
+                        inherit_rule("owner"),
+                        inherit_rule("checker"),
+                        inherit_rule("auditor"),
+                        computed_rule("parent_tenant", "read_tenant"),
+                    ],
+                ),
+                relation(
+                    "list",
+                    &[
+                        inherit_rule("owner"),
+                        inherit_rule("auditor"),
+                        computed_rule("parent_tenant", "read_tenant"),
+                    ],
+                ),
+            ],
+        ),
         schema_json: system_schema_json(SYSTEM_AUTHZ_REALM_NAMESPACE),
         schema_hash: String::new(),
         schema_version: 0,
@@ -941,36 +1075,39 @@ fn authz_realm_namespace_schema() -> AuthzNamespaceSchema {
 fn registry_namespace_schema() -> AuthzNamespaceSchema {
     AuthzNamespaceSchema {
         namespace: SYSTEM_REGISTRY_NAMESPACE.to_string(),
-        relations: relations(&[
-            relation("parent_tenant", &[]),
-            relation("owner", &[]),
-            relation("publisher", &[]),
-            relation("reader", &[]),
-            relation(
-                "publish",
-                &[
-                    inherit_rule("owner"),
-                    inherit_rule("publisher"),
-                    computed_rule("parent_tenant", "manage_tenant"),
-                ],
-            ),
-            relation(
-                "read",
-                &[
-                    inherit_rule("owner"),
-                    inherit_rule("reader"),
-                    computed_rule("parent_tenant", "read_tenant"),
-                ],
-            ),
-            relation(
-                "manage_refs",
-                &[
-                    inherit_rule("owner"),
-                    inherit_rule("publisher"),
-                    computed_rule("parent_tenant", "manage_tenant"),
-                ],
-            ),
-        ]),
+        relations: relations(
+            SYSTEM_REGISTRY_NAMESPACE,
+            &[
+                relation("parent_tenant", &[]),
+                relation("owner", &[]),
+                relation("publisher", &[]),
+                relation("reader", &[]),
+                relation(
+                    "publish",
+                    &[
+                        inherit_rule("owner"),
+                        inherit_rule("publisher"),
+                        computed_rule("parent_tenant", "manage_tenant"),
+                    ],
+                ),
+                relation(
+                    "read",
+                    &[
+                        inherit_rule("owner"),
+                        inherit_rule("reader"),
+                        computed_rule("parent_tenant", "read_tenant"),
+                    ],
+                ),
+                relation(
+                    "manage_refs",
+                    &[
+                        inherit_rule("owner"),
+                        inherit_rule("publisher"),
+                        computed_rule("parent_tenant", "manage_tenant"),
+                    ],
+                ),
+            ],
+        ),
         schema_json: system_schema_json(SYSTEM_REGISTRY_NAMESPACE),
         schema_hash: String::new(),
         schema_version: 0,
@@ -982,22 +1119,25 @@ fn registry_namespace_schema() -> AuthzNamespaceSchema {
 fn personaldb_group_namespace_schema() -> AuthzNamespaceSchema {
     AuthzNamespaceSchema {
         namespace: SYSTEM_PERSONALDB_GROUP_NAMESPACE.to_string(),
-        relations: relations(&[
-            relation("parent_tenant", &[]),
-            relation("owner", &[]),
-            relation("writer", &[]),
-            relation("reader", &[]),
-            relation("witness", &[inherit_rule("owner")]),
-            relation(
-                "apply_changeset",
-                &[inherit_rule("owner"), inherit_rule("writer")],
-            ),
-            relation(
-                "get_snapshot",
-                &[inherit_rule("owner"), inherit_rule("reader")],
-            ),
-            relation("watch", &[inherit_rule("owner"), inherit_rule("reader")]),
-        ]),
+        relations: relations(
+            SYSTEM_PERSONALDB_GROUP_NAMESPACE,
+            &[
+                relation("parent_tenant", &[]),
+                relation("owner", &[]),
+                relation("writer", &[]),
+                relation("reader", &[]),
+                relation("witness", &[inherit_rule("owner")]),
+                relation(
+                    "apply_changeset",
+                    &[inherit_rule("owner"), inherit_rule("writer")],
+                ),
+                relation(
+                    "get_snapshot",
+                    &[inherit_rule("owner"), inherit_rule("reader")],
+                ),
+                relation("watch", &[inherit_rule("owner"), inherit_rule("reader")]),
+            ],
+        ),
         schema_json: system_schema_json(SYSTEM_PERSONALDB_GROUP_NAMESPACE),
         schema_hash: String::new(),
         schema_version: 0,
@@ -1009,11 +1149,14 @@ fn personaldb_group_namespace_schema() -> AuthzNamespaceSchema {
 fn region_namespace_schema() -> AuthzNamespaceSchema {
     AuthzNamespaceSchema {
         namespace: SYSTEM_REGION_NAMESPACE.to_string(),
-        relations: relations(&[
-            relation("system", &[]),
-            relation("manage", &[computed_rule("system", "manage_regions")]),
-            relation("view", &[computed_rule("system", "view_system")]),
-        ]),
+        relations: relations(
+            SYSTEM_REGION_NAMESPACE,
+            &[
+                relation("system", &[]),
+                relation("manage", &[computed_rule("system", "manage_regions")]),
+                relation("view", &[computed_rule("system", "view_system")]),
+            ],
+        ),
         schema_json: system_schema_json(SYSTEM_REGION_NAMESPACE),
         schema_hash: String::new(),
         schema_version: 0,
@@ -1025,11 +1168,14 @@ fn region_namespace_schema() -> AuthzNamespaceSchema {
 fn cell_namespace_schema() -> AuthzNamespaceSchema {
     AuthzNamespaceSchema {
         namespace: SYSTEM_CELL_NAMESPACE.to_string(),
-        relations: relations(&[
-            relation("parent_region", &[]),
-            relation("manage", &[computed_rule("parent_region", "manage")]),
-            relation("view", &[computed_rule("parent_region", "view")]),
-        ]),
+        relations: relations(
+            SYSTEM_CELL_NAMESPACE,
+            &[
+                relation("parent_region", &[]),
+                relation("manage", &[computed_rule("parent_region", "manage")]),
+                relation("view", &[computed_rule("parent_region", "view")]),
+            ],
+        ),
         schema_json: system_schema_json(SYSTEM_CELL_NAMESPACE),
         schema_hash: String::new(),
         schema_version: 0,
@@ -1041,12 +1187,15 @@ fn cell_namespace_schema() -> AuthzNamespaceSchema {
 fn node_namespace_schema() -> AuthzNamespaceSchema {
     AuthzNamespaceSchema {
         namespace: SYSTEM_NODE_NAMESPACE.to_string(),
-        relations: relations(&[
-            relation("parent_cell", &[]),
-            relation("manage", &[computed_rule("parent_cell", "manage")]),
-            relation("drain", &[computed_rule("parent_cell", "manage")]),
-            relation("view", &[computed_rule("parent_cell", "view")]),
-        ]),
+        relations: relations(
+            SYSTEM_NODE_NAMESPACE,
+            &[
+                relation("parent_cell", &[]),
+                relation("manage", &[computed_rule("parent_cell", "manage")]),
+                relation("drain", &[computed_rule("parent_cell", "manage")]),
+                relation("view", &[computed_rule("parent_cell", "view")]),
+            ],
+        ),
         schema_json: system_schema_json(SYSTEM_NODE_NAMESPACE),
         schema_hash: String::new(),
         schema_version: 0,
@@ -1058,11 +1207,14 @@ fn node_namespace_schema() -> AuthzNamespaceSchema {
 fn partition_namespace_schema() -> AuthzNamespaceSchema {
     AuthzNamespaceSchema {
         namespace: SYSTEM_PARTITION_NAMESPACE.to_string(),
-        relations: relations(&[
-            relation("system", &[]),
-            relation("move", &[computed_rule("system", "manage_partitions")]),
-            relation("view", &[computed_rule("system", "view_system")]),
-        ]),
+        relations: relations(
+            SYSTEM_PARTITION_NAMESPACE,
+            &[
+                relation("system", &[]),
+                relation("move", &[computed_rule("system", "manage_partitions")]),
+                relation("view", &[computed_rule("system", "view_system")]),
+            ],
+        ),
         schema_json: system_schema_json(SYSTEM_PARTITION_NAMESPACE),
         schema_hash: String::new(),
         schema_version: 0,
@@ -1071,20 +1223,83 @@ fn partition_namespace_schema() -> AuthzNamespaceSchema {
     }
 }
 
-fn relations(definitions: &[AuthzRelationSchema]) -> Vec<AuthzRelationSchema> {
-    definitions.to_vec()
+fn relations(namespace: &str, definitions: &[AuthzRelationSchema]) -> Vec<AuthzRelationSchema> {
+    let mut members = Vec::with_capacity(definitions.len() * 2);
+    for definition in definitions {
+        if definition.rules.is_empty() {
+            let mut relation = definition.clone();
+            relation.member_kind = AuthzSchemaMemberKind::DirectRelation as i32;
+            relation.allowed_subjects = direct_relation_subjects(namespace, &relation.relation);
+            members.push(relation);
+            continue;
+        }
+
+        let grant_relation = format!("{}_grant", definition.relation);
+        members.push(AuthzRelationSchema {
+            relation: grant_relation.clone(),
+            rules: Vec::new(),
+            member_kind: AuthzSchemaMemberKind::DirectRelation as i32,
+            allowed_subjects: vec![any_subject(SYSTEM_ADMIN_SUBJECT_KIND_APP)],
+        });
+        let mut permission = definition.clone();
+        permission.member_kind = AuthzSchemaMemberKind::Permission as i32;
+        permission.allowed_subjects.clear();
+        permission.rules.insert(0, inherit_rule(&grant_relation));
+        members.push(permission);
+    }
+    members
 }
 
 fn relation(name: &str, rules: &[AuthzRelationRule]) -> AuthzRelationSchema {
     AuthzRelationSchema {
         relation: name.to_string(),
         rules: rules.to_vec(),
+        member_kind: AuthzSchemaMemberKind::Unspecified as i32,
+        allowed_subjects: Vec::new(),
+    }
+}
+
+fn direct_relation_subjects(namespace: &str, relation: &str) -> Vec<AuthzAllowedSubject> {
+    match relation {
+        "parent_tenant" => vec![any_subject(SYSTEM_STORAGE_TENANT_NAMESPACE)],
+        "parent_bucket" => vec![any_subject(SYSTEM_BUCKET_NAMESPACE)],
+        "parent_region" => vec![any_subject(SYSTEM_REGION_NAMESPACE)],
+        "parent_cell" => vec![any_subject(SYSTEM_CELL_NAMESPACE)],
+        "system" => vec![exact_subject(SYSTEM_NAMESPACE, SYSTEM_OBJECT_ID)],
+        "reader" if namespace == SYSTEM_BUCKET_NAMESPACE => {
+            vec![any_subject(SYSTEM_ADMIN_SUBJECT_KIND_APP), public_subject()]
+        }
+        _ => vec![any_subject(SYSTEM_ADMIN_SUBJECT_KIND_APP)],
+    }
+}
+
+fn any_subject(subject_kind: &str) -> AuthzAllowedSubject {
+    AuthzAllowedSubject {
+        selector_kind: AuthzSubjectSelectorKind::AnyCanonicalId as i32,
+        subject_kind: subject_kind.to_string(),
+        subject_id: String::new(),
+    }
+}
+
+fn exact_subject(subject_kind: &str, subject_id: &str) -> AuthzAllowedSubject {
+    AuthzAllowedSubject {
+        selector_kind: AuthzSubjectSelectorKind::Exact as i32,
+        subject_kind: subject_kind.to_string(),
+        subject_id: subject_id.to_string(),
+    }
+}
+
+fn public_subject() -> AuthzAllowedSubject {
+    AuthzAllowedSubject {
+        selector_kind: AuthzSubjectSelectorKind::Public as i32,
+        subject_kind: String::new(),
+        subject_id: String::new(),
     }
 }
 
 fn system_schema_json(namespace: &str) -> String {
     serde_json::json!({
-        "schema": "anvil.system.authz_schema.v1",
+        "schema": "anvil.system.authz_schema.v2",
         "namespace": namespace,
         "description": "Built-in Anvil system realm. Public tenant APIs cannot mutate this schema."
     })
@@ -1136,7 +1351,7 @@ async fn write_system_relation_tuples(
         mutations.push(AuthzTupleBatchMutation {
             namespace: namespace.clone(),
             object_id: SYSTEM_OBJECT_ID.to_string(),
-            relation: "manage_nodes".to_string(),
+            relation: "manage_nodes_grant".to_string(),
             subject_kind: SYSTEM_ADMIN_SUBJECT_KIND_APP.to_string(),
             subject_id: node_id.to_string(),
             caveat_hash: String::new(),
@@ -1468,7 +1683,7 @@ mod tests {
         let persistence = Persistence::new(&config, None).unwrap();
         let keyring = config.secret_keyring().unwrap();
 
-        install_system_schema(&storage).await.unwrap();
+        install_system_schema(&storage, &persistence).await.unwrap();
         assert!(
             !bootstrap_marker_exists(&storage, &config.mesh_id)
                 .await

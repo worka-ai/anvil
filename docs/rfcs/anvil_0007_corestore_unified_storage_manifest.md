@@ -502,6 +502,7 @@ Initial CoreMeta table registry:
 | `0x8402` | `cf_boundary` | `realm / bucket / dimension_id / encoded_value / object_ref` | `BoundaryValueRow` | committed root generation only |
 | `0x8501` | `cf_authz` | `realm / schema_generation` | `AuthzSchemaRow` | committed authz root generation only |
 | `0x8502` | `cf_authz` | `realm / revision / tuple_hash` | `AuthzTuplePageRow` | committed authz root generation only |
+| `0x8503` | `cf_authz` | `tenant / principal / operation_hash` | `AuthzIdempotencyReceiptRow` | committed atomically with the tuple batch revision |
 | `0x8601` | `cf_personaldb` | `realm / group_id / generation` | `PersonalDbGroupRow` | committed root generation only |
 | `0x8602` | `cf_personaldb` | `realm / group_id / snapshot_or_changeset_id` | `PersonalDbDataLocatorRow` | committed root generation only |
 | `0x8701` | `cf_registry` | `realm / registry_kind / namespace / package / version` | `RegistryVersionRow` | committed root generation only |
