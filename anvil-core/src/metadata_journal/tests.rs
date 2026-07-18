@@ -127,6 +127,66 @@ async fn append_object_mutation_writes_direct_metadata_and_directory_records() {
 }
 
 #[tokio::test]
+async fn object_metadata_source_checkpoint_uses_stream_metadata() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let bucket = sample_bucket();
+    let first = sample_object(1, "docs/a.txt", false);
+    let second = sample_object(2, "docs/b.txt", false);
+
+    append_object_mutation(&storage, &bucket, &first, ObjectJournalMutation::Put)
+        .await
+        .unwrap();
+    let first_cursor = object_metadata_source_cursor(&storage, &bucket, PARTITION_OWNER_KEY)
+        .await
+        .unwrap();
+    assert_eq!(first_cursor, 2);
+    let first_hash = object_metadata_source_checkpoint_hash(
+        &storage,
+        &bucket,
+        PARTITION_OWNER_KEY,
+        first_cursor,
+    )
+    .await
+    .unwrap();
+
+    append_object_mutation(&storage, &bucket, &second, ObjectJournalMutation::Put)
+        .await
+        .unwrap();
+    let second_cursor = object_metadata_source_cursor(&storage, &bucket, PARTITION_OWNER_KEY)
+        .await
+        .unwrap();
+    assert_eq!(second_cursor, 4);
+    let second_hash = object_metadata_source_checkpoint_hash(
+        &storage,
+        &bucket,
+        PARTITION_OWNER_KEY,
+        second_cursor,
+    )
+    .await
+    .unwrap();
+    assert_ne!(first_hash, second_hash);
+    assert_eq!(
+        object_metadata_source_checkpoint_hash(
+            &storage,
+            &bucket,
+            PARTITION_OWNER_KEY,
+            first_cursor,
+        )
+        .await
+        .unwrap(),
+        first_hash
+    );
+
+    let stats = active_object_journal_stats(&storage, &bucket, PARTITION_OWNER_KEY)
+        .await
+        .unwrap();
+    assert_eq!(stats.last_sequence, 4);
+    assert_eq!(stats.uncompacted_frame_count, 4);
+    assert!(stats.uncompacted_encoded_bytes > 0);
+}
+
+#[tokio::test]
 async fn object_metadata_write_permit_sets_frame_and_manifest_fence() {
     let temp = tempdir().unwrap();
     let storage = Storage::new_at(temp.path()).await.unwrap();

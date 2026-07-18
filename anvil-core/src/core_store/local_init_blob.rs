@@ -1,4 +1,6 @@
-use super::local_stream_control::control_record_proto::encode_object_manifest_record;
+use super::local_stream_control::control_record_proto::{
+    encode_object_manifest_record, object_manifest_root_generation,
+};
 use super::local_tx_rows::{OwnedCoreMetaBatchOp, borrow_owned_coremeta_batch_ops};
 use super::*;
 use crate::formats::{
@@ -61,6 +63,7 @@ impl CoreStore {
         pipeline_keyring: Option<Arc<CorePipelineKeyring>>,
         node_identity: CoreStoreNodeIdentity,
     ) -> Result<Self> {
+        clear_stale_process_locks_once(&storage)?;
         let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
         let node_signing_keypair = Arc::new(load_or_create_node_signing_keypair(&meta)?);
         store_node_receipt_signing_public_key(
@@ -621,7 +624,7 @@ impl CoreStore {
         let common = core_meta_committed_row_common(
             format!("mesh/{}/region/{}", manifest.mesh_id, manifest.region_id),
             core_meta_root_key_hash(&format!("object-manifest/{}", manifest.object_hash)),
-            manifest.logical_size,
+            object_manifest_root_generation(manifest.logical_size),
             manifest.mutation_id.clone(),
             unix_timestamp_nanos(),
         );

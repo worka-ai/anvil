@@ -618,7 +618,7 @@ async fn append_task_event(
         stream_id,
         record_kind: TASK_QUEUE_AUDIT_RECORD_KIND.to_string(),
         payload,
-        idempotency_key: Some(format!("task-queue-audit:{mutation_id}")),
+        idempotency_key: None,
     }];
     if let Some(row) = current_update.row.as_ref() {
         operations.push(CoreMutationOperation::CoreMetaPut {

@@ -628,6 +628,14 @@ pub struct StreamRecord {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CoreStreamRecordMetadata {
+    pub sequence: u64,
+    pub event_hash: String,
+    pub record_kind: String,
+    pub payload_len: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SealStreamSegment {
     pub stream_id: String,
