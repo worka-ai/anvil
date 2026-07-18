@@ -186,6 +186,79 @@ async fn seeded_core_store_link() -> (TempDir, ObjectManager, Bucket, Object, Ob
     (temp, manager, bucket, target, link, claims)
 }
 
+async fn seeded_object_manager(
+    bucket_name: &str,
+) -> (TempDir, ObjectManager, Bucket, auth::Claims) {
+    let temp = tempdir().unwrap();
+    let storage_path = temp.path().join("storage");
+    let config = test_config(&storage_path);
+    let storage = Storage::new_at(&config.storage_path).await.unwrap();
+    let core_store = CoreStore::new(storage.clone()).await.unwrap();
+    let persistence = Persistence::new(&config, None).unwrap();
+    persistence.create_region("test-region").await.unwrap();
+    let tenant = persistence
+        .create_tenant("tenant-a", "tenant-a")
+        .await
+        .unwrap();
+    let bucket = persistence
+        .create_bucket(tenant.id, bucket_name, "test-region")
+        .await
+        .unwrap();
+    let claims = auth::Claims {
+        sub: "test-app".to_string(),
+        exp: usize::MAX,
+        tenant_id: tenant.id,
+        jti: None,
+    };
+    access_control::grant_storage_tenant_owner(
+        &persistence,
+        tenant.id,
+        &claims.sub,
+        "test",
+        "object manager dedupe seed",
+    )
+    .await
+    .unwrap();
+    access_control::grant_bucket_defaults(
+        &persistence,
+        &bucket,
+        &claims.sub,
+        "test",
+        "object manager dedupe seed",
+    )
+    .await
+    .unwrap();
+    for relation in ["put_object", "get_object", "delete_object"] {
+        persistence
+            .write_authz_tuple(
+                system_realm::SYSTEM_STORAGE_TENANT_ID,
+                &access_control::system_realm_namespace(system_realm::SYSTEM_BUCKET_NAMESPACE),
+                &access_control::bucket_object_id(&bucket),
+                relation,
+                access_control::APP_SUBJECT_KIND,
+                &claims.sub,
+                "",
+                "add",
+                "test",
+                "object manager dedupe direct bucket permission",
+            )
+            .await
+            .unwrap();
+    }
+    let (watch_tx, _) = tokio::sync::broadcast::channel(8);
+    let manager = ObjectManager::new(
+        persistence,
+        storage,
+        core_store,
+        "test-region".to_string(),
+        CrossRegionRoutingPolicy::RedirectPreferred,
+        hex::decode(&config.anvil_secret_encryption_key).unwrap(),
+        watch_tx,
+        Observability::default(),
+    );
+    (temp, manager, bucket, claims)
+}
+
 fn boundary_schema() -> CoreBoundarySchema {
     CoreBoundarySchema {
         schema: crate::core_store::CORE_BOUNDARY_SCHEMA_SCHEMA.to_string(),
@@ -362,6 +435,211 @@ fn strict_write_visibility_preserves_previous_synchronous_behaviour() {
     assert!(options.exact_authz_revision);
     assert!(options.enqueue_index_maintenance);
     assert!(options.enqueue_metadata_compaction);
+}
+
+#[tokio::test]
+async fn small_inline_object_versions_dedupe_and_reference_count_payload() {
+    let (_temp, manager, bucket, claims) = seeded_object_manager("inline-dedupe").await;
+    let payload = br#"{"schema_version":"1.6.0","id":"GHSA-inline","modified":"2026-07-18T00:00:00Z","aliases":["CVE-2026-0001"]}"#.to_vec();
+    let key = "osv/GHSA-inline.json";
+
+    let first = manager
+        .put_object(
+            &claims,
+            &bucket.name,
+            key,
+            tokio_stream::iter(vec![Ok(payload.clone())]),
+            ObjectWriteOptions {
+                content_type: Some("application/json".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let second = manager
+        .put_object(
+            &claims,
+            &bucket.name,
+            key,
+            tokio_stream::iter(vec![Ok(payload.clone())]),
+            ObjectWriteOptions {
+                content_type: Some("application/json".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(first.version_id, second.version_id);
+    assert_eq!(first.content_hash, second.content_hash);
+    let summaries = manager
+        .core_store
+        .payload_reference_summaries_for_object(&second)
+        .await
+        .unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].storage_kind, "inline_payload");
+    assert_eq!(summaries[0].reference_count, 2);
+
+    manager
+        .delete_object_version(
+            &claims,
+            &bucket.name,
+            key,
+            first.version_id,
+            None,
+            None,
+            ObjectWriteVisibility::default(),
+        )
+        .await
+        .unwrap();
+    let after_first_delete = manager
+        .core_store
+        .payload_reference_summaries_for_object(&second)
+        .await
+        .unwrap();
+    assert_eq!(after_first_delete[0].reference_count, 1);
+
+    let result = manager
+        .get_object(
+            Some(claims.clone()),
+            bucket.name.clone(),
+            key.to_string(),
+            Some(second.version_id),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(collect_stream_bytes(result.1).await.unwrap(), payload);
+
+    manager
+        .delete_object_version(
+            &claims,
+            &bucket.name,
+            key,
+            second.version_id,
+            None,
+            None,
+            ObjectWriteVisibility::default(),
+        )
+        .await
+        .unwrap();
+    let after_all_deletes = manager
+        .core_store
+        .payload_reference_summaries_for_object(&second)
+        .await
+        .unwrap();
+    assert_eq!(after_all_deletes[0].reference_count, 0);
+}
+
+#[tokio::test]
+async fn erasure_coded_object_versions_dedupe_and_reference_count_blocks() {
+    let (_temp, manager, bucket, claims) = seeded_object_manager("erasure-dedupe").await;
+    let payload = vec![0xAB; 80 * 1024];
+    let key = "payloads/repeated.bin";
+
+    let first = manager
+        .put_object(
+            &claims,
+            &bucket.name,
+            key,
+            tokio_stream::iter(vec![Ok(payload.clone())]),
+            ObjectWriteOptions {
+                content_type: Some("application/octet-stream".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let second = manager
+        .put_object(
+            &claims,
+            &bucket.name,
+            key,
+            tokio_stream::iter(vec![Ok(payload.clone())]),
+            ObjectWriteOptions {
+                content_type: Some("application/octet-stream".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(first.version_id, second.version_id);
+    assert_eq!(first.content_hash, second.content_hash);
+    let summaries = manager
+        .core_store
+        .payload_reference_summaries_for_object(&second)
+        .await
+        .unwrap();
+    assert!(!summaries.is_empty());
+    assert!(
+        summaries
+            .iter()
+            .all(|summary| summary.storage_kind == "erasure_block")
+    );
+    assert!(
+        summaries.iter().all(|summary| summary.reference_count == 2),
+        "large ref summaries: {summaries:?}"
+    );
+
+    manager
+        .delete_object_version(
+            &claims,
+            &bucket.name,
+            key,
+            first.version_id,
+            None,
+            None,
+            ObjectWriteVisibility::default(),
+        )
+        .await
+        .unwrap();
+    let after_first_delete = manager
+        .core_store
+        .payload_reference_summaries_for_object(&second)
+        .await
+        .unwrap();
+    assert!(
+        after_first_delete
+            .iter()
+            .all(|summary| summary.reference_count == 1)
+    );
+
+    let result = manager
+        .get_object(
+            Some(claims.clone()),
+            bucket.name.clone(),
+            key.to_string(),
+            Some(second.version_id),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(collect_stream_bytes(result.1).await.unwrap(), payload);
+
+    manager
+        .delete_object_version(
+            &claims,
+            &bucket.name,
+            key,
+            second.version_id,
+            None,
+            None,
+            ObjectWriteVisibility::default(),
+        )
+        .await
+        .unwrap();
+    let after_all_deletes = manager
+        .core_store
+        .payload_reference_summaries_for_object(&second)
+        .await
+        .unwrap();
+    assert!(
+        after_all_deletes
+            .iter()
+            .all(|summary| summary.reference_count == 0)
+    );
 }
 
 #[tokio::test]
