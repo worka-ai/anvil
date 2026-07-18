@@ -41,10 +41,12 @@ jobs:
             arch: amd64
             image: anvil:test-amd64
             artifact: anvil-test-image-amd64
+            native_cargo: "1"
           - platform: linux/arm64
             arch: arm64
             image: anvil:test-arm64
             artifact: anvil-test-image-arm64
+            native_cargo: "0"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -98,7 +100,8 @@ jobs:
           ANVIL_IMAGE: ${{ matrix.image }}
           ANVIL_DOCKER_PLATFORM: ${{ matrix.platform }}
           ANVIL_BUILD_PROFILE: release
-          CARGO_BUILD_JOBS: "2"
+          ANVIL_USE_NATIVE_CARGO: ${{ matrix.native_cargo }}
+          CARGO_BUILD_JOBS: "1"
         run: ./scripts/build-image.sh
 
       - name: Smoke check image binaries
