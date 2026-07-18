@@ -32,9 +32,9 @@ use super::meta::{
     TABLE_INLINE_PAYLOAD_ROW, TABLE_LANDED_BYTE_REF_ROW, TABLE_MATERIALISATION_CURSOR_ROW,
     TABLE_NODE_SIGNING_KEYPAIR_ROW, TABLE_OBJECT_HEAD_ROW, TABLE_OBJECT_VERSION_META_ROW,
     TABLE_PENDING_MUTATION_ROW, TABLE_QUORUM_PROFILE_CURRENT_ROW, TABLE_ROOT_CACHE_ROW,
-    TABLE_ROOT_CATALOG_CURRENT_ROW, TABLE_STREAM_HEAD_ROW, TABLE_STREAM_RECORD_INDEX_ROW,
-    TABLE_TRANSACTION_COMMIT_EVIDENCE_ROW, TABLE_TRANSACTION_LOCATOR_ROW,
-    canonical_coremeta_cf_name, core_meta_committed_row_common,
+    TABLE_ROOT_CATALOG_CURRENT_ROW, TABLE_STREAM_HEAD_ROW, TABLE_STREAM_IDEMPOTENCY_ROW,
+    TABLE_STREAM_RECORD_INDEX_ROW, TABLE_TRANSACTION_COMMIT_EVIDENCE_ROW,
+    TABLE_TRANSACTION_LOCATOR_ROW, canonical_coremeta_cf_name, core_meta_committed_row_common,
     core_meta_locator_from_manifest_locator, core_meta_locator_to_manifest_locator,
     core_meta_payload_digest, core_meta_pending_row_common, core_meta_root_key_hash,
     core_meta_row_common_from_payload, core_meta_tuple_key, encode_core_meta_inline_payload_row,
@@ -570,6 +570,20 @@ struct StoredStreamRecordIndexRow {
     created_at: String,
 }
 
+#[derive(Debug, Clone)]
+struct StoredStreamIdempotencyRow {
+    schema: String,
+    stream_id: String,
+    sequence: u64,
+    cursor: String,
+    event_hash: String,
+    record_kind: String,
+    payload_hash: String,
+    transaction_id: Option<String>,
+    idempotency_key_hash: String,
+    created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct CoreRootAnchorRecord {
     pub(crate) schema: String,
@@ -633,6 +647,7 @@ struct CoreStoredStreamHead {
     last_sequence: u64,
     last_event_hash: String,
     record_count: u64,
+    idempotency_index_complete: bool,
     updated_at: String,
 }
 
@@ -740,6 +755,23 @@ impl StoredStreamRecordIndexRow {
             idempotency_key_hash: record.idempotency_key_hash.clone(),
             created_at: record.created_at.clone(),
         }
+    }
+}
+
+impl StoredStreamIdempotencyRow {
+    fn from_record_index(row: &StoredStreamRecordIndexRow) -> Option<Self> {
+        Some(Self {
+            schema: "anvil.core.stream_idempotency.v1".to_string(),
+            stream_id: row.stream_id.clone(),
+            sequence: row.sequence,
+            cursor: row.cursor.clone(),
+            event_hash: row.event_hash.clone(),
+            record_kind: row.record_kind.clone(),
+            payload_hash: row.payload_hash.clone(),
+            transaction_id: row.transaction_id.clone(),
+            idempotency_key_hash: row.idempotency_key_hash.clone()?,
+            created_at: row.created_at.clone(),
+        })
     }
 }
 

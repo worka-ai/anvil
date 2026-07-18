@@ -496,6 +496,7 @@ Initial CoreMeta table registry:
 | `0x8103` | `cf_inline_payloads` | `realm / bucket / object_key / version_id` | `InlinePayloadRow` | committed root generation only |
 | `0x8201` | `cf_stream_heads` | `realm / stream_id` | `StreamHeadRow` | committed root generation only |
 | `0x8202` | `cf_stream_records` | `realm / stream_id / sequence` | `StreamRecordIndexRow` | committed root generation only |
+| `0x8203` | `cf_stream_records` | `realm / stream_id / idempotency_key_hash` | `StreamIdempotencyRow` | committed root generation only |
 | `0x8301` | `cf_index_defs` | `realm / bucket / index_id` | `IndexDefinitionRow` | committed root generation only |
 | `0x8302` | `cf_index_rows` | `realm / bucket / index_id / encoded_sort_key / object_ref` | `IndexRow` | committed root generation only |
 | `0x8401` | `cf_boundary` | `realm / bucket / generation` | `BoundarySchemaRow` | committed root generation only |
@@ -662,6 +663,7 @@ message StreamHeadRow {
   CoreMetaLocator tail_segment_locator = 5;
   string open_segment_id = 6;
   uint64 sealed_through_sequence = 7;
+  bool idempotency_index_complete = 8;
 }
 
 message StreamRecordIndexRow {
@@ -675,6 +677,29 @@ message StreamRecordIndexRow {
   CoreMetaInlineOrLocator inline_payload_or_locator = 8;
   CoreMetaLocator segment_locator = 9;
 }
+
+message StreamIdempotencyRow {
+  CoreMetaRowCommon common = 1;
+  string schema = 2;                 // anvil.core.stream_idempotency.v1
+  string stream_id = 3;
+  uint64 sequence = 4;
+  string cursor = 5;
+  string event_hash = 6;
+  string record_kind = 7;
+  string payload_hash = 8;
+  optional string transaction_id = 9;
+  string idempotency_key_hash = 10;
+  string created_at = 11;            // RFC 3339
+}
+
+For streams whose `idempotency_index_complete` flag is true, every append with
+an idempotency key MUST commit the compact `StreamIdempotencyRow`, stream record,
+and stream head in the same root generation. A repeated key is therefore a
+single CoreMeta point lookup rather than a replay of stream history. Streams
+created by an older binary have the flag unset and MUST retain the historical
+lookup behavior until an explicit migration has indexed their complete history;
+a writer MUST NOT claim completeness merely because it appended a new tail
+record.
 
 message IndexDefinitionRow {
   CoreMetaRowCommon common = 1;

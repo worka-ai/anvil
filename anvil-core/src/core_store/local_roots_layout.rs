@@ -241,16 +241,18 @@ impl CoreStore {
         }
 
         let existing_head = self.read_stream_head_from_meta(stream_id)?;
-        let (existing_sequence, existing_hash, existing_record_count) = existing_head
-            .as_ref()
-            .map(|head| {
-                (
-                    head.last_sequence,
-                    head.last_event_hash.clone(),
-                    head.record_count,
-                )
-            })
-            .unwrap_or_else(|| (0, ZERO_HASH.to_string(), 0));
+        let (existing_sequence, existing_hash, existing_record_count, idempotency_index_complete) =
+            existing_head
+                .as_ref()
+                .map(|head| {
+                    (
+                        head.last_sequence,
+                        head.last_event_hash.clone(),
+                        head.record_count,
+                        head.idempotency_index_complete,
+                    )
+                })
+                .unwrap_or_else(|| (0, ZERO_HASH.to_string(), 0, true));
         let mut new_records = records
             .iter()
             .filter(|record| record.sequence > existing_sequence)
@@ -276,12 +278,10 @@ impl CoreStore {
             previous_event_hash = record.event_hash.clone();
         }
 
-        let mut payloads = Vec::with_capacity(new_records.len() + 1);
-        let mut record_keys = Vec::with_capacity(new_records.len());
+        let mut record_rows = Vec::with_capacity(new_records.len());
         for record in new_records {
             let inline_payload = record.payload.clone();
             let mut stored = StoredStreamRecordIndexRow::new(record, Some(inline_payload), None);
-            record_keys.push(stream_record_key(stream_id, record.sequence));
             let mut payload = encode_stream_record_index_row(&stored)?;
             if payload.len() > CORE_META_STREAM_RECORD_INDEX_MAX_PAYLOAD_BYTES {
                 let payload_locator = self.write_stream_record_payload(record).await?;
@@ -295,7 +295,19 @@ impl CoreStore {
                     );
                 }
             }
-            payloads.push(payload);
+            let idempotency_row = StoredStreamIdempotencyRow::from_record_index(&stored)
+                .map(|row| {
+                    Ok::<_, anyhow::Error>((
+                        stream_idempotency_key(stream_id, &row.idempotency_key_hash),
+                        encode_stream_idempotency_row(&row)?,
+                    ))
+                })
+                .transpose()?;
+            record_rows.push((
+                stream_record_key(stream_id, record.sequence),
+                idempotency_row,
+                payload,
+            ));
         }
         let head = CoreStoredStreamHead {
             schema: "anvil.core.stream_head.v1".to_string(),
@@ -303,31 +315,38 @@ impl CoreStore {
             last_sequence: previous_sequence,
             last_event_hash: previous_event_hash,
             record_count: existing_record_count
-                .checked_add(record_keys.len() as u64)
+                .checked_add(record_rows.len() as u64)
                 .ok_or_else(|| anyhow!("CoreStore stream record count overflow"))?,
+            idempotency_index_complete,
             updated_at: now_rfc3339(),
         };
         let head_key = stream_head_key(stream_id);
-        payloads.push(encode_stream_head_record(&head)?);
+        let head_payload = encode_stream_head_record(&head)?;
 
-        let mut owned_ops = Vec::with_capacity(payloads.len());
-        for (idx, key) in record_keys.iter().enumerate() {
+        let mut owned_ops = Vec::with_capacity(record_rows.len().saturating_mul(2) + 1);
+        for (record_key, idempotency_row, payload) in record_rows {
             owned_ops.push(OwnedCoreMetaBatchOp::Put {
                 cf: CF_STREAM_RECORDS,
                 table_id: TABLE_STREAM_RECORD_INDEX_ROW,
-                tuple_key: key.clone(),
-                payload: payloads[idx].clone(),
+                tuple_key: record_key,
+                payload: payload.clone(),
                 common: None,
             });
+            if let Some((idempotency_key, idempotency_payload)) = idempotency_row {
+                owned_ops.push(OwnedCoreMetaBatchOp::Put {
+                    cf: CF_STREAM_RECORDS,
+                    table_id: TABLE_STREAM_IDEMPOTENCY_ROW,
+                    tuple_key: idempotency_key,
+                    payload: idempotency_payload,
+                    common: None,
+                });
+            }
         }
         owned_ops.push(OwnedCoreMetaBatchOp::Put {
             cf: CF_STREAM_HEADS,
             table_id: TABLE_STREAM_HEAD_ROW,
             tuple_key: head_key,
-            payload: payloads
-                .last()
-                .expect("stream head payload is pushed after record payloads")
-                .clone(),
+            payload: head_payload,
             common: None,
         });
         let transaction_id = records

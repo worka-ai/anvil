@@ -54,6 +54,7 @@ pub const TABLE_MULTIPART_PART_CURRENT_ROW: u16 = 0x8106;
 pub const TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW: u16 = 0x8107;
 pub const TABLE_STREAM_HEAD_ROW: u16 = 0x8201;
 pub const TABLE_STREAM_RECORD_INDEX_ROW: u16 = 0x8202;
+pub const TABLE_STREAM_IDEMPOTENCY_ROW: u16 = 0x8203;
 pub const TABLE_INDEX_DEFINITION_ROW: u16 = 0x8301;
 pub const TABLE_INDEX_ROW: u16 = 0x8302;
 pub const TABLE_DERIVED_INDEX_PROOF_ROW: u16 = 0x8303;
@@ -1431,7 +1432,7 @@ fn table_spec(table_id: u16) -> Result<CoreMetaTableSpec> {
             cf: CF_STREAM_HEADS,
             max_payload_bytes: CORE_META_STREAM_RECORD_INDEX_MAX_PAYLOAD_BYTES,
         },
-        TABLE_STREAM_RECORD_INDEX_ROW => CoreMetaTableSpec {
+        TABLE_STREAM_RECORD_INDEX_ROW | TABLE_STREAM_IDEMPOTENCY_ROW => CoreMetaTableSpec {
             cf: CF_STREAM_RECORDS,
             max_payload_bytes: CORE_META_STREAM_RECORD_INDEX_MAX_PAYLOAD_BYTES,
         },
@@ -1725,6 +1726,7 @@ fn expected_schema_markers(table_id: u16) -> Option<&'static [&'static str]> {
             "anvil.core.watch_event.v1",
             "anvil.core.stream_record_index.v1",
         ]),
+        TABLE_STREAM_IDEMPOTENCY_ROW => Some(&["anvil.core.stream_idempotency.v1"]),
         TABLE_MANIFEST_CAS_CURRENT_ROW => Some(&["anvil.core.manifest_cas.current_row.v1"]),
         TABLE_MULTIPART_UPLOAD_CURRENT_ROW => Some(&["anvil.multipart.upload_current_row.v1"]),
         TABLE_MULTIPART_PART_CURRENT_ROW => Some(&["anvil.multipart.part_current_row.v1"]),
