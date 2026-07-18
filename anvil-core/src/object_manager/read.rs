@@ -987,6 +987,7 @@ impl ObjectManager {
         let authz_reader = ObjectListingAuthzCandidateReader::new(
             self.storage.clone(),
             crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
+            claims.clone(),
             bucket.clone(),
             reader.docs.clone(),
         );
