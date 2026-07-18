@@ -331,7 +331,11 @@ fn non_corestore_direct_persistence_paths_are_scratch_or_operator_exports() {
 #[test]
 fn object_current_heads_and_version_rows_use_separate_coremeta_column_families() {
     let object_metadata = workspace_file("anvil-core/src/core_store/local_object_metadata.rs");
-    let meta = workspace_file("anvil-core/src/core_store/meta.rs");
+    let meta = format!(
+        "{}\n{}",
+        workspace_file("anvil-core/src/core_store/meta.rs"),
+        workspace_file("anvil-core/src/core_store/meta/payload_validation.rs"),
+    );
 
     assert_contains_all(
         "object head/version CoreMeta split",
@@ -595,7 +599,11 @@ fn personaldb_control_envelope_and_certificate_records_are_not_json() {
 
 #[test]
 fn coremeta_rocksdb_plane_defines_rfc_storage_model_tables_and_caps() {
-    let meta = workspace_file("anvil-core/src/core_store/meta.rs");
+    let meta = format!(
+        "{}\n{}",
+        workspace_file("anvil-core/src/core_store/meta.rs"),
+        workspace_file("anvil-core/src/core_store/meta/payload_validation.rs"),
+    );
     let core_store_mod = workspace_file("anvil-core/src/core_store/mod.rs");
     let storage = workspace_file("anvil-core/src/storage.rs");
 
@@ -677,7 +685,11 @@ fn coremeta_rocksdb_plane_defines_rfc_storage_model_tables_and_caps() {
 
 #[test]
 fn coremeta_tuple_keys_are_typed_and_prefix_scans_decode_tuple_parts() {
-    let meta = workspace_file("anvil-core/src/core_store/meta.rs");
+    let meta = format!(
+        "{}\n{}",
+        workspace_file("anvil-core/src/core_store/meta.rs"),
+        workspace_file("anvil-core/src/core_store/meta/payload_validation.rs"),
+    );
     let helpers = workspace_file("anvil-core/src/core_store/local_key_helpers.rs");
 
     assert_contains_all(
@@ -700,7 +712,11 @@ fn coremeta_tuple_keys_are_typed_and_prefix_scans_decode_tuple_parts() {
 
 #[test]
 fn coremeta_inline_payloads_are_explicit_rows_not_large_metadata_values() {
-    let meta = workspace_file("anvil-core/src/core_store/meta.rs");
+    let meta = format!(
+        "{}\n{}",
+        workspace_file("anvil-core/src/core_store/meta.rs"),
+        workspace_file("anvil-core/src/core_store/meta/payload_validation.rs"),
+    );
 
     assert_contains_all(
         "CoreMeta inline payload guard",
@@ -780,7 +796,11 @@ fn corestore_admission_uses_pending_rows_and_materialisation_rows_not_transactio
 
 #[test]
 fn coremeta_common_root_identity_is_validated_and_hash_based() {
-    let meta = workspace_file("anvil-core/src/core_store/meta.rs");
+    let meta = format!(
+        "{}\n{}",
+        workspace_file("anvil-core/src/core_store/meta.rs"),
+        workspace_file("anvil-core/src/core_store/meta/payload_validation.rs"),
+    );
     assert_contains_all(
         "CoreMeta common validation",
         &meta,
@@ -983,7 +1003,11 @@ fn low_level_byte_pipeline_uses_landed_bytes_before_final_shards() {
 
 #[test]
 fn bounded_small_payloads_use_coremeta_inline_payload_rows() {
-    let meta = workspace_file("anvil-core/src/core_store/meta.rs");
+    let meta = format!(
+        "{}\n{}",
+        workspace_file("anvil-core/src/core_store/meta.rs"),
+        workspace_file("anvil-core/src/core_store/meta/payload_validation.rs"),
+    );
     let blob = format!(
         "{}\n{}",
         workspace_file("anvil-core/src/core_store/local_init_blob.rs"),
@@ -1168,7 +1192,11 @@ fn gateway_metadata_uses_coremeta_rows_not_legacy_refs() {
         workspace_file("anvil-core/src/gateway_store/coremeta.rs"),
         workspace_file("anvil-core/src/gateway_store/metadata_rows.rs")
     );
-    let meta = workspace_file("anvil-core/src/core_store/meta.rs");
+    let meta = format!(
+        "{}\n{}",
+        workspace_file("anvil-core/src/core_store/meta.rs"),
+        workspace_file("anvil-core/src/core_store/meta/payload_validation.rs"),
+    );
     let core_store_mod = workspace_file("anvil-core/src/core_store/mod.rs");
 
     assert_contains_all(
