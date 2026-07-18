@@ -475,5 +475,5 @@ fn contains_local_bootstrap_locator(row: &CoreMetaEncodedOwnedRow) -> bool {
 
 fn encoded_coremeta_table_id(row: &CoreMetaEncodedOwnedRow) -> Option<u16> {
     (row.core_meta_key.len() >= 3)
-        .then(|| u16::from_le_bytes([row.core_meta_key[1], row.core_meta_key[2]]))
+        .then(|| u16::from_be_bytes([row.core_meta_key[1], row.core_meta_key[2]]))
 }

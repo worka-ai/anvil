@@ -1,7 +1,8 @@
 use super::*;
 use crate::core_store::{
-    CoreMetaRowCommonProto, CoreMetaVisibilityState, core_meta_committed_row_common,
-    core_meta_root_key_hash, decode_deterministic_proto, encode_deterministic_proto,
+    CoreMetaRowCommonProto, CoreMetaTuplePart, CoreMetaVisibilityState,
+    core_meta_committed_row_common, core_meta_root_key_hash, core_meta_tuple_key,
+    decode_deterministic_proto, encode_deterministic_proto,
 };
 use prost::Message;
 
@@ -313,48 +314,28 @@ fn decode_node_receipt_signing_public_key_row(
 }
 
 pub(super) fn meta_tuple_key(parts: &[&[u8]]) -> Vec<u8> {
-    let part_count =
-        u16::try_from(parts.len()).expect("CoreStore metadata tuple exceeds u16 parts");
-    let mut key = Vec::new();
-    key.extend_from_slice(&part_count.to_le_bytes());
-    for part in parts {
-        push_meta_tuple_raw_bytes(&mut key, part);
-    }
-    key
+    let parts = parts
+        .iter()
+        .map(|part| CoreMetaTuplePart::Raw(part))
+        .collect::<Vec<_>>();
+    core_meta_tuple_key(&parts).expect("CoreStore raw metadata tuple must be valid")
 }
 
 pub(super) fn meta_tuple_utf8(parts: &[&str]) -> Vec<u8> {
-    let part_count =
-        u16::try_from(parts.len()).expect("CoreStore metadata tuple exceeds u16 parts");
-    let mut key = Vec::new();
-    key.extend_from_slice(&part_count.to_le_bytes());
-    for part in parts {
-        push_meta_tuple_part(&mut key, 0x01, part.as_bytes());
-    }
-    key
+    let parts = parts
+        .iter()
+        .map(|part| CoreMetaTuplePart::Utf8(part))
+        .collect::<Vec<_>>();
+    core_meta_tuple_key(&parts).expect("CoreStore UTF-8 metadata tuple must be valid")
 }
 
 pub(super) fn meta_tuple_u64(parts: &[u64]) -> Vec<u8> {
-    let part_count =
-        u16::try_from(parts.len()).expect("CoreStore metadata tuple exceeds u16 parts");
-    let mut key = Vec::new();
-    key.extend_from_slice(&part_count.to_le_bytes());
-    for part in parts {
-        push_meta_tuple_part(&mut key, 0x02, &part.to_be_bytes());
-    }
-    key
-}
-
-fn push_meta_tuple_raw_bytes(key: &mut Vec<u8>, part: &[u8]) {
-    push_meta_tuple_part(key, 0x05, part);
-}
-
-fn push_meta_tuple_part(key: &mut Vec<u8>, kind: u8, part: &[u8]) {
-    let len = u16::try_from(part.len()).expect("CoreStore metadata tuple field exceeds u16");
-    key.push(kind);
-    key.push(0);
-    key.extend_from_slice(&len.to_le_bytes());
-    key.extend_from_slice(part);
+    let parts = parts
+        .iter()
+        .copied()
+        .map(CoreMetaTuplePart::U64)
+        .collect::<Vec<_>>();
+    core_meta_tuple_key(&parts).expect("CoreStore u64 metadata tuple must be valid")
 }
 
 pub(super) fn decode_u64_le(bytes: &[u8], label: &str) -> Result<u64> {

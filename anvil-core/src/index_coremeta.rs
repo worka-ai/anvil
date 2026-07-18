@@ -7,7 +7,7 @@ use crate::{
     },
     storage::Storage,
 };
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use prost::Message;
 
 const INDEX_SEGMENT_ROW_SCHEMA: &str = "anvil.coremeta.index_segment_row.v1";
@@ -674,53 +674,20 @@ fn index_definition_state_tuple_key(tenant_id: i64, bucket_id: i64) -> Result<Ve
 }
 
 fn index_segment_tuple_prefix(index_id: &str) -> Result<Vec<u8>> {
-    tuple_key(&[TuplePart::Str("index_segment"), TuplePart::Str(index_id)])
-}
-
-fn index_segment_tuple_key(record: &IndexSegmentCoreMetaRecord) -> Result<Vec<u8>> {
-    tuple_key(&[
-        TuplePart::Str("index_segment"),
-        TuplePart::Str(&record.index_id),
-        TuplePart::Str(&record.index_kind),
-        TuplePart::U64(record.generation),
-        TuplePart::Str(&record.segment_hash),
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("index_segment"),
+        CoreMetaTuplePart::Utf8(index_id),
     ])
 }
 
-enum TuplePart<'a> {
-    Str(&'a str),
-    U64(u64),
-}
-
-fn tuple_key(parts: &[TuplePart<'_>]) -> Result<Vec<u8>> {
-    if parts.len() > u16::MAX as usize {
-        bail!("CoreMeta tuple key has too many parts");
-    }
-    let mut out = Vec::new();
-    out.extend_from_slice(&(parts.len() as u16).to_le_bytes());
-    for part in parts {
-        match part {
-            TuplePart::Str(value) => {
-                if value.as_bytes().contains(&0) {
-                    bail!("CoreMeta tuple string part contains NUL");
-                }
-                push_tuple_part(&mut out, 0x01, value.as_bytes())?;
-            }
-            TuplePart::U64(value) => push_tuple_part(&mut out, 0x03, &value.to_le_bytes())?,
-        }
-    }
-    Ok(out)
-}
-
-fn push_tuple_part(out: &mut Vec<u8>, kind: u8, value: &[u8]) -> Result<()> {
-    if value.len() > u16::MAX as usize {
-        return Err(anyhow!("CoreMeta tuple part exceeds u16 length"));
-    }
-    out.push(kind);
-    out.push(0);
-    out.extend_from_slice(&(value.len() as u16).to_le_bytes());
-    out.extend_from_slice(value);
-    Ok(())
+fn index_segment_tuple_key(record: &IndexSegmentCoreMetaRecord) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("index_segment"),
+        CoreMetaTuplePart::Utf8(&record.index_id),
+        CoreMetaTuplePart::Utf8(&record.index_kind),
+        CoreMetaTuplePart::U64(record.generation),
+        CoreMetaTuplePart::Utf8(&record.segment_hash),
+    ])
 }
 
 fn validate_hex32(value: &str, field: &'static str) -> Result<()> {

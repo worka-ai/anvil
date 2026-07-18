@@ -1,13 +1,7 @@
 use super::*;
 
 fn test_tuple_key(part: &[u8]) -> Vec<u8> {
-    let mut key = Vec::new();
-    key.extend_from_slice(&1u16.to_le_bytes());
-    key.push(0x05);
-    key.push(0);
-    key.extend_from_slice(&(part.len() as u16).to_le_bytes());
-    key.extend_from_slice(part);
-    key
+    core_meta_tuple_key(&[CoreMetaTuplePart::Raw(part)]).unwrap()
 }
 
 #[test]
@@ -124,7 +118,7 @@ fn reverse_range_scan_returns_rows_from_end_to_start() {
     }
 
     let records = store
-        .scan_range_reverse(
+        .scan_range_reverse_inclusive(
             CF_INLINE_PAYLOADS,
             TABLE_INLINE_PAYLOAD_ROW,
             &keys[0],
@@ -140,5 +134,71 @@ fn reverse_range_scan_returns_rows_from_end_to_start() {
     assert_eq!(
         tuple_keys,
         vec![keys[2].clone(), keys[1].clone(), keys[0].clone()]
+    );
+}
+
+#[test]
+fn prefix_scan_returns_only_physical_descendants() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = CoreMetaStore::open(tmp.path()).unwrap();
+    let matching_prefix = core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("matching")]).unwrap();
+
+    for index in 0..32_u64 {
+        let matching_key = core_meta_tuple_key(&[
+            CoreMetaTuplePart::Utf8("matching"),
+            CoreMetaTuplePart::U64(index),
+        ])
+        .unwrap();
+        store
+            .put_inline_payload(&matching_key, format!("matching-{index}").as_bytes())
+            .unwrap();
+
+        let unrelated_key = core_meta_tuple_key(&[
+            CoreMetaTuplePart::Utf8("unrelated"),
+            CoreMetaTuplePart::U64(index),
+        ])
+        .unwrap();
+        store
+            .put_inline_payload(&unrelated_key, format!("unrelated-{index}").as_bytes())
+            .unwrap();
+    }
+
+    let records = store
+        .scan_prefix(
+            CF_INLINE_PAYLOADS,
+            TABLE_INLINE_PAYLOAD_ROW,
+            &matching_prefix,
+        )
+        .unwrap();
+    assert_eq!(records.len(), 32);
+    assert!(records.iter().all(|record| {
+        core_meta_record_tuple_key(&record.key)
+            .unwrap()
+            .starts_with(&matching_prefix)
+    }));
+}
+
+#[test]
+fn nonempty_store_without_current_format_marker_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        options.create_missing_column_families(true);
+        let descriptors = column_families()
+            .iter()
+            .map(|name| ColumnFamilyDescriptor::new(*name, cf_options(name)))
+            .collect::<Vec<_>>();
+        let db = DB::open_cf_descriptors(&options, tmp.path(), descriptors).unwrap();
+        let cf = db.cf_handle(CF_META_VERSION).unwrap();
+        db.put_cf(&cf, b"superseded-physical-key", b"superseded-value")
+            .unwrap();
+    }
+
+    let error = CoreMetaStore::open(tmp.path()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("delete and recreate this pre-release store")
     );
 }

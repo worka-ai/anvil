@@ -714,7 +714,7 @@ impl CoreStore {
             let start_sequence = end_sequence
                 .saturating_sub(REPLAY_SCAN_BATCH_SIZE - 1)
                 .max(1);
-            for item in self.meta.scan_range_reverse(
+            for item in self.meta.scan_range_reverse_inclusive(
                 CF_STREAM_RECORDS,
                 TABLE_STREAM_RECORD_INDEX_ROW,
                 &stream_record_key(stream_id, start_sequence),

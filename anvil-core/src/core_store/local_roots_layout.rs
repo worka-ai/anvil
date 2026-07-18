@@ -408,7 +408,7 @@ impl CoreStore {
             bail!("CoreStore stream head metadata row has invalid scope");
         }
         let mut records = Vec::new();
-        for item in self.meta.scan_range(
+        for item in self.meta.scan_range_inclusive(
             CF_STREAM_RECORDS,
             TABLE_STREAM_RECORD_INDEX_ROW,
             &stream_record_key(stream_id, 1),
@@ -492,7 +492,7 @@ impl CoreStore {
         };
         let mut rows = self
             .meta
-            .scan_range(
+            .scan_range_inclusive(
                 CF_STREAM_RECORDS,
                 TABLE_STREAM_RECORD_INDEX_ROW,
                 &stream_record_key(stream_id, first_requested),

@@ -2,19 +2,26 @@ use anyhow::{Context, Result, anyhow, bail};
 use blake3::Hasher;
 use prost::{Enumeration, Message};
 use rocksdb::{
-    ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options, WriteBatch, WriteOptions,
+    ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options, ReadOptions, WriteBatch,
+    WriteOptions,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, Weak};
 use std::time::Instant;
-use unicode_normalization::UnicodeNormalization;
 
 use super::deterministic_proto::sha256_hex;
 use super::transaction_manifest_proto::{
     decode_manifest_locator_proto, encode_manifest_locator_proto,
 };
 use super::types::CoreManifestLocator;
+
+mod key;
+pub use key::{CoreMetaTuplePart, core_meta_tuple_key};
+use key::{
+    core_meta_key, decode_core_meta_table_id, decode_core_meta_tuple_key,
+    exclusive_prefix_successor,
+};
 
 pub const CF_META_VERSION: &str = "cf_meta_version";
 pub const CF_ROOT_CACHE: &str = "cf_root_cache";
@@ -98,7 +105,6 @@ pub const TABLE_OBSERVABILITY_CURSOR_ROW: u16 = 0x8c01;
 pub const TABLE_DIAGNOSTIC_ROW: u16 = 0x8c02;
 pub const TABLE_NODE_SIGNING_KEYPAIR_ROW: u16 = 0x8d01;
 
-const CORE_META_KEY_VERSION: u8 = 1;
 const CORE_META_VALUE_SCHEMA_VERSION: u32 = 1;
 pub(crate) const CORE_META_MAX_VALUE_BYTES: usize = 64 * 1024;
 pub(crate) const CORE_META_MAX_INLINE_PAYLOAD_BYTES: usize = 32 * 1024;
@@ -152,16 +158,6 @@ pub struct CoreMetaInventoryRow {
 pub struct CoreMetaRecord {
     pub key: Vec<u8>,
     pub payload: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CoreMetaTuplePart<'a> {
-    Utf8(&'a str),
-    U64(u64),
-    I64(i64),
-    Hash(&'a str),
-    Raw(&'a [u8]),
-    Bool(bool),
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -345,6 +341,11 @@ impl CoreMetaStore {
         {
             return Ok(());
         }
+        if self.contains_any_row()? {
+            bail!(
+                "CoreMeta store has no current physical-format marker; delete and recreate this pre-release store"
+            );
+        }
         let row = CoreMetaSchemaVersionRowProto {
             common: Some(CoreMetaRowCommonProto {
                 realm_id: String::new(),
@@ -368,6 +369,17 @@ impl CoreMetaStore {
             &key,
             &payload,
         )
+    }
+
+    fn contains_any_row(&self) -> Result<bool> {
+        for cf_name in column_families() {
+            let cf = self.cf(cf_name)?;
+            if let Some(item) = self.db.iterator_cf(&cf, IteratorMode::Start).next() {
+                let _ = item?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn put(
@@ -484,12 +496,19 @@ impl CoreMetaStore {
         tuple_prefix: &[u8],
     ) -> Result<Vec<CoreMetaRecord>> {
         validate_meta_payload(cf, table_id, 0)?;
-        let prefix = core_meta_partition_prefix(table_id, 0);
+        let prefix = core_meta_key(table_id, 0, tuple_prefix)?;
+        let upper_bound = exclusive_prefix_successor(&prefix)
+            .context("CoreMeta prefix has no finite exclusive upper bound")?;
         let cf_name = cf;
         let cf = self.cf(cf_name)?;
-        let iter = self
-            .db
-            .iterator_cf(&cf, IteratorMode::From(&prefix, Direction::Forward));
+        let mut read_options = ReadOptions::default();
+        read_options.set_iterate_lower_bound(prefix.clone());
+        read_options.set_iterate_upper_bound(upper_bound);
+        let iter = self.db.iterator_cf_opt(
+            &cf,
+            read_options,
+            IteratorMode::From(&prefix, Direction::Forward),
+        );
         let mut records = Vec::new();
         let mut scanned = 0_u64;
         let mut bytes = 0_u64;
@@ -497,14 +516,11 @@ impl CoreMetaStore {
         for item in iter {
             let (key, value) = item?;
             if !key.starts_with(&prefix) {
-                break;
+                bail!("bounded CoreMeta prefix iterator returned an out-of-range key");
             }
             scanned = scanned.saturating_add(1);
             bytes = bytes.saturating_add((key.len() + value.len()) as u64);
-            let tuple_key = decode_core_meta_tuple_key(&key)?;
-            if !core_meta_tuple_key_has_prefix(tuple_key, tuple_prefix)? {
-                continue;
-            }
+            let _ = decode_core_meta_tuple_key(&key)?;
             records.push(CoreMetaRecord {
                 key: key.to_vec(),
                 payload: decode_envelope(cf_name, table_id, &value)?,
@@ -521,7 +537,7 @@ impl CoreMetaStore {
         Ok(records)
     }
 
-    pub fn scan_range(
+    pub fn scan_range_inclusive(
         &self,
         cf: &'static str,
         table_id: u16,
@@ -534,11 +550,18 @@ impl CoreMetaStore {
         if start_key > end_key {
             bail!("CoreMeta scan range start key exceeds end key");
         }
+        let upper_bound = exclusive_prefix_successor(&end_key)
+            .context("CoreMeta range has no finite exclusive upper bound")?;
         let cf_name = cf;
         let cf = self.cf(cf_name)?;
-        let iter = self
-            .db
-            .iterator_cf(&cf, IteratorMode::From(&start_key, Direction::Forward));
+        let mut read_options = ReadOptions::default();
+        read_options.set_iterate_lower_bound(start_key.clone());
+        read_options.set_iterate_upper_bound(upper_bound);
+        let iter = self.db.iterator_cf_opt(
+            &cf,
+            read_options,
+            IteratorMode::From(&start_key, Direction::Forward),
+        );
         let mut records = Vec::new();
         let mut scanned = 0_u64;
         let mut bytes = 0_u64;
@@ -566,7 +589,7 @@ impl CoreMetaStore {
         Ok(records)
     }
 
-    pub fn scan_range_reverse(
+    pub fn scan_range_reverse_inclusive(
         &self,
         cf: &'static str,
         table_id: u16,
@@ -580,11 +603,18 @@ impl CoreMetaStore {
         if start_key > end_key {
             bail!("CoreMeta reverse scan range start key exceeds end key");
         }
+        let upper_bound = exclusive_prefix_successor(&end_key)
+            .context("CoreMeta reverse range has no finite exclusive upper bound")?;
         let cf_name = cf;
         let cf = self.cf(cf_name)?;
-        let iter = self
-            .db
-            .iterator_cf(&cf, IteratorMode::From(&end_key, Direction::Reverse));
+        let mut read_options = ReadOptions::default();
+        read_options.set_iterate_lower_bound(start_key.clone());
+        read_options.set_iterate_upper_bound(upper_bound);
+        let iter = self.db.iterator_cf_opt(
+            &cf,
+            read_options,
+            IteratorMode::From(&end_key, Direction::Reverse),
+        );
         let mut records = Vec::new();
         let mut scanned = 0_u64;
         let mut bytes = 0_u64;
@@ -956,18 +986,6 @@ pub fn encode_core_meta_inline_payload_row(
     Ok(payload)
 }
 
-pub fn core_meta_tuple_key(parts: &[CoreMetaTuplePart<'_>]) -> Result<Vec<u8>> {
-    let part_count =
-        u16::try_from(parts.len()).context("CoreMetaTupleKey part count exceeds u16")?;
-    let mut key = Vec::new();
-    key.extend_from_slice(&part_count.to_le_bytes());
-    for part in parts {
-        encode_core_meta_tuple_part(&mut key, *part)?;
-    }
-    validate_core_meta_tuple_key(&key)?;
-    Ok(key)
-}
-
 pub fn core_meta_record_tuple_key(encoded_key: &[u8]) -> Result<&[u8]> {
     decode_core_meta_tuple_key(encoded_key)
 }
@@ -1135,193 +1153,6 @@ fn durable_write_options() -> WriteOptions {
     options
 }
 
-fn core_meta_key(table_id: u16, partition_id: u64, tuple_key: &[u8]) -> Result<Vec<u8>> {
-    if tuple_key.len() > u16::MAX as usize {
-        bail!("CoreMetaKey tuple key exceeds u16 length");
-    }
-    validate_core_meta_tuple_key(tuple_key)?;
-    let mut key = Vec::with_capacity(13 + tuple_key.len());
-    key.push(CORE_META_KEY_VERSION);
-    key.extend_from_slice(&table_id.to_le_bytes());
-    key.extend_from_slice(&partition_id.to_le_bytes());
-    key.extend_from_slice(&(tuple_key.len() as u16).to_le_bytes());
-    key.extend_from_slice(tuple_key);
-    Ok(key)
-}
-
-fn core_meta_partition_prefix(table_id: u16, partition_id: u64) -> Vec<u8> {
-    let mut key = Vec::with_capacity(11);
-    key.push(CORE_META_KEY_VERSION);
-    key.extend_from_slice(&table_id.to_le_bytes());
-    key.extend_from_slice(&partition_id.to_le_bytes());
-    key
-}
-
-fn decode_core_meta_table_id(key: &[u8]) -> Result<u16> {
-    if key.len() < 13 {
-        bail!("CoreMetaKey is shorter than fixed header");
-    }
-    if key[0] != CORE_META_KEY_VERSION {
-        bail!("CoreMetaKey has unsupported version {}", key[0]);
-    }
-    let table_id = u16::from_le_bytes([key[1], key[2]]);
-    let _ = decode_core_meta_tuple_key(key)?;
-    Ok(table_id)
-}
-
-fn decode_core_meta_tuple_key(key: &[u8]) -> Result<&[u8]> {
-    if key.len() < 13 {
-        bail!("CoreMetaKey is shorter than fixed header");
-    }
-    if key[0] != CORE_META_KEY_VERSION {
-        bail!("CoreMetaKey has unsupported version {}", key[0]);
-    }
-    let len = u16::from_le_bytes([key[11], key[12]]) as usize;
-    let end = 13usize
-        .checked_add(len)
-        .ok_or_else(|| anyhow!("CoreMetaKey tuple key length overflow"))?;
-    if key.len() != end {
-        bail!("CoreMetaKey tuple key length mismatch");
-    }
-    let tuple_key = &key[13..end];
-    validate_core_meta_tuple_key(tuple_key)?;
-    Ok(tuple_key)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DecodedCoreMetaTuplePart<'a> {
-    kind: u8,
-    value: &'a [u8],
-}
-
-fn validate_core_meta_tuple_key(tuple_key: &[u8]) -> Result<()> {
-    decode_core_meta_tuple_parts(tuple_key).map(|_| ())
-}
-
-fn encode_core_meta_tuple_part(key: &mut Vec<u8>, part: CoreMetaTuplePart<'_>) -> Result<()> {
-    let (kind, value): (u8, Vec<u8>) = match part {
-        CoreMetaTuplePart::Utf8(value) => (0x01, value.as_bytes().to_vec()),
-        CoreMetaTuplePart::U64(value) => (0x02, value.to_be_bytes().to_vec()),
-        CoreMetaTuplePart::I64(value) => {
-            let sortable = (value as u64) ^ (1_u64 << 63);
-            (0x03, sortable.to_be_bytes().to_vec())
-        }
-        CoreMetaTuplePart::Hash(value) => (0x04, normalise_tuple_hash_part(value).into_bytes()),
-        CoreMetaTuplePart::Raw(value) => (0x05, value.to_vec()),
-        CoreMetaTuplePart::Bool(value) => (0x06, vec![u8::from(value)]),
-    };
-    let value_len =
-        u16::try_from(value.len()).context("CoreMetaTupleKey part value exceeds u16")?;
-    key.push(kind);
-    key.push(0);
-    key.extend_from_slice(&value_len.to_le_bytes());
-    key.extend_from_slice(&value);
-    Ok(())
-}
-
-fn normalise_tuple_hash_part(value: &str) -> String {
-    if value.contains(':') {
-        return value.to_string();
-    }
-    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return format!("blake3:{value}");
-    }
-    value.to_string()
-}
-
-fn core_meta_tuple_key_has_prefix(tuple_key: &[u8], tuple_prefix: &[u8]) -> Result<bool> {
-    if tuple_prefix.is_empty() {
-        validate_core_meta_tuple_key(tuple_key)?;
-        return Ok(true);
-    }
-    let key_parts = decode_core_meta_tuple_parts(tuple_key)?;
-    let prefix_parts = decode_core_meta_tuple_parts(tuple_prefix)?;
-    if prefix_parts.len() > key_parts.len() {
-        return Ok(false);
-    }
-    Ok(key_parts
-        .iter()
-        .zip(prefix_parts.iter())
-        .all(|(part, prefix)| part == prefix))
-}
-
-fn decode_core_meta_tuple_parts(tuple_key: &[u8]) -> Result<Vec<DecodedCoreMetaTuplePart<'_>>> {
-    if tuple_key.len() < 2 {
-        bail!("CoreMetaTupleKey missing part_count");
-    }
-    let part_count = u16::from_le_bytes([tuple_key[0], tuple_key[1]]) as usize;
-    let mut offset = 2usize;
-    let mut parts = Vec::with_capacity(part_count);
-    for _ in 0..part_count {
-        if tuple_key.len().saturating_sub(offset) < 4 {
-            bail!("CoreMetaTupleKey part header truncated");
-        }
-        let kind = tuple_key[offset];
-        let flags = tuple_key[offset + 1];
-        let value_len = u16::from_le_bytes([tuple_key[offset + 2], tuple_key[offset + 3]]) as usize;
-        offset += 4;
-        if flags != 0 {
-            bail!("CoreMetaTupleKey part has unsupported flags {flags}");
-        }
-        let end = offset
-            .checked_add(value_len)
-            .ok_or_else(|| anyhow!("CoreMetaTupleKey part length overflow"))?;
-        if end > tuple_key.len() {
-            bail!("CoreMetaTupleKey part value truncated");
-        }
-        validate_core_meta_tuple_part(kind, &tuple_key[offset..end])?;
-        parts.push(DecodedCoreMetaTuplePart {
-            kind,
-            value: &tuple_key[offset..end],
-        });
-        offset = end;
-    }
-    if offset != tuple_key.len() {
-        bail!("CoreMetaTupleKey has trailing bytes");
-    }
-    Ok(parts)
-}
-
-fn validate_core_meta_tuple_part(kind: u8, value: &[u8]) -> Result<()> {
-    match kind {
-        0x01 => {
-            let s = std::str::from_utf8(value).context("CoreMetaTupleKey utf8 part is invalid")?;
-            if s.as_bytes().contains(&0) {
-                bail!("CoreMetaTupleKey utf8 part contains NUL");
-            }
-            if !s.chars().eq(s.nfc()) {
-                bail!("CoreMetaTupleKey utf8 part must be NFC-normalized");
-            }
-        }
-        0x02 | 0x03 => {
-            if value.len() != 8 {
-                bail!("CoreMetaTupleKey integer part must be 8 bytes");
-            }
-        }
-        0x04 => {
-            let s = std::str::from_utf8(value).context("CoreMetaTupleKey hash part is invalid")?;
-            let Some((algorithm, hex_value)) = s.split_once(':') else {
-                bail!("CoreMetaTupleKey hash part must be algorithm:hex ASCII");
-            };
-            if algorithm.is_empty()
-                || hex_value.is_empty()
-                || s.bytes().any(|byte| !byte.is_ascii())
-                || hex_value.bytes().any(|byte| !byte.is_ascii_hexdigit())
-            {
-                bail!("CoreMetaTupleKey hash part must be algorithm:hex ASCII");
-            }
-        }
-        0x05 => {}
-        0x06 => {
-            if !matches!(value, [0] | [1]) {
-                bail!("CoreMetaTupleKey bool part must be 0x00 or 0x01");
-            }
-        }
-        other => bail!("CoreMetaTupleKey has unknown part kind {other:#04x}"),
-    }
-    Ok(())
-}
-
 fn local_committed_row_common() -> CoreMetaRowCommonProto {
     CoreMetaRowCommonProto {
         realm_id: String::new(),
@@ -1373,13 +1204,8 @@ fn core_meta_inline_payload_hash(payload: &[u8]) -> String {
 }
 
 fn core_meta_schema_key() -> Vec<u8> {
-    let mut key = Vec::new();
-    key.extend_from_slice(&1u16.to_le_bytes());
-    key.push(0x01);
-    key.push(0);
-    key.extend_from_slice(&6u16.to_le_bytes());
-    key.extend_from_slice(b"schema");
-    key
+    core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("schema")])
+        .expect("static CoreMeta schema tuple key must be valid")
 }
 
 fn column_family_set_hash() -> String {

@@ -427,7 +427,7 @@ is encoded as `0x00 0xff`; the value terminator is `0x00 0x00`. Any other byte i
 encoded unchanged. The decoder rejects a lone trailing `0x00`, an escape other
 than `0x00 0xff`, and bytes after a malformed terminator. UTF-8 strings reject
 embedded NUL before escaping and MUST be NFC-normalised. Hash strings use the
-same escaping but remain restricted to their canonical ASCII grammar.
+same escaping and the canonical lowercase `algorithm:hex` ASCII grammar.
 
 The tuple-key type is intentionally independent of protobuf because it is the
 RocksDB ordering key. It MUST therefore satisfy all of these properties, which
@@ -451,7 +451,7 @@ contain exactly those parts in that order with the implied kind. A scan prefix
 MAY contain any complete leading subset of those parts, including zero parts.
 Unknown kinds, malformed escapes, overlong values, non-NFC strings, and complete
 row keys with extra or missing parts are corrupt and MUST be rejected before a
-row is visible to readers.
+row is visible to readers. An encoded tuple key MUST NOT exceed 65,535 bytes.
 
 `CoreMetaPrefix(table_id, partition_id, tuple_prefix)` is the fixed 11-byte key
 header followed by the encoded tuple prefix. A prefix scan MUST seek directly to

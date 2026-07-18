@@ -672,10 +672,10 @@ fn watch_checkpoint_tuple_key(watch_stream_id: &str, consumer_id: &str) -> Resul
 }
 
 fn watch_checkpoint_lag_tuple_key(watch_stream_id: &str, consumer_id: &str) -> Result<Vec<u8>> {
-    tuple_key(&[
-        TuplePart::Str("watch_checkpoint_lag"),
-        TuplePart::Str(watch_stream_id),
-        TuplePart::Str(consumer_id),
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("watch_checkpoint_lag"),
+        CoreMetaTuplePart::Utf8(watch_stream_id),
+        CoreMetaTuplePart::Utf8(consumer_id),
     ])
 }
 
@@ -694,32 +694,6 @@ fn validate_lag_record(record: &WatchCheckpointLagRecord) -> Result<()> {
         return Err(anyhow!("watch checkpoint lag generation must be nonzero"));
     }
     Ok(())
-}
-
-enum TuplePart<'a> {
-    Str(&'a str),
-}
-
-fn tuple_key(parts: &[TuplePart<'_>]) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&(parts.len() as u16).to_le_bytes());
-    for part in parts {
-        match part {
-            TuplePart::Str(value) => {
-                if value.as_bytes().contains(&0) {
-                    return Err(anyhow!("CoreMeta tuple string part contains NUL"));
-                }
-                if value.len() > u16::MAX as usize {
-                    return Err(anyhow!("CoreMeta tuple string part exceeds u16 length"));
-                }
-                out.push(0x01);
-                out.push(0);
-                out.extend_from_slice(&(value.len() as u16).to_le_bytes());
-                out.extend_from_slice(value.as_bytes());
-            }
-        }
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
