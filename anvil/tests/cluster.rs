@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::{sync::Arc, time::Duration};
 
 use anvil::cluster::{ClusterBehaviour, ClusterEvent, ClusterMessage, create_swarm};

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::{fs, path::Path};
 
 fn repo_file(path: &str) -> String {
