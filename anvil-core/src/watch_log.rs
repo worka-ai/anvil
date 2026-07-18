@@ -91,12 +91,20 @@ pub async fn append_object_watch_record(
             user_metadata_json: "{}".to_string(),
             fence: None,
             transaction_id: None,
-            idempotency_key: Some(format!(
-                "object-watch:{}:{}:{}",
-                bucket.tenant_id, bucket.id, event.mutation_id
-            )),
+            idempotency_key: Some(object_watch_idempotency_key(bucket, event)),
         })
         .await
+}
+
+fn object_watch_idempotency_key(bucket: &Bucket, event: &ObjectWatchEvent) -> String {
+    let object_identity = event
+        .version_id
+        .map(|version_id| version_id.to_string())
+        .unwrap_or_else(|| hex::encode(hash32(event.key.as_bytes())));
+    format!(
+        "object-watch:{}:{}:{}:{object_identity}:{}",
+        bucket.tenant_id, bucket.id, event.mutation_id, event.event_type
+    )
 }
 
 pub async fn latest_object_watch_cursor(
@@ -305,7 +313,7 @@ mod tests {
             etag: Some(object.etag.clone()),
             size: object.size,
             is_delete_marker: false,
-            created_at: Utc::now(),
+            created_at: object.created_at,
         }
     }
 
@@ -342,6 +350,58 @@ mod tests {
         assert_eq!(decoded[1].cursor, 2);
         assert_ne!(decoded[0].payload.first().copied(), Some(b'{'));
         assert!(decode_object_watch_payload(&decoded[0].payload).is_ok());
+    }
+
+    #[tokio::test]
+    async fn transaction_objects_with_one_mutation_id_get_distinct_watch_records() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let bucket = sample_bucket();
+        let first = sample_object(1, "devices/capability-a.json");
+        let mut second = sample_object(2, "devices/capability-b.json");
+        second.mutation_id = first.mutation_id;
+
+        let first_receipt = append_object_watch_record(
+            &storage,
+            &bucket,
+            &first,
+            &sample_event(1, &bucket, &first, "put"),
+        )
+        .await
+        .unwrap();
+        let second_receipt = append_object_watch_record(
+            &storage,
+            &bucket,
+            &second,
+            &sample_event(2, &bucket, &second, "put"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first_receipt.sequence, 1);
+        assert_eq!(second_receipt.sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn retrying_one_object_watch_append_is_idempotent() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let bucket = sample_bucket();
+        let object = sample_object(1, "devices/capability.json");
+        let event = sample_event(1, &bucket, &object, "put");
+
+        let first = append_object_watch_record(&storage, &bucket, &object, &event)
+            .await
+            .unwrap();
+        let retried = append_object_watch_record(&storage, &bucket, &object, &event)
+            .await
+            .unwrap();
+
+        assert_eq!(first.sequence, retried.sequence);
+        let decoded = read_object_watch_records(&storage, bucket.tenant_id, bucket.id)
+            .await
+            .unwrap();
+        assert_eq!(decoded.len(), 1);
     }
 
     #[tokio::test]
