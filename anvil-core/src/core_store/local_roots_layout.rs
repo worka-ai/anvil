@@ -184,15 +184,17 @@ impl CoreStore {
         limit: usize,
     ) -> Result<Vec<StreamRecord>> {
         if stream_id != CORE_TRANSACTION_STREAM_ID {
-            let records = self.read_all_stream_records(stream_id).await?;
-            let filtered = records
-                .into_iter()
-                .filter(|record| record.sequence > after_sequence)
-                .collect::<Vec<_>>();
-            if limit > 0 {
-                return Ok(filtered.into_iter().take(limit).collect());
-            }
-            return Ok(filtered);
+            let Some(head) = self.read_stream_head_from_meta(stream_id)? else {
+                return Ok(Vec::new());
+            };
+            return self
+                .read_stream_records_from_meta_range(
+                    stream_id,
+                    after_sequence,
+                    head.last_sequence,
+                    limit,
+                )
+                .await;
         }
         self.read_core_transaction_stream_records_after_from_root(after_sequence, limit)
             .await
@@ -415,6 +417,17 @@ impl CoreStore {
         stream_id: &str,
         sequence: u64,
     ) -> Result<Option<StreamRecord>> {
+        let Some(stored) = self.read_stream_record_index_row_from_meta(stream_id, sequence)? else {
+            return Ok(None);
+        };
+        self.stream_record_from_index_row(stored).await.map(Some)
+    }
+
+    pub(super) fn read_stream_record_index_row_from_meta(
+        &self,
+        stream_id: &str,
+        sequence: u64,
+    ) -> Result<Option<StoredStreamRecordIndexRow>> {
         let Some(bytes) = self.meta.get(
             CF_STREAM_RECORDS,
             TABLE_STREAM_RECORD_INDEX_ROW,
@@ -427,16 +440,16 @@ impl CoreStore {
         if stored.stream_id != stream_id || stored.sequence != sequence {
             bail!("CoreStore stream record metadata row has invalid scope");
         }
-        self.stream_record_from_index_row(stored).await.map(Some)
+        Ok(Some(stored))
     }
 
-    pub(super) async fn read_stream_records_from_meta_range(
+    pub(super) fn read_stream_record_index_rows_from_meta_range(
         &self,
         stream_id: &str,
         after_sequence: u64,
         through_sequence: u64,
         limit: usize,
-    ) -> Result<Vec<StreamRecord>> {
+    ) -> Result<Vec<StoredStreamRecordIndexRow>> {
         if through_sequence <= after_sequence {
             return Ok(Vec::new());
         }
@@ -451,24 +464,59 @@ impl CoreStore {
             );
         }
 
-        let mut last_requested = through_sequence;
-        if limit > 0 {
-            last_requested = last_requested
-                .min(after_sequence.saturating_add(u64::try_from(limit).unwrap_or(u64::MAX)));
-        }
+        let first_requested = after_sequence.saturating_add(1);
+        let last_requested = if limit > 0 {
+            through_sequence
+                .min(after_sequence.saturating_add(u64::try_from(limit).unwrap_or(u64::MAX)))
+        } else {
+            through_sequence
+        };
+        let mut rows = self
+            .meta
+            .scan_range(
+                CF_STREAM_RECORDS,
+                TABLE_STREAM_RECORD_INDEX_ROW,
+                &stream_record_key(stream_id, first_requested),
+                &stream_record_key(stream_id, last_requested),
+            )?
+            .into_iter()
+            .map(|item| decode_stream_record_index_row(&item.payload))
+            .collect::<Result<Vec<_>>>()?;
+        rows.sort_by_key(|row| row.sequence);
 
+        let expected_count = last_requested
+            .saturating_sub(first_requested)
+            .saturating_add(1);
+        if rows.len() as u64 != expected_count {
+            bail!("CoreStore stream {stream_id} metadata range has missing records");
+        }
+        for (offset, row) in rows.iter().enumerate() {
+            let expected_sequence =
+                first_requested.saturating_add(u64::try_from(offset).unwrap_or(u64::MAX));
+            if row.stream_id != stream_id || row.sequence != expected_sequence {
+                bail!("CoreStore stream record metadata row has invalid scope");
+            }
+        }
+        Ok(rows)
+    }
+
+    pub(super) async fn read_stream_records_from_meta_range(
+        &self,
+        stream_id: &str,
+        after_sequence: u64,
+        through_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<StreamRecord>> {
         let mut records = Vec::new();
         let mut previous_record: Option<StreamRecord> = None;
-        for sequence in after_sequence.saturating_add(1)..=last_requested {
-            let Some(record) = self
-                .read_stream_record_from_meta(stream_id, sequence)
-                .await?
-            else {
-                bail!("CoreStore stream {stream_id} is missing record {sequence}");
-            };
-            if record.sequence != sequence {
-                bail!("CoreStore stream record metadata row has invalid sequence");
-            }
+        for row in self.read_stream_record_index_rows_from_meta_range(
+            stream_id,
+            after_sequence,
+            through_sequence,
+            limit,
+        )? {
+            let record = self.stream_record_from_index_row(row).await?;
+            let sequence = record.sequence;
             if sequence == 1 && record.previous_event_hash != ZERO_HASH {
                 bail!("CoreStore stream {stream_id} first record previous hash is invalid");
             }

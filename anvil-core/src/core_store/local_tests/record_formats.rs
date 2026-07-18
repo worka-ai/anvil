@@ -319,3 +319,40 @@ async fn large_stream_payloads_use_locator_rows_not_rocksdb_inline_payloads() {
         format!("sha256:{}", sha256_hex(&payload))
     );
 }
+
+#[tokio::test]
+async fn stream_reads_apply_after_sequence_and_limit_without_replaying_the_stream() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let store = CoreStore::new(storage).await.unwrap();
+    let stream_id = "tenant:t/bucket:b/bounded-stream-read".to_string();
+
+    for sequence in 1..=3 {
+        store
+            .append_stream(AppendStreamRecord {
+                stream_id: stream_id.clone(),
+                partition_id: "tenant:t/bucket:b".to_string(),
+                record_kind: "bounded.record".to_string(),
+                payload: format!("record-{sequence}").into_bytes(),
+                content_type: Some("text/plain".to_string()),
+                user_metadata_json: "{}".to_string(),
+                fence: None,
+                transaction_id: None,
+                idempotency_key: Some(format!("bounded-stream-read-{sequence}")),
+            })
+            .await
+            .unwrap();
+    }
+
+    let records = store
+        .read_stream(ReadStream {
+            stream_id,
+            after_sequence: 1,
+            limit: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].sequence, 2);
+    assert_eq!(records[0].payload, b"record-2");
+}

@@ -1503,18 +1503,32 @@ pub(super) fn transaction_lists_stream_record(
     transaction: &CoreTransaction,
     record: &StreamRecord,
 ) -> Result<bool> {
-    Ok(transaction.visible_updates.iter().any(|visible_update| {
+    Ok(transaction_lists_stream_record_identity(
+        transaction,
+        &record.stream_id,
+        record.sequence,
+        &record.event_hash,
+    ))
+}
+
+pub(super) fn transaction_lists_stream_record_identity(
+    transaction: &CoreTransaction,
+    stream_id: &str,
+    sequence: u64,
+    event_hash: &str,
+) -> bool {
+    transaction.visible_updates.iter().any(|visible_update| {
         matches!(
             visible_update,
             CoreTransactionUpdate::StreamAppend {
-                stream_id,
+                stream_id: update_stream_id,
                 visible_sequence,
                 prepared_record_hash,
-            } if stream_id == &record.stream_id
-                && *visible_sequence == record.sequence
-                && prepared_record_hash == &record.event_hash
+            } if update_stream_id == stream_id
+                && *visible_sequence == sequence
+                && prepared_record_hash == event_hash
         )
-    }))
+    })
 }
 
 fn ensure_coremeta_payload_in_transaction_scope(

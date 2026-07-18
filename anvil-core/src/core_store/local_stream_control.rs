@@ -313,6 +313,75 @@ impl CoreStore {
             .unwrap_or_else(|| (0, ZERO_HASH.to_string())))
     }
 
+    pub(crate) fn raw_stream_record_metadata_range(
+        &self,
+        stream_id: &str,
+        after_sequence: u64,
+        through_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<CoreStreamRecordMetadata>> {
+        self.read_stream_record_index_rows_from_meta_range(
+            stream_id,
+            after_sequence,
+            through_sequence,
+            limit,
+        )
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| CoreStreamRecordMetadata {
+                    sequence: row.sequence,
+                    event_hash: row.event_hash,
+                    record_kind: row.record_kind,
+                    payload_len: row.payload_len,
+                })
+                .collect()
+        })
+    }
+
+    pub(crate) async fn visible_stream_record_metadata(
+        &self,
+        stream_id: &str,
+        sequence: u64,
+    ) -> Result<Option<CoreStreamRecordMetadata>> {
+        let Some(row) = self.read_stream_record_index_row_from_meta(stream_id, sequence)? else {
+            return Ok(None);
+        };
+        if !self
+            .stream_record_identity_is_visible(
+                &row.stream_id,
+                row.sequence,
+                &row.event_hash,
+                row.transaction_id.as_deref(),
+            )
+            .await?
+        {
+            return Ok(None);
+        }
+        Ok(Some(CoreStreamRecordMetadata {
+            sequence: row.sequence,
+            event_hash: row.event_hash,
+            record_kind: row.record_kind,
+            payload_len: row.payload_len,
+        }))
+    }
+
+    pub(crate) async fn visible_stream_head_metadata(
+        &self,
+        stream_id: &str,
+    ) -> Result<Option<CoreStreamRecordMetadata>> {
+        let (mut sequence, _) = self.raw_stream_head(stream_id).await?;
+        while sequence > 0 {
+            if let Some(metadata) = self
+                .visible_stream_record_metadata(stream_id, sequence)
+                .await?
+            {
+                return Ok(Some(metadata));
+            }
+            sequence = sequence.saturating_sub(1);
+        }
+        Ok(None)
+    }
+
     #[cfg(test)]
     pub(crate) fn corrupt_stream_record_payload_for_test(
         &self,
