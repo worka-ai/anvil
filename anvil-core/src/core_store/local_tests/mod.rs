@@ -433,6 +433,7 @@ fn sample_boundary_schema(bucket: &str, generation: u64) -> CoreBoundarySchema {
     }
 }
 
+mod cancellation;
 mod control_record_encoding;
 mod erasure_roots;
 mod logical;

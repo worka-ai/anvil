@@ -1389,6 +1389,37 @@ pub async fn grant_object_defaults(
     Ok(())
 }
 
+pub async fn grant_object_defaults_batch<'a>(
+    persistence: &Persistence,
+    objects: impl IntoIterator<Item = (&'a Bucket, &'a str)>,
+    reason: &str,
+) -> Result<()> {
+    let mutations = objects
+        .into_iter()
+        .map(|(bucket, object_key)| AuthzTupleBatchMutation {
+            namespace: system_realm_namespace(SYSTEM_OBJECT_NAMESPACE),
+            object_id: object_object_id(bucket, object_key),
+            relation: "parent_bucket".to_string(),
+            subject_kind: USERSET_SUBJECT_KIND.to_string(),
+            subject_id: userset_subject(
+                SYSTEM_BUCKET_NAMESPACE,
+                &bucket_object_id(bucket),
+                "manage_bucket",
+            ),
+            caveat_hash: String::new(),
+            operation: "add".to_string(),
+            reason: reason.to_string(),
+        })
+        .collect::<Vec<_>>();
+    if mutations.is_empty() {
+        return Ok(());
+    }
+    persistence
+        .write_authz_tuple_batch(SYSTEM_STORAGE_TENANT_ID, mutations, "system")
+        .await?;
+    Ok(())
+}
+
 pub async fn grant_stream_defaults(
     persistence: &Persistence,
     bucket: &Bucket,

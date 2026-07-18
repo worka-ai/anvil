@@ -54,6 +54,7 @@ pub const TABLE_MULTIPART_PART_CURRENT_ROW: u16 = 0x8106;
 pub const TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW: u16 = 0x8107;
 pub const TABLE_STREAM_HEAD_ROW: u16 = 0x8201;
 pub const TABLE_STREAM_RECORD_INDEX_ROW: u16 = 0x8202;
+pub const TABLE_STREAM_IDEMPOTENCY_ROW: u16 = 0x8203;
 pub const TABLE_INDEX_DEFINITION_ROW: u16 = 0x8301;
 pub const TABLE_INDEX_ROW: u16 = 0x8302;
 pub const TABLE_DERIVED_INDEX_PROOF_ROW: u16 = 0x8303;
@@ -511,6 +512,101 @@ impl CoreMetaStore {
         }
         crate::perf::record_coremeta_duration(
             "scan_prefix",
+            cf_name,
+            table_id,
+            scanned,
+            bytes,
+            started_at.elapsed(),
+        );
+        Ok(records)
+    }
+
+    pub fn scan_range(
+        &self,
+        cf: &'static str,
+        table_id: u16,
+        start_tuple_key: &[u8],
+        end_tuple_key: &[u8],
+    ) -> Result<Vec<CoreMetaRecord>> {
+        validate_meta_payload(cf, table_id, 0)?;
+        let start_key = core_meta_key(table_id, 0, start_tuple_key)?;
+        let end_key = core_meta_key(table_id, 0, end_tuple_key)?;
+        if start_key > end_key {
+            bail!("CoreMeta scan range start key exceeds end key");
+        }
+        let cf_name = cf;
+        let cf = self.cf(cf_name)?;
+        let iter = self
+            .db
+            .iterator_cf(&cf, IteratorMode::From(&start_key, Direction::Forward));
+        let mut records = Vec::new();
+        let mut scanned = 0_u64;
+        let mut bytes = 0_u64;
+        let started_at = Instant::now();
+        for item in iter {
+            let (key, value) = item?;
+            if key.as_ref() > end_key.as_slice() {
+                break;
+            }
+            scanned = scanned.saturating_add(1);
+            bytes = bytes.saturating_add((key.len() + value.len()) as u64);
+            records.push(CoreMetaRecord {
+                key: key.to_vec(),
+                payload: decode_envelope(cf_name, table_id, &value)?,
+            });
+        }
+        crate::perf::record_coremeta_duration(
+            "scan_range",
+            cf_name,
+            table_id,
+            scanned,
+            bytes,
+            started_at.elapsed(),
+        );
+        Ok(records)
+    }
+
+    pub fn scan_range_reverse(
+        &self,
+        cf: &'static str,
+        table_id: u16,
+        start_tuple_key: &[u8],
+        end_tuple_key: &[u8],
+        limit: usize,
+    ) -> Result<Vec<CoreMetaRecord>> {
+        validate_meta_payload(cf, table_id, 0)?;
+        let start_key = core_meta_key(table_id, 0, start_tuple_key)?;
+        let end_key = core_meta_key(table_id, 0, end_tuple_key)?;
+        if start_key > end_key {
+            bail!("CoreMeta reverse scan range start key exceeds end key");
+        }
+        let cf_name = cf;
+        let cf = self.cf(cf_name)?;
+        let iter = self
+            .db
+            .iterator_cf(&cf, IteratorMode::From(&end_key, Direction::Reverse));
+        let mut records = Vec::new();
+        let mut scanned = 0_u64;
+        let mut bytes = 0_u64;
+        let scan_limit = limit.max(1);
+        let started_at = Instant::now();
+        for item in iter {
+            let (key, value) = item?;
+            if key.as_ref() < start_key.as_slice() {
+                break;
+            }
+            scanned = scanned.saturating_add(1);
+            bytes = bytes.saturating_add((key.len() + value.len()) as u64);
+            records.push(CoreMetaRecord {
+                key: key.to_vec(),
+                payload: decode_envelope(cf_name, table_id, &value)?,
+            });
+            if records.len() >= scan_limit {
+                break;
+            }
+        }
+        crate::perf::record_coremeta_duration(
+            "scan_range_reverse",
             cf_name,
             table_id,
             scanned,
@@ -1342,7 +1438,7 @@ fn table_spec(table_id: u16) -> Result<CoreMetaTableSpec> {
             cf: CF_STREAM_HEADS,
             max_payload_bytes: CORE_META_STREAM_RECORD_INDEX_MAX_PAYLOAD_BYTES,
         },
-        TABLE_STREAM_RECORD_INDEX_ROW => CoreMetaTableSpec {
+        TABLE_STREAM_RECORD_INDEX_ROW | TABLE_STREAM_IDEMPOTENCY_ROW => CoreMetaTableSpec {
             cf: CF_STREAM_RECORDS,
             max_payload_bytes: CORE_META_STREAM_RECORD_INDEX_MAX_PAYLOAD_BYTES,
         },
@@ -1644,6 +1740,7 @@ fn expected_schema_markers(table_id: u16) -> Option<&'static [&'static str]> {
             "anvil.core.watch_event.v1",
             "anvil.core.stream_record_index.v1",
         ]),
+        TABLE_STREAM_IDEMPOTENCY_ROW => Some(&["anvil.core.stream_idempotency.v1"]),
         TABLE_MANIFEST_CAS_CURRENT_ROW => Some(&["anvil.core.manifest_cas.current_row.v1"]),
         TABLE_MULTIPART_UPLOAD_CURRENT_ROW => Some(&["anvil.multipart.upload_current_row.v1"]),
         TABLE_MULTIPART_PART_CURRENT_ROW => Some(&["anvil.multipart.part_current_row.v1"]),
@@ -1813,7 +1910,13 @@ fn validate_coremeta_pending_batch_marker_row(payload: &[u8]) -> Result<()> {
         bail!("CoreMeta pending batch marker must reference at least one CoreMeta row");
     }
     if row.post_root_generation <= row.expected_root_generation {
-        bail!("CoreMeta pending batch marker root generation must advance");
+        bail!(
+            "CoreMeta pending batch marker root generation must advance: root_key_hash={}, transaction_id={}, expected_root_generation={}, post_root_generation={}",
+            row.root_key_hash,
+            row.transaction_id,
+            row.expected_root_generation,
+            row.post_root_generation
+        );
     }
     let common = row
         .common

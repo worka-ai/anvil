@@ -599,30 +599,57 @@ pub async fn active_object_journal_stats(
         compacted_through_sequence = manifest.compacted_through_sequence;
     }
 
-    let records = read_all_metadata_journal_records(storage, bucket).await?;
+    let stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let last_sequence = core_store
+        .visible_stream_head_metadata(&stream_id)
+        .await?
+        .map(|metadata| metadata.sequence)
+        .unwrap_or(0);
     let mut stats = ActiveObjectJournalStats {
-        last_sequence: records
-            .last()
-            .map(|record| record.partition_sequence)
-            .unwrap_or(0),
+        last_sequence,
         compacted_through_sequence,
         ..ActiveObjectJournalStats::default()
     };
     let mut tombstone_debt = 0_u64;
-    for record in records {
-        if record.partition_sequence <= compacted_through_sequence {
-            continue;
-        }
+    for record in core_store.raw_stream_record_metadata_range(
+        &stream_id,
+        compacted_through_sequence,
+        last_sequence,
+        0,
+    )? {
         stats.uncompacted_frame_count = stats.uncompacted_frame_count.saturating_add(1);
         stats.uncompacted_encoded_bytes = stats
             .uncompacted_encoded_bytes
-            .saturating_add(record.payload.len() as u64);
-        if record.record_kind == ObjectMetadataRecordKind::DeleteMarker {
+            .saturating_add(record.payload_len);
+        if record.record_kind == DELETE_MARKER_RECORD_KIND {
             tombstone_debt = tombstone_debt.saturating_add(1);
         }
     }
     crate::perf::record_tombstone_debt("object_blob", tombstone_debt);
     Ok(stats)
+}
+
+pub async fn object_metadata_source_cursor(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+) -> Result<u128> {
+    let compacted_through_sequence = if let Some(manifest) =
+        read_latest_partition_manifest(storage, bucket, manifest_signing_key).await?
+    {
+        manifest.compacted_through_sequence
+    } else {
+        0
+    };
+    let stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let active_sequence = core_store
+        .visible_stream_head_metadata(&stream_id)
+        .await?
+        .map(|metadata| metadata.sequence)
+        .unwrap_or(0);
+    Ok(u128::from(active_sequence.max(compacted_through_sequence)))
 }
 
 pub async fn object_metadata_source_checkpoint_hash(
@@ -634,12 +661,13 @@ pub async fn object_metadata_source_checkpoint_hash(
     let max_sequence = u64::try_from(max_sequence)
         .map_err(|_| anyhow!("object metadata source cursor exceeds u64 sequence range"))?;
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"anvil.object_metadata.source_checkpoint.v1");
+    hasher.update(b"anvil.object_metadata.source_checkpoint.v2");
     hasher.update(&bucket.tenant_id.to_le_bytes());
     hasher.update(&bucket.id.to_le_bytes());
     hasher.update(&max_sequence.to_le_bytes());
 
     let mut compacted_through_sequence = 0u64;
+    let mut compacted_event_hash = String::new();
     if let Some(manifest) =
         read_latest_partition_manifest(storage, bucket, manifest_signing_key).await?
     {
@@ -650,19 +678,26 @@ pub async fn object_metadata_source_checkpoint_hash(
             ));
         }
         hasher.update(manifest.manifest_hash.as_deref().unwrap_or("").as_bytes());
+        compacted_event_hash = manifest.last_record_hash;
     } else {
         hasher.update(&[0; 32]);
     }
+    hasher.update(&compacted_through_sequence.to_le_bytes());
 
-    for record in read_all_metadata_journal_records(storage, bucket).await? {
-        if record.partition_sequence <= compacted_through_sequence
-            || record.partition_sequence > max_sequence
-        {
-            continue;
-        }
-        hasher.update(&record.partition_sequence.to_le_bytes());
-        hasher.update(record.event_hash.as_bytes());
-    }
+    let checkpoint_event_hash = if max_sequence == compacted_through_sequence {
+        compacted_event_hash
+    } else if max_sequence > compacted_through_sequence {
+        let stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
+        let core_store = CoreStore::new(storage.clone()).await?;
+        core_store
+            .visible_stream_record_metadata(&stream_id, max_sequence)
+            .await?
+            .ok_or_else(|| anyhow!("object metadata source cursor is not visible"))?
+            .event_hash
+    } else {
+        String::new()
+    };
+    hasher.update(checkpoint_event_hash.as_bytes());
 
     Ok(hasher.finalize().to_hex().to_string())
 }

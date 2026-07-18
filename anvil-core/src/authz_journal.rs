@@ -823,12 +823,7 @@ async fn advance_authz_materialization(
 }
 
 pub async fn latest_authz_revision(storage: &Storage, tenant_id: i64) -> Result<i64> {
-    let tuple_revision = read_all_authz_tuple_records(storage, tenant_id)
-        .await?
-        .into_iter()
-        .map(|record| record.revision)
-        .max()
-        .unwrap_or(0);
+    let tuple_revision = latest_authz_tuple_revision(storage, tenant_id).await?;
     let schema_revision = crate::authz_realm_schema::list_schema_revisions(storage, tenant_id)
         .await?
         .into_iter()
@@ -842,6 +837,35 @@ pub async fn latest_authz_revision(storage: &Storage, tenant_id: i64) -> Result<
         .max()
         .unwrap_or(0);
     Ok(tuple_revision.max(i64::try_from(schema_revision)?))
+}
+
+async fn latest_authz_tuple_revision(storage: &Storage, tenant_id: i64) -> Result<i64> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let stream_id = authz_tuple_stream_id(tenant_id);
+    let (sequence, _) = store.raw_stream_head(&stream_id).await?;
+    if sequence == 0 {
+        return Ok(0);
+    }
+    let record = store
+        .read_stream(ReadStream {
+            stream_id,
+            after_sequence: sequence.saturating_sub(1),
+            limit: 1,
+        })
+        .await?
+        .pop()
+        .ok_or_else(|| anyhow!("authorization journal head record is missing"))?;
+    match record.record_kind.as_str() {
+        AUTHZ_TUPLE_RECORD_KIND => Ok(decode_authz_tuple_journal_body(&record.payload)?.revision),
+        AUTHZ_TUPLE_BATCH_RECORD_KIND => decode_authz_tuple_batch_journal_body(&record.payload)?
+            .into_iter()
+            .map(|record| record.revision)
+            .max()
+            .ok_or_else(|| anyhow!("authorization journal head batch is empty")),
+        other => Err(anyhow!(
+            "authorization journal head has unsupported record kind {other}"
+        )),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -947,6 +971,26 @@ pub async fn resolve_permission_at_revision(
                     error = %error,
                     "derived userset index lookup failed; falling back to revision resolver"
                 );
+            }
+        }
+
+        // The current materialized rows are substantially cheaper than replaying the
+        // append journal. Double-check the revision around the read so an update racing
+        // this lookup falls back to the historical resolver instead of mixing revisions.
+        if latest_authz_revision(storage, tenant_id).await? == revision {
+            let allowed = resolve_current_permission(
+                storage,
+                tenant_id,
+                namespace,
+                object_id,
+                relation,
+                subject_kind,
+                subject_id,
+                caveat_hash,
+            )
+            .await?;
+            if latest_authz_revision(storage, tenant_id).await? == revision {
+                return Ok(allowed);
             }
         }
     }
@@ -1207,7 +1251,8 @@ async fn current_authz_view_at_revision(
     tenant_id: i64,
     revision: i64,
 ) -> Result<BTreeMap<TupleViewKey, AuthzTupleRecord>> {
-    let mut records = if revision == i64::MAX {
+    let tuple_revision = latest_authz_tuple_revision(storage, tenant_id).await?;
+    let mut records = if revision >= tuple_revision {
         read_all_authz_tuple_records(storage, tenant_id).await?
     } else {
         read_all_authz_tuple_records_from_journal(storage, tenant_id).await?

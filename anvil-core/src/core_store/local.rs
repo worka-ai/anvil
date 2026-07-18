@@ -32,9 +32,9 @@ use super::meta::{
     TABLE_INLINE_PAYLOAD_ROW, TABLE_LANDED_BYTE_REF_ROW, TABLE_MATERIALISATION_CURSOR_ROW,
     TABLE_NODE_SIGNING_KEYPAIR_ROW, TABLE_OBJECT_HEAD_ROW, TABLE_OBJECT_VERSION_META_ROW,
     TABLE_PENDING_MUTATION_ROW, TABLE_QUORUM_PROFILE_CURRENT_ROW, TABLE_ROOT_CACHE_ROW,
-    TABLE_ROOT_CATALOG_CURRENT_ROW, TABLE_STREAM_HEAD_ROW, TABLE_STREAM_RECORD_INDEX_ROW,
-    TABLE_TRANSACTION_COMMIT_EVIDENCE_ROW, TABLE_TRANSACTION_LOCATOR_ROW,
-    canonical_coremeta_cf_name, core_meta_committed_row_common,
+    TABLE_ROOT_CATALOG_CURRENT_ROW, TABLE_STREAM_HEAD_ROW, TABLE_STREAM_IDEMPOTENCY_ROW,
+    TABLE_STREAM_RECORD_INDEX_ROW, TABLE_TRANSACTION_COMMIT_EVIDENCE_ROW,
+    TABLE_TRANSACTION_LOCATOR_ROW, canonical_coremeta_cf_name, core_meta_committed_row_common,
     core_meta_locator_from_manifest_locator, core_meta_locator_to_manifest_locator,
     core_meta_payload_digest, core_meta_pending_row_common, core_meta_root_key_hash,
     core_meta_row_common_from_payload, core_meta_tuple_key, encode_core_meta_inline_payload_row,
@@ -147,6 +147,8 @@ type HmacSha256 = Hmac<Sha256>;
 
 static CORE_STORE_PROCESS_WRITE_LOCKS: LazyLock<StdMutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>> =
     LazyLock::new(|| StdMutex::new(BTreeMap::new()));
+static CORE_STORE_PROCESS_LOCKS_INITIALIZED: LazyLock<StdMutex<BTreeSet<PathBuf>>> =
+    LazyLock::new(|| StdMutex::new(BTreeSet::new()));
 static CORE_STORE_INSTANCE_REGISTRY: LazyLock<StdMutex<BTreeMap<PathBuf, CoreStore>>> =
     LazyLock::new(|| StdMutex::new(BTreeMap::new()));
 
@@ -496,6 +498,30 @@ fn process_write_lock(storage_root: PathBuf) -> Arc<Mutex<()>> {
     lock
 }
 
+fn clear_stale_process_locks_once(storage: &Storage) -> Result<()> {
+    let storage_root = storage.core_store_root_path();
+    let mut initialized = CORE_STORE_PROCESS_LOCKS_INITIALIZED
+        .lock()
+        .expect("CoreStore process lock registry poisoned");
+    if initialized.contains(&storage_root) {
+        return Ok(());
+    }
+
+    // Process lock files are expendable Class C state. A crashed process cannot
+    // remove them through Drop, so discard them before recovery starts.
+    let lock_root = storage.core_store_staging_path().join("locks");
+    match std::fs::remove_dir_all(&lock_root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("remove stale CoreStore locks {}", lock_root.display()));
+        }
+    }
+    initialized.insert(storage_root);
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct PipelineBlockBytes {
     stored: Vec<u8>,
@@ -545,6 +571,21 @@ struct StoredStreamRecordIndexRow {
     payload_locator: Option<CoreManifestLocator>,
     transaction_id: Option<String>,
     idempotency_key_hash: Option<String>,
+    created_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct StoredStreamIdempotencyRow {
+    schema: String,
+    stream_id: String,
+    sequence: u64,
+    cursor: String,
+    event_hash: String,
+    record_kind: String,
+    payload_hash: String,
+    authenticated_principal: String,
+    transaction_id: Option<String>,
+    idempotency_key_hash: String,
     created_at: String,
 }
 
@@ -611,6 +652,7 @@ struct CoreStoredStreamHead {
     last_sequence: u64,
     last_event_hash: String,
     record_count: u64,
+    idempotency_index_complete: bool,
     updated_at: String,
 }
 
@@ -721,6 +763,24 @@ impl StoredStreamRecordIndexRow {
             idempotency_key_hash: record.idempotency_key_hash.clone(),
             created_at: record.created_at.clone(),
         }
+    }
+}
+
+impl StoredStreamIdempotencyRow {
+    fn from_record_index(row: &StoredStreamRecordIndexRow) -> Option<Self> {
+        Some(Self {
+            schema: "anvil.core.stream_idempotency.v1".to_string(),
+            stream_id: row.stream_id.clone(),
+            sequence: row.sequence,
+            cursor: row.cursor.clone(),
+            event_hash: row.event_hash.clone(),
+            record_kind: row.record_kind.clone(),
+            payload_hash: row.payload_hash.clone(),
+            authenticated_principal: row.authenticated_principal.clone(),
+            transaction_id: row.transaction_id.clone(),
+            idempotency_key_hash: row.idempotency_key_hash.clone()?,
+            created_at: row.created_at.clone(),
+        })
     }
 }
 

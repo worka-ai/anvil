@@ -184,15 +184,17 @@ impl CoreStore {
         limit: usize,
     ) -> Result<Vec<StreamRecord>> {
         if stream_id != CORE_TRANSACTION_STREAM_ID {
-            let records = self.read_all_stream_records(stream_id).await?;
-            let filtered = records
-                .into_iter()
-                .filter(|record| record.sequence > after_sequence)
-                .collect::<Vec<_>>();
-            if limit > 0 {
-                return Ok(filtered.into_iter().take(limit).collect());
-            }
-            return Ok(filtered);
+            let Some(head) = self.read_stream_head_from_meta(stream_id)? else {
+                return Ok(Vec::new());
+            };
+            return self
+                .read_stream_records_from_meta_range(
+                    stream_id,
+                    after_sequence,
+                    head.last_sequence,
+                    limit,
+                )
+                .await;
         }
         self.read_core_transaction_stream_records_after_from_root(after_sequence, limit)
             .await
@@ -239,16 +241,18 @@ impl CoreStore {
         }
 
         let existing_head = self.read_stream_head_from_meta(stream_id)?;
-        let (existing_sequence, existing_hash, existing_record_count) = existing_head
-            .as_ref()
-            .map(|head| {
-                (
-                    head.last_sequence,
-                    head.last_event_hash.clone(),
-                    head.record_count,
-                )
-            })
-            .unwrap_or_else(|| (0, ZERO_HASH.to_string(), 0));
+        let (existing_sequence, existing_hash, existing_record_count, idempotency_index_complete) =
+            existing_head
+                .as_ref()
+                .map(|head| {
+                    (
+                        head.last_sequence,
+                        head.last_event_hash.clone(),
+                        head.record_count,
+                        head.idempotency_index_complete,
+                    )
+                })
+                .unwrap_or_else(|| (0, ZERO_HASH.to_string(), 0, true));
         let mut new_records = records
             .iter()
             .filter(|record| record.sequence > existing_sequence)
@@ -274,12 +278,10 @@ impl CoreStore {
             previous_event_hash = record.event_hash.clone();
         }
 
-        let mut payloads = Vec::with_capacity(new_records.len() + 1);
-        let mut record_keys = Vec::with_capacity(new_records.len());
+        let mut record_rows = Vec::with_capacity(new_records.len());
         for record in new_records {
             let inline_payload = record.payload.clone();
             let mut stored = StoredStreamRecordIndexRow::new(record, Some(inline_payload), None);
-            record_keys.push(stream_record_key(stream_id, record.sequence));
             let mut payload = encode_stream_record_index_row(&stored)?;
             if payload.len() > CORE_META_STREAM_RECORD_INDEX_MAX_PAYLOAD_BYTES {
                 let payload_locator = self.write_stream_record_payload(record).await?;
@@ -293,7 +295,19 @@ impl CoreStore {
                     );
                 }
             }
-            payloads.push(payload);
+            let idempotency_row = StoredStreamIdempotencyRow::from_record_index(&stored)
+                .map(|row| {
+                    Ok::<_, anyhow::Error>((
+                        stream_idempotency_key(stream_id, &row.idempotency_key_hash),
+                        encode_stream_idempotency_row(&row)?,
+                    ))
+                })
+                .transpose()?;
+            record_rows.push((
+                stream_record_key(stream_id, record.sequence),
+                idempotency_row,
+                payload,
+            ));
         }
         let head = CoreStoredStreamHead {
             schema: "anvil.core.stream_head.v1".to_string(),
@@ -301,31 +315,38 @@ impl CoreStore {
             last_sequence: previous_sequence,
             last_event_hash: previous_event_hash,
             record_count: existing_record_count
-                .checked_add(record_keys.len() as u64)
+                .checked_add(record_rows.len() as u64)
                 .ok_or_else(|| anyhow!("CoreStore stream record count overflow"))?,
+            idempotency_index_complete,
             updated_at: now_rfc3339(),
         };
         let head_key = stream_head_key(stream_id);
-        payloads.push(encode_stream_head_record(&head)?);
+        let head_payload = encode_stream_head_record(&head)?;
 
-        let mut owned_ops = Vec::with_capacity(payloads.len());
-        for (idx, key) in record_keys.iter().enumerate() {
+        let mut owned_ops = Vec::with_capacity(record_rows.len().saturating_mul(2) + 1);
+        for (record_key, idempotency_row, payload) in record_rows {
             owned_ops.push(OwnedCoreMetaBatchOp::Put {
                 cf: CF_STREAM_RECORDS,
                 table_id: TABLE_STREAM_RECORD_INDEX_ROW,
-                tuple_key: key.clone(),
-                payload: payloads[idx].clone(),
+                tuple_key: record_key,
+                payload: payload.clone(),
                 common: None,
             });
+            if let Some((idempotency_key, idempotency_payload)) = idempotency_row {
+                owned_ops.push(OwnedCoreMetaBatchOp::Put {
+                    cf: CF_STREAM_RECORDS,
+                    table_id: TABLE_STREAM_IDEMPOTENCY_ROW,
+                    tuple_key: idempotency_key,
+                    payload: idempotency_payload,
+                    common: None,
+                });
+            }
         }
         owned_ops.push(OwnedCoreMetaBatchOp::Put {
             cf: CF_STREAM_HEADS,
             table_id: TABLE_STREAM_HEAD_ROW,
             tuple_key: head_key,
-            payload: payloads
-                .last()
-                .expect("stream head payload is pushed after record payloads")
-                .clone(),
+            payload: head_payload,
             common: None,
         });
         let transaction_id = records
@@ -386,12 +407,13 @@ impl CoreStore {
         if head.schema != "anvil.core.stream_head.v1" || head.stream_id != stream_id {
             bail!("CoreStore stream head metadata row has invalid scope");
         }
-        let prefix = stream_record_prefix(stream_id);
         let mut records = Vec::new();
-        for item in
-            self.meta
-                .scan_prefix(CF_STREAM_RECORDS, TABLE_STREAM_RECORD_INDEX_ROW, &prefix)?
-        {
+        for item in self.meta.scan_range(
+            CF_STREAM_RECORDS,
+            TABLE_STREAM_RECORD_INDEX_ROW,
+            &stream_record_key(stream_id, 1),
+            &stream_record_key(stream_id, u64::MAX),
+        )? {
             let stored = decode_stream_record_index_row(&item.payload)?;
             if stored.stream_id != stream_id {
                 bail!("CoreStore stream record metadata row has invalid scope");
@@ -414,6 +436,17 @@ impl CoreStore {
         stream_id: &str,
         sequence: u64,
     ) -> Result<Option<StreamRecord>> {
+        let Some(stored) = self.read_stream_record_index_row_from_meta(stream_id, sequence)? else {
+            return Ok(None);
+        };
+        self.stream_record_from_index_row(stored).await.map(Some)
+    }
+
+    pub(super) fn read_stream_record_index_row_from_meta(
+        &self,
+        stream_id: &str,
+        sequence: u64,
+    ) -> Result<Option<StoredStreamRecordIndexRow>> {
         let Some(bytes) = self.meta.get(
             CF_STREAM_RECORDS,
             TABLE_STREAM_RECORD_INDEX_ROW,
@@ -426,16 +459,16 @@ impl CoreStore {
         if stored.stream_id != stream_id || stored.sequence != sequence {
             bail!("CoreStore stream record metadata row has invalid scope");
         }
-        self.stream_record_from_index_row(stored).await.map(Some)
+        Ok(Some(stored))
     }
 
-    pub(super) async fn read_stream_records_from_meta_range(
+    pub(super) fn read_stream_record_index_rows_from_meta_range(
         &self,
         stream_id: &str,
         after_sequence: u64,
         through_sequence: u64,
         limit: usize,
-    ) -> Result<Vec<StreamRecord>> {
+    ) -> Result<Vec<StoredStreamRecordIndexRow>> {
         if through_sequence <= after_sequence {
             return Ok(Vec::new());
         }
@@ -450,24 +483,59 @@ impl CoreStore {
             );
         }
 
-        let mut last_requested = through_sequence;
-        if limit > 0 {
-            last_requested = last_requested
-                .min(after_sequence.saturating_add(u64::try_from(limit).unwrap_or(u64::MAX)));
-        }
+        let first_requested = after_sequence.saturating_add(1);
+        let last_requested = if limit > 0 {
+            through_sequence
+                .min(after_sequence.saturating_add(u64::try_from(limit).unwrap_or(u64::MAX)))
+        } else {
+            through_sequence
+        };
+        let mut rows = self
+            .meta
+            .scan_range(
+                CF_STREAM_RECORDS,
+                TABLE_STREAM_RECORD_INDEX_ROW,
+                &stream_record_key(stream_id, first_requested),
+                &stream_record_key(stream_id, last_requested),
+            )?
+            .into_iter()
+            .map(|item| decode_stream_record_index_row(&item.payload))
+            .collect::<Result<Vec<_>>>()?;
+        rows.sort_by_key(|row| row.sequence);
 
+        let expected_count = last_requested
+            .saturating_sub(first_requested)
+            .saturating_add(1);
+        if rows.len() as u64 != expected_count {
+            bail!("CoreStore stream {stream_id} metadata range has missing records");
+        }
+        for (offset, row) in rows.iter().enumerate() {
+            let expected_sequence =
+                first_requested.saturating_add(u64::try_from(offset).unwrap_or(u64::MAX));
+            if row.stream_id != stream_id || row.sequence != expected_sequence {
+                bail!("CoreStore stream record metadata row has invalid scope");
+            }
+        }
+        Ok(rows)
+    }
+
+    pub(super) async fn read_stream_records_from_meta_range(
+        &self,
+        stream_id: &str,
+        after_sequence: u64,
+        through_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<StreamRecord>> {
         let mut records = Vec::new();
         let mut previous_record: Option<StreamRecord> = None;
-        for sequence in after_sequence.saturating_add(1)..=last_requested {
-            let Some(record) = self
-                .read_stream_record_from_meta(stream_id, sequence)
-                .await?
-            else {
-                bail!("CoreStore stream {stream_id} is missing record {sequence}");
-            };
-            if record.sequence != sequence {
-                bail!("CoreStore stream record metadata row has invalid sequence");
-            }
+        for row in self.read_stream_record_index_rows_from_meta_range(
+            stream_id,
+            after_sequence,
+            through_sequence,
+            limit,
+        )? {
+            let record = self.stream_record_from_index_row(row).await?;
+            let sequence = record.sequence;
             if sequence == 1 && record.previous_event_hash != ZERO_HASH {
                 bail!("CoreStore stream {stream_id} first record previous hash is invalid");
             }
