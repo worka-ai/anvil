@@ -2,7 +2,7 @@ use super::*;
 use anyhow::Context;
 
 impl CoreStore {
-    pub async fn put_internal_shard(
+    pub(crate) async fn put_internal_shard(
         &self,
         request: CoreInternalPutShard,
     ) -> Result<CoreInternalShardReceipt> {
@@ -78,7 +78,7 @@ impl CoreStore {
         })
     }
 
-    pub async fn read_internal_shard_range(
+    pub(crate) async fn read_internal_shard_range(
         &self,
         request: CoreInternalGetShard,
     ) -> Result<Vec<u8>> {
@@ -120,7 +120,7 @@ impl CoreStore {
         }
     }
 
-    pub async fn get_internal_shard_receipt(
+    pub(crate) async fn get_internal_shard_receipt(
         &self,
         request: CoreInternalGetShard,
     ) -> Result<CoreInternalShardReceipt> {

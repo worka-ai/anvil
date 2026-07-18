@@ -1791,6 +1791,7 @@ fn expected_schema_markers(table_id: u16) -> Option<&'static [&'static str]> {
             "anvil.coremeta.watch_checkpoint_lag.v1",
         ]),
         TABLE_LANDED_BYTE_REF_ROW => Some(&["anvil.core.landed_byte_ref.v1"]),
+        TABLE_REFCOUNT_ROW => Some(&["anvil.core.payload_reference.v1"]),
         TABLE_WRITER_SEGMENT_ROW => Some(&["anvil.coremeta.writer_segment_locator.v1"]),
         TABLE_WATCH_CHECKPOINT_ROW => Some(&[
             "anvil.coremeta.watch_checkpoint.v1",

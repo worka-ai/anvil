@@ -533,12 +533,14 @@ fn internal_proxy_authorisation_is_zanzibar_only() {
         std::fs::read_to_string(repo_root().join("anvil-core/src/services/internal_proxy.rs"))
             .unwrap();
     assert!(
-        source.contains("access_control::require_action")
-            && source.contains("AnvilAction::InternalProxyObject"),
-        "internal proxy must enter the same Zanzibar action matrix as other operations"
+        source.contains("system_realm::check_admin_relation")
+            && source.contains("SystemAdminRelation::ManageNodes"),
+        "internal proxy must require the same system-realm node authority as CoreStore internal RPCs"
     );
     for forbidden in [
         "internal:proxy_object",
+        "AnvilAction::InternalProxyObject",
+        "access_control::require_action",
         "claims.tenant_id != 0",
         "claims.sub == \"internal\"",
         "claims.sub == \"internal-worker\"",
@@ -547,6 +549,46 @@ fn internal_proxy_authorisation_is_zanzibar_only() {
         assert!(
             !source.contains(forbidden),
             "internal proxy must not retain string/scope/sub bypass: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn raw_blob_and_shard_internal_paths_are_not_public_service_apis() {
+    let proto = std::fs::read_to_string(repo_root().join("anvil-core/proto/anvil.proto")).unwrap();
+    assert!(
+        !proto.contains("rpc PutBlob("),
+        "raw CoreStore blob writes must stay behind object/gateway APIs, not become public RPCs"
+    );
+    assert!(
+        proto.contains("service BlockStoreInternal")
+            && proto.contains("message InternalRequestHeader")
+            && proto.contains("bytes signature = 6;"),
+        "raw shard operations must remain internal signed-node RPCs"
+    );
+
+    let corestore_internal =
+        std::fs::read_to_string(repo_root().join("anvil-core/src/services/corestore_internal.rs"))
+            .unwrap();
+    assert!(
+        corestore_internal.contains("ensure_internal_node_request(self, &request).await?")
+            && corestore_internal.contains("claims.sub != header.source_node_id")
+            && corestore_internal.contains("verify_internal_core_receipt_signature"),
+        "CoreStore internal services must authorise a signed node identity before touching shards or replicated metadata"
+    );
+
+    let local_internal_shards = std::fs::read_to_string(
+        repo_root().join("anvil-core/src/core_store/local_internal_shards.rs"),
+    )
+    .unwrap();
+    for method in [
+        "pub(crate) async fn put_internal_shard",
+        "pub(crate) async fn read_internal_shard_range",
+        "pub(crate) async fn get_internal_shard_receipt",
+    ] {
+        assert!(
+            local_internal_shards.contains(method),
+            "raw internal shard method must not be publicly exported: {method}"
         );
     }
 }
