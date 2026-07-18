@@ -679,7 +679,7 @@ impl Persistence {
         reason: &str,
     ) -> Result<AuthzTupleRecord> {
         let permit = self.authz_write_permit(tenant_id).await?;
-        authz_journal::write_authz_tuple_with_permit(
+        let record = authz_journal::write_authz_tuple_with_permit(
             &self.storage,
             authz_journal::AuthzTupleWrite {
                 tenant_id,
@@ -696,7 +696,10 @@ impl Persistence {
             &permit,
             &self.partition_owner_signing_key,
         )
-        .await
+        .await?;
+        self.enqueue_authz_materialization_after_write(tenant_id, record.revision)
+            .await;
+        Ok(record)
     }
 
     pub async fn write_authz_tuple_batch(
@@ -721,13 +724,18 @@ impl Persistence {
                 reason: mutation.reason.as_str(),
             })
             .collect();
-        authz_journal::write_authz_tuple_batch_with_permit(
+        let records = authz_journal::write_authz_tuple_batch_with_permit(
             &self.storage,
             writes,
             &permit,
             &self.partition_owner_signing_key,
         )
-        .await
+        .await?;
+        if let Some(revision) = records.iter().map(|record| record.revision).max() {
+            self.enqueue_authz_materialization_after_write(tenant_id, revision)
+                .await;
+        }
+        Ok(records)
     }
 
     pub async fn replay_authz_tuple_batch(
@@ -750,14 +758,43 @@ impl Persistence {
     ) -> Result<AuthzTupleBatchWriteOutcome> {
         let permit = self.authz_write_permit(tenant_id).await?;
         let writes = authz_tuple_batch_writes(tenant_id, &mutations, written_by);
-        authz_journal::write_authz_tuple_batch_conditionally_with_permit(
+        let outcome = authz_journal::write_authz_tuple_batch_conditionally_with_permit(
             &self.storage,
             writes,
             options,
             &permit,
             &self.partition_owner_signing_key,
         )
-        .await
+        .await?;
+        if !outcome.replayed
+            && let Some(revision) = outcome.records.iter().map(|record| record.revision).max()
+        {
+            self.enqueue_authz_materialization_after_write(tenant_id, revision)
+                .await;
+        }
+        Ok(outcome)
+    }
+
+    async fn enqueue_authz_materialization_after_write(&self, tenant_id: i64, revision: i64) {
+        let Ok(target_revision) = u64::try_from(revision) else {
+            tracing::warn!(
+                tenant_id,
+                revision,
+                "skipping authz materialization enqueue for negative revision"
+            );
+            return;
+        };
+        if let Err(error) = self
+            .enqueue_authz_materialization(tenant_id, target_revision)
+            .await
+        {
+            tracing::warn!(
+                tenant_id,
+                target_revision,
+                %error,
+                "failed to enqueue authz materialization task after tuple write"
+            );
+        }
     }
 
     pub async fn check_authz_tuple(

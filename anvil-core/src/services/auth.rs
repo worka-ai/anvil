@@ -8,7 +8,7 @@ use crate::{
         encode_optional_realm_namespace, encode_realm_namespace, encode_userset_subject_realm,
         parse_userset_subject,
     },
-    authz_userset_index, bucket_journal,
+    bucket_journal,
     formats::hash32,
     permissions::AnvilAction,
     services::watch_envelope::{self, WatchEnvelopeParts},

@@ -1373,27 +1373,44 @@ async fn authz_tuple_write_latency_with_retained_history_perf() {
     .unwrap();
     let write_elapsed = write_started.elapsed();
 
-    let check_started = std::time::Instant::now();
-    let allowed = resolve_permission_at_revision(
-        &storage,
-        42,
-        "document",
-        "measured",
-        "viewer",
-        "user",
-        "alice",
-        "",
-        retained as i64 + 1,
-    )
-    .await
-    .unwrap();
-    let check_elapsed = check_started.elapsed();
-    assert!(allowed);
+    if std::env::var_os("ANVIL_AUTHZ_PERF_MATERIALIZE").is_some() {
+        let materialize_started = std::time::Instant::now();
+        let fence = latest_authz_journal_fence_token(&storage, 42)
+            .await
+            .unwrap();
+        materialize_authz_derived_state_at_revision(&storage, 42, retained as u64 + 1, fence)
+            .await
+            .unwrap();
+        eprintln!(
+            "[authz-perf] materialize_ms={}",
+            materialize_started.elapsed().as_millis()
+        );
+    }
+
+    let mut check_elapsed_ms = Vec::new();
+    for _ in 0..10 {
+        let check_started = std::time::Instant::now();
+        let allowed = resolve_permission_at_revision(
+            &storage,
+            42,
+            "document",
+            "measured",
+            "viewer",
+            "user",
+            "alice",
+            "",
+            retained as i64 + 1,
+        )
+        .await
+        .unwrap();
+        check_elapsed_ms.push(check_started.elapsed().as_millis());
+        assert!(allowed);
+    }
 
     eprintln!(
-        "[authz-perf] retained={retained} seed_ms={} measured_write_ms={} check_ms={}",
+        "[authz-perf] retained={retained} seed_ms={} measured_write_ms={} check_ms={:?}",
         seed_elapsed.as_millis(),
         write_elapsed.as_millis(),
-        check_elapsed.as_millis()
+        check_elapsed_ms
     );
 }

@@ -1006,15 +1006,6 @@ fn authz_tuple_write_status(error: anyhow::Error) -> Status {
     }
 }
 
-fn userset_subject(namespace: &str, object_id: &str, relation: &str) -> String {
-    format!(
-        "{}/{}#{}",
-        system_realm_namespace(namespace),
-        object_id,
-        relation
-    )
-}
-
 pub async fn system_realm_relationship_allows(
     storage: &Storage,
     claims: &auth::Claims,
@@ -1405,20 +1396,7 @@ pub async fn grant_object_defaults_batch<'a>(
 ) -> Result<()> {
     let mutations = objects
         .into_iter()
-        .map(|(bucket, object_key)| AuthzTupleBatchMutation {
-            namespace: system_realm_namespace(SYSTEM_OBJECT_NAMESPACE),
-            object_id: object_object_id(bucket, object_key),
-            relation: "parent_bucket".to_string(),
-            subject_kind: USERSET_SUBJECT_KIND.to_string(),
-            subject_id: userset_subject(
-                SYSTEM_BUCKET_NAMESPACE,
-                &bucket_object_id(bucket),
-                "manage_bucket",
-            ),
-            caveat_hash: String::new(),
-            operation: "add".to_string(),
-            reason: reason.to_string(),
-        })
+        .map(|(bucket, object_key)| object_parent_bucket_mutation(bucket, object_key, reason))
         .collect::<Vec<_>>();
     if mutations.is_empty() {
         return Ok(());
@@ -1427,6 +1405,23 @@ pub async fn grant_object_defaults_batch<'a>(
         .write_authz_tuple_batch(SYSTEM_STORAGE_TENANT_ID, mutations, "system")
         .await?;
     Ok(())
+}
+
+fn object_parent_bucket_mutation(
+    bucket: &Bucket,
+    object_key: &str,
+    reason: &str,
+) -> AuthzTupleBatchMutation {
+    AuthzTupleBatchMutation {
+        namespace: system_realm_namespace(SYSTEM_OBJECT_NAMESPACE),
+        object_id: object_object_id(bucket, object_key),
+        relation: "parent_bucket".to_string(),
+        subject_kind: SYSTEM_BUCKET_NAMESPACE.to_string(),
+        subject_id: bucket_object_id(bucket),
+        caveat_hash: String::new(),
+        operation: "add".to_string(),
+        reason: reason.to_string(),
+    }
 }
 
 pub async fn grant_stream_defaults(
@@ -1683,7 +1678,13 @@ pub async fn grant_authz_realm_defaults(
 
 #[cfg(test)]
 mod tests {
-    use super::split_bucket_key;
+    use chrono::Utc;
+
+    use super::{
+        SYSTEM_BUCKET_NAMESPACE, USERSET_SUBJECT_KIND, object_parent_bucket_mutation,
+        split_bucket_key,
+    };
+    use crate::persistence::Bucket;
 
     #[test]
     fn split_bucket_key_treats_empty_prefix_as_bucket_scope() {
@@ -1694,5 +1695,24 @@ mod tests {
             split_bucket_key("photos/2026/report.txt"),
             ("photos", Some("2026/report.txt"))
         );
+    }
+
+    #[test]
+    fn batched_object_defaults_reference_the_parent_bucket_directly() {
+        let bucket = Bucket {
+            id: 17,
+            tenant_id: 9,
+            name: "workspace".to_string(),
+            region: "test-region".to_string(),
+            created_at: Utc::now(),
+            is_public_read: false,
+        };
+
+        let mutation = object_parent_bucket_mutation(&bucket, "devices/capability.json", "test");
+
+        assert_eq!(mutation.relation, "parent_bucket");
+        assert_eq!(mutation.subject_kind, SYSTEM_BUCKET_NAMESPACE);
+        assert_eq!(mutation.subject_id, "17");
+        assert_ne!(mutation.subject_kind, USERSET_SUBJECT_KIND);
     }
 }

@@ -139,6 +139,7 @@ enum TaskTypeProto {
     IndexBuild = 4,
     RebalanceShard = 5,
     HfIngestion = 6,
+    AuthzMaterialization = 7,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
@@ -309,6 +310,56 @@ pub(crate) async fn enqueue_index_build_task_with_permit(
     .map(|_| true)
 }
 
+pub(crate) async fn enqueue_authz_materialization_task_with_permit(
+    storage: &Storage,
+    payload: JsonValue,
+    priority: i32,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<bool> {
+    require_task_queue_permit(permit)?;
+    let partition_precondition =
+        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    validate_authz_materialization_payload(&payload)?;
+    let state = read_task_queue_state(storage).await?;
+    let now = Utc::now();
+    let requested_revision = json_u128(&payload, "target_revision")
+        .ok_or_else(|| anyhow!("authz materialization target_revision must be nonnegative"))?;
+    let existing = state.authz_materialization_tasks_for_payload(&payload);
+    if existing.iter().any(|task| {
+        matches!(task.status, TaskStatus::Pending | TaskStatus::Failed)
+            && task.priority == priority
+            && json_u128(&task.payload, "target_revision").unwrap_or(0) >= requested_revision
+    }) {
+        return Ok(false);
+    }
+    for task in existing {
+        if matches!(task.status, TaskStatus::Pending | TaskStatus::Failed) {
+            append_task_event(
+                storage,
+                TaskJournalBody::StatusUpdated {
+                    task_id: task.id,
+                    status: TaskStatus::Completed,
+                    updated_at: now,
+                },
+                permit.fence_token,
+                Some(partition_precondition.clone()),
+            )
+            .await?;
+        }
+    }
+    enqueue_task_inner(
+        storage,
+        TaskType::AuthzMaterialization,
+        payload,
+        priority,
+        permit.fence_token,
+        Some(partition_precondition),
+    )
+    .await
+    .map(|_| true)
+}
+
 async fn enqueue_task_inner(
     storage: &Storage,
     task_type: TaskType,
@@ -410,7 +461,9 @@ async fn claim_pending_tasks_inner(
     let state = read_task_queue_state(storage).await?;
     let now = Utc::now();
     let running_index_build_keys = state.running_index_build_keys();
+    let running_authz_materialization_keys = state.running_authz_materialization_keys();
     let mut selected_index_build_keys = BTreeSet::new();
+    let mut selected_authz_materialization_keys = BTreeSet::new();
     let mut tasks = state
         .tasks
         .values()
@@ -432,11 +485,23 @@ async fn claim_pending_tasks_inner(
         if selected.len() >= limit {
             break;
         }
-        if let Some(key) = index_build_key(&task.payload) {
+        if task.task_type == TaskType::IndexBuild
+            && let Some(key) = index_build_key(&task.payload)
+        {
             if running_index_build_keys.contains(&key) || selected_index_build_keys.contains(&key) {
                 continue;
             }
             selected_index_build_keys.insert(key);
+        }
+        if task.task_type == TaskType::AuthzMaterialization
+            && let Some(key) = authz_materialization_key(&task.payload)
+        {
+            if running_authz_materialization_keys.contains(&key)
+                || selected_authz_materialization_keys.contains(&key)
+            {
+                continue;
+            }
+            selected_authz_materialization_keys.insert(key);
         }
         selected.push(task);
     }
@@ -1143,6 +1208,7 @@ fn task_type_to_proto(task_type: TaskType) -> TaskTypeProto {
         TaskType::IndexBuild => TaskTypeProto::IndexBuild,
         TaskType::RebalanceShard => TaskTypeProto::RebalanceShard,
         TaskType::HFIngestion => TaskTypeProto::HfIngestion,
+        TaskType::AuthzMaterialization => TaskTypeProto::AuthzMaterialization,
     }
 }
 
@@ -1158,6 +1224,7 @@ fn task_type_from_proto_i32(value: i32) -> Result<TaskType> {
             TaskTypeProto::IndexBuild => TaskType::IndexBuild,
             TaskTypeProto::RebalanceShard => TaskType::RebalanceShard,
             TaskTypeProto::HfIngestion => TaskType::HFIngestion,
+            TaskTypeProto::AuthzMaterialization => TaskType::AuthzMaterialization,
         },
     )
 }
@@ -1324,6 +1391,30 @@ impl TaskQueueState {
         tasks
     }
 
+    fn authz_materialization_tasks_for_payload(&self, payload: &JsonValue) -> Vec<TaskRecord> {
+        let Some(key) = authz_materialization_key(payload) else {
+            return Vec::new();
+        };
+        let mut tasks = self
+            .tasks
+            .values()
+            .filter(|task| {
+                task.task_type == TaskType::AuthzMaterialization
+                    && matches!(task.status, TaskStatus::Pending | TaskStatus::Failed)
+                    && authz_materialization_key(&task.payload).as_ref() == Some(&key)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        tasks.sort_by(|left, right| {
+            json_u128(&left.payload, "target_revision")
+                .unwrap_or(0)
+                .cmp(&json_u128(&right.payload, "target_revision").unwrap_or(0))
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        tasks
+    }
+
     fn running_index_build_keys(&self) -> BTreeSet<IndexBuildKey> {
         self.tasks
             .values()
@@ -1331,6 +1422,17 @@ impl TaskQueueState {
                 task.task_type == TaskType::IndexBuild && task.status == TaskStatus::Running
             })
             .filter_map(|task| index_build_key(&task.payload))
+            .collect()
+    }
+
+    fn running_authz_materialization_keys(&self) -> BTreeSet<AuthzMaterializationKey> {
+        self.tasks
+            .values()
+            .filter(|task| {
+                task.task_type == TaskType::AuthzMaterialization
+                    && task.status == TaskStatus::Running
+            })
+            .filter_map(|task| authz_materialization_key(&task.payload))
             .collect()
     }
 }
@@ -1341,6 +1443,11 @@ struct IndexBuildKey {
     bucket_id: i64,
     index_id: i64,
     index_version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct AuthzMaterializationKey {
+    tenant_id: i64,
 }
 
 fn validate_index_build_payload(payload: &JsonValue) -> Result<()> {
@@ -1360,6 +1467,21 @@ fn index_build_key(payload: &JsonValue) -> Option<IndexBuildKey> {
         bucket_id: json_i64(payload, "bucket_id")?,
         index_id: json_i64(payload, "index_id")?,
         index_version: json_i64(payload, "index_version")?,
+    })
+}
+
+fn validate_authz_materialization_payload(payload: &JsonValue) -> Result<()> {
+    authz_materialization_key(payload)
+        .ok_or_else(|| anyhow!("authz materialization payload must include tenant_id"))?;
+    json_u128(payload, "target_revision").ok_or_else(|| {
+        anyhow!("authz materialization payload must include nonnegative target_revision")
+    })?;
+    Ok(())
+}
+
+fn authz_materialization_key(payload: &JsonValue) -> Option<AuthzMaterializationKey> {
+    Some(AuthzMaterializationKey {
+        tenant_id: json_i64(payload, "tenant_id")?,
     })
 }
 
@@ -1762,6 +1884,112 @@ mod tests {
             .unwrap();
         assert_eq!(followup.len(), 1);
         assert_eq!(followup[0].payload["source_cursor"], json!(8));
+    }
+
+    #[tokio::test]
+    async fn task_journal_coalesces_pending_authz_materialization_by_tenant() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let owner = ready_owner(&storage, "node-a").await;
+        let permit = owner.write_permit().unwrap();
+
+        assert!(
+            enqueue_authz_materialization_task_with_permit(
+                &storage,
+                json!({"tenant_id": 42, "target_revision": 10}),
+                30,
+                &permit,
+                KEY,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            enqueue_authz_materialization_task_with_permit(
+                &storage,
+                json!({"tenant_id": 42, "target_revision": 15}),
+                30,
+                &permit,
+                KEY,
+            )
+            .await
+            .unwrap(),
+            "newer authz materialization should supersede the older pending task"
+        );
+        assert!(
+            !enqueue_authz_materialization_task_with_permit(
+                &storage,
+                json!({"tenant_id": 42, "target_revision": 14}),
+                30,
+                &permit,
+                KEY,
+            )
+            .await
+            .unwrap(),
+            "older requested revision is already covered by the pending task"
+        );
+
+        let tasks = list_tasks(&storage).await.unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].status, TaskStatus::Completed);
+        assert_eq!(tasks[0].payload["target_revision"], json!(10));
+        assert_eq!(tasks[1].status, TaskStatus::Pending);
+        assert_eq!(tasks[1].payload["target_revision"], json!(15));
+    }
+
+    #[tokio::test]
+    async fn task_journal_serializes_running_and_followup_authz_materialization() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let owner = ready_owner(&storage, "node-a").await;
+        let permit = owner.write_permit().unwrap();
+
+        enqueue_authz_materialization_task_with_permit(
+            &storage,
+            json!({"tenant_id": 42, "target_revision": 10}),
+            30,
+            &permit,
+            KEY,
+        )
+        .await
+        .unwrap();
+        let first_claim = claim_pending_tasks_with_permit(&storage, 10, &permit, KEY)
+            .await
+            .unwrap();
+        assert_eq!(first_claim.len(), 1);
+        assert_eq!(first_claim[0].payload["target_revision"], json!(10));
+
+        enqueue_authz_materialization_task_with_permit(
+            &storage,
+            json!({"tenant_id": 42, "target_revision": 20}),
+            30,
+            &permit,
+            KEY,
+        )
+        .await
+        .unwrap();
+        let blocked_by_running = claim_pending_tasks_with_permit(&storage, 10, &permit, KEY)
+            .await
+            .unwrap();
+        assert!(
+            blocked_by_running.is_empty(),
+            "pending follow-up for the same tenant must not run beside active materialization"
+        );
+
+        update_task_status_with_permit(
+            &storage,
+            first_claim[0].id,
+            TaskStatus::Completed,
+            &permit,
+            KEY,
+        )
+        .await
+        .unwrap();
+        let followup = claim_pending_tasks_with_permit(&storage, 10, &permit, KEY)
+            .await
+            .unwrap();
+        assert_eq!(followup.len(), 1);
+        assert_eq!(followup[0].payload["target_revision"], json!(20));
     }
 
     #[tokio::test]

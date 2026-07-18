@@ -687,6 +687,46 @@ pub(crate) async fn materialize_authz_tuple_segment_at_revision(
     .await
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AuthzMaterializationOutcome {
+    pub processed_revision: u64,
+    pub source_record_count: u64,
+    pub source_records_hash: String,
+    pub generation: u64,
+    pub segment_ref: String,
+}
+
+pub(crate) async fn materialize_authz_derived_state_at_revision(
+    storage: &Storage,
+    tenant_id: i64,
+    target_revision: u64,
+    source_fence_token: u64,
+) -> Result<AuthzMaterializationOutcome> {
+    let derived = crate::authz_userset_index::build_expected_derived_userset_index_at_revision(
+        storage,
+        tenant_id,
+        DEFAULT_DERIVED_USERSET_INDEX_ID,
+        target_revision,
+    )
+    .await?;
+    crate::authz_userset_index::write_derived_userset_index(storage, &derived).await?;
+    let segment_ref = materialize_authz_tuple_segment_at_revision_with_derived(
+        storage,
+        tenant_id,
+        target_revision,
+        source_fence_token,
+        Some(derived.entries.clone()),
+    )
+    .await?;
+    Ok(AuthzMaterializationOutcome {
+        processed_revision: derived.processed_revision,
+        source_record_count: derived.source_record_count,
+        source_records_hash: derived.source_records_hash,
+        generation: derived.generation,
+        segment_ref,
+    })
+}
+
 async fn materialize_authz_tuple_segment_at_revision_with_derived(
     storage: &Storage,
     tenant_id: i64,
@@ -852,7 +892,7 @@ pub async fn latest_authz_revision(storage: &Storage, tenant_id: i64) -> Result<
     Ok(tuple_revision.max(i64::try_from(schema_revision)?))
 }
 
-async fn latest_authz_tuple_revision(storage: &Storage, tenant_id: i64) -> Result<i64> {
+pub(crate) async fn latest_authz_tuple_revision(storage: &Storage, tenant_id: i64) -> Result<i64> {
     let store = CoreStore::new(storage.clone()).await?;
     let stream_id = authz_tuple_stream_id(tenant_id);
     let (sequence, _) = store.raw_stream_head(&stream_id).await?;
