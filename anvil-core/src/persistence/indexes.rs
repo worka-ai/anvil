@@ -245,13 +245,12 @@ impl Persistence {
             append_journal::append_record_source_cursor(&self.storage, bucket.tenant_id, bucket.id)
                 .await?
         } else {
-            let stats = metadata_journal::active_object_journal_stats(
+            metadata_journal::object_metadata_source_cursor(
                 &self.storage,
                 bucket,
                 &self.partition_owner_signing_key,
             )
-            .await?;
-            index_repair::source_cursor_from_stats(stats)
+            .await?
         };
         let index_storage_id =
             index_journal::index_storage_id(bucket.tenant_id, bucket.id, index.id);
@@ -525,13 +524,12 @@ impl Persistence {
             ));
         }
 
-        let stats = metadata_journal::active_object_journal_stats(
+        let source_cursor = metadata_journal::object_metadata_source_cursor(
             &self.storage,
             &bucket,
             &self.partition_owner_signing_key,
         )
         .await?;
-        let source_cursor = index_repair::source_cursor_from_stats(stats);
         let index_storage_id =
             index_journal::index_storage_id(bucket.tenant_id, bucket.id, index.id);
         let source_manifest_hash = if source_cursor == 0 {

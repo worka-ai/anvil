@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow, bail};
 use prost::{Message, Oneof};
 
-use super::super::{CoreStoredStreamHead, StoredStreamRecordIndexRow};
+use super::super::{CoreStoredStreamHead, StoredStreamIdempotencyRow, StoredStreamRecordIndexRow};
 use crate::core_store::types::{
     CoreBlockLocator, CoreBoundaryDimension, CoreBoundarySchema, CoreBoundarySource,
     CoreBoundaryValue, CoreCompressionDescriptor, CoreEncryptionDescriptor, CoreFenceRecord,
@@ -138,6 +138,32 @@ struct StreamRecordIndexRowProto {
 }
 
 #[derive(Clone, PartialEq, Message)]
+struct StreamIdempotencyRowProto {
+    #[prost(message, optional, tag = "1")]
+    common: Option<CoreMetaRowCommonProto>,
+    #[prost(string, tag = "2")]
+    schema: String,
+    #[prost(string, tag = "3")]
+    stream_id: String,
+    #[prost(uint64, tag = "4")]
+    sequence: u64,
+    #[prost(string, tag = "5")]
+    cursor: String,
+    #[prost(string, tag = "6")]
+    event_hash: String,
+    #[prost(string, tag = "7")]
+    record_kind: String,
+    #[prost(string, tag = "8")]
+    payload_hash: String,
+    #[prost(string, optional, tag = "9")]
+    transaction_id: Option<String>,
+    #[prost(string, tag = "10")]
+    idempotency_key_hash: String,
+    #[prost(string, tag = "11")]
+    created_at: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
 struct StreamHeadProto {
     #[prost(message, optional, tag = "1")]
     common: Option<CoreMetaRowCommonProto>,
@@ -153,6 +179,8 @@ struct StreamHeadProto {
     record_count: u64,
     #[prost(string, tag = "7")]
     updated_at: String,
+    #[prost(bool, tag = "8")]
+    idempotency_index_complete: bool,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -584,6 +612,35 @@ pub(in crate::core_store::local) fn decode_stream_record_index_row(
     stream_record_index_row_from_proto(proto)
 }
 
+pub(in crate::core_store::local) fn encode_stream_idempotency_row(
+    row: &StoredStreamIdempotencyRow,
+) -> Result<Vec<u8>> {
+    encode_det(&stream_idempotency_row_to_proto(row))
+}
+
+pub(in crate::core_store::local) fn decode_stream_idempotency_row(
+    bytes: &[u8],
+) -> Result<StoredStreamIdempotencyRow> {
+    let proto = StreamIdempotencyRowProto::decode(bytes)?;
+    ensure_det(&proto, bytes, "stream idempotency row")?;
+    proto
+        .common
+        .as_ref()
+        .ok_or_else(|| anyhow!("CoreStore stream idempotency row missing CoreMeta common"))?;
+    Ok(StoredStreamIdempotencyRow {
+        schema: proto.schema,
+        stream_id: proto.stream_id,
+        sequence: proto.sequence,
+        cursor: proto.cursor,
+        event_hash: proto.event_hash,
+        record_kind: proto.record_kind,
+        payload_hash: proto.payload_hash,
+        transaction_id: proto.transaction_id,
+        idempotency_key_hash: proto.idempotency_key_hash,
+        created_at: proto.created_at,
+    })
+}
+
 pub(in crate::core_store::local) fn encode_stream_head_record(
     head: &CoreStoredStreamHead,
 ) -> Result<Vec<u8>> {
@@ -601,6 +658,7 @@ pub(in crate::core_store::local) fn decode_stream_head_record(
         last_sequence: proto.last_sequence,
         last_event_hash: proto.last_event_hash,
         record_count: proto.record_count,
+        idempotency_index_complete: proto.idempotency_index_complete,
         updated_at: proto.updated_at,
     })
 }
@@ -896,6 +954,30 @@ fn stream_record_index_row_to_proto(
     }
 }
 
+fn stream_idempotency_row_to_proto(
+    value: &StoredStreamIdempotencyRow,
+) -> StreamIdempotencyRowProto {
+    StreamIdempotencyRowProto {
+        common: Some(core_meta_committed_row_common(
+            stream_realm_id(&value.stream_id),
+            stream_root_key_hash(&value.stream_id),
+            value.sequence,
+            value.transaction_id.clone().unwrap_or_default(),
+            0,
+        )),
+        schema: value.schema.clone(),
+        stream_id: value.stream_id.clone(),
+        sequence: value.sequence,
+        cursor: value.cursor.clone(),
+        event_hash: value.event_hash.clone(),
+        record_kind: value.record_kind.clone(),
+        payload_hash: value.payload_hash.clone(),
+        transaction_id: value.transaction_id.clone(),
+        idempotency_key_hash: value.idempotency_key_hash.clone(),
+        created_at: value.created_at.clone(),
+    }
+}
+
 fn stream_record_index_row_from_proto(
     value: StreamRecordIndexRowProto,
 ) -> Result<StoredStreamRecordIndexRow> {
@@ -946,6 +1028,7 @@ fn stream_head_to_proto(value: &CoreStoredStreamHead) -> StreamHeadProto {
         last_event_hash: value.last_event_hash.clone(),
         record_count: value.record_count,
         updated_at: value.updated_at.clone(),
+        idempotency_index_complete: value.idempotency_index_complete,
     }
 }
 
@@ -1126,7 +1209,7 @@ fn object_manifest_common(value: &CoreObjectManifest) -> Result<CoreMetaRowCommo
     Ok(core_meta_committed_row_common(
         format!("mesh/{}/region/{}", value.mesh_id, value.region_id),
         object_manifest_root_key_hash(&value.object_hash),
-        value.logical_size,
+        object_manifest_root_generation(value.logical_size),
         value.mutation_id.clone(),
         rfc3339_unix_nanos(&value.created_at)?,
     ))
@@ -1142,7 +1225,7 @@ fn validate_object_manifest_common(
     if common.root_key_hash != object_manifest_root_key_hash(&value.object_hash) {
         return Err(anyhow!("CoreStore object manifest CoreMeta root mismatch"));
     }
-    if common.root_generation != value.logical_size {
+    if common.root_generation != object_manifest_root_generation(value.logical_size) {
         return Err(anyhow!(
             "CoreStore object manifest CoreMeta generation mismatch"
         ));
@@ -1162,6 +1245,12 @@ fn validate_object_manifest_common(
 
 fn object_manifest_root_key_hash(object_hash: &str) -> String {
     core_meta_root_key_hash(&format!("object-manifest/{object_hash}"))
+}
+
+pub(in crate::core_store::local) fn object_manifest_root_generation(logical_size: u64) -> u64 {
+    // A content-addressed manifest owns one immutable root. Empty objects still
+    // need a positive CoreMeta generation so quorum preparation can advance.
+    logical_size.max(1)
 }
 
 fn rfc3339_unix_nanos(value: &str) -> Result<u64> {

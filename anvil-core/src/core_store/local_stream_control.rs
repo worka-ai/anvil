@@ -313,6 +313,75 @@ impl CoreStore {
             .unwrap_or_else(|| (0, ZERO_HASH.to_string())))
     }
 
+    pub(crate) fn raw_stream_record_metadata_range(
+        &self,
+        stream_id: &str,
+        after_sequence: u64,
+        through_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<CoreStreamRecordMetadata>> {
+        self.read_stream_record_index_rows_from_meta_range(
+            stream_id,
+            after_sequence,
+            through_sequence,
+            limit,
+        )
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| CoreStreamRecordMetadata {
+                    sequence: row.sequence,
+                    event_hash: row.event_hash,
+                    record_kind: row.record_kind,
+                    payload_len: row.payload_len,
+                })
+                .collect()
+        })
+    }
+
+    pub(crate) async fn visible_stream_record_metadata(
+        &self,
+        stream_id: &str,
+        sequence: u64,
+    ) -> Result<Option<CoreStreamRecordMetadata>> {
+        let Some(row) = self.read_stream_record_index_row_from_meta(stream_id, sequence)? else {
+            return Ok(None);
+        };
+        if !self
+            .stream_record_identity_is_visible(
+                &row.stream_id,
+                row.sequence,
+                &row.event_hash,
+                row.transaction_id.as_deref(),
+            )
+            .await?
+        {
+            return Ok(None);
+        }
+        Ok(Some(CoreStreamRecordMetadata {
+            sequence: row.sequence,
+            event_hash: row.event_hash,
+            record_kind: row.record_kind,
+            payload_len: row.payload_len,
+        }))
+    }
+
+    pub(crate) async fn visible_stream_head_metadata(
+        &self,
+        stream_id: &str,
+    ) -> Result<Option<CoreStreamRecordMetadata>> {
+        let (mut sequence, _) = self.raw_stream_head(stream_id).await?;
+        while sequence > 0 {
+            if let Some(metadata) = self
+                .visible_stream_record_metadata(stream_id, sequence)
+                .await?
+            {
+                return Ok(Some(metadata));
+            }
+            sequence = sequence.saturating_sub(1);
+        }
+        Ok(None)
+    }
+
     #[cfg(test)]
     pub(crate) fn corrupt_stream_record_payload_for_test(
         &self,
@@ -416,6 +485,15 @@ impl CoreStore {
                 },
             });
         }
+        self.prepare_new_stream_append_unlocked_with_idempotency_hash(input, idempotency_key_hash)
+            .await
+    }
+
+    pub(super) async fn prepare_new_stream_append_unlocked_with_idempotency_hash(
+        &self,
+        input: AppendStreamRecord,
+        idempotency_key_hash: Option<String>,
+    ) -> Result<PreparedStreamAppend> {
         let payload_hash = format!("sha256:{}", sha256_hex(&input.payload));
         let head = self.read_stream_head_from_meta(&input.stream_id)?;
         let (last_sequence, previous_event_hash) = head
@@ -492,57 +570,151 @@ impl CoreStore {
             return Ok(None);
         };
         let payload_hash = format!("sha256:{}", sha256_hex(payload));
-        for item in self.meta.scan_prefix(
-            CF_STREAM_RECORDS,
-            TABLE_STREAM_RECORD_INDEX_ROW,
-            &stream_record_prefix(stream_id),
-        )? {
-            let existing = decode_stream_record_index_row(&item.payload)?;
-            validate_stream_record_index_row_metadata(stream_id, &existing)?;
-            if existing.idempotency_key_hash.as_deref() != Some(idempotency_key_hash) {
-                continue;
-            }
-            if let Some(existing_transaction_id) = existing.transaction_id.as_deref()
-                && Some(existing_transaction_id) != transaction_id
+        let head = self.read_stream_head_from_meta(stream_id)?;
+        if head
+            .as_ref()
+            .is_some_and(|head| head.idempotency_index_complete)
+        {
+            let Some(bytes) = self.meta.get(
+                CF_STREAM_RECORDS,
+                TABLE_STREAM_IDEMPOTENCY_ROW,
+                &stream_idempotency_key(stream_id, idempotency_key_hash),
+            )?
+            else {
+                return Ok(None);
+            };
+            let existing = decode_stream_idempotency_row(&bytes)?;
+            if existing.schema != "anvil.core.stream_idempotency.v1"
+                || existing.stream_id != stream_id
+                || existing.idempotency_key_hash != idempotency_key_hash
             {
-                let visible = self
-                    .read_transaction_unlocked(existing_transaction_id)
+                bail!("CoreStore stream idempotency index row has invalid key scope");
+            }
+            return self
+                .stream_idempotent_receipt_from_idempotency_row_unlocked(
+                    stream_id,
+                    &payload_hash,
+                    idempotency_key_hash,
+                    transaction_id,
+                    existing,
+                )
+                .await;
+        }
+        // Streams created before the direct idempotency index retain the
+        // historical lookup path. New streams never pay this scan cost.
+        let head_sequence = head.map(|head| head.last_sequence);
+        if let Some(sequence) = head_sequence
+            && let Some(bytes) = self.meta.get(
+                CF_STREAM_RECORDS,
+                TABLE_STREAM_RECORD_INDEX_ROW,
+                &stream_record_key(stream_id, sequence),
+            )?
+        {
+            let existing = decode_stream_record_index_row(&bytes)?;
+            validate_stream_record_index_row_metadata(stream_id, &existing)?;
+            if let Some(existing) = StoredStreamIdempotencyRow::from_record_index(&existing) {
+                if let Some(receipt) = self
+                    .stream_idempotent_receipt_from_idempotency_row_unlocked(
+                        stream_id,
+                        &payload_hash,
+                        idempotency_key_hash,
+                        transaction_id,
+                        existing,
+                    )
                     .await?
-                    .is_some_and(|transaction| {
-                        transaction.state == CoreTransactionState::Committed
-                            && transaction.visible_updates.iter().any(|visible_update| {
-                                matches!(
-                                    visible_update,
-                                    CoreTransactionUpdate::StreamAppend {
-                                        stream_id: visible_stream_id,
-                                        visible_sequence,
-                                        prepared_record_hash,
-                                    } if visible_stream_id == &existing.stream_id
-                                        && *visible_sequence == existing.sequence
-                                        && prepared_record_hash == &existing.event_hash
-                                )
-                            })
-                    });
-                if !visible {
-                    continue;
+                {
+                    return Ok(Some(receipt));
                 }
             }
-            if existing.payload_hash != payload_hash {
-                bail!(
-                    "CoreStore stream idempotency conflict for stream {stream_id}: idempotency_key_hash={idempotency_key_hash}, existing_record_kind={}, existing_payload_hash={}, new_payload_hash={payload_hash}",
-                    existing.record_kind,
-                    existing.payload_hash
-                );
+        }
+        const REPLAY_SCAN_BATCH_SIZE: u64 = 256;
+        let mut end_sequence = head_sequence.unwrap_or_default().saturating_sub(1);
+        while end_sequence > 0 {
+            let start_sequence = end_sequence
+                .saturating_sub(REPLAY_SCAN_BATCH_SIZE - 1)
+                .max(1);
+            for item in self.meta.scan_range_reverse(
+                CF_STREAM_RECORDS,
+                TABLE_STREAM_RECORD_INDEX_ROW,
+                &stream_record_key(stream_id, start_sequence),
+                &stream_record_key(stream_id, end_sequence),
+                REPLAY_SCAN_BATCH_SIZE as usize,
+            )? {
+                let existing = decode_stream_record_index_row(&item.payload)?;
+                validate_stream_record_index_row_metadata(stream_id, &existing)?;
+                if let Some(existing) = StoredStreamIdempotencyRow::from_record_index(&existing) {
+                    if let Some(receipt) = self
+                        .stream_idempotent_receipt_from_idempotency_row_unlocked(
+                            stream_id,
+                            &payload_hash,
+                            idempotency_key_hash,
+                            transaction_id,
+                            existing,
+                        )
+                        .await?
+                    {
+                        return Ok(Some(receipt));
+                    }
+                }
             }
-            return Ok(Some(StreamAppendReceipt {
-                stream_id: existing.stream_id,
-                sequence: existing.sequence,
-                cursor: existing.cursor,
-                event_hash: existing.event_hash,
-                idempotent_replay: true,
-            }));
+            if start_sequence == 1 {
+                break;
+            }
+            end_sequence = start_sequence - 1;
         }
         Ok(None)
+    }
+
+    async fn stream_idempotent_receipt_from_idempotency_row_unlocked(
+        &self,
+        stream_id: &str,
+        payload_hash: &str,
+        idempotency_key_hash: &str,
+        transaction_id: Option<&str>,
+        existing: StoredStreamIdempotencyRow,
+    ) -> Result<Option<StreamAppendReceipt>> {
+        if existing.idempotency_key_hash != idempotency_key_hash {
+            return Ok(None);
+        }
+        if let Some(existing_transaction_id) = existing.transaction_id.as_deref()
+            && Some(existing_transaction_id) != transaction_id
+        {
+            let visible = self
+                .read_transaction_unlocked(existing_transaction_id)
+                .await?
+                .is_some_and(|transaction| {
+                    transaction.state == CoreTransactionState::Committed
+                        && transaction.visible_updates.iter().any(|visible_update| {
+                            matches!(
+                                visible_update,
+                                CoreTransactionUpdate::StreamAppend {
+                                    stream_id: visible_stream_id,
+                                    visible_sequence,
+                                    prepared_record_hash,
+                                } if visible_stream_id == &existing.stream_id
+                                    && *visible_sequence == existing.sequence
+                                    && prepared_record_hash == &existing.event_hash
+                            )
+                        })
+                });
+            if !visible {
+                return Ok(None);
+            }
+        }
+        if existing.payload_hash != payload_hash {
+            bail!(
+                "CoreStore stream idempotency conflict for stream {stream_id}: idempotency_key_hash={idempotency_key_hash}, existing_record_kind={}, existing_payload_hash={}, new_payload_hash={payload_hash}",
+                existing.record_kind,
+                existing.payload_hash
+            );
+        }
+        Ok(Some(StreamAppendReceipt {
+            stream_id: existing.stream_id,
+            sequence: existing.sequence,
+            cursor: existing.cursor,
+            event_hash: existing.event_hash,
+            idempotent_replay: true,
+        }))
     }
 
     pub async fn read_stream(&self, input: ReadStream) -> Result<Vec<StreamRecord>> {

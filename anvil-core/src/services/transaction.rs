@@ -118,16 +118,17 @@ impl TransactionService for AppState {
             )
             .await
             .map_err(core_store_status)?;
+        crate::access_control::grant_object_defaults_batch(
+            &self.persistence,
+            object_projections
+                .iter()
+                .map(|projection| (&projection.bucket, projection.object.key.as_str())),
+            "explicit transaction object materialisation",
+        )
+        .await
+        .map_err(core_store_status)?;
         let mut changed_object_keys_by_bucket = BTreeMap::new();
         for projection in object_projections {
-            crate::access_control::grant_object_defaults(
-                &self.persistence,
-                &projection.bucket,
-                &projection.object.key,
-                "explicit transaction object materialisation",
-            )
-            .await
-            .map_err(core_store_status)?;
             self.object_manager
                 .publish_object_watch_event(
                     projection.object.tenant_id,
@@ -902,6 +903,29 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(committed.state, WriteState::Committed as i32);
+
+        let object_default_records = crate::authz_journal::list_authz_tuple_log(
+            &state.storage,
+            crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
+            0,
+            "",
+            0,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|record| record.reason == "explicit transaction object materialisation")
+        .collect::<Vec<_>>();
+        assert_eq!(object_default_records.len(), 2);
+        assert_eq!(
+            object_default_records
+                .iter()
+                .map(|record| record.revision)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            1,
+            "one explicit transaction must materialize object defaults in one authz revision"
+        );
 
         for object_key in ["first.json", "second.json"] {
             state

@@ -1,4 +1,36 @@
 use super::*;
+use crate::core_store::local::local_stream_control::control_record_proto::decode_stream_idempotency_row;
+
+#[tokio::test]
+async fn core_store_round_trips_an_empty_inline_blob() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let store = CoreStore::new(storage).await.unwrap();
+
+    let object_ref = store
+        .put_blob(PutBlob {
+            logical_name: "mesh:test/tenant:t/bucket:b/object:empty".to_string(),
+            bytes: Vec::new(),
+            boundary_values: Vec::new(),
+            region_id: "local".to_string(),
+            mutation_id: "empty-inline-blob".to_string(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(object_ref.logical_size, 0);
+    assert_eq!(
+        store
+            .get_blob(GetBlob {
+                object_ref: object_ref.clone(),
+            })
+            .await
+            .unwrap(),
+        Vec::<u8>::new()
+    );
+    let manifest = store.read_object_manifest(&object_ref).await.unwrap();
+    assert_eq!(manifest.logical_size, 0);
+}
 
 #[tokio::test]
 async fn core_store_deduplicates_large_content_across_logical_names_and_boundaries() {
@@ -263,6 +295,27 @@ async fn core_store_streams_are_gap_free_hash_chained_and_idempotent() {
         })
         .await
         .unwrap();
+    let idempotency_key_hash = format!("sha256:{}", sha256_hex(b"idem-1"));
+    let indexed = store
+        .meta
+        .get(
+            CF_STREAM_RECORDS,
+            TABLE_STREAM_IDEMPOTENCY_ROW,
+            &stream_idempotency_key("object_metadata:tenant:b", &idempotency_key_hash),
+        )
+        .unwrap()
+        .expect("stream idempotency row");
+    assert_eq!(
+        decode_stream_idempotency_row(&indexed).unwrap().sequence,
+        first.sequence
+    );
+    assert!(
+        store
+            .read_stream_head_from_meta("object_metadata:tenant:b")
+            .unwrap()
+            .expect("stream head")
+            .idempotency_index_complete
+    );
     let replay = store
         .append_stream(AppendStreamRecord {
             stream_id: "object_metadata:tenant:b".to_string(),
@@ -279,6 +332,27 @@ async fn core_store_streams_are_gap_free_hash_chained_and_idempotent() {
         .unwrap();
     assert!(replay.idempotent_replay);
     assert_eq!(first.sequence, replay.sequence);
+
+    let conflict = store
+        .append_stream(AppendStreamRecord {
+            stream_id: "object_metadata:tenant:b".to_string(),
+            partition_id: "partition-1".to_string(),
+            record_kind: "object.put".to_string(),
+            payload: br#"{"key":"different"}"#.to_vec(),
+            content_type: None,
+            user_metadata_json: "{}".to_string(),
+            fence: None,
+            transaction_id: None,
+            idempotency_key: Some("idem-1".to_string()),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        conflict
+            .to_string()
+            .contains("CoreStore stream idempotency conflict"),
+        "unexpected idempotency conflict: {conflict:#}"
+    );
 
     let second = store
         .append_stream(AppendStreamRecord {

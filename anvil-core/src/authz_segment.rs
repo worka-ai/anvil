@@ -543,17 +543,17 @@ pub async fn ensure_authz_tuple_segment_at_revision(
 
     let source_fence_token =
         authz_journal::latest_authz_journal_fence_token(storage, tenant_id).await?;
-    for revision in 1..=target_revision {
-        let segment_ref = authz_tuple_segment_ref_name(tenant_id, revision)?;
-        if read_authz_tuple_segment_catalog_record(storage, tenant_id, &segment_ref)?.is_none() {
-            authz_journal::materialize_authz_tuple_segment_at_revision(
-                storage,
-                tenant_id,
-                revision,
-                source_fence_token,
-            )
-            .await?;
-        }
+    let segment_ref = authz_tuple_segment_ref_name(tenant_id, target_revision)?;
+    if read_authz_tuple_segment_catalog_record(storage, tenant_id, &segment_ref)?.is_none() {
+        // Historical stores may predate synchronous segment materialisation. Build the
+        // requested revision as a checkpoint instead of replaying every missing revision.
+        authz_journal::materialize_authz_tuple_segment_at_revision(
+            storage,
+            tenant_id,
+            target_revision,
+            source_fence_token,
+        )
+        .await?;
     }
 
     let Some(segment) =
