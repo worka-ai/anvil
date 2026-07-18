@@ -360,6 +360,8 @@ PersonalDB commands operate on Anvil's PersonalDB witness and log surfaces. They
 
 ```bash
 anvil --profile acme personaldb group create customer-notes "$SCHEMA_HASH" "$GENESIS_HASH" \
+  --proposer-signature-purpose source-proposer \
+  --policy-epoch 1 \
   --schema-sql "$SCHEMA_SQL"
 anvil --profile acme personaldb group read customer-notes
 ```
@@ -382,18 +384,17 @@ anvil --profile acme personaldb catch-up customer-notes \
 anvil --profile acme personaldb watch customer-notes --after-cursor-low 0 --after-cursor-high 0
 ```
 
-Projection commands:
+Projection reads:
 
 ```bash
-anvil --profile acme personaldb projection create customer-notes "$(cat projection.json)"
 anvil --profile acme personaldb projection read customer-notes open-notes
 ```
 
-Purpose: create/read a group, submit a changeset payload, request catch-up entries, watch group events, and create/read projection definitions.
+Purpose: create/read a group, submit a changeset payload, request catch-up entries, watch group events, and read projection definitions. Projection groups are created atomically with `group create` by passing `--proposer-signature-purpose projection-proposer`, `--projection-definition-json`, and `--projection-builder-key-policy-json`.
 
 Auth/scope shape: group creation uses `personaldb:create`; group reads and catch-up use `personaldb:read`; changeset submit uses `personaldb:commit` and row-level actions as implemented by PersonalDB policy; watches use `personaldb:watch`. Resources are shaped with the tenant and database id, for example `tenant-<tenant_id>/<database_id>`.
 
-Limitations: the CLI submit path uses generated request and idempotency ids, sends empty session-token/debug metadata, and does not expose voter acknowledgements. Catch-up output is compact: it reports counts and flags, not a full client sync workflow. Snapshot restore/download and richer projection maintenance are API/client responsibilities where implemented.
+Limitations: the CLI submit path uses generated request and idempotency ids, sends empty session-token/debug metadata, and does not expose voter acknowledgements. Catch-up output is compact: it reports counts and flags, not a full client sync workflow. Snapshot restore/download and projection watch are API/client responsibilities where implemented.
 
 ## Tenant diagnostics and repair
 

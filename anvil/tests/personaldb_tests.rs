@@ -4,9 +4,9 @@ use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::personal_db_service_client::PersonalDbServiceClient;
 use anvil::anvil_api::repair_service_client::RepairServiceClient;
 use anvil::anvil_api::{
-    CreatePersonalDbGroupRequest, CreatePersonalDbProjectionRequest, GetPersonalDbGroupRequest,
-    GetPersonalDbProjectionRequest, PersonalDbCatchUpRequest, PersonalDbVoterAck,
-    RepairPersonalDbLogChainRequest, SubmitPersonalDbChangesetRequest, WatchPersonalDbGroupRequest,
+    CreatePersonalDbGroupRequest, GetPersonalDbGroupRequest, GetPersonalDbProjectionRequest,
+    PersonalDbCatchUpRequest, PersonalDbVoterAck, RepairPersonalDbLogChainRequest,
+    SubmitPersonalDbChangesetRequest, WatchPersonalDbGroupRequest,
     WatchPersonalDbProjectionRequest, WriteAuthzTupleRequest,
 };
 use anvil::anvil_personaldb_sqlite_changeset::iterate_changeset;
@@ -35,6 +35,7 @@ use anvil::personaldb_watch::{
 };
 use anvil_test_utils::*;
 use futures_util::StreamExt;
+use personaldb_protocol::{DatabaseId, KeyGeneration, KeyTrustPolicy, SignaturePurpose};
 use rusqlite::{Connection, session::Session};
 use std::time::Duration;
 use tonic::{Code, Request};
@@ -137,17 +138,73 @@ async fn create_group_with_schema(
     let genesis_hash = hex::encode(hash32(format!("genesis:{database_id}").as_bytes()));
     client
         .create_personal_db_group(authorized(
+            source_group_create_request(database_id, schema_hash, &genesis_hash, schema_sql),
+            token,
+        ))
+        .await
+        .unwrap();
+    genesis_hash
+}
+
+fn source_group_create_request(
+    database_id: &str,
+    schema_hash: &str,
+    genesis_hash: &str,
+    schema_sql: &str,
+) -> CreatePersonalDbGroupRequest {
+    CreatePersonalDbGroupRequest {
+        database_id: database_id.to_string(),
+        schema_hash: schema_hash.to_string(),
+        genesis_hash: genesis_hash.to_string(),
+        schema_sql: schema_sql.to_string(),
+        proposer_signature_purpose: SignaturePurpose::SourceProposer.as_str().to_string(),
+        policy_epoch: 1,
+        projection_definition_json: String::new(),
+        projection_builder_key_policy_json: String::new(),
+    }
+}
+
+async fn create_projection_group_with_schema(
+    client: &mut PersonalDbServiceClient<tonic::transport::Channel>,
+    token: &str,
+    database_id: &str,
+    schema_sql: &str,
+    schema_hash: &str,
+    definition: &ProjectionDefinition,
+) -> String {
+    let genesis_hash = hex::encode(hash32(format!("genesis:{database_id}").as_bytes()));
+    client
+        .create_personal_db_group(authorized(
             CreatePersonalDbGroupRequest {
                 database_id: database_id.to_string(),
                 schema_hash: schema_hash.to_string(),
                 genesis_hash: genesis_hash.clone(),
                 schema_sql: schema_sql.to_string(),
+                proposer_signature_purpose: SignaturePurpose::ProjectionProposer
+                    .as_str()
+                    .to_string(),
+                policy_epoch: 1,
+                projection_definition_json: serde_json::to_string(definition).unwrap(),
+                projection_builder_key_policy_json: projection_builder_policy_json(database_id),
             },
             token,
         ))
         .await
         .unwrap();
     genesis_hash
+}
+
+fn projection_builder_policy_json(database_id: &str) -> String {
+    serde_json::to_string(
+        &KeyTrustPolicy::new(
+            KeyGeneration::new(1).unwrap(),
+            SignaturePurpose::ProjectionBuilder,
+            0,
+        )
+        .with_database_scopes(vec![DatabaseId::new(database_id)])
+        .with_group_scopes(vec![database_id.to_string()]),
+    )
+    .unwrap()
 }
 
 fn personaldb_group_partition_id_for_test(tenant_id: i64, database_id: &str) -> String {

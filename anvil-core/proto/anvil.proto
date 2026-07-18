@@ -2790,7 +2790,6 @@ service CoordinationService {
 service PersonalDbService {
   rpc CreatePersonalDbGroup(CreatePersonalDbGroupRequest) returns (PersonalDbGroupResponse);
   rpc GetPersonalDbGroup(GetPersonalDbGroupRequest) returns (PersonalDbGroupResponse);
-  rpc CreatePersonalDbProjection(CreatePersonalDbProjectionRequest) returns (PersonalDbProjectionResponse);
   rpc GetPersonalDbProjection(GetPersonalDbProjectionRequest) returns (PersonalDbProjectionResponse);
   rpc SubmitPersonalDbChangeset(SubmitPersonalDbChangesetRequest) returns (SubmitPersonalDbChangesetResponse);
   rpc CatchUpPersonalDb(PersonalDbCatchUpRequest) returns (PersonalDbCatchUpResponse);
@@ -3453,6 +3452,10 @@ message CreatePersonalDbGroupRequest {
     string schema_hash = 2;
     string genesis_hash = 3;
     string schema_sql = 4;
+    string proposer_signature_purpose = 5;
+    uint64 policy_epoch = 6;
+    string projection_definition_json = 7;
+    string projection_builder_key_policy_json = 8;
 }
 
 message GetPersonalDbGroupRequest {
@@ -3463,12 +3466,6 @@ message GetPersonalDbGroupRequest {
 message PersonalDbGroupResponse {
     PersonalDbGroupManifestRecord manifest = 1;
     PersonalDbCommittedHeadRecord committed_head = 2;
-}
-
-message CreatePersonalDbProjectionRequest {
-    int64 tenant_id = 1;
-    string database_id = 2;
-    string projection_definition_json = 3;
 }
 
 message GetPersonalDbProjectionRequest {
@@ -3515,6 +3512,12 @@ message PersonalDbGroupManifestRecord {
     uint64 current_projection_generation = 13;
     string manifest_hash = 14;
     SignatureEnvelopeV1 manifest_signature = 15;
+    string proposer_signature_purpose = 16;
+    string projection_definition_ref = 17;
+    string projection_definition_hash = 18;
+    repeated string projection_source_database_ids = 19;
+    string projection_builder_key_policy_json = 20;
+    optional uint64 genesis_authorization_revision = 21;
 }
 
 message PersonalDbCommittedHeadRecord {

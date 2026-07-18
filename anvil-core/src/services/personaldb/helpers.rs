@@ -59,6 +59,14 @@ pub(super) fn group_manifest_record(
         current_projection_generation: manifest.current_projection_generation,
         manifest_hash: manifest.manifest_hash.unwrap_or_default(),
         manifest_signature: manifest.manifest_signature.map(signature_envelope_record),
+        proposer_signature_purpose: manifest.proposer_signature_purpose.as_str().to_string(),
+        projection_definition_ref: manifest.projection_definition_ref.unwrap_or_default(),
+        projection_definition_hash: manifest.projection_definition_hash.unwrap_or_default(),
+        projection_source_database_ids: manifest.projection_source_database_ids,
+        projection_builder_key_policy_json: manifest
+            .projection_builder_key_policy_json
+            .unwrap_or_default(),
+        genesis_authorization_revision: manifest.genesis_authorization_revision,
     }
 }
 
@@ -352,14 +360,6 @@ pub(super) fn personaldb_group_partition_id(tenant_id: i64, database_id: &str) -
     ))
 }
 
-pub(super) fn personaldb_projection_resource(
-    tenant_id: i64,
-    database_id: &str,
-    projection_id: &str,
-) -> String {
-    format!("tenant-{tenant_id}/{database_id}/projections/{projection_id}")
-}
-
 pub(super) async fn personaldb_projection_access_allowed(
     storage: &crate::storage::Storage,
     claims: &auth::Claims,
@@ -425,34 +425,79 @@ pub(super) fn personaldb_ownership_status(err: impl std::fmt::Display) -> Status
     ))
 }
 
+pub(super) fn invalid_group_genesis(reason: &'static str) -> Status {
+    Status::invalid_argument(format!("{}: {reason}", AnvilErrorCode::ManifestInvalid))
+}
+
+pub(super) fn invalid_group_genesis_owned(reason: String) -> Status {
+    Status::invalid_argument(format!("{}: {reason}", AnvilErrorCode::ManifestInvalid))
+}
+
+fn invalid_stored_group_genesis(reason: &'static str) -> Status {
+    Status::failed_precondition(format!("{}: {reason}", AnvilErrorCode::ManifestInvalid))
+}
+
+pub(super) fn authorize_personaldb_commit_for_genesis(
+    manifest: &PersonalDbGroupManifest,
+    actor: &PersonalDbCommitActor,
+) -> Result<(), Status> {
+    match manifest.proposer_signature_purpose {
+        SignaturePurpose::ProjectionProposer => {
+            if actor.proposal_purpose == Some(SignaturePurpose::ProjectionBuilder) {
+                Ok(())
+            } else {
+                Err(projection_writeback_rejected(
+                    "ordinary external mutations are forbidden for projection groups",
+                ))
+            }
+        }
+        SignaturePurpose::SourceProposer | SignaturePurpose::StandaloneProposer => {
+            if actor.proposal_purpose.is_none() {
+                Ok(())
+            } else {
+                Err(invalid_stored_group_genesis(
+                    "projection builder cannot mutate a non-projection group",
+                ))
+            }
+        }
+        _ => Err(invalid_stored_group_genesis(
+            "group proposer signature purpose is unsupported",
+        )),
+    }
+}
+
+pub(super) fn validate_projection_genesis_binding(
+    tenant_id: i64,
+    manifest: &PersonalDbGroupManifest,
+    definition: &ProjectionDefinition,
+) -> Result<(), Status> {
+    if !manifest.is_projection()
+        || definition.database_id != manifest.database_id
+        || definition.target_database_id != manifest.database_id
+        || definition.writeback_policy != WriteBackPolicy::Deny
+        || manifest.projection_source_database_ids != definition.source_database_ids
+        || manifest.projection_definition_hash.as_deref() != definition.definition_hash.as_deref()
+    {
+        return Err(invalid_stored_group_genesis(
+            "projection definition does not match immutable group genesis",
+        ));
+    }
+    let expected_ref =
+        projection_definition_ref(tenant_id, &manifest.database_id, &definition.projection_id)
+            .map_err(internal_status)?;
+    if manifest.projection_definition_ref.as_deref() != Some(expected_ref.as_str()) {
+        return Err(invalid_stored_group_genesis(
+            "projection definition ref does not match immutable group genesis",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn projection_writeback_rejected(reason: &'static str) -> Status {
     Status::failed_precondition(format!(
         "{}: {reason}",
         AnvilErrorCode::PersonalDbProjectionWriteBackRejected
     ))
-}
-
-pub(super) fn projection_writeback_rejected_owned(reason: String) -> Status {
-    Status::failed_precondition(format!(
-        "{}: {reason}",
-        AnvilErrorCode::PersonalDbProjectionWriteBackRejected
-    ))
-}
-
-pub(super) fn single_projection_writeback_source(
-    definition: &ProjectionDefinition,
-) -> Result<String, Status> {
-    let sources = definition
-        .table_mappings
-        .iter()
-        .map(|mapping| mapping.source_database_id.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    if sources.len() != 1 {
-        return Err(projection_writeback_rejected(
-            "projection write-back has ambiguous source database bindings",
-        ));
-    }
-    Ok(sources.into_iter().next().expect("one source database"))
 }
 
 pub(super) fn submit_changeset_response(

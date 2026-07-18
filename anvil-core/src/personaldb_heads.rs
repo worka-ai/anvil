@@ -153,6 +153,18 @@ struct PersonalDbGroupManifestProto {
     manifest_hash: Option<String>,
     #[prost(message, optional, tag = "15")]
     manifest_signature: Option<WireSignatureEnvelopeV1>,
+    #[prost(uint32, tag = "16")]
+    proposer_signature_purpose: u32,
+    #[prost(string, optional, tag = "17")]
+    projection_definition_ref: Option<String>,
+    #[prost(string, optional, tag = "18")]
+    projection_definition_hash: Option<String>,
+    #[prost(string, repeated, tag = "19")]
+    projection_source_database_ids: Vec<String>,
+    #[prost(string, optional, tag = "20")]
+    projection_builder_key_policy_json: Option<String>,
+    #[prost(uint64, optional, tag = "21")]
+    genesis_authorization_revision: Option<u64>,
 }
 
 impl PersonalDbCommittedHead {
@@ -278,12 +290,16 @@ pub async fn write_personaldb_group_manifest(
         &manifest.tenant_id,
         &manifest.database_id,
     )?;
-    write_head_record(
-        storage,
-        &personaldb_head_data_id(tenant_id, &manifest.database_id, "group_manifest")?,
-        manifest,
-    )
-    .await
+    let data_id = personaldb_head_data_id(tenant_id, &manifest.database_id, "group_manifest")?;
+    if read_head_record::<PersonalDbGroupManifest>(storage, &data_id)
+        .await?
+        .is_some()
+    {
+        return Err(anyhow!(
+            "personaldb group manifest is immutable and already exists"
+        ));
+    }
+    write_head_record(storage, &data_id, manifest).await
 }
 
 pub async fn read_personaldb_group_manifest(
@@ -796,6 +812,12 @@ fn group_manifest_to_proto(manifest: &PersonalDbGroupManifest) -> PersonalDbGrou
             .manifest_signature
             .as_ref()
             .map(signature_envelope_to_proto),
+        proposer_signature_purpose: u32::from(manifest.proposer_signature_purpose as u16),
+        projection_definition_ref: manifest.projection_definition_ref.clone(),
+        projection_definition_hash: manifest.projection_definition_hash.clone(),
+        projection_source_database_ids: manifest.projection_source_database_ids.clone(),
+        projection_builder_key_policy_json: manifest.projection_builder_key_policy_json.clone(),
+        genesis_authorization_revision: manifest.genesis_authorization_revision,
     }
 }
 
@@ -832,6 +854,16 @@ fn group_manifest_from_proto(
         active_policy_epoch: proto.active_policy_epoch,
         current_row_index_generation: proto.current_row_index_generation,
         current_projection_generation: proto.current_projection_generation,
+        proposer_signature_purpose: SignaturePurpose::try_from(
+            u16::try_from(proto.proposer_signature_purpose)
+                .map_err(|_| anyhow!("personaldb group proposer signature purpose exceeds u16"))?,
+        )
+        .map_err(|err| anyhow!("invalid personaldb group proposer signature purpose: {err}"))?,
+        projection_definition_ref: proto.projection_definition_ref,
+        projection_definition_hash: proto.projection_definition_hash,
+        projection_source_database_ids: proto.projection_source_database_ids,
+        projection_builder_key_policy_json: proto.projection_builder_key_policy_json,
+        genesis_authorization_revision: proto.genesis_authorization_revision,
         manifest_hash: proto.manifest_hash,
         manifest_signature: proto
             .manifest_signature
@@ -1004,6 +1036,10 @@ mod tests {
             64,
             "raw Ed25519 signature must survive the CoreStore protobuf round trip"
         );
+        let error = write_personaldb_group_manifest(&storage, 7, &manifest, keyring.trust_store())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("immutable"));
     }
 
     #[tokio::test]
@@ -1167,7 +1203,7 @@ mod tests {
 
     fn sample_group_manifest() -> PersonalDbGroupManifest {
         PersonalDbGroupManifest {
-            format_version: 2,
+            format_version: 3,
             tenant_id: "7".to_string(),
             database_id: "db-alpha".to_string(),
             schema_hash: hex::encode([1; 32]),
@@ -1180,6 +1216,12 @@ mod tests {
             active_policy_epoch: 5,
             current_row_index_generation: 3,
             current_projection_generation: 0,
+            proposer_signature_purpose: SignaturePurpose::SourceProposer,
+            projection_definition_ref: None,
+            projection_definition_hash: None,
+            projection_source_database_ids: Vec::new(),
+            projection_builder_key_policy_json: None,
+            genesis_authorization_revision: None,
             manifest_hash: None,
             manifest_signature: None,
         }

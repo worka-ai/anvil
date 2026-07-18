@@ -3,8 +3,9 @@ use crate::{
     formats::hash32,
     personaldb_coremeta::{
         list_personaldb_data_locator_rows, list_personaldb_data_locator_rows_for_tenant,
-        personaldb_payload_hash, read_personaldb_data_locator_bytes,
-        read_personaldb_data_locator_row, write_personaldb_bytes_as_data_locator,
+        personaldb_data_locator_precondition, personaldb_payload_hash,
+        read_personaldb_data_locator_bytes, read_personaldb_data_locator_row,
+        write_personaldb_bytes_as_data_locator_with_preconditions,
     },
     storage::Storage,
 };
@@ -241,7 +242,7 @@ pub fn hash_projection_definition(definition: &ProjectionDefinition) -> Result<S
     )?)))
 }
 
-pub async fn write_projection_definition(
+pub(crate) async fn write_projection_definition(
     storage: &Storage,
     tenant_id: i64,
     database_id: &str,
@@ -250,17 +251,21 @@ pub async fn write_projection_definition(
     definition.verify()?;
     ensure_scope(tenant_id, database_id, definition)?;
     let data_id = projection_definition_data_id(tenant_id, database_id, &definition.projection_id)?;
+    if read_personaldb_data_locator_row(storage, tenant_id, database_id, &data_id)?.is_some() {
+        return Err(anyhow!(
+            "projection definition is immutable and already exists"
+        ));
+    }
     let bytes = encode_projection_definition(definition)?;
-    let generation = read_personaldb_data_locator_row(storage, tenant_id, database_id, &data_id)?
-        .map(|row| row.generation.saturating_add(1))
-        .unwrap_or(1);
-    write_personaldb_bytes_as_data_locator(
+    let precondition =
+        personaldb_data_locator_precondition(storage, tenant_id, database_id, &data_id)?;
+    write_personaldb_bytes_as_data_locator_with_preconditions(
         storage,
         tenant_id,
         database_id,
         &data_id,
         PERSONALDB_PROJECTION_DEFINITION_KIND,
-        generation,
+        1,
         bytes.clone(),
         personaldb_payload_hash(&bytes),
         definition.source_database_ids.clone(),
@@ -268,9 +273,18 @@ pub async fn write_projection_definition(
             "personaldb-projection-definition:{tenant_id}:{database_id}:{}",
             definition.projection_id
         ),
+        &[precondition],
     )
     .await?;
     Ok(())
+}
+
+pub fn projection_definition_ref(
+    tenant_id: i64,
+    database_id: &str,
+    projection_id: &str,
+) -> Result<String> {
+    projection_definition_data_id(tenant_id, database_id, projection_id)
 }
 
 pub async fn read_projection_definition(
@@ -963,6 +977,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(read, definition);
+
+        let error = write_projection_definition(&storage, 7, "projection-db", &definition)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("immutable"));
     }
 
     #[tokio::test]

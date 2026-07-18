@@ -101,7 +101,7 @@ When a source commit is accepted, the projection builder looks for definitions t
 
 This is useful when a server needs a smaller or permission-shaped SQLite dataset for sync. For example, a source group might contain all notes in a workspace, while a projection group contains only not-deleted notes visible to one service actor. The projection is derived state. If it lags or becomes inconsistent, the source commits and projection definition are the evidence needed to diagnose or rebuild it.
 
-Writeback is supported only for projection definitions whose writeback policy allows mapped columns. Definitions with `deny` reject direct writeback. Writeback translates a changeset submitted to the projection group back into a source-group changeset, then witnesses that source commit. This should be treated as an API/client feature today because the current CLI submit helper does not expose the fields needed for a production submit loop.
+Projection definitions use a `deny` writeback policy. Ordinary external submits to a projection group are rejected, including submits by the owner; only Anvil's in-process projection builder can apply derived changesets.
 
 ## Repair and operational evidence
 
@@ -113,7 +113,7 @@ Operationally, watch the same source-versus-derived split that appears elsewhere
 
 ## Current public surfaces and gaps
 
-The current public API exposes group create/read, projection create/read, changeset submit, catch-up, group watch, and projection watch. The public CLI exposes `anvil personaldb group create`, `group read`, `projection create`, `projection read`, `changeset submit`, `catch-up`, and `watch`; the generic `anvil watch personaldb` command tails the same group watch surface.
+The current public API exposes group create/read, projection read, changeset submit, catch-up, group watch, and projection watch. Projection definitions are supplied atomically when a projection group is created. The public CLI exposes `anvil personaldb group create`, `group read`, `projection read`, `changeset submit`, `catch-up`, and `watch`; the generic `anvil watch personaldb` command tails the same group watch surface.
 
 There are important gaps to design around. The CLI `changeset submit` command is not a complete production submit helper today: it generates request and idempotency fields itself, sends an empty session token, and cannot provide voter acknowledgements, while the service requires the session token to match the authenticated bearer token and requires at least one voter acknowledgement. The CLI `group read` prints only a compact manifest line, not the full committed head. The CLI `catch-up` prints counts and booleans, not replayable changeset payloads and certificates. There is no public CLI projection-watch helper. Snapshot restore and snapshot download are not exposed as a complete public workflow. There is also no standalone, full PersonalDB projection-definition reference page comparable to the index JSON reference; today you must rely on the tutorial, proto, and source for the exact projection JSON shape.
 

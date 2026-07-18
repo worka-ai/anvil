@@ -540,7 +540,7 @@ mod tests {
             let protocol_keyring = personaldb_protocol_keyring();
             let genesis_hash = hex::encode([0; 32]);
             let manifest = PersonalDbGroupManifest {
-                format_version: 2,
+                format_version: 3,
                 tenant_id: "3".to_string(),
                 database_id: "db-alpha".to_string(),
                 schema_hash: hex::encode([7; 32]),
@@ -553,6 +553,12 @@ mod tests {
                 active_policy_epoch: 1,
                 current_row_index_generation: 0,
                 current_projection_generation: 0,
+                proposer_signature_purpose: personaldb_protocol::SignaturePurpose::SourceProposer,
+                projection_definition_ref: None,
+                projection_definition_hash: None,
+                projection_source_database_ids: Vec::new(),
+                projection_builder_key_policy_json: None,
+                genesis_authorization_revision: None,
                 manifest_hash: None,
                 manifest_signature: None,
             }

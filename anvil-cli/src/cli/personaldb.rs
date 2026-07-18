@@ -34,8 +34,16 @@ pub enum GroupCommands {
         database_id: String,
         schema_hash: String,
         genesis_hash: String,
+        #[clap(long)]
+        proposer_signature_purpose: String,
+        #[clap(long)]
+        policy_epoch: u64,
         #[clap(long, default_value = "")]
         schema_sql: String,
+        #[clap(long, default_value = "")]
+        projection_definition_json: String,
+        #[clap(long, default_value = "")]
+        projection_builder_key_policy_json: String,
     },
     Read {
         database_id: String,
@@ -44,10 +52,6 @@ pub enum GroupCommands {
 
 #[derive(Subcommand)]
 pub enum ProjectionCommands {
-    Create {
-        database_id: String,
-        projection_definition_json: String,
-    },
     Read {
         database_id: String,
         projection_id: String,
@@ -104,7 +108,11 @@ pub async fn handle_personaldb_command(
                     database_id,
                     schema_hash,
                     genesis_hash,
+                    proposer_signature_purpose,
+                    policy_epoch,
                     schema_sql,
+                    projection_definition_json,
+                    projection_builder_key_policy_json,
                 },
         } => {
             let mut request = tonic::Request::new(api::CreatePersonalDbGroupRequest {
@@ -112,6 +120,10 @@ pub async fn handle_personaldb_command(
                 schema_hash: schema_hash.clone(),
                 genesis_hash: genesis_hash.clone(),
                 schema_sql: schema_sql.clone(),
+                proposer_signature_purpose: proposer_signature_purpose.clone(),
+                policy_epoch: *policy_epoch,
+                projection_definition_json: projection_definition_json.clone(),
+                projection_builder_key_policy_json: projection_builder_key_policy_json.clone(),
             });
             add_auth(&mut request, &token);
             print_group(client.create_personal_db_group(request).await?.into_inner());
@@ -125,28 +137,6 @@ pub async fn handle_personaldb_command(
             });
             add_auth(&mut request, &token);
             print_group(client.get_personal_db_group(request).await?.into_inner());
-        }
-        PersonalDbCommands::Projection {
-            command:
-                ProjectionCommands::Create {
-                    database_id,
-                    projection_definition_json,
-                },
-        } => {
-            let mut request = tonic::Request::new(api::CreatePersonalDbProjectionRequest {
-                tenant_id: claims.tenant_id,
-                database_id: database_id.clone(),
-                projection_definition_json: projection_definition_json.clone(),
-            });
-            add_auth(&mut request, &token);
-            println!(
-                "{}",
-                client
-                    .create_personal_db_projection(request)
-                    .await?
-                    .into_inner()
-                    .projection_definition_json
-            );
         }
         PersonalDbCommands::Projection {
             command:

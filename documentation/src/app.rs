@@ -359,7 +359,7 @@ impl From<CapabilitySection> for Widget {
                         CapabilityLine::new("Find", "Directory indexes, metadata filters, full text search, vector search, hybrid ranking, source indexes, model tensor lookup.", "/tutorials/hybrid-search/").into(),
                         CapabilityLine::new("Protect", "Principal credentials, public access policy, relationship tuples, caveats, permission checks, authz watches, fail-closed internal namespaces.", "/tutorials/authorisation/").into(),
                         CapabilityLine::new("React", "Bucket metadata watches, prefix watches, index definition watches, partition watches, authz watches, source watches, PersonalDB watches.", "/tutorials/watches/").into(),
-                        CapabilityLine::new("Sync", "PersonalDB groups, changesets, catch-up, snapshots, projections, row metadata, projection writeback, witness certificates.", "/tutorials/personaldb/").into(),
+                        CapabilityLine::new("Sync", "PersonalDB groups, changesets, catch-up, snapshots, projections, row metadata, witness certificates.", "/tutorials/personaldb/").into(),
                         CapabilityLine::new("Operate", "Index repair, directory repair, authz derived repair, PersonalDB log-chain repair, diagnostics, release smoke tests, package publishing.", "/tutorials/repair-and-diagnostics/").into(),
                     ],
                     ..Default::default()

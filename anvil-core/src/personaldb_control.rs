@@ -6,12 +6,14 @@ use crate::{
 };
 use anyhow::{Result, anyhow};
 use personaldb_protocol::{
-    DatabaseId, ProtocolSignable, PublicKeyTrustStore, SignatureDomain, SignatureEnvelopeV1,
+    DatabaseId, GROUP_KIND_PROJECTION, GROUP_KIND_SOURCE, GROUP_KIND_STANDALONE, KeyTrustPolicy,
+    ProtocolSignable, PublicKeyStatus, PublicKeyTrustStore, SignatureDomain, SignatureEnvelopeV1,
     SignatureMetadata, SignaturePurpose, SignatureScope, SigningPayload,
 };
 use prost::Message;
 
 const PERSONALDB_SNAPSHOT_OBJECT_REF_PREFIX: &str = "personaldb_snapshot_object:";
+const PERSONALDB_PROJECTION_DEFINITION_REF_PREFIX: &str = "personaldb_projection_definition:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersonalDbGroupManifest {
@@ -28,6 +30,12 @@ pub struct PersonalDbGroupManifest {
     pub active_policy_epoch: u64,
     pub current_row_index_generation: u64,
     pub current_projection_generation: u64,
+    pub proposer_signature_purpose: SignaturePurpose,
+    pub projection_definition_ref: Option<String>,
+    pub projection_definition_hash: Option<String>,
+    pub projection_source_database_ids: Vec<String>,
+    pub projection_builder_key_policy_json: Option<String>,
+    pub genesis_authorization_revision: Option<u64>,
     pub manifest_hash: Option<String>,
     pub manifest_signature: Option<SignatureEnvelopeV1>,
 }
@@ -102,6 +110,18 @@ struct PersonalDbGroupManifestHashProto {
     current_row_index_generation: u64,
     #[prost(uint64, tag = "13")]
     current_projection_generation: u64,
+    #[prost(uint32, tag = "14")]
+    proposer_signature_purpose: u32,
+    #[prost(string, optional, tag = "15")]
+    projection_definition_ref: Option<String>,
+    #[prost(string, optional, tag = "16")]
+    projection_definition_hash: Option<String>,
+    #[prost(string, repeated, tag = "17")]
+    projection_source_database_ids: Vec<String>,
+    #[prost(string, optional, tag = "18")]
+    projection_builder_key_policy_json: Option<String>,
+    #[prost(uint64, optional, tag = "19")]
+    genesis_authorization_revision: Option<u64>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -201,6 +221,14 @@ impl PersonalDbGroupManifest {
             .ok_or_else(|| anyhow!("personaldb group manifest signature missing"))?;
         trust_store.verify(self, signature)?;
         Ok(())
+    }
+
+    pub fn is_projection(&self) -> bool {
+        self.proposer_signature_purpose == SignaturePurpose::ProjectionProposer
+    }
+
+    pub fn group_kind_name(&self) -> Result<&'static str> {
+        group_kind_name_from_proposer_purpose(self.proposer_signature_purpose)
     }
 }
 
@@ -386,6 +414,12 @@ fn group_manifest_hash_proto(
         active_policy_epoch: manifest.active_policy_epoch,
         current_row_index_generation: manifest.current_row_index_generation,
         current_projection_generation: manifest.current_projection_generation,
+        proposer_signature_purpose: u32::from(manifest.proposer_signature_purpose as u16),
+        projection_definition_ref: manifest.projection_definition_ref.clone(),
+        projection_definition_hash: manifest.projection_definition_hash.clone(),
+        projection_source_database_ids: manifest.projection_source_database_ids.clone(),
+        projection_builder_key_policy_json: manifest.projection_builder_key_policy_json.clone(),
+        genesis_authorization_revision: manifest.genesis_authorization_revision,
     }
 }
 
@@ -434,7 +468,7 @@ fn commit_certificate_hash_proto(
 }
 
 pub(crate) fn validate_group_manifest_unsigned(manifest: &PersonalDbGroupManifest) -> Result<()> {
-    if manifest.format_version != 2 {
+    if manifest.format_version != 3 {
         return Err(anyhow!("unsupported personaldb group manifest version"));
     }
     if manifest.consistency_policy != "StrictWitnessed" {
@@ -445,7 +479,113 @@ pub(crate) fn validate_group_manifest_unsigned(manifest: &PersonalDbGroupManifes
     require_nonempty(&manifest.tenant_id, "tenant_id")?;
     require_nonempty(&manifest.database_id, "database_id")?;
     require_nonempty(&manifest.created_by, "created_by")?;
+    group_kind_name_from_proposer_purpose(manifest.proposer_signature_purpose)?;
+    if manifest.active_membership_epoch == 0 || manifest.active_policy_epoch == 0 {
+        return Err(anyhow!(
+            "personaldb group membership and policy epochs must be nonzero"
+        ));
+    }
+    if manifest.is_projection() {
+        if manifest.current_projection_generation != 1 {
+            return Err(anyhow!(
+                "projection group genesis must bind exactly one projection generation"
+            ));
+        }
+        require_corestore_ref(
+            manifest
+                .projection_definition_ref
+                .as_deref()
+                .ok_or_else(|| anyhow!("projection definition ref missing from genesis"))?,
+            "projection_definition_ref",
+            PERSONALDB_PROJECTION_DEFINITION_REF_PREFIX,
+        )?;
+        validate_hex32(
+            manifest
+                .projection_definition_hash
+                .as_deref()
+                .ok_or_else(|| anyhow!("projection definition hash missing from genesis"))?,
+            "projection_definition_hash",
+        )?;
+        validate_sorted_unique_nonempty(
+            &manifest.projection_source_database_ids,
+            "projection_source_database_ids",
+        )?;
+        let builder_policy = manifest
+            .projection_builder_key_policy_json
+            .as_deref()
+            .ok_or_else(|| anyhow!("projection builder key policy missing from genesis"))?;
+        let canonical =
+            canonical_projection_builder_key_policy_json(builder_policy, &manifest.database_id)?;
+        if canonical != builder_policy {
+            return Err(anyhow!("projection builder key policy is not canonical"));
+        }
+        if manifest.genesis_authorization_revision.is_none() {
+            return Err(anyhow!(
+                "projection authorization revision missing from genesis"
+            ));
+        }
+    } else if manifest.current_projection_generation != 0
+        || manifest.projection_definition_ref.is_some()
+        || manifest.projection_definition_hash.is_some()
+        || !manifest.projection_source_database_ids.is_empty()
+        || manifest.projection_builder_key_policy_json.is_some()
+        || manifest.genesis_authorization_revision.is_some()
+    {
+        return Err(anyhow!(
+            "non-projection group genesis must not carry projection bindings"
+        ));
+    }
     Ok(())
+}
+
+pub fn group_kind_name_from_proposer_purpose(purpose: SignaturePurpose) -> Result<&'static str> {
+    match purpose {
+        SignaturePurpose::SourceProposer => Ok(GROUP_KIND_SOURCE),
+        SignaturePurpose::ProjectionProposer => Ok(GROUP_KIND_PROJECTION),
+        SignaturePurpose::StandaloneProposer => Ok(GROUP_KIND_STANDALONE),
+        _ => Err(anyhow!(
+            "personaldb group proposer signature purpose is unsupported"
+        )),
+    }
+}
+
+pub fn canonical_projection_builder_key_policy_json(
+    raw_json: &str,
+    database_id: &str,
+) -> Result<String> {
+    let mut policy: KeyTrustPolicy = serde_json::from_str(raw_json)
+        .map_err(|err| anyhow!("projection builder key policy is invalid: {err}"))?;
+    policy
+        .validate()
+        .map_err(|err| anyhow!("projection builder key policy is invalid: {err}"))?;
+    if policy.purpose != SignaturePurpose::ProjectionBuilder {
+        return Err(anyhow!(
+            "projection builder key policy must use projection-builder purpose"
+        ));
+    }
+    policy
+        .database_scopes
+        .sort_by(|left, right| left.0.cmp(&right.0));
+    policy.group_scopes.sort();
+    if policy.database_scopes.len() != 1
+        || policy.database_scopes[0].0 != database_id
+        || policy.group_scopes.len() != 1
+        || policy.group_scopes[0] != database_id
+    {
+        return Err(anyhow!(
+            "projection builder key policy must be scoped exactly to the projection database and group"
+        ));
+    }
+    if policy.valid_from_log_index != 0
+        || policy.valid_until_log_index.is_some()
+        || policy.status != PublicKeyStatus::Active
+    {
+        return Err(anyhow!(
+            "projection builder key policy must be active for the complete group log"
+        ));
+    }
+    serde_json::to_string(&policy)
+        .map_err(|err| anyhow!("encode projection builder key policy: {err}"))
 }
 
 pub(crate) fn validate_snapshot_manifest_unsigned(
@@ -521,6 +661,19 @@ fn require_nonempty(value: &str, field: &'static str) -> Result<()> {
     Ok(())
 }
 
+fn validate_sorted_unique_nonempty(values: &[String], field: &'static str) -> Result<()> {
+    if values.is_empty() {
+        return Err(anyhow!("{field} must not be empty"));
+    }
+    for value in values {
+        require_nonempty(value, field)?;
+    }
+    if values.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(anyhow!("{field} must be sorted and unique"));
+    }
+    Ok(())
+}
+
 fn require_corestore_ref(value: &str, field: &'static str, prefix: &str) -> Result<()> {
     require_nonempty(value, field)?;
     if !value.starts_with(prefix) {
@@ -557,6 +710,27 @@ mod tests {
 
         let mut tampered = manifest;
         tampered.active_policy_epoch += 1;
+        assert!(tampered.verify(keyring.trust_store()).is_err());
+    }
+
+    #[tokio::test]
+    async fn projection_group_manifest_binds_immutable_genesis_policy() {
+        let keyring = personaldb_protocol_keyring();
+        let mut manifest = sample_group_manifest();
+        manifest.proposer_signature_purpose = SignaturePurpose::ProjectionProposer;
+        manifest.current_projection_generation = 1;
+        manifest.projection_definition_ref = Some(
+            "personaldb_projection_definition:tenant:1:database:db:projection:items".to_string(),
+        );
+        manifest.projection_definition_hash = Some(hex::encode([3; 32]));
+        manifest.projection_source_database_ids = vec!["source-db".to_string()];
+        manifest.projection_builder_key_policy_json = Some(builder_policy_json("db"));
+        manifest.genesis_authorization_revision = Some(7);
+        let manifest = manifest.seal(&keyring).await.unwrap();
+        manifest.verify(keyring.trust_store()).unwrap();
+
+        let mut tampered = manifest;
+        tampered.projection_source_database_ids = vec!["other-source".to_string()];
         assert!(tampered.verify(keyring.trust_store()).is_err());
     }
 
@@ -645,7 +819,7 @@ mod tests {
 
     fn sample_group_manifest() -> PersonalDbGroupManifest {
         PersonalDbGroupManifest {
-            format_version: 2,
+            format_version: 3,
             tenant_id: "tenant".to_string(),
             database_id: "db".to_string(),
             schema_hash: hex::encode([1; 32]),
@@ -658,9 +832,28 @@ mod tests {
             active_policy_epoch: 1,
             current_row_index_generation: 0,
             current_projection_generation: 0,
+            proposer_signature_purpose: SignaturePurpose::SourceProposer,
+            projection_definition_ref: None,
+            projection_definition_hash: None,
+            projection_source_database_ids: Vec::new(),
+            projection_builder_key_policy_json: None,
+            genesis_authorization_revision: None,
             manifest_hash: None,
             manifest_signature: None,
         }
+    }
+
+    fn builder_policy_json(database_id: &str) -> String {
+        serde_json::to_string(
+            &KeyTrustPolicy::new(
+                personaldb_protocol::KeyGeneration::new(1).unwrap(),
+                SignaturePurpose::ProjectionBuilder,
+                0,
+            )
+            .with_database_scopes(vec![DatabaseId::new(database_id)])
+            .with_group_scopes(vec![database_id.to_string()]),
+        )
+        .unwrap()
     }
 
     fn sample_snapshot_manifest() -> PersonalDbSnapshotManifest {

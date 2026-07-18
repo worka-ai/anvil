@@ -564,7 +564,7 @@ mod tests {
             let schema_hash = hex::encode(hash32(SCHEMA_SQL.as_bytes()));
             let genesis_hash = hex::encode(hash32(b"snapshot-genesis"));
             let manifest = PersonalDbGroupManifest {
-                format_version: 2,
+                format_version: 3,
                 tenant_id: "9".to_string(),
                 database_id: "db-snapshot".to_string(),
                 schema_hash: schema_hash.clone(),
@@ -577,6 +577,12 @@ mod tests {
                 active_policy_epoch: 1,
                 current_row_index_generation: 0,
                 current_projection_generation: 0,
+                proposer_signature_purpose: personaldb_protocol::SignaturePurpose::SourceProposer,
+                projection_definition_ref: None,
+                projection_definition_hash: None,
+                projection_source_database_ids: Vec::new(),
+                projection_builder_key_policy_json: None,
+                genesis_authorization_revision: None,
                 manifest_hash: None,
                 manifest_signature: None,
             }

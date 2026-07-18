@@ -44,9 +44,9 @@ A **head** is the current accepted position. At genesis the committed head has l
 
 ## Public API first, CLI for manual evidence
 
-Production synchronisation should use `PersonalDbService` or a real client library. The API exposes group create/read, projection create/read, changeset submit, catch-up, group watch, and projection watch. It returns richer evidence than the CLI, including committed heads, certificates, replayable changeset bytes, and split watch cursors.
+Production synchronisation should use `PersonalDbService` or a real client library. The API exposes group create/read, projection read, changeset submit, catch-up, group watch, and projection watch. Projection definitions are supplied atomically when a projection group is created. It returns richer evidence than the CLI, including committed heads, certificates, replayable changeset bytes, and split watch cursors.
 
-The public `anvil personaldb` CLI is a manual helper. It is useful for smoke tests and operator inspection: create or read a group, create or read a projection definition, ask catch-up for counts, tail group watches, and run repair checks through the public repair CLI. It is not a full PersonalDB sync client today.
+The public `anvil personaldb` CLI is a manual helper. It is useful for smoke tests and operator inspection: create or read a group, read its immutable projection definition, ask catch-up for counts, tail group watches, and run repair checks through the public repair CLI. It is not a full PersonalDB sync client today.
 
 Two current gaps matter during incidents. First, `anvil personaldb changeset submit` is incomplete for real public commits: it generates request and idempotency values itself, sends an empty `session_token`, and cannot send voter acknowledgements. The service requires the session token to match the authenticated bearer token and requires at least one voter acknowledgement, so a normal CLI submit is expected to fail validation. Second, `anvil personaldb catch-up` prints compact counts and booleans; it does not print replayable changeset bytes or certificates. Use the API when a client must actually replay history.
 
@@ -232,7 +232,7 @@ Current code and documentation define several observability ideas, including `pe
 
 ## Current public surfaces and gaps
 
-The current public API exposes the main PersonalDB service surface: group create/read, projection create/read, changeset submit, catch-up, group watch, and projection watch. The public CLI exposes `anvil personaldb group create`, `group read`, `projection create`, `projection read`, `changeset submit`, `catch-up`, and `watch`; the generic `anvil watch personaldb` tails the same group watch path. Public repair exposes `anvil repair run personal-db` and `anvil repair findings`.
+The current public API exposes the main PersonalDB service surface: group create/read, projection read, changeset submit, catch-up, group watch, and projection watch. Projection definitions are supplied atomically when a projection group is created. The public CLI exposes `anvil personaldb group create`, `group read`, `projection read`, `changeset submit`, `catch-up`, and `watch`; the generic `anvil watch personaldb` tails the same group watch path. Public repair exposes `anvil repair run personal-db` and `anvil repair findings`.
 
 The gaps are operationally significant:
 

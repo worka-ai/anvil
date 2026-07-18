@@ -23,7 +23,10 @@ use crate::{
         decode_commit_certificate, personaldb_commit_certificate_ref_name,
         write_personaldb_changeset_payload, write_personaldb_commit_certificate,
     },
-    personaldb_control::{PersonalDbCommitCertificate, PersonalDbGroupManifest},
+    personaldb_control::{
+        PersonalDbCommitCertificate, PersonalDbGroupManifest,
+        canonical_projection_builder_key_policy_json, group_kind_name_from_proposer_purpose,
+    },
     personaldb_envelope::{
         PersonalDbEnvelopeDerivationInput, TableOperation, VerifiedMutationEnvelope,
         derive_verified_mutation_envelope,
@@ -35,16 +38,12 @@ use crate::{
         write_personaldb_group_manifest,
     },
     personaldb_projection::{
-        ProjectionDefinition, WriteBackPolicy, list_projection_definitions_for_database,
-        list_projection_definitions_for_source, read_projection_definition,
-        write_projection_definition,
+        ProjectionDefinition, WriteBackPolicy, list_projection_definitions_for_source,
+        projection_definition_ref, read_projection_definition, write_projection_definition,
     },
     personaldb_projection_builder::{
         ProjectionAuthorizationCheck, ProjectionAuthorizationDecisions, ProjectionBuildInput,
         build_projection_changeset_with_authorization, collect_projection_authorization_checks,
-    },
-    personaldb_projection_writeback::{
-        ProjectionWriteBackInput, build_projection_writeback_changeset,
     },
     personaldb_proposal_admission::{
         BeginWitnessSigningV1, PersonalDbAdmissionAuthority,
@@ -91,6 +90,7 @@ struct PersonalDbCommitActor {
     bearer_token: Option<String>,
     require_public_commit_authorization: bool,
     require_admission_protocol: bool,
+    proposal_purpose: Option<SignaturePurpose>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +104,7 @@ struct CommittedPersonalDbChangeset {
     committed_head: PersonalDbCommittedHead,
     watch_cursor: u128,
     authz_revision: u64,
+    proposer_signature_purpose: SignaturePurpose,
 }
 
 #[tonic::async_trait]
@@ -129,6 +130,79 @@ impl PersonalDbService for AppState {
         validate_hex32(&req.genesis_hash, "genesis_hash")?;
         validate_schema_sql(&req.schema_sql, &req.schema_hash)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        if req.policy_epoch == 0 {
+            return Err(invalid_group_genesis(
+                "PersonalDB group policy epoch must be nonzero",
+            ));
+        }
+        let proposer_signature_purpose = req
+            .proposer_signature_purpose
+            .parse::<SignaturePurpose>()
+            .map_err(|err| {
+                invalid_group_genesis_owned(format!(
+                    "PersonalDB group proposer signature purpose is invalid: {err}"
+                ))
+            })?;
+        group_kind_name_from_proposer_purpose(proposer_signature_purpose)
+            .map_err(|err| invalid_group_genesis_owned(err.to_string()))?;
+
+        let projection_definition = if proposer_signature_purpose
+            == SignaturePurpose::ProjectionProposer
+        {
+            if req.projection_definition_json.is_empty()
+                || req.projection_builder_key_policy_json.is_empty()
+            {
+                return Err(invalid_group_genesis(
+                    "Projection group genesis requires one definition and builder key policy",
+                ));
+            }
+            let mut definition: ProjectionDefinition =
+                serde_json::from_str(&req.projection_definition_json)
+                    .map_err(|err| invalid_group_genesis_owned(err.to_string()))?;
+            validate_projection_definition_scope(claims.tenant_id, &req.database_id, &definition)?;
+            validate_projection_id(&definition.projection_id)?;
+            if definition.writeback_policy != WriteBackPolicy::Deny {
+                return Err(invalid_group_genesis(
+                    "Projection group genesis requires Deny write-back policy",
+                ));
+            }
+            definition.definition_hash = None;
+            Some(
+                definition
+                    .seal()
+                    .map_err(|err| invalid_group_genesis_owned(err.to_string()))?,
+            )
+        } else {
+            if !req.projection_definition_json.is_empty()
+                || !req.projection_builder_key_policy_json.is_empty()
+            {
+                return Err(invalid_group_genesis(
+                    "Non-projection group genesis must not carry projection bindings",
+                ));
+            }
+            None
+        };
+        let projection_builder_key_policy_json = projection_definition
+            .as_ref()
+            .map(|_| {
+                canonical_projection_builder_key_policy_json(
+                    &req.projection_builder_key_policy_json,
+                    &req.database_id,
+                )
+                .map_err(|err| invalid_group_genesis_owned(err.to_string()))
+            })
+            .transpose()?;
+        let projection_definition_ref = projection_definition
+            .as_ref()
+            .map(|definition| {
+                projection_definition_ref(
+                    claims.tenant_id,
+                    &req.database_id,
+                    &definition.projection_id,
+                )
+                .map_err(|err| invalid_group_genesis_owned(err.to_string()))
+            })
+            .transpose()?;
 
         let resource = personaldb_resource(claims.tenant_id, &req.database_id);
         access_control::require_action(
@@ -139,6 +213,9 @@ impl PersonalDbService for AppState {
             &resource,
         )
         .await?;
+        let _creation_guard = self
+            .personaldb_commit_guard(claims.tenant_id, &req.database_id)
+            .await;
         let protocol_keyring = self.personaldb_protocol_keyring.as_ref();
         if read_personaldb_group_manifest(
             &self.storage,
@@ -157,9 +234,41 @@ impl PersonalDbService for AppState {
             .await
             .map_err(personaldb_ownership_status)?;
 
+        if let Some(definition) = projection_definition.as_ref() {
+            for source_database_id in &definition.source_database_ids {
+                validate_database_id(source_database_id)?;
+                let source_manifest = read_personaldb_group_manifest(
+                    &self.storage,
+                    claims.tenant_id,
+                    source_database_id,
+                    protocol_keyring.trust_store(),
+                )
+                .await
+                .map_err(internal_status)?
+                .ok_or_else(|| Status::not_found("PersonalDB projection source group not found"))?;
+                if source_manifest.proposer_signature_purpose != SignaturePurpose::SourceProposer {
+                    return Err(invalid_group_genesis(
+                        "Projection source allowlist may contain only source groups",
+                    ));
+                }
+            }
+        }
+        let genesis_authorization_revision = if projection_definition.is_some() {
+            Some(
+                u64::try_from(
+                    authz_journal::latest_authz_revision(&self.storage, claims.tenant_id)
+                        .await
+                        .map_err(internal_status)?,
+                )
+                .map_err(|_| Status::internal("Invalid authorization revision"))?,
+            )
+        } else {
+            None
+        };
+
         let now = now_rfc3339();
         let manifest = PersonalDbGroupManifest {
-            format_version: 2,
+            format_version: 3,
             tenant_id: claims.tenant_id.to_string(),
             database_id: req.database_id.clone(),
             schema_hash: req.schema_hash.clone(),
@@ -169,37 +278,34 @@ impl PersonalDbService for AppState {
             consistency_policy: "StrictWitnessed".to_string(),
             object_layout_version: 1,
             active_membership_epoch: 1,
-            active_policy_epoch: 1,
+            active_policy_epoch: req.policy_epoch,
             current_row_index_generation: 0,
-            current_projection_generation: 0,
+            current_projection_generation: if projection_definition.is_some() {
+                1
+            } else {
+                0
+            },
+            proposer_signature_purpose,
+            projection_definition_ref,
+            projection_definition_hash: projection_definition
+                .as_ref()
+                .and_then(|definition| definition.definition_hash.clone()),
+            projection_source_database_ids: projection_definition
+                .as_ref()
+                .map(|definition| definition.source_database_ids.clone())
+                .unwrap_or_default(),
+            projection_builder_key_policy_json,
+            genesis_authorization_revision,
             manifest_hash: None,
             manifest_signature: None,
         }
         .seal(protocol_keyring)
         .await
         .map_err(internal_status)?;
-        write_personaldb_schema_sql(
-            &self.storage,
-            claims.tenant_id,
-            &req.database_id,
-            &req.schema_sql,
-            &req.schema_hash,
-        )
-        .await
-        .map_err(internal_status)?;
-        write_personaldb_group_manifest(
-            &self.storage,
-            claims.tenant_id,
-            &manifest,
-            protocol_keyring.trust_store(),
-        )
-        .await
-        .map_err(internal_status)?;
-
         let committed_head = PersonalDbCommittedHead {
             format_version: 2,
             tenant_id: claims.tenant_id.to_string(),
-            database_id: req.database_id,
+            database_id: req.database_id.clone(),
             log_index: 0,
             log_hash: manifest.genesis_hash.clone(),
             segment_ref: String::new(),
@@ -215,11 +321,40 @@ impl PersonalDbService for AppState {
         .seal(protocol_keyring)
         .await
         .map_err(internal_status)?;
+        write_personaldb_schema_sql(
+            &self.storage,
+            claims.tenant_id,
+            &req.database_id,
+            &req.schema_sql,
+            &req.schema_hash,
+        )
+        .await
+        .map_err(internal_status)?;
+        if let Some(definition) = projection_definition.as_ref() {
+            write_projection_definition(
+                &self.storage,
+                claims.tenant_id,
+                &req.database_id,
+                definition,
+            )
+            .await
+            .map_err(internal_status)?;
+        }
         write_personaldb_committed_head(
             &self.storage,
             claims.tenant_id,
             &committed_head.database_id,
             &committed_head,
+            protocol_keyring.trust_store(),
+        )
+        .await
+        .map_err(internal_status)?;
+        // The immutable manifest is the activation record. Publishing it last ensures no
+        // partially initialized group can be admitted as an ordinary writable group.
+        write_personaldb_group_manifest(
+            &self.storage,
+            claims.tenant_id,
+            &manifest,
             protocol_keyring.trust_store(),
         )
         .await
@@ -283,82 +418,6 @@ impl PersonalDbService for AppState {
         }))
     }
 
-    async fn create_personal_db_projection(
-        &self,
-        request: Request<CreatePersonalDbProjectionRequest>,
-    ) -> Result<Response<PersonalDbProjectionResponse>, Status> {
-        let claims = request_claims(&request)?.clone();
-        let req = request.into_inner();
-        validate_claim_tenant(claims.tenant_id, req.tenant_id)?;
-        validate_database_id(&req.database_id)?;
-        let mut definition: ProjectionDefinition =
-            serde_json::from_str(&req.projection_definition_json)
-                .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        validate_projection_definition_scope(claims.tenant_id, &req.database_id, &definition)?;
-        validate_projection_id(&definition.projection_id)?;
-        let resource = personaldb_projection_resource(
-            claims.tenant_id,
-            &req.database_id,
-            &definition.projection_id,
-        );
-        access_control::require_action(
-            &self.storage,
-            &self.persistence,
-            &claims,
-            AnvilAction::PersonalDbCreate,
-            &resource,
-        )
-        .await?;
-        read_personaldb_group_manifest(
-            &self.storage,
-            claims.tenant_id,
-            &req.database_id,
-            self.personaldb_protocol_keyring.trust_store(),
-        )
-        .await
-        .map_err(internal_status)?
-        .ok_or_else(|| Status::not_found("PersonalDB projection group not found"))?;
-        for source_database_id in &definition.source_database_ids {
-            validate_database_id(source_database_id)?;
-            read_personaldb_group_manifest(
-                &self.storage,
-                claims.tenant_id,
-                source_database_id,
-                self.personaldb_protocol_keyring.trust_store(),
-            )
-            .await
-            .map_err(internal_status)?
-            .ok_or_else(|| Status::not_found("PersonalDB projection source group not found"))?;
-        }
-        if read_projection_definition(
-            &self.storage,
-            claims.tenant_id,
-            &req.database_id,
-            &definition.projection_id,
-        )
-        .await
-        .map_err(internal_status)?
-        .is_some()
-        {
-            return Err(Status::already_exists(
-                "PersonalDB projection already exists",
-            ));
-        }
-        definition.definition_hash = None;
-        let definition = definition
-            .seal()
-            .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        write_projection_definition(
-            &self.storage,
-            claims.tenant_id,
-            &req.database_id,
-            &definition,
-        )
-        .await
-        .map_err(internal_status)?;
-        Ok(Response::new(projection_response(definition)?))
-    }
-
     async fn get_personal_db_projection(
         &self,
         request: Request<GetPersonalDbProjectionRequest>,
@@ -379,6 +438,15 @@ impl PersonalDbService for AppState {
         {
             return Err(Status::permission_denied("Permission denied"));
         }
+        let manifest = read_personaldb_group_manifest(
+            &self.storage,
+            claims.tenant_id,
+            &req.database_id,
+            self.personaldb_protocol_keyring.trust_store(),
+        )
+        .await
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::not_found("PersonalDB projection group not found"))?;
         let definition = read_projection_definition(
             &self.storage,
             claims.tenant_id,
@@ -388,6 +456,7 @@ impl PersonalDbService for AppState {
         .await
         .map_err(internal_status)?
         .ok_or_else(|| Status::not_found("PersonalDB projection not found"))?;
+        validate_projection_genesis_binding(claims.tenant_id, &manifest, &definition)?;
         Ok(Response::new(projection_response(definition)?))
     }
 
@@ -407,33 +476,24 @@ impl PersonalDbService for AppState {
             bearer_token: Some(bearer_token),
             require_public_commit_authorization: true,
             require_admission_protocol: true,
+            proposal_purpose: None,
         };
-        let projection_definitions = list_projection_definitions_for_database(
-            &self.storage,
-            claims.tenant_id,
-            &core_request.database_id,
-        )
-        .await
-        .map_err(internal_status)?;
-        if !projection_definitions.is_empty() {
-            return self
-                .handle_personaldb_projection_writeback(core_request, actor, projection_definitions)
-                .await;
-        }
         let source_database_id = core_request.database_id.clone();
         let source_changeset_bytes = core_request.changeset_bytes.clone();
         let committed = self
             .commit_personaldb_changeset(core_request, actor)
             .await?;
-        self.build_personaldb_projections_for_source_commit(
-            claims.tenant_id,
-            &source_database_id,
-            &source_changeset_bytes,
-            committed.log_index,
-            &committed.log_hash,
-            committed.authz_revision,
-        )
-        .await?;
+        if committed.proposer_signature_purpose == SignaturePurpose::SourceProposer {
+            self.build_personaldb_projections_for_source_commit(
+                claims.tenant_id,
+                &source_database_id,
+                &source_changeset_bytes,
+                committed.log_index,
+                &committed.log_hash,
+                committed.authz_revision,
+            )
+            .await?;
+        }
         Ok(submit_changeset_response(committed))
     }
 
@@ -721,177 +781,6 @@ impl AppState {
         })
     }
 
-    async fn handle_personaldb_projection_writeback(
-        &self,
-        request: CoreSubmitChangeset,
-        actor: PersonalDbCommitActor,
-        definitions: Vec<ProjectionDefinition>,
-    ) -> Result<Response<SubmitPersonalDbChangesetResponse>, Status> {
-        validate_claim_tenant(actor.tenant_id, request.tenant_id)?;
-        validate_database_id(&request.database_id)?;
-        if let Some(bearer_token) = actor.bearer_token.as_deref() {
-            bind_personaldb_submit_session(&request, &actor, bearer_token)?;
-        }
-        if !personaldb_actor_access_allowed(
-            &self.storage,
-            &actor,
-            &request.database_id,
-            AnvilAction::PersonalDbCommit,
-        )
-        .await?
-        {
-            return Err(Status::permission_denied("Permission denied"));
-        }
-        let validated = validate_submit_personaldb_changeset(request, default_max_changeset_size())
-            .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        iterate_changeset(&validated.request.changeset_bytes)
-            .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        if definitions.len() != 1 {
-            return Err(projection_writeback_rejected(
-                "projection write-back has ambiguous projection bindings",
-            ));
-        }
-        let definition = definitions.into_iter().next().ok_or_else(|| {
-            projection_writeback_rejected("projection write-back binding missing")
-        })?;
-        match definition.writeback_policy {
-            WriteBackPolicy::Deny => Err(projection_writeback_rejected(
-                "projection write-back is denied by projection policy",
-            )),
-            WriteBackPolicy::AllowMappedColumns { .. } => {
-                self.commit_personaldb_projection_writeback(validated.request, actor, definition)
-                    .await
-            }
-        }
-    }
-
-    async fn commit_personaldb_projection_writeback(
-        &self,
-        request: CoreSubmitChangeset,
-        actor: PersonalDbCommitActor,
-        definition: ProjectionDefinition,
-    ) -> Result<Response<SubmitPersonalDbChangesetResponse>, Status> {
-        let projection_manifest = read_personaldb_group_manifest(
-            &self.storage,
-            actor.tenant_id,
-            &definition.database_id,
-            self.personaldb_protocol_keyring.trust_store(),
-        )
-        .await
-        .map_err(internal_status)?
-        .ok_or_else(|| Status::not_found("PersonalDB projection group not found"))?;
-        let projection_head = read_personaldb_committed_head(
-            &self.storage,
-            actor.tenant_id,
-            &definition.database_id,
-            self.personaldb_protocol_keyring.trust_store(),
-        )
-        .await
-        .map_err(internal_status)?
-        .ok_or_else(|| Status::failed_precondition("PersonalDB projection head missing"))?;
-        if projection_head.log_index != request.base_log_index
-            || projection_head.log_hash != request.base_log_hash
-        {
-            return Err(projection_writeback_rejected(
-                "projection write-back base does not match projection head",
-            ));
-        }
-        let target_schema_sql = read_personaldb_schema_sql(
-            &self.storage,
-            actor.tenant_id,
-            &definition.database_id,
-            &projection_manifest.schema_hash,
-        )
-        .await
-        .map_err(internal_status)?
-        .ok_or_else(|| Status::failed_precondition("PersonalDB projection schema SQL missing"))?;
-        let source_database_id = single_projection_writeback_source(&definition)?;
-        let source_manifest = read_personaldb_group_manifest(
-            &self.storage,
-            actor.tenant_id,
-            &source_database_id,
-            self.personaldb_protocol_keyring.trust_store(),
-        )
-        .await
-        .map_err(internal_status)?
-        .ok_or_else(|| Status::not_found("PersonalDB source group not found"))?;
-        let source_head = read_personaldb_committed_head(
-            &self.storage,
-            actor.tenant_id,
-            &source_database_id,
-            self.personaldb_protocol_keyring.trust_store(),
-        )
-        .await
-        .map_err(internal_status)?
-        .ok_or_else(|| Status::failed_precondition("PersonalDB source head missing"))?;
-        let source_schema_sql = read_personaldb_schema_sql(
-            &self.storage,
-            actor.tenant_id,
-            &source_database_id,
-            &source_manifest.schema_hash,
-        )
-        .await
-        .map_err(internal_status)?
-        .ok_or_else(|| Status::failed_precondition("PersonalDB source schema SQL missing"))?;
-        let writeback = build_projection_writeback_changeset(ProjectionWriteBackInput {
-            source_schema_sql: &source_schema_sql,
-            target_schema_sql: &target_schema_sql,
-            definition: &definition,
-            projection_changeset_bytes: &request.changeset_bytes,
-        })
-        .map_err(|err| projection_writeback_rejected_owned(err.to_string()))?;
-        if writeback.source_database_id != source_database_id {
-            return Err(projection_writeback_rejected(
-                "projection write-back source binding changed during translation",
-            ));
-        }
-        let payload_hash = hash32(&writeback.changeset_bytes);
-        let source_request = CoreSubmitChangeset {
-            tenant_id: actor.tenant_id,
-            database_id: source_database_id.clone(),
-            principal: request.principal,
-            session_token: request.session_token,
-            request_id: format!(
-                "projection-writeback:{}:{}",
-                definition.projection_id, request.request_id
-            ),
-            idempotency_key: format!(
-                "projection-writeback:{}:{}",
-                definition.projection_id, request.idempotency_key
-            ),
-            base_log_index: source_head.log_index,
-            base_log_hash: source_head.log_hash.clone(),
-            client_log_epoch: source_head.log_index.saturating_add(1),
-            membership_epoch: source_manifest.active_membership_epoch,
-            policy_epoch: source_manifest.active_policy_epoch,
-            leader_replica_id: request.leader_replica_id,
-            voter_acks: vec![crate::personaldb_submit::PersonalDbVoterAck {
-                replica_id: "projection-writeback".to_string(),
-                log_index: source_head.log_index.saturating_add(1),
-                log_hash: hex::encode(payload_hash),
-                signature: "projection-writeback".to_string(),
-            }],
-            changeset_payload_hash: hex::encode(payload_hash),
-            changeset_bytes: writeback.changeset_bytes,
-            client_debug_metadata: request.client_debug_metadata,
-        };
-        let source_changeset_bytes = source_request.changeset_bytes.clone();
-        let tenant_id = actor.tenant_id;
-        let committed = self
-            .commit_personaldb_changeset(source_request, actor)
-            .await?;
-        self.build_personaldb_projections_for_source_commit(
-            tenant_id,
-            &source_database_id,
-            &source_changeset_bytes,
-            committed.log_index,
-            &committed.log_hash,
-            committed.authz_revision,
-        )
-        .await?;
-        Ok(submit_changeset_response(committed))
-    }
-
     async fn commit_personaldb_changeset(
         &self,
         request: CoreSubmitChangeset,
@@ -911,24 +800,25 @@ impl AppState {
             return Err(Status::permission_denied("Permission denied"));
         }
 
-        let validated = validate_submit_personaldb_changeset(request, default_max_changeset_size())
-            .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        if let Some(bearer_token) = actor.bearer_token.as_deref() {
-            bind_personaldb_submit_session(&validated.request, &actor, bearer_token)?;
-        }
         let _commit_guard = self
-            .personaldb_commit_guard(actor.tenant_id, &validated.request.database_id)
+            .personaldb_commit_guard(actor.tenant_id, &request.database_id)
             .await;
         let protocol_keyring = self.personaldb_protocol_keyring.as_ref();
         let manifest = read_personaldb_group_manifest(
             &self.storage,
             actor.tenant_id,
-            &validated.request.database_id,
+            &request.database_id,
             protocol_keyring.trust_store(),
         )
         .await
         .map_err(internal_status)?
         .ok_or_else(|| Status::not_found("PersonalDB group not found"))?;
+        authorize_personaldb_commit_for_genesis(&manifest, &actor)?;
+        let validated = validate_submit_personaldb_changeset(request, default_max_changeset_size())
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        if let Some(bearer_token) = actor.bearer_token.as_deref() {
+            bind_personaldb_submit_session(&validated.request, &actor, bearer_token)?;
+        }
         let previous_head = read_personaldb_committed_head(
             &self.storage,
             actor.tenant_id,
@@ -1084,7 +974,10 @@ impl AppState {
                 reservation_id: derive_reservation_id(&validated.request.database_id, claim_hash)
                     .map_err(internal_status)?,
                 database_id: validated.request.database_id.clone(),
-                group_kind: "source".to_string(),
+                group_kind: manifest
+                    .group_kind_name()
+                    .map_err(internal_status)?
+                    .to_string(),
                 proposer_id: actor.principal.clone(),
                 client_proposal_hash_sha256: claim.client_proposal_hash_sha256,
                 changeset_payload_hash_sha256: claim.changeset_payload_hash_sha256,
@@ -1513,6 +1406,7 @@ impl AppState {
             committed_head,
             watch_cursor,
             authz_revision,
+            proposer_signature_purpose: manifest.proposer_signature_purpose,
         })
     }
 
@@ -1534,6 +1428,12 @@ impl AppState {
         .await
         .map_err(internal_status)?
         .ok_or_else(|| Status::not_found("PersonalDB source group not found"))?;
+        if source_manifest.proposer_signature_purpose != SignaturePurpose::SourceProposer {
+            return Err(Status::failed_precondition(format!(
+                "{}: projection builds require a source group commitment",
+                AnvilErrorCode::ManifestInvalid
+            )));
+        }
         let source_schema_sql = read_personaldb_schema_sql(
             &self.storage,
             tenant_id,
@@ -1579,7 +1479,7 @@ impl AppState {
                 "PersonalDB projection target database scope mismatch",
             ));
         }
-        let target_manifest = read_personaldb_group_manifest(
+        let Some(target_manifest) = read_personaldb_group_manifest(
             &self.storage,
             tenant_id,
             &definition.database_id,
@@ -1587,7 +1487,22 @@ impl AppState {
         )
         .await
         .map_err(internal_status)?
-        .ok_or_else(|| Status::not_found("PersonalDB projection group not found"))?;
+        else {
+            return Ok(());
+        };
+        validate_projection_genesis_binding(tenant_id, &target_manifest, definition)?;
+        if authz_revision
+            < target_manifest
+                .genesis_authorization_revision
+                .ok_or_else(|| {
+                    Status::failed_precondition(AnvilErrorCode::ManifestInvalid.as_str())
+                })?
+        {
+            return Err(Status::failed_precondition(format!(
+                "{}: projection source authorization revision predates group genesis",
+                AnvilErrorCode::AuthzRevisionUnavailable
+            )));
+        }
         let target_head = read_personaldb_committed_head(
             &self.storage,
             tenant_id,
@@ -1671,6 +1586,7 @@ impl AppState {
                     bearer_token: None,
                     require_public_commit_authorization: false,
                     require_admission_protocol: false,
+                    proposal_purpose: Some(SignaturePurpose::ProjectionBuilder),
                 },
             )
             .await?;
