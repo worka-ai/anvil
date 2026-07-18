@@ -137,8 +137,6 @@ pub(super) async fn append_stream_record_rpc(
     let stream_id = uuid::Uuid::parse_str(&req.stream_id)
         .map_err(|_| Status::invalid_argument("Invalid stream_id"))?;
     let user_metadata = parse_user_metadata_json(&req.user_metadata_json)?;
-    let transaction_principal =
-        transaction_id.map(|_| object_manager::transaction_principal_from_claims(&claims));
     let record = state
         .object_manager
         .append_stream_record(
@@ -150,7 +148,6 @@ pub(super) async fn append_stream_record_rpc(
             req.content_type,
             user_metadata,
             transaction_id,
-            transaction_principal.as_deref(),
         )
         .await?;
     let authz_revision = latest_authz_revision(state, claims.tenant_id).await?;

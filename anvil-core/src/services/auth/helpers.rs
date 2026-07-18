@@ -205,7 +205,7 @@ pub(super) async fn write_authz_tuple_record(
             &req.reason,
         )
         .await
-        .map_err(|e| Status::internal(format!("{e:#}")))?;
+        .map_err(authz_tuple_write_status)?;
     emit_authz_tuple_write_side_effects(state, claims.tenant_id, &record).await?;
     Ok(record)
 }
@@ -215,17 +215,8 @@ pub(super) async fn validate_authz_tuple_mutation<'a>(
     claims: &auth::Claims,
     req: &'a AuthzTupleMutation,
 ) -> Result<&'a str, Status> {
-    validate_public_authz_namespace(&req.namespace)?;
-    validate_tuple_field("object_id", &req.object_id)?;
-    validate_tuple_component("relation", &req.relation)?;
-    validate_tuple_component("subject_kind", &req.subject_kind)?;
-    validate_tuple_field("subject_id", &req.subject_id)?;
-    validate_caveat_hash(&req.caveat_hash)?;
+    let operation = validate_authz_tuple_mutation_shape(req)?;
     let scope = resolve_authz_scope(claims, req.scope.as_ref())?;
-    let operation = match req.operation.as_str() {
-        "add" | "remove" => req.operation.as_str(),
-        _ => return Err(Status::invalid_argument("operation must be add or remove")),
-    };
     crate::access_control::require_action(
         &state.storage,
         &state.persistence,
@@ -235,6 +226,81 @@ pub(super) async fn validate_authz_tuple_mutation<'a>(
     )
     .await?;
     Ok(operation)
+}
+
+pub(super) fn validate_authz_tuple_mutation_shape(
+    req: &AuthzTupleMutation,
+) -> Result<&str, Status> {
+    validate_public_authz_namespace(&req.namespace)?;
+    validate_tuple_field("object_id", &req.object_id)?;
+    validate_tuple_component("relation", &req.relation)?;
+    validate_tuple_component("subject_kind", &req.subject_kind)?;
+    validate_tuple_field("subject_id", &req.subject_id)?;
+    validate_caveat_hash(&req.caveat_hash)?;
+    let operation = match req.operation.as_str() {
+        "add" | "remove" => req.operation.as_str(),
+        _ => return Err(Status::invalid_argument("operation must be add or remove")),
+    };
+    if req.subject_kind == "userset" {
+        let subject = parse_userset_subject(&req.subject_id).ok_or_else(|| {
+            Status::invalid_argument(
+                "userset subject_id must use namespace/object_id#relation format",
+            )
+        })?;
+        validate_public_authz_namespace(subject.namespace)?;
+        validate_tuple_field("userset object_id", subject.object_id)?;
+        validate_tuple_component("userset relation", subject.relation)?;
+    }
+    Ok(operation)
+}
+
+pub(super) fn validate_authz_batch_operation_id(operation_id: Option<&str>) -> Result<(), Status> {
+    let Some(operation_id) = operation_id else {
+        return Ok(());
+    };
+    authz_journal::validate_authz_batch_operation_id(operation_id)
+        .map_err(|error| Status::invalid_argument(error.to_string()))
+}
+
+pub(super) fn optional_expected_authz_revision(
+    expected_revision: Option<u64>,
+) -> Result<Option<i64>, Status> {
+    expected_revision
+        .map(|revision| {
+            i64::try_from(revision)
+                .map_err(|_| Status::invalid_argument("expected_revision exceeds supported range"))
+        })
+        .transpose()
+}
+
+pub(super) fn authz_tuple_batch_write_status(error: anyhow::Error) -> Status {
+    if let Some(contract) = error.chain().find_map(|cause| {
+        cause.downcast_ref::<crate::authz_schema_contract::AuthzSchemaContractError>()
+    }) {
+        return Status::invalid_argument(contract.to_string());
+    }
+    let conflict = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::persistence::AuthzTupleBatchWriteError>());
+    match conflict {
+        Some(crate::persistence::AuthzTupleBatchWriteError::OperationConflict) => {
+            Status::aborted("AuthzOperationConflict")
+        }
+        Some(crate::persistence::AuthzTupleBatchWriteError::RevisionConflict {
+            expected,
+            actual,
+        }) => Status::aborted(format!(
+            "AuthzRevisionConflict: expected {expected}, current {actual}"
+        )),
+        Some(crate::persistence::AuthzTupleBatchWriteError::SchemaBindingChanged) => {
+            Status::aborted("AuthzSchemaBindingChanged")
+        }
+        None => Status::internal(format!("{error:#}")),
+    }
+}
+
+pub(super) fn authz_tuple_write_status(error: anyhow::Error) -> Status {
+    authz_tuple_batch_write_status(error)
 }
 
 pub(super) async fn emit_authz_tuple_write_side_effects(
@@ -429,6 +495,24 @@ pub(super) fn write_authz_tuple_response(
         revision: revision_to_u64(record.revision)?,
         zookie: zookie(record.revision),
         record_hash: record.record_hash.clone(),
+    })
+}
+
+pub(super) fn write_authz_tuple_batch_response(
+    records: &[crate::persistence::AuthzTupleRecord],
+) -> Result<WriteAuthzTuplesResponse, Status> {
+    let revision = records
+        .iter()
+        .map(|record| record.revision)
+        .max()
+        .unwrap_or(0);
+    Ok(WriteAuthzTuplesResponse {
+        results: records
+            .iter()
+            .map(write_authz_tuple_response)
+            .collect::<Result<Vec<_>, _>>()?,
+        revision: revision_to_u64(revision)?,
+        zookie: zookie(revision),
     })
 }
 

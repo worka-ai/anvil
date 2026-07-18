@@ -630,9 +630,18 @@ pub struct StreamRecord {
     pub payload: Vec<u8>,
     pub content_type: Option<String>,
     pub user_metadata_json: String,
+    pub authenticated_principal: String,
     pub transaction_id: Option<String>,
     pub idempotency_key_hash: Option<String>,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CoreStreamRecordMetadata {
+    pub sequence: u64,
+    pub event_hash: String,
+    pub record_kind: String,
+    pub payload_len: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

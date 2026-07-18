@@ -245,13 +245,12 @@ impl Persistence {
             append_journal::append_record_source_cursor(&self.storage, bucket.tenant_id, bucket.id)
                 .await?
         } else {
-            let stats = metadata_journal::active_object_journal_stats(
+            metadata_journal::object_metadata_source_cursor(
                 &self.storage,
                 bucket,
                 &self.partition_owner_signing_key,
             )
-            .await?;
-            index_repair::source_cursor_from_stats(stats)
+            .await?
         };
         let index_storage_id =
             index_journal::index_storage_id(bucket.tenant_id, bucket.id, index.id);
@@ -525,13 +524,12 @@ impl Persistence {
             ));
         }
 
-        let stats = metadata_journal::active_object_journal_stats(
+        let source_cursor = metadata_journal::object_metadata_source_cursor(
             &self.storage,
             &bucket,
             &self.partition_owner_signing_key,
         )
         .await?;
-        let source_cursor = index_repair::source_cursor_from_stats(stats);
         let index_storage_id =
             index_journal::index_storage_id(bucket.tenant_id, bucket.id, index.id);
         let source_manifest_hash = if source_cursor == 0 {
@@ -669,6 +667,7 @@ impl Persistence {
         &self,
         tenant_id: i64,
         database_id: &str,
+        trust_store: &personaldb_protocol::PublicKeyTrustStore,
     ) -> Result<personaldb_repair::PersonalDbLogChainRepairReport> {
         let scope_id = format!("tenant-{tenant_id}-database-{database_id}");
         let permit = self.repair_write_permit("personaldb", &scope_id).await?;
@@ -677,7 +676,7 @@ impl Persistence {
             tenant_id,
             database_id,
             permit.fence_token,
-            &self.personaldb_signing_key,
+            trust_store,
             &self.partition_owner_signing_key,
         )
         .await

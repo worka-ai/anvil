@@ -5,7 +5,6 @@ use crate::{
         read_personaldb_changeset_payload_ref, read_personaldb_commit_certificate,
         read_personaldb_commit_certificate_ref,
     },
-    personaldb_control::PersonalDbCommitCertificate,
     personaldb_heads::{
         PersonalDbCommittedHead, read_personaldb_committed_head, read_personaldb_group_manifest,
     },
@@ -17,6 +16,7 @@ use crate::{
     storage::Storage,
 };
 use anyhow::{Result, anyhow};
+use personaldb_protocol::PublicKeyTrustStore;
 use serde_json::json;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,8 +61,8 @@ pub async fn repair_personaldb_log_chain(
     tenant_id: i64,
     database_id: &str,
     lease_fence_token: u64,
-    personaldb_signing_key: &[u8],
-    repair_signing_key: &[u8],
+    personaldb_trust_store: &PublicKeyTrustStore,
+    repair_finding_signing_key: &[u8],
 ) -> Result<PersonalDbLogChainRepairReport> {
     if lease_fence_token == 0 {
         return Err(anyhow!(
@@ -71,7 +71,7 @@ pub async fn repair_personaldb_log_chain(
     }
 
     let mut report =
-        assess_log_chain(storage, tenant_id, database_id, personaldb_signing_key).await?;
+        assess_log_chain(storage, tenant_id, database_id, personaldb_trust_store).await?;
     if let PersonalDbLogChainRepairStatus::NeedsReview(reason) = report.status.clone() {
         let write = repair_finding_write(
             tenant_id,
@@ -81,7 +81,8 @@ pub async fn repair_personaldb_log_chain(
             &reason,
             lease_fence_token,
         )?;
-        report.finding = Some(write_repair_finding(storage, write, repair_signing_key).await?);
+        report.finding =
+            Some(write_repair_finding(storage, write, repair_finding_signing_key).await?);
     }
     Ok(report)
 }
@@ -90,10 +91,10 @@ async fn assess_log_chain(
     storage: &Storage,
     tenant_id: i64,
     database_id: &str,
-    signing_key: &[u8],
+    trust_store: &PublicKeyTrustStore,
 ) -> Result<PersonalDbLogChainRepairReport> {
     let manifest =
-        match read_personaldb_group_manifest(storage, tenant_id, database_id, signing_key).await {
+        match read_personaldb_group_manifest(storage, tenant_id, database_id, trust_store).await {
             Ok(Some(manifest)) => manifest,
             Ok(None) => {
                 return Ok(report_without_head(
@@ -111,7 +112,7 @@ async fn assess_log_chain(
             }
         };
     let head =
-        match read_personaldb_committed_head(storage, tenant_id, database_id, signing_key).await {
+        match read_personaldb_committed_head(storage, tenant_id, database_id, trust_store).await {
             Ok(Some(head)) => head,
             Ok(None) => {
                 return Ok(report_without_head(
@@ -197,7 +198,7 @@ async fn assess_log_chain(
             ));
         }
         if let Err(reason) =
-            verify_record_certificate(storage, tenant_id, database_id, record, signing_key).await
+            verify_record_certificate(storage, tenant_id, database_id, record, trust_store).await
         {
             return Ok(report_with_head(
                 tenant_id,
@@ -397,7 +398,7 @@ async fn verify_record_certificate(
     tenant_id: i64,
     database_id: &str,
     record: &PersonalDbLogRecord,
-    signing_key: &[u8],
+    trust_store: &PublicKeyTrustStore,
 ) -> std::result::Result<(), PersonalDbLogChainRepairReason> {
     let certificate = if !record.inline_certificate_bytes.is_empty() {
         decode_commit_certificate(&record.inline_certificate_bytes).map_err(|err| {
@@ -413,7 +414,7 @@ async fn verify_record_certificate(
                 message: err.to_string(),
             }
         })?;
-        match read_personaldb_commit_certificate_ref(storage, certificate_ref, signing_key).await {
+        match read_personaldb_commit_certificate_ref(storage, certificate_ref, trust_store).await {
             Ok(Some(certificate)) => certificate,
             Ok(None) => {
                 return Err(PersonalDbLogChainRepairReason::MissingCommitCertificate {
@@ -435,7 +436,7 @@ async fn verify_record_certificate(
             database_id,
             record.log_index,
             &entry_hash,
-            signing_key,
+            trust_store,
         )
         .await
         {
@@ -454,7 +455,7 @@ async fn verify_record_certificate(
         }
     };
 
-    certificate.verify(signing_key).map_err(|err| {
+    certificate.verify(trust_store).map_err(|err| {
         PersonalDbLogChainRepairReason::InvalidCommitCertificate {
             log_index: record.log_index,
             message: err.to_string(),
@@ -752,6 +753,7 @@ mod tests {
             write_personaldb_group_manifest,
         },
         personaldb_segment::{PersonalDbLogSegmentWrite, write_personaldb_log_segment},
+        test_support::personaldb_protocol_keyring,
     };
     use tempfile::{TempDir, tempdir};
 
@@ -760,9 +762,16 @@ mod tests {
     #[tokio::test]
     async fn healthy_chain_is_up_to_date() {
         let fixture = Fixture::create().await;
-        let report = repair_personaldb_log_chain(&fixture.storage, 7, "db-alpha", 9, KEY, KEY)
-            .await
-            .unwrap();
+        let report = repair_personaldb_log_chain(
+            &fixture.storage,
+            7,
+            "db-alpha",
+            9,
+            fixture.protocol_keyring.trust_store(),
+            KEY,
+        )
+        .await
+        .unwrap();
         assert_eq!(report.status, PersonalDbLogChainRepairStatus::UpToDate);
         assert_eq!(report.committed_log_index, 1);
         assert_eq!(report.verified_log_index, 1);
@@ -782,9 +791,16 @@ mod tests {
         .await
         .unwrap();
 
-        let report = repair_personaldb_log_chain(&fixture.storage, 7, "db-alpha", 9, KEY, KEY)
-            .await
-            .unwrap();
+        let report = repair_personaldb_log_chain(
+            &fixture.storage,
+            7,
+            "db-alpha",
+            9,
+            fixture.protocol_keyring.trust_store(),
+            KEY,
+        )
+        .await
+        .unwrap();
         assert_eq!(status_name(&report.status), "needs_review");
         assert_eq!(
             status_reason(&report.status),
@@ -808,9 +824,16 @@ mod tests {
         .await
         .unwrap();
 
-        let report = repair_personaldb_log_chain(&fixture.storage, 7, "db-alpha", 9, KEY, KEY)
-            .await
-            .unwrap();
+        let report = repair_personaldb_log_chain(
+            &fixture.storage,
+            7,
+            "db-alpha",
+            9,
+            fixture.protocol_keyring.trust_store(),
+            KEY,
+        )
+        .await
+        .unwrap();
         assert_eq!(status_name(&report.status), "needs_review");
         assert_eq!(
             status_reason(&report.status),
@@ -826,12 +849,14 @@ mod tests {
         storage: Storage,
         payload_ref: String,
         certificate_ref: String,
+        protocol_keyring: crate::personaldb_signing::PersonalDbProtocolKeyring,
     }
 
     impl Fixture {
         async fn create() -> Self {
             let temp = tempdir().unwrap();
             let storage = Storage::new_at(temp.path()).await.unwrap();
+            let protocol_keyring = personaldb_protocol_keyring();
             let schema_hash = hash32(b"schema");
             let genesis_hash = hash32(b"genesis");
             let payload = b"changeset";
@@ -861,7 +886,7 @@ mod tests {
                 Vec::new(),
             );
             let certificate = PersonalDbCommitCertificate {
-                format_version: 1,
+                format_version: 2,
                 tenant_id: "7".to_string(),
                 database_id: "db-alpha".to_string(),
                 log_index: 1,
@@ -880,12 +905,18 @@ mod tests {
                 certificate_hash: None,
                 witness_signature: None,
             }
-            .seal(KEY)
+            .seal(&protocol_keyring)
+            .await
             .unwrap();
-            let certificate_ref =
-                write_personaldb_commit_certificate(&storage, 7, "db-alpha", &certificate, KEY)
-                    .await
-                    .unwrap();
+            let certificate_ref = write_personaldb_commit_certificate(
+                &storage,
+                7,
+                "db-alpha",
+                &certificate,
+                protocol_keyring.trust_store(),
+            )
+            .await
+            .unwrap();
             let record = PersonalDbLogRecord::new(
                 1,
                 1,
@@ -900,7 +931,7 @@ mod tests {
                 Vec::new(),
             );
             let manifest = PersonalDbGroupManifest {
-                format_version: 1,
+                format_version: 2,
                 tenant_id: "7".to_string(),
                 database_id: "db-alpha".to_string(),
                 schema_hash: hex::encode(schema_hash),
@@ -916,9 +947,10 @@ mod tests {
                 manifest_hash: None,
                 manifest_signature: None,
             }
-            .seal(KEY)
+            .seal(&protocol_keyring)
+            .await
             .unwrap();
-            write_personaldb_group_manifest(&storage, 7, &manifest, KEY)
+            write_personaldb_group_manifest(&storage, 7, &manifest, protocol_keyring.trust_store())
                 .await
                 .unwrap();
             let segment_ref = write_personaldb_log_segment(
@@ -934,12 +966,12 @@ mod tests {
             .await
             .unwrap();
             let head = PersonalDbCommittedHead {
-                format_version: 1,
+                format_version: 2,
                 tenant_id: "7".to_string(),
                 database_id: "db-alpha".to_string(),
                 log_index: 1,
                 log_hash: hex::encode(record.entry_hash),
-                segment_ref: segment_ref,
+                segment_ref,
                 row_index_generation: 0,
                 policy_epoch: 1,
                 membership_epoch: 1,
@@ -949,16 +981,24 @@ mod tests {
                 head_hash: None,
                 head_signature: None,
             }
-            .seal(KEY)
+            .seal(&protocol_keyring)
+            .await
             .unwrap();
-            write_personaldb_committed_head(&storage, 7, "db-alpha", &head, KEY)
-                .await
-                .unwrap();
+            write_personaldb_committed_head(
+                &storage,
+                7,
+                "db-alpha",
+                &head,
+                protocol_keyring.trust_store(),
+            )
+            .await
+            .unwrap();
             Self {
                 _temp: temp,
                 storage,
                 payload_ref,
                 certificate_ref,
+                protocol_keyring,
             }
         }
     }

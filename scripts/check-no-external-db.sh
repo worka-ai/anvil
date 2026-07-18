@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+command -v rg >/dev/null 2>&1 || { echo "ripgrep (rg) is required for this gate" >&2; exit 2; }
+
 # Anvil must not depend on an external relational metadata store.
 # Build the matcher from fragments so this checker can scan the whole repo
 # without matching its own source.

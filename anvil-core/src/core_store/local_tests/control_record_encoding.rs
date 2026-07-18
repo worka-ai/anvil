@@ -90,6 +90,7 @@ fn stream_event_hash_input_is_protobuf_not_json_or_cbor() {
         payload: b"payload".to_vec(),
         content_type: None,
         user_metadata_json: "{}".to_string(),
+        authenticated_principal: "tenant/1/principal/test-writer".to_string(),
         transaction_id: None,
         idempotency_key_hash: Some("sha256:key-a".to_string()),
         created_at: "2026-07-08T00:00:00+00:00".to_string(),

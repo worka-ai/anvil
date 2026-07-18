@@ -6,6 +6,7 @@ use crate::{
     authz_scope::{
         DEFAULT_AUTHZ_REALM_ID, decode_realm_namespace, decode_userset_subject_realm,
         encode_optional_realm_namespace, encode_realm_namespace, encode_userset_subject_realm,
+        parse_userset_subject,
     },
     authz_userset_index, bucket_journal,
     formats::hash32,
@@ -388,14 +389,6 @@ impl AuthService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.get_ref();
 
-        access_control::require_action(
-            &self.storage,
-            &self.persistence,
-            claims,
-            AnvilAction::PolicyGrant,
-            &req.resource,
-        )
-        .await?;
         validate_public_delegation_resource(claims, &req.resource)?;
         if req.action.trim() == "*"
             || req.action.trim().ends_with(":*")
@@ -409,6 +402,14 @@ impl AuthService for AppState {
             .action
             .parse::<AnvilAction>()
             .map_err(|_| Status::invalid_argument("Invalid delegated action"))?;
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            claims,
+            AnvilAction::PolicyGrant,
+            &req.resource,
+        )
+        .await?;
         access_control::require_action(
             &self.storage,
             &self.persistence,
@@ -622,48 +623,71 @@ impl AuthService for AppState {
             ));
         }
         for mutation in &req.mutations {
-            validate_authz_tuple_mutation(self, &claims, mutation).await?;
+            validate_authz_tuple_mutation_shape(mutation)?;
         }
         let scope = resolve_batch_scope(&claims, req.scope.as_ref(), &req.mutations)?;
+        validate_authz_batch_operation_id(req.operation_id.as_deref())?;
+        let expected_revision = optional_expected_authz_revision(req.expected_revision)?;
+        access_control::require_action(
+            &self.storage,
+            &self.persistence,
+            &claims,
+            AnvilAction::AuthzTupleWrite,
+            &scope.authz_realm_id,
+        )
+        .await?;
 
         let mutations = req
             .mutations
-            .into_iter()
+            .iter()
             .map(|mutation| crate::persistence::AuthzTupleBatchMutation {
                 namespace: encode_realm_namespace(&scope.authz_realm_id, &mutation.namespace),
-                object_id: mutation.object_id,
-                relation: mutation.relation,
+                object_id: mutation.object_id.clone(),
+                relation: mutation.relation.clone(),
                 subject_id: encode_userset_subject_realm(
                     &scope.authz_realm_id,
                     &mutation.subject_kind,
                     &mutation.subject_id,
                 ),
-                subject_kind: mutation.subject_kind,
-                caveat_hash: mutation.caveat_hash,
-                operation: mutation.operation,
-                reason: mutation.reason,
+                subject_kind: mutation.subject_kind.clone(),
+                caveat_hash: mutation.caveat_hash.clone(),
+                operation: mutation.operation.clone(),
+                reason: mutation.reason.clone(),
             })
-            .collect();
-        let records = self
+            .collect::<Vec<_>>();
+        let options = crate::persistence::AuthzTupleBatchWriteOptions {
+            authz_realm_id: scope.authz_realm_id.clone(),
+            operation_id: req.operation_id,
+            expected_revision,
+            schema_binding_precondition: None,
+        };
+        if let Some(replay) = self
             .persistence
-            .write_authz_tuple_batch(claims.tenant_id, mutations, &claims.sub)
+            .replay_authz_tuple_batch(claims.tenant_id, &mutations, &claims.sub, &options)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let latest_revision = records
-            .iter()
-            .map(|record| record.revision)
-            .max()
-            .unwrap_or(0);
-        emit_authz_tuple_batch_side_effects(self, claims.tenant_id, &records).await?;
+            .map_err(authz_tuple_batch_write_status)?
+        {
+            return Ok(Response::new(write_authz_tuple_batch_response(
+                &replay.records,
+            )?));
+        }
 
-        Ok(Response::new(WriteAuthzTuplesResponse {
-            results: records
-                .iter()
-                .map(write_authz_tuple_response)
-                .collect::<Result<Vec<_>, _>>()?,
-            revision: revision_to_u64(latest_revision)?,
-            zookie: zookie(latest_revision),
-        }))
+        let outcome = self
+            .persistence
+            .write_authz_tuple_batch_conditionally(
+                claims.tenant_id,
+                mutations,
+                &claims.sub,
+                &options,
+            )
+            .await
+            .map_err(authz_tuple_batch_write_status)?;
+        if !outcome.replayed {
+            emit_authz_tuple_batch_side_effects(self, claims.tenant_id, &outcome.records).await?;
+        }
+        Ok(Response::new(write_authz_tuple_batch_response(
+            &outcome.records,
+        )?))
     }
 
     async fn read_authz_tuples(
@@ -995,6 +1019,8 @@ impl AuthService for AppState {
         for namespace in &req.namespaces {
             validate_public_authz_namespace(&namespace.namespace)?;
         }
+        crate::authz_schema_contract::validate_schema_set(&req.namespaces)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         access_control::require_action(
             &self.storage,
             &self.persistence,
@@ -1149,6 +1175,11 @@ impl AuthService for AppState {
                 "namespaces must contain no more than 1000 schemas",
             ));
         }
+        for namespace in &req.namespaces {
+            validate_public_authz_namespace(&namespace.namespace)?;
+        }
+        crate::authz_schema_contract::validate_schema_set(&req.namespaces)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
 
         access_control::require_action(
             &self.storage,
@@ -1176,7 +1207,6 @@ impl AuthService for AppState {
             .and_then(revision_to_u64)?
             .max(1);
         for namespace in req.namespaces {
-            validate_public_authz_namespace(&namespace.namespace)?;
             let record = authz_schema::write_authz_namespace_schema(
                 &self.storage,
                 claims.tenant_id,

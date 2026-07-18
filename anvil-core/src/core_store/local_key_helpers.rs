@@ -127,6 +127,14 @@ pub(super) fn stream_record_prefix(stream_id: &str) -> Vec<u8> {
     meta_tuple_key(&[b"stream-record", stream_id.as_bytes()])
 }
 
+pub(super) fn stream_idempotency_key(stream_id: &str, idempotency_key_hash: &str) -> Vec<u8> {
+    meta_tuple_key(&[
+        b"stream-idempotency",
+        stream_id.as_bytes(),
+        idempotency_key_hash.as_bytes(),
+    ])
+}
+
 pub(super) fn node_signing_keypair_key() -> Vec<u8> {
     meta_tuple_key(&[b"node-signing-keypair"])
 }

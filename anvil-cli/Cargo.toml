@@ -39,6 +39,7 @@ anvil = { package = "anvil-server", path = "../anvil", version = "0.3.0" }
 tempfile = "3.10.1"
 uuid = { version = "1.18", features = ["v4"] }
 blake3 = "1.8"
+personaldb-protocol = "=0.1.0"
 
 [build-dependencies]
 tonic-build = "0.14.2"

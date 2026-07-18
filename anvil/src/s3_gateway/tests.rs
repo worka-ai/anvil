@@ -14,6 +14,7 @@ use anvil_core::{
         PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
     },
 };
+use anvil_test_utils::personaldb_test_protocol_keyring;
 use futures_util::TryStreamExt;
 use tempfile::tempdir;
 
@@ -79,9 +80,13 @@ async fn seeded_remote_bucket_route(
 ) -> (tempfile::TempDir, AppState, Claims, ObjectRoute) {
     let temp = tempdir().unwrap();
     let storage_path = temp.path().join("storage");
-    let state = AppState::new(routing_config_with_policy(&storage_path, policy), None)
-        .await
-        .unwrap();
+    let state = AppState::new(
+        routing_config_with_policy(&storage_path, policy),
+        None,
+        personaldb_test_protocol_keyring(),
+    )
+    .await
+    .unwrap();
     let tenant = state
         .persistence
         .create_tenant("acme", "remote-bucket-test")
@@ -172,9 +177,13 @@ async fn seeded_remote_bucket_locator_only(
 ) -> (tempfile::TempDir, AppState, Claims, String) {
     let temp = tempdir().unwrap();
     let storage_path = temp.path().join("storage");
-    let state = AppState::new(routing_config_with_policy(&storage_path, policy), None)
-        .await
-        .unwrap();
+    let state = AppState::new(
+        routing_config_with_policy(&storage_path, policy),
+        None,
+        personaldb_test_protocol_keyring(),
+    )
+    .await
+    .unwrap();
     let tenant = state
         .persistence
         .create_tenant("acme", "remote-locator-only-test")
@@ -262,6 +271,7 @@ async fn seeded_local_object_link() -> (tempfile::TempDir, AppState, Claims, Str
     let state = AppState::new(
         routing_config_with_policy(&storage_path, CrossRegionRoutingPolicy::RedirectPreferred),
         None,
+        personaldb_test_protocol_keyring(),
     )
     .await
     .unwrap();
@@ -849,7 +859,9 @@ fn reserved_namespace_guard_detects_native_routed_keys_before_auth() {
         let mut config =
             routing_config_with_policy(&storage_path, CrossRegionRoutingPolicy::RedirectPreferred);
         config.public_region_base_domain = "us-east-1.anvil-storage.test".to_string();
-        let state = AppState::new(config, None).await.unwrap();
+        let state = AppState::new(config, None, personaldb_test_protocol_keyring())
+            .await
+            .unwrap();
 
         let reserved = Request::builder()
             .uri("/default/releases/_anvil/authz/tuples")

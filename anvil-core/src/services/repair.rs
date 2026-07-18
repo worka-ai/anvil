@@ -226,7 +226,11 @@ impl RepairService for AppState {
 
         let report = self
             .persistence
-            .repair_personaldb_log_chain(claims.tenant_id, &req.database_id)
+            .repair_personaldb_log_chain(
+                claims.tenant_id,
+                &req.database_id,
+                self.personaldb_protocol_keyring.trust_store(),
+            )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(RepairPersonalDbLogChainResponse {

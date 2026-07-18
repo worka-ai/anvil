@@ -16,9 +16,19 @@ use crate::routing::{
 use crate::system_realm::{AdminPrincipal, SystemAdminRelation};
 use crate::{
     AppState, auth, authz_repair, directory_repair, index_repair, mesh_control_stream,
-    mesh_directory, persistence::Bucket, personaldb_repair,
+    mesh_directory,
+    persistence::Bucket,
+    personaldb_repair,
+    personaldb_signing_store::{
+        PersonalDbSigningKeyAuditMetadata, PersonalDbSigningKeyImport,
+        PersonalDbSigningKeyPublicRecord, PersonalDbSigningKeyStatusUpdate, SensitiveBytes,
+    },
 };
 use chrono::Utc;
+use personaldb_protocol::{
+    DatabaseId, Ed25519PublicKey, KeyGeneration, KeyTrustPolicy, PublicKeyStatus,
+    PublicKeyTrustRecord, SignaturePurpose,
+};
 use serde_json::json;
 use tonic::{Request, Response, Status};
 
@@ -339,6 +349,165 @@ impl AdminService for AppState {
             hf_keys_rotated: stats.hf_keys_rotated,
             already_active: stats.already_active,
             audit_event_id,
+        }))
+    }
+
+    async fn import_personal_db_signing_key(
+        &self,
+        request: Request<ImportPersonalDbSigningKeyRequest>,
+    ) -> Result<Response<PersonalDbSigningKeyResponse>, Status> {
+        let principal = require_admin(
+            &request,
+            self,
+            SystemAdminRelation::ManagePersonalDbSigningKeys,
+        )
+        .await?;
+        let mut req = request.into_inner();
+        let private_key_pkcs8_der =
+            SensitiveBytes::new(std::mem::take(&mut req.private_key_pkcs8_der));
+        let context = require_mutation_context(req.context.as_ref(), true)?;
+        let purpose = req
+            .purpose
+            .parse::<SignaturePurpose>()
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let status = parse_personaldb_key_status(&req.status, true)?;
+        let public_key = Ed25519PublicKey::try_from(req.public_key.as_slice())
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let policy = KeyTrustPolicy {
+            key_generation: KeyGeneration::new(req.key_generation)
+                .map_err(|err| Status::invalid_argument(err.to_string()))?,
+            purpose,
+            database_scopes: req
+                .database_scopes
+                .into_iter()
+                .map(DatabaseId::new)
+                .collect(),
+            group_scopes: req.group_scopes,
+            valid_from_log_index: req.valid_from_log_index,
+            valid_until_log_index: req.valid_until_log_index,
+            status,
+        };
+        let trust_record = PublicKeyTrustRecord::new(public_key, policy);
+        let import_result = self
+            .personaldb_signing_key_store
+            .import_key(PersonalDbSigningKeyImport {
+                trust_record,
+                private_key_pkcs8_der: private_key_pkcs8_der.as_slice(),
+                audit: PersonalDbSigningKeyAuditMetadata::new(
+                    &principal.principal_id,
+                    &context.request_id,
+                )
+                .with_reason(&context.audit_reason),
+            })
+            .await;
+        let record = import_result.map_err(|err| Status::failed_precondition(err.to_string()))?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.personaldb_signing_key.import",
+            &format!("personaldb_signing_key:{}", record.trust_record.key_id),
+            json!({
+                "resource_kind": "personaldb_signing_key",
+                "key_id": record.trust_record.key_id.as_str(),
+                "key_generation": record.trust_record.key_generation.get(),
+                "purpose": record.trust_record.purpose.as_str(),
+                "status": record.trust_record.status.as_str(),
+                "record_revision": record.record_revision,
+            }),
+        )
+        .await?;
+        Ok(Response::new(PersonalDbSigningKeyResponse {
+            request_id: context.request_id.clone(),
+            key: Some(personaldb_signing_key_to_proto(record)),
+            audit_event_id,
+            runtime_reload_required: true,
+        }))
+    }
+
+    async fn list_personal_db_signing_keys(
+        &self,
+        request: Request<ListPersonalDbSigningKeysRequest>,
+    ) -> Result<Response<ListPersonalDbSigningKeysResponse>, Status> {
+        let _principal = require_admin(
+            &request,
+            self,
+            SystemAdminRelation::ManagePersonalDbSigningKeys,
+        )
+        .await?;
+        let keys = self
+            .personaldb_signing_key_store
+            .list_public_records()
+            .map_err(|err| Status::internal(err.to_string()))?
+            .into_iter()
+            .map(personaldb_signing_key_to_proto)
+            .collect();
+        Ok(Response::new(ListPersonalDbSigningKeysResponse { keys }))
+    }
+
+    async fn set_personal_db_signing_key_status(
+        &self,
+        request: Request<SetPersonalDbSigningKeyStatusRequest>,
+    ) -> Result<Response<PersonalDbSigningKeyResponse>, Status> {
+        let principal = require_admin(
+            &request,
+            self,
+            SystemAdminRelation::ManagePersonalDbSigningKeys,
+        )
+        .await?;
+        let req = request.into_inner();
+        let context = require_mutation_context(req.context.as_ref(), false)?;
+        let key_id = personaldb_protocol::KeyId::new(req.key_id)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let status = parse_personaldb_key_status(&req.status, false)?;
+        let current = self
+            .personaldb_signing_key_store
+            .get_public_record(&key_id)
+            .map_err(|err| Status::internal(err.to_string()))?
+            .ok_or_else(|| Status::not_found("PersonalDB signing key not found"))?;
+        if current.record_revision != context.expected_generation {
+            return Err(Status::aborted(format!(
+                "PersonalDB signing key record revision mismatch: expected {}, current {}",
+                context.expected_generation, current.record_revision
+            )));
+        }
+        let record = self
+            .personaldb_signing_key_store
+            .set_status(PersonalDbSigningKeyStatusUpdate {
+                key_id,
+                expected_record_revision: context.expected_generation,
+                status,
+                valid_until_log_index: req.valid_until_log_index,
+                audit: PersonalDbSigningKeyAuditMetadata::new(
+                    &principal.principal_id,
+                    &context.request_id,
+                )
+                .with_reason(&context.audit_reason),
+            })
+            .await
+            .map_err(|err| Status::failed_precondition(err.to_string()))?;
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            context,
+            "admin.personaldb_signing_key.status_set",
+            &format!("personaldb_signing_key:{}", record.trust_record.key_id),
+            json!({
+                "resource_kind": "personaldb_signing_key",
+                "key_id": record.trust_record.key_id.as_str(),
+                "key_generation": record.trust_record.key_generation.get(),
+                "purpose": record.trust_record.purpose.as_str(),
+                "status": record.trust_record.status.as_str(),
+                "valid_until_log_index": record.trust_record.valid_until_log_index,
+                "record_revision": record.record_revision,
+            }),
+        )
+        .await?;
+        Ok(Response::new(PersonalDbSigningKeyResponse {
+            request_id: context.request_id.clone(),
+            key: Some(personaldb_signing_key_to_proto(record)),
+            audit_event_id,
+            runtime_reload_required: true,
         }))
     }
 
@@ -1925,6 +2094,52 @@ impl AdminService for AppState {
 
 mod helpers;
 use helpers::*;
+
+fn parse_personaldb_key_status(value: &str, allow_active: bool) -> Result<PublicKeyStatus, Status> {
+    let status = match value {
+        "active" if allow_active => PublicKeyStatus::Active,
+        "retiring" => PublicKeyStatus::Retiring,
+        "revoked_future" => PublicKeyStatus::RevokedFuture,
+        "compromised" => PublicKeyStatus::Compromised,
+        "active" => {
+            return Err(Status::invalid_argument(
+                "A non-active PersonalDB signing key cannot be reactivated",
+            ));
+        }
+        _ => {
+            return Err(Status::invalid_argument(
+                "PersonalDB signing key status must be active, retiring, revoked_future, or compromised",
+            ));
+        }
+    };
+    Ok(status)
+}
+
+fn personaldb_signing_key_to_proto(
+    record: PersonalDbSigningKeyPublicRecord,
+) -> PersonalDbSigningKeyRecord {
+    PersonalDbSigningKeyRecord {
+        key_id: record.trust_record.key_id.to_string(),
+        key_generation: record.trust_record.key_generation.get(),
+        purpose: record.trust_record.purpose.as_str().to_string(),
+        database_scopes: record
+            .trust_record
+            .database_scopes
+            .iter()
+            .map(|database_id| database_id.0.clone())
+            .collect(),
+        group_scopes: record.trust_record.group_scopes.clone(),
+        valid_from_log_index: record.trust_record.valid_from_log_index,
+        valid_until_log_index: record.trust_record.valid_until_log_index,
+        status: record.trust_record.status.as_str().to_string(),
+        public_key: record.trust_record.public_key.as_bytes().to_vec(),
+        created_at_unix_nanos: record.created_at_unix_nanos,
+        updated_at_unix_nanos: record.updated_at_unix_nanos,
+        created_by: record.created_audit.actor_id,
+        updated_by: record.updated_audit.actor_id,
+        record_revision: record.record_revision,
+    }
+}
 
 fn storage_class_to_proto(
     class: &crate::core_store::CoreStorageClass,

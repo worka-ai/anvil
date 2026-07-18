@@ -1,4 +1,9 @@
 use super::*;
+use crate::anvil_api::{
+    AuthzAllowedSubject, AuthzRelationRule, AuthzRelationSchema, AuthzSchemaMemberKind,
+    AuthzSubjectSelectorKind,
+};
+use crate::core_store::TABLE_AUTHZ_IDEMPOTENCY_RECEIPT_ROW;
 use crate::partition_fence::{
     PartitionRecoveryAcquire, acquire_partition_recovery, force_expire_partition_owner_for_node,
     publish_partition_ready,
@@ -7,6 +12,32 @@ use chrono::Utc;
 use tempfile::tempdir;
 
 const PARTITION_OWNER_KEY: &[u8] = b"authorization tuple partition owner signing key";
+
+fn any_subject(subject_kind: &str) -> AuthzAllowedSubject {
+    AuthzAllowedSubject {
+        selector_kind: AuthzSubjectSelectorKind::AnyCanonicalId as i32,
+        subject_kind: subject_kind.to_string(),
+        subject_id: String::new(),
+    }
+}
+
+fn direct_relation(name: &str, subject_kinds: &[&str]) -> AuthzRelationSchema {
+    AuthzRelationSchema {
+        relation: name.to_string(),
+        rules: Vec::new(),
+        member_kind: AuthzSchemaMemberKind::DirectRelation as i32,
+        allowed_subjects: subject_kinds.iter().map(|kind| any_subject(kind)).collect(),
+    }
+}
+
+fn permission(name: &str, rules: Vec<AuthzRelationRule>) -> AuthzRelationSchema {
+    AuthzRelationSchema {
+        relation: name.to_string(),
+        rules,
+        member_kind: AuthzSchemaMemberKind::Permission as i32,
+        allowed_subjects: Vec::new(),
+    }
+}
 
 fn record(revision: i64, operation: &str) -> AuthzTupleRecord {
     AuthzTupleRecord {
@@ -94,6 +125,30 @@ async fn ready_authz_permit(
     .unwrap()
 }
 
+async fn append_authz_record_without_segment(
+    storage: &Storage,
+    record: &AuthzTupleRecord,
+) -> Result<()> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let partition_id = hex::encode(authz_partition_id(record.tenant_id));
+    core_store
+        .commit_mutation_batch(CoreMutationBatch {
+            transaction_id: format!("authz-tuple-unmaterialized:{}", record.mutation_id),
+            scope_partition: partition_id.clone(),
+            committed_by_principal: authz_partition_principal(record.tenant_id),
+            preconditions: Vec::new(),
+            operations: vec![CoreMutationOperation::StreamAppend {
+                partition_id,
+                stream_id: authz_tuple_stream_id(record.tenant_id),
+                record_kind: AUTHZ_TUPLE_RECORD_KIND.to_string(),
+                payload: encode_authz_tuple_journal_body(record, 0)?,
+                idempotency_key: Some(format!("authz-tuple-unmaterialized:{}", record.mutation_id)),
+            }],
+        })
+        .await?;
+    write_authz_tuple_records_to_current_rows(storage, std::slice::from_ref(record)).await
+}
+
 #[tokio::test]
 async fn authz_journal_recovers_latest_exact_and_watch_ranges() {
     let temp = tempdir().unwrap();
@@ -131,6 +186,97 @@ async fn authz_journal_recovers_latest_exact_and_watch_ranges() {
         .unwrap();
     assert_eq!(watched.len(), 2);
     assert_eq!(watched[1].revision, 2);
+}
+
+#[tokio::test]
+async fn latest_authz_revision_uses_the_journal_head_not_a_tuple_scan() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let record = record(1, "add");
+    test_append_authz_tuple_record_unfenced(&storage, &record)
+        .await
+        .unwrap();
+
+    let meta = CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
+    meta.delete(
+        CF_AUTHZ,
+        TABLE_AUTHZ_TUPLE_PAGE_ROW,
+        &authz_tuple_current_row_key(&record).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(latest_authz_revision(&storage, 42).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn current_permission_uses_the_materialized_userset_index() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let record = record(1, "add");
+    test_append_authz_tuple_record_unfenced(&storage, &record)
+        .await
+        .unwrap();
+
+    // Current rows are a rebuildable projection. Permission checks should use
+    // the revision-bound userset index rather than scanning that projection.
+    CoreMetaStore::open(storage.core_store_meta_path())
+        .unwrap()
+        .delete(
+            CF_AUTHZ,
+            TABLE_AUTHZ_TUPLE_PAGE_ROW,
+            &authz_tuple_current_row_key(&record).unwrap(),
+        )
+        .unwrap();
+
+    assert!(
+        resolve_current_permission(
+            &storage, 42, "document", "alpha", "viewer", "user", "alice", ""
+        )
+        .await
+        .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn missing_authz_segments_materialize_only_the_requested_revision() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    for revision in 1..=3 {
+        append_authz_record_without_segment(&storage, &record(revision, "add"))
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(latest_authz_revision(&storage, 42).await.unwrap(), 3);
+    for revision in 1..=3 {
+        assert!(
+            authz_segment::existing_authz_tuple_segment_ref(&storage, 42, revision)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    let segment = authz_segment::ensure_authz_tuple_segment_at_revision(&storage, 42, 3)
+        .await
+        .unwrap()
+        .expect("requested authorization segment");
+    assert_eq!(segment.header.generation, 3);
+    assert_eq!(segment.records.len(), 3);
+    assert!(
+        authz_segment::existing_authz_tuple_segment_ref(&storage, 42, 1)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        authz_segment::existing_authz_tuple_segment_ref(&storage, 42, 2)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        authz_segment::existing_authz_tuple_segment_ref(&storage, 42, 3)
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]
@@ -290,7 +436,7 @@ async fn authz_userset_removal_and_cycles_do_not_grant_access() {
 
 #[tokio::test]
 async fn authz_bound_schema_inherit_computed_and_tuple_to_userset_rules_are_enforced() {
-    use crate::anvil_api::{AuthzNamespaceSchema, AuthzRelationRule, AuthzRelationSchema};
+    use crate::anvil_api::AuthzNamespaceSchema;
     use crate::authz_scope::encode_realm_namespace;
 
     let temp = tempdir().unwrap();
@@ -308,9 +454,9 @@ async fn authz_bound_schema_inherit_computed_and_tuple_to_userset_rules_are_enfo
             AuthzNamespaceSchema {
                 namespace: "document".to_string(),
                 relations: vec![
-                    AuthzRelationSchema {
-                        relation: "viewer".to_string(),
-                        rules: vec![
+                    permission(
+                        "viewer",
+                        vec![
                             AuthzRelationRule {
                                 kind: "inherit".to_string(),
                                 relation: "editor".to_string(),
@@ -330,11 +476,10 @@ async fn authz_bound_schema_inherit_computed_and_tuple_to_userset_rules_are_enfo
                                 target_relation: "member".to_string(),
                             },
                         ],
-                    },
-                    AuthzRelationSchema {
-                        relation: "editor".to_string(),
-                        rules: vec![],
-                    },
+                    ),
+                    direct_relation("editor", &["user"]),
+                    direct_relation("parent_folder", &["folder"]),
+                    direct_relation("shared_group", &["group"]),
                 ],
                 schema_json: String::new(),
                 schema_hash: String::new(),
@@ -344,15 +489,18 @@ async fn authz_bound_schema_inherit_computed_and_tuple_to_userset_rules_are_enfo
             },
             AuthzNamespaceSchema {
                 namespace: "folder".to_string(),
-                relations: vec![AuthzRelationSchema {
-                    relation: "viewer".to_string(),
-                    rules: vec![AuthzRelationRule {
-                        kind: "computed".to_string(),
-                        relation: String::new(),
-                        tuple_relation: "parent_tenant".to_string(),
-                        target_relation: "member".to_string(),
-                    }],
-                }],
+                relations: vec![
+                    permission(
+                        "viewer",
+                        vec![AuthzRelationRule {
+                            kind: "computed".to_string(),
+                            relation: String::new(),
+                            tuple_relation: "parent_tenant".to_string(),
+                            target_relation: "member".to_string(),
+                        }],
+                    ),
+                    direct_relation("parent_tenant", &["tenant"]),
+                ],
                 schema_json: String::new(),
                 schema_hash: String::new(),
                 schema_version: 0,
@@ -361,10 +509,7 @@ async fn authz_bound_schema_inherit_computed_and_tuple_to_userset_rules_are_enfo
             },
             AuthzNamespaceSchema {
                 namespace: "tenant".to_string(),
-                relations: vec![AuthzRelationSchema {
-                    relation: "member".to_string(),
-                    rules: vec![],
-                }],
+                relations: vec![direct_relation("member", &["user"])],
                 schema_json: String::new(),
                 schema_hash: String::new(),
                 schema_version: 0,
@@ -373,10 +518,7 @@ async fn authz_bound_schema_inherit_computed_and_tuple_to_userset_rules_are_enfo
             },
             AuthzNamespaceSchema {
                 namespace: "group".to_string(),
-                relations: vec![AuthzRelationSchema {
-                    relation: "member".to_string(),
-                    rules: vec![],
-                }],
+                relations: vec![direct_relation("member", &["user"])],
                 schema_json: String::new(),
                 schema_hash: String::new(),
                 schema_version: 0,
@@ -531,7 +673,7 @@ async fn authz_bound_schema_inherit_computed_and_tuple_to_userset_rules_are_enfo
 
 #[tokio::test]
 async fn authz_schema_writes_materialize_segment_schema_tables() {
-    use crate::anvil_api::{AuthzNamespaceSchema, AuthzRelationRule, AuthzRelationSchema};
+    use crate::anvil_api::AuthzNamespaceSchema;
     use crate::authz_scope::encode_realm_namespace;
 
     let temp = tempdir().unwrap();
@@ -542,15 +684,18 @@ async fn authz_schema_writes_materialize_segment_schema_tables() {
         "workspace-authz",
         vec![AuthzNamespaceSchema {
             namespace: "document".to_string(),
-            relations: vec![AuthzRelationSchema {
-                relation: "viewer".to_string(),
-                rules: vec![AuthzRelationRule {
-                    kind: "inherit".to_string(),
-                    relation: "editor".to_string(),
-                    tuple_relation: String::new(),
-                    target_relation: String::new(),
-                }],
-            }],
+            relations: vec![
+                permission(
+                    "viewer",
+                    vec![AuthzRelationRule {
+                        kind: "inherit".to_string(),
+                        relation: "editor".to_string(),
+                        tuple_relation: String::new(),
+                        target_relation: String::new(),
+                    }],
+                ),
+                direct_relation("editor", &["user"]),
+            ],
             schema_json: String::new(),
             schema_hash: String::new(),
             schema_version: 0,
@@ -878,6 +1023,7 @@ async fn authz_journal_batch_rejects_stale_partition_precondition() {
         &record(1, "add"),
         stale.fence_token,
         Some(stale_precondition),
+        None,
     )
     .await
     .unwrap_err();
@@ -972,4 +1118,174 @@ pub(crate) async fn authz_write_with_permit_allocates_revision_under_fence() {
         .await
         .unwrap();
     assert_eq!(fences[0], permit.fence_token);
+}
+
+#[tokio::test]
+async fn conditional_authz_batch_receipt_replays_and_conflicts() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let permit = ready_authz_permit(&storage, 42, "node-a").await;
+    let schema_binding_key = core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("schema_binding"),
+        CoreMetaTuplePart::I64(42),
+        CoreMetaTuplePart::Utf8("default"),
+    ])
+    .unwrap();
+    let options = crate::persistence::AuthzTupleBatchWriteOptions {
+        authz_realm_id: "default".to_string(),
+        operation_id: Some("provision-access-1".to_string()),
+        expected_revision: Some(0),
+        schema_binding_precondition: Some(crate::persistence::AuthzSchemaBindingPrecondition {
+            tuple_key: schema_binding_key.clone(),
+            expected_payload_hash: None,
+        }),
+    };
+    let writes = || {
+        vec![
+            AuthzTupleWrite {
+                tenant_id: 42,
+                namespace: "realm__default__document",
+                object_id: "alpha",
+                relation: "viewer",
+                subject_kind: "user",
+                subject_id: "alice",
+                caveat_hash: "",
+                operation: "add",
+                written_by: "app:writer",
+                reason: "provision",
+            },
+            AuthzTupleWrite {
+                tenant_id: 42,
+                namespace: "realm__default__document",
+                object_id: "beta",
+                relation: "viewer",
+                subject_kind: "user",
+                subject_id: "alice",
+                caveat_hash: "",
+                operation: "add",
+                written_by: "app:writer",
+                reason: "provision",
+            },
+        ]
+    };
+
+    let first = write_authz_tuple_batch_conditionally_with_permit(
+        &storage,
+        writes(),
+        &options,
+        &permit,
+        PARTITION_OWNER_KEY,
+    )
+    .await
+    .unwrap();
+    assert!(!first.replayed);
+    assert_eq!(first.records.len(), 2);
+    assert!(first.records.iter().all(|record| record.revision == 1));
+    assert_eq!(
+        CoreMetaStore::open(storage.core_store_meta_path())
+            .unwrap()
+            .scan_prefix(CF_AUTHZ, TABLE_AUTHZ_IDEMPOTENCY_RECEIPT_ROW, &[],)
+            .unwrap()
+            .len(),
+        1,
+        "the receipt must be committed with the tuple journal batch"
+    );
+
+    let second_options = crate::persistence::AuthzTupleBatchWriteOptions {
+        operation_id: Some("provision-access-2".to_string()),
+        expected_revision: Some(1),
+        ..options.clone()
+    };
+    let second = write_authz_tuple_batch_conditionally_with_permit(
+        &storage,
+        vec![AuthzTupleWrite {
+            tenant_id: 42,
+            namespace: "realm__default__document",
+            object_id: "gamma",
+            relation: "viewer",
+            subject_kind: "user",
+            subject_id: "bob",
+            caveat_hash: "",
+            operation: "add",
+            written_by: "app:writer",
+            reason: "provision",
+        }],
+        &second_options,
+        &permit,
+        PARTITION_OWNER_KEY,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.records[0].revision, 2);
+
+    let replay = write_authz_tuple_batch_conditionally_with_permit(
+        &storage,
+        writes(),
+        &options,
+        &permit,
+        PARTITION_OWNER_KEY,
+    )
+    .await
+    .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.records.len(), first.records.len());
+    assert_eq!(
+        replay
+            .records
+            .iter()
+            .map(|record| record.record_hash.as_str())
+            .collect::<Vec<_>>(),
+        first
+            .records
+            .iter()
+            .map(|record| record.record_hash.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(replay.records.iter().all(|record| record.revision == 1));
+    assert_eq!(latest_authz_revision(&storage, 42).await.unwrap(), 2);
+
+    let changed = write_authz_tuple_batch_conditionally_with_permit(
+        &storage,
+        vec![AuthzTupleWrite {
+            object_id: "changed",
+            ..writes()[0]
+        }],
+        &options,
+        &permit,
+        PARTITION_OWNER_KEY,
+    )
+    .await
+    .unwrap_err();
+    assert!(changed.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<crate::persistence::AuthzTupleBatchWriteError>(),
+            Some(crate::persistence::AuthzTupleBatchWriteError::OperationConflict)
+        )
+    }));
+
+    let stale_options = crate::persistence::AuthzTupleBatchWriteOptions {
+        operation_id: Some("stale-operation".to_string()),
+        expected_revision: Some(1),
+        ..options
+    };
+    let stale = write_authz_tuple_batch_conditionally_with_permit(
+        &storage,
+        writes(),
+        &stale_options,
+        &permit,
+        PARTITION_OWNER_KEY,
+    )
+    .await
+    .unwrap_err();
+    assert!(stale.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<crate::persistence::AuthzTupleBatchWriteError>(),
+            Some(
+                crate::persistence::AuthzTupleBatchWriteError::RevisionConflict {
+                    expected: 1,
+                    actual: 2,
+                }
+            )
+        )
+    }));
 }

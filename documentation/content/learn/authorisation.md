@@ -97,6 +97,8 @@ Until caveat evaluation exists, treat `caveat_hash` as provenance or an advanced
 
 Every committed relationship-authorisation write advances a tenant authz revision. A response zookie is the portable string form of that revision, currently `authz:<revision>`. Reads, checks, object listings, and query paths use revisions so callers can avoid reading from an older permission view than the one they just wrote.
 
+`WriteAuthzTuples` accepts an optional `operation_id` of at most 128 UTF-8 bytes and an optional `expected_revision`. Operation ids are scoped to the authenticated principal and storage tenant. Retrying the same canonical scoped batch with the same operation id returns its original revision, per-tuple results, and zookie even after later writes; reusing that id with different mutations fails with `AuthzOperationConflict`. An `expected_revision` that is not current fails with `AuthzRevisionConflict`. The receipt and tuple batch are committed atomically, so callers do not need to infer success after a lost response.
+
 The consistency options are:
 
 | Option | Meaning |

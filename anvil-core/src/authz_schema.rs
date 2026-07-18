@@ -1,5 +1,7 @@
 use crate::{
-    anvil_api::{AuthzNamespaceSchema, AuthzRelationRule, AuthzRelationSchema},
+    anvil_api::{
+        AuthzAllowedSubject, AuthzNamespaceSchema, AuthzRelationRule, AuthzRelationSchema,
+    },
     authz_coremeta_payload::{decode_authz_payload_row, encode_authz_payload_row},
     core_store::{
         CF_AUTHZ, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaStore, CoreMetaTuplePart,
@@ -14,7 +16,6 @@ use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 const AUTHZ_NAMESPACE_SCHEMA_ROW_KIND: &str = "namespace_schema";
 
@@ -38,6 +39,15 @@ pub struct AuthzNamespaceSchemaRecord {
 pub struct AuthzRelationSchemaRecord {
     pub relation: String,
     pub rules: Vec<AuthzRelationRuleRecord>,
+    pub member_kind: i32,
+    pub allowed_subjects: Vec<AuthzAllowedSubjectRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthzAllowedSubjectRecord {
+    pub selector_kind: i32,
+    pub subject_kind: String,
+    pub subject_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -84,6 +94,20 @@ struct AuthzRelationSchemaRecordProto {
     relation: String,
     #[prost(message, repeated, tag = "2")]
     rules: Vec<AuthzRelationRuleRecordProto>,
+    #[prost(int32, tag = "3")]
+    member_kind: i32,
+    #[prost(message, repeated, tag = "4")]
+    allowed_subjects: Vec<AuthzAllowedSubjectRecordProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct AuthzAllowedSubjectRecordProto {
+    #[prost(int32, tag = "1")]
+    selector_kind: i32,
+    #[prost(string, tag = "2")]
+    subject_kind: String,
+    #[prost(string, tag = "3")]
+    subject_id: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -189,41 +213,7 @@ pub fn schema_response(record: &AuthzNamespaceSchemaRecord) -> AuthzNamespaceSch
 }
 
 fn validate_namespace_schema(schema: &AuthzNamespaceSchema) -> Result<()> {
-    validate_component(&schema.namespace, "namespace")?;
-    let mut seen_relations = BTreeMap::new();
-    for relation in &schema.relations {
-        validate_component(&relation.relation, "relation")?;
-        if seen_relations
-            .insert(relation.relation.clone(), ())
-            .is_some()
-        {
-            return Err(anyhow!("duplicate authorization schema relation"));
-        }
-        for rule in &relation.rules {
-            match rule.kind.as_str() {
-                "inherit" => {
-                    validate_component(&rule.relation, "inherited relation")?;
-                    require_empty(&rule.tuple_relation, "tuple_relation")?;
-                    require_empty(&rule.target_relation, "target_relation")?;
-                }
-                "computed" | "tuple_to_userset" => {
-                    require_empty(&rule.relation, "relation")?;
-                    validate_component(&rule.tuple_relation, "tuple relation")?;
-                    validate_component(&rule.target_relation, "target relation")?;
-                }
-                _ => {
-                    return Err(anyhow!(
-                        "authorization schema rule kind must be inherit, computed, or tuple_to_userset"
-                    ));
-                }
-            }
-        }
-    }
-    if !schema.schema_json.is_empty() {
-        serde_json::from_str::<serde_json::Value>(&schema.schema_json)
-            .context("authorization schema_json must be valid JSON")?;
-    }
-    Ok(())
+    crate::authz_schema_contract::validate_namespace_shape(schema)
 }
 
 fn validate_record(
@@ -272,16 +262,6 @@ fn validate_component(value: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn require_empty(value: &str, name: &str) -> Result<()> {
-    if value.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "{name} must be empty for this authorization rule kind"
-        ))
-    }
-}
-
 fn schema_hash(schema: &AuthzNamespaceSchema) -> Result<String> {
     let canonical = canonical_schema(schema);
     Ok(hex::encode(hash32(&encode_authz_schema(&canonical))))
@@ -318,6 +298,13 @@ fn canonical_schema(schema: &AuthzNamespaceSchema) -> AuthzNamespaceSchema {
                     &right.tuple_relation,
                     &right.target_relation,
                 ))
+        });
+        relation.allowed_subjects.sort_by(|left, right| {
+            (left.selector_kind, &left.subject_kind, &left.subject_id).cmp(&(
+                right.selector_kind,
+                &right.subject_kind,
+                &right.subject_id,
+            ))
         });
     }
     schema
@@ -504,6 +491,16 @@ fn authz_schema_to_proto(schema: &AuthzNamespaceSchema) -> AuthzNamespaceSchemaR
                         target_relation: rule.target_relation.clone(),
                     })
                     .collect(),
+                member_kind: relation.member_kind,
+                allowed_subjects: relation
+                    .allowed_subjects
+                    .iter()
+                    .map(|selector| AuthzAllowedSubjectRecordProto {
+                        selector_kind: selector.selector_kind,
+                        subject_kind: selector.subject_kind.clone(),
+                        subject_id: selector.subject_id.clone(),
+                    })
+                    .collect(),
             })
             .collect(),
         schema_json: schema.schema_json.clone(),
@@ -523,6 +520,12 @@ fn relation_record_to_proto(
     AuthzRelationSchemaRecordProto {
         relation: relation.relation.clone(),
         rules: relation.rules.iter().map(rule_record_to_proto).collect(),
+        member_kind: relation.member_kind,
+        allowed_subjects: relation
+            .allowed_subjects
+            .iter()
+            .map(allowed_subject_record_to_proto)
+            .collect(),
     }
 }
 
@@ -534,6 +537,32 @@ fn relation_record_from_proto(proto: AuthzRelationSchemaRecordProto) -> AuthzRel
             .into_iter()
             .map(rule_record_from_proto)
             .collect(),
+        member_kind: proto.member_kind,
+        allowed_subjects: proto
+            .allowed_subjects
+            .into_iter()
+            .map(allowed_subject_record_from_proto)
+            .collect(),
+    }
+}
+
+fn allowed_subject_record_to_proto(
+    selector: &AuthzAllowedSubjectRecord,
+) -> AuthzAllowedSubjectRecordProto {
+    AuthzAllowedSubjectRecordProto {
+        selector_kind: selector.selector_kind,
+        subject_kind: selector.subject_kind.clone(),
+        subject_id: selector.subject_id.clone(),
+    }
+}
+
+fn allowed_subject_record_from_proto(
+    proto: AuthzAllowedSubjectRecordProto,
+) -> AuthzAllowedSubjectRecord {
+    AuthzAllowedSubjectRecord {
+        selector_kind: proto.selector_kind,
+        subject_kind: proto.subject_kind,
+        subject_id: proto.subject_id,
     }
 }
 
@@ -601,6 +630,22 @@ impl From<AuthzRelationSchema> for AuthzRelationSchemaRecord {
                 .into_iter()
                 .map(AuthzRelationRuleRecord::from)
                 .collect(),
+            member_kind: schema.member_kind,
+            allowed_subjects: schema
+                .allowed_subjects
+                .into_iter()
+                .map(AuthzAllowedSubjectRecord::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<AuthzAllowedSubject> for AuthzAllowedSubjectRecord {
+    fn from(selector: AuthzAllowedSubject) -> Self {
+        Self {
+            selector_kind: selector.selector_kind,
+            subject_kind: selector.subject_kind,
+            subject_id: selector.subject_id,
         }
     }
 }
@@ -621,6 +666,22 @@ impl From<&AuthzRelationSchemaRecord> for AuthzRelationSchema {
         Self {
             relation: schema.relation.clone(),
             rules: schema.rules.iter().map(AuthzRelationRule::from).collect(),
+            member_kind: schema.member_kind,
+            allowed_subjects: schema
+                .allowed_subjects
+                .iter()
+                .map(AuthzAllowedSubject::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<&AuthzAllowedSubjectRecord> for AuthzAllowedSubject {
+    fn from(selector: &AuthzAllowedSubjectRecord) -> Self {
+        Self {
+            selector_kind: selector.selector_kind,
+            subject_kind: selector.subject_kind.clone(),
+            subject_id: selector.subject_id.clone(),
         }
     }
 }
@@ -628,20 +689,35 @@ impl From<&AuthzRelationSchemaRecord> for AuthzRelationSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::anvil_api::{AuthzSchemaMemberKind, AuthzSubjectSelectorKind};
     use tempfile::tempdir;
 
     fn schema(namespace: &str) -> AuthzNamespaceSchema {
         AuthzNamespaceSchema {
             namespace: namespace.to_string(),
-            relations: vec![AuthzRelationSchema {
-                relation: "viewer".to_string(),
-                rules: vec![AuthzRelationRule {
-                    kind: "inherit".to_string(),
+            relations: vec![
+                AuthzRelationSchema {
+                    relation: "viewer".to_string(),
+                    rules: vec![AuthzRelationRule {
+                        kind: "inherit".to_string(),
+                        relation: "editor".to_string(),
+                        tuple_relation: String::new(),
+                        target_relation: String::new(),
+                    }],
+                    member_kind: AuthzSchemaMemberKind::Permission as i32,
+                    allowed_subjects: Vec::new(),
+                },
+                AuthzRelationSchema {
                     relation: "editor".to_string(),
-                    tuple_relation: String::new(),
-                    target_relation: String::new(),
-                }],
-            }],
+                    rules: Vec::new(),
+                    member_kind: AuthzSchemaMemberKind::DirectRelation as i32,
+                    allowed_subjects: vec![AuthzAllowedSubject {
+                        selector_kind: AuthzSubjectSelectorKind::AnyCanonicalId as i32,
+                        subject_kind: "user".to_string(),
+                        subject_id: String::new(),
+                    }],
+                },
+            ],
             schema_json: r#"{"namespace":"document"}"#.to_string(),
             schema_hash: String::new(),
             schema_version: 0,

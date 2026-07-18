@@ -116,7 +116,13 @@ async fn stream_capabilities_are_zanzibar_grants_not_object_or_scope_bypasses() 
             "granted-stream-append",
         )),
         content_type: Some("text/plain".to_string()),
-        user_metadata_json: String::new(),
+        user_metadata_json: serde_json::json!({
+            "authenticated_principal": format!(
+                "tenant/{}/principal/{}",
+                actor.tenant_id, actor.app_id
+            )
+        })
+        .to_string(),
         precondition: None,
     });
     add_bearer(&mut append, &limited_token);
@@ -126,6 +132,35 @@ async fn stream_capabilities_are_zanzibar_grants_not_object_or_scope_bypasses() 
         .unwrap()
         .into_inner();
     assert_eq!(appended.record_sequence, 1);
+
+    let mut owner_spoof = Request::new(AppendStreamRecordRequest {
+        bucket_name: bucket_name.clone(),
+        stream_key: stream_key.clone(),
+        stream_id: created.stream_id.clone(),
+        payload: b"owner append".to_vec(),
+        mutation_context: Some(native_mutation_context(
+            actor.tenant_id,
+            bucket_id,
+            &actor.app_id,
+            "owner-stream-append",
+        )),
+        content_type: Some("text/plain".to_string()),
+        user_metadata_json: serde_json::json!({
+            "authenticated_principal": format!(
+                "tenant/{}/principal/{}",
+                limited.tenant_id, limited.app_id
+            )
+        })
+        .to_string(),
+        precondition: None,
+    });
+    add_bearer(&mut owner_spoof, &actor.token);
+    let owner_appended = owner_stream
+        .append_record(owner_spoof)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(owner_appended.record_sequence, 2);
 
     let mut still_denied_read = Request::new(ReadAppendStreamRequest {
         bucket_name: bucket_name.clone(),
@@ -164,8 +199,28 @@ async fn stream_capabilities_are_zanzibar_grants_not_object_or_scope_bypasses() 
     });
     add_bearer(&mut read, &limited_token);
     let read = limited_stream.read_stream(read).await.unwrap().into_inner();
-    assert_eq!(read.records.len(), 1);
+    assert_eq!(read.records.len(), 2);
     assert_eq!(read.records[0].payload, b"granted append".to_vec());
+    assert_eq!(
+        read.records[0].authenticated_principal,
+        format!("tenant/{}/principal/{}", limited.tenant_id, limited.app_id)
+    );
+    assert_eq!(
+        read.records[1].authenticated_principal,
+        format!("tenant/{}/principal/{}", actor.tenant_id, actor.app_id)
+    );
+    let limited_claim: serde_json::Value =
+        serde_json::from_str(&read.records[0].user_metadata_json).unwrap();
+    let owner_claim: serde_json::Value =
+        serde_json::from_str(&read.records[1].user_metadata_json).unwrap();
+    assert_eq!(
+        limited_claim["authenticated_principal"],
+        format!("tenant/{}/principal/{}", actor.tenant_id, actor.app_id)
+    );
+    assert_eq!(
+        owner_claim["authenticated_principal"],
+        format!("tenant/{}/principal/{}", limited.tenant_id, limited.app_id)
+    );
 
     let mut denied_seal = Request::new(SealAppendStreamSegmentRequest {
         bucket_name: bucket_name.clone(),
@@ -212,5 +267,5 @@ async fn stream_capabilities_are_zanzibar_grants_not_object_or_scope_bypasses() 
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(sealed.record_count, 1);
+    assert_eq!(sealed.record_count, 2);
 }

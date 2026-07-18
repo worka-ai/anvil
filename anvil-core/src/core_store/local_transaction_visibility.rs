@@ -1,5 +1,6 @@
 use super::local_transactions::{
-    transaction_lists_stream_record, validate_core_meta_row_precondition,
+    transaction_lists_stream_record, transaction_lists_stream_record_identity,
+    validate_core_meta_row_precondition,
 };
 use super::local_tx_rows::OwnedCoreMetaBatchOp;
 use super::*;
@@ -17,6 +18,28 @@ impl CoreStore {
             return Ok(false);
         }
         transaction_lists_stream_record(&transaction, record)
+    }
+
+    pub(super) async fn stream_record_identity_is_visible(
+        &self,
+        stream_id: &str,
+        sequence: u64,
+        event_hash: &str,
+        transaction_id: Option<&str>,
+    ) -> Result<bool> {
+        let Some(transaction_id) = transaction_id else {
+            return Ok(true);
+        };
+        let Some(transaction) = self.read_transaction_unlocked(transaction_id).await? else {
+            return Ok(false);
+        };
+        Ok(transaction.state == CoreTransactionState::Committed
+            && transaction_lists_stream_record_identity(
+                &transaction,
+                stream_id,
+                sequence,
+                event_hash,
+            ))
     }
 
     pub(super) async fn filter_committed_stream_records(

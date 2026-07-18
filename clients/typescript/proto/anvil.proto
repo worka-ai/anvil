@@ -11,6 +11,9 @@ service AdminService {
   rpc GrantApplicationPolicies(ApplicationPoliciesRequest) returns (ApplicationPoliciesResponse);
   rpc RevokeApplicationPolicies(ApplicationPoliciesRequest) returns (ApplicationPoliciesResponse);
   rpc RotateSecretEncryptionKey(RotateSecretEncryptionKeyRequest) returns (SecretEncryptionKeyRotationResponse);
+  rpc ImportPersonalDbSigningKey(ImportPersonalDbSigningKeyRequest) returns (PersonalDbSigningKeyResponse);
+  rpc ListPersonalDbSigningKeys(ListPersonalDbSigningKeysRequest) returns (ListPersonalDbSigningKeysResponse);
+  rpc SetPersonalDbSigningKeyStatus(SetPersonalDbSigningKeyStatusRequest) returns (PersonalDbSigningKeyResponse);
   rpc CreateBucketAdmin(CreateBucketAdminRequest) returns (BucketAdminResponse);
   rpc SetBucketPublicAccessAdmin(SetBucketPublicAccessAdminRequest) returns (BucketAdminResponse);
 
@@ -398,6 +401,56 @@ message SecretEncryptionKeyRotationResponse {
   uint64 hf_keys_rotated = 7;
   uint64 already_active = 10;
   string audit_event_id = 11;
+}
+
+message ImportPersonalDbSigningKeyRequest {
+  AdminRequestContext context = 1;
+  bytes private_key_pkcs8_der = 2;
+  bytes public_key = 3;
+  uint64 key_generation = 4;
+  string purpose = 5;
+  repeated string database_scopes = 6;
+  repeated string group_scopes = 7;
+  uint64 valid_from_log_index = 8;
+  optional uint64 valid_until_log_index = 9;
+  string status = 10;
+}
+
+message ListPersonalDbSigningKeysRequest {}
+
+message SetPersonalDbSigningKeyStatusRequest {
+  AdminRequestContext context = 1;
+  string key_id = 2;
+  string status = 3;
+  optional uint64 valid_until_log_index = 4;
+}
+
+message PersonalDbSigningKeyRecord {
+  string key_id = 1;
+  uint64 key_generation = 2;
+  string purpose = 3;
+  repeated string database_scopes = 4;
+  repeated string group_scopes = 5;
+  uint64 valid_from_log_index = 6;
+  optional uint64 valid_until_log_index = 7;
+  string status = 8;
+  bytes public_key = 9;
+  uint64 created_at_unix_nanos = 10;
+  uint64 updated_at_unix_nanos = 11;
+  string created_by = 12;
+  string updated_by = 13;
+  uint64 record_revision = 14;
+}
+
+message PersonalDbSigningKeyResponse {
+  string request_id = 1;
+  PersonalDbSigningKeyRecord key = 2;
+  string audit_event_id = 3;
+  bool runtime_reload_required = 4;
+}
+
+message ListPersonalDbSigningKeysResponse {
+  repeated PersonalDbSigningKeyRecord keys = 1;
 }
 
 message CreateBucketAdminRequest {
@@ -1429,6 +1482,46 @@ message PutObjectRequest {
     }
 }
 
+enum IndexMaintenanceMode {
+    INDEX_MAINTENANCE_DEFERRED = 0;
+    INDEX_MAINTENANCE_ENQUEUED = 1;
+    INDEX_MAINTENANCE_CAUGHT_UP = 2;
+}
+
+enum WatchVisibilityMode {
+    WATCH_VISIBILITY_DEFERRED = 0;
+    WATCH_VISIBILITY_PUBLISHED = 1;
+}
+
+enum AuthzMaterializationMode {
+    AUTHZ_MATERIALIZATION_INHERITED_OK = 0;
+    AUTHZ_MATERIALIZATION_MATERIALIZED = 1;
+}
+
+enum BoundaryExtractionMode {
+    BOUNDARY_EXTRACTION_HINTS_ONLY = 0;
+    BOUNDARY_EXTRACTION_PAYLOAD_NOW = 1;
+}
+
+enum IndexPolicySnapshotMode {
+    INDEX_POLICY_SNAPSHOT_CACHED = 0;
+    INDEX_POLICY_SNAPSHOT_EXACT = 1;
+}
+
+enum AuthzRevisionMode {
+    AUTHZ_REVISION_CURRENT_KNOWN = 0;
+    AUTHZ_REVISION_FENCE_EXACT = 1;
+}
+
+message WriteVisibilityOptions {
+    IndexMaintenanceMode indexes = 1;
+    WatchVisibilityMode watches = 2;
+    AuthzMaterializationMode authz_materialization = 3;
+    BoundaryExtractionMode boundary_extraction = 4;
+    IndexPolicySnapshotMode index_policy_snapshot = 5;
+    AuthzRevisionMode authz_revision = 6;
+}
+
 message NativeMutationContext {
     int64 tenant_id = 1;
     int64 bucket_id = 2;
@@ -1440,6 +1533,7 @@ message NativeMutationContext {
     optional string transaction_id = 8;
     optional SagaOperationContext saga_operation = 9;
     optional SagaCompensationOperationContext saga_compensation_operation = 10;
+    optional WriteVisibilityOptions write_visibility = 11;
 }
 
 message ObjectMetadata {
@@ -1818,6 +1912,7 @@ message AppendStreamRecordInfo {
     string content_type = 5;
     string user_metadata_json = 6;
     bytes payload = 7;
+    string authenticated_principal = 8;
 }
 
 message ReadAppendStreamResponse {
@@ -2866,6 +2961,8 @@ message AuthzTupleMutation {
 message WriteAuthzTuplesRequest {
     repeated AuthzTupleMutation mutations = 1;
     AuthzScope scope = 2;
+    optional string operation_id = 3;
+    optional uint64 expected_revision = 4;
 }
 
 message WriteAuthzTuplesResponse {
@@ -2976,9 +3073,31 @@ message AuthzRelationRule {
     string target_relation = 4;  // target relation for computed / tuple_to_userset
 }
 
+enum AuthzSchemaMemberKind {
+    AUTHZ_SCHEMA_MEMBER_KIND_UNSPECIFIED = 0;
+    AUTHZ_SCHEMA_MEMBER_KIND_DIRECT_RELATION = 1;
+    AUTHZ_SCHEMA_MEMBER_KIND_PERMISSION = 2;
+}
+
+enum AuthzSubjectSelectorKind {
+    AUTHZ_SUBJECT_SELECTOR_KIND_UNSPECIFIED = 0;
+    AUTHZ_SUBJECT_SELECTOR_KIND_ANY_CANONICAL_ID = 1;
+    AUTHZ_SUBJECT_SELECTOR_KIND_EXACT = 2;
+    AUTHZ_SUBJECT_SELECTOR_KIND_SAME_RESOURCE_ID = 3;
+    AUTHZ_SUBJECT_SELECTOR_KIND_PUBLIC = 4;
+}
+
+message AuthzAllowedSubject {
+    AuthzSubjectSelectorKind selector_kind = 1;
+    string subject_kind = 2;
+    string subject_id = 3;
+}
+
 message AuthzRelationSchema {
     string relation = 1;
     repeated AuthzRelationRule rules = 2;
+    AuthzSchemaMemberKind member_kind = 3;
+    repeated AuthzAllowedSubject allowed_subjects = 4;
 }
 
 message AuthzNamespaceSchema {
@@ -3323,6 +3442,24 @@ message PersonalDbProjectionResponse {
     string projection_definition_json = 1;
 }
 
+enum HashAlgorithmV1 {
+    HASH_ALGORITHM_UNSPECIFIED = 0;
+    HASH_ALGORITHM_SHA256 = 1;
+}
+
+enum SignatureAlgorithmV1 {
+    SIGNATURE_ALGORITHM_UNSPECIFIED = 0;
+    SIGNATURE_ALGORITHM_ED25519 = 1;
+}
+
+message SignatureEnvelopeV1 {
+    uint32 format_version = 1;
+    HashAlgorithmV1 hash_algorithm = 2;
+    SignatureAlgorithmV1 signature_algorithm = 3;
+    string key_id = 4;
+    bytes signature = 5;
+}
+
 message PersonalDbGroupManifestRecord {
     uint32 format_version = 1;
     string tenant_id = 2;
@@ -3338,7 +3475,7 @@ message PersonalDbGroupManifestRecord {
     uint64 current_row_index_generation = 12;
     uint64 current_projection_generation = 13;
     string manifest_hash = 14;
-    string manifest_signature = 15;
+    SignatureEnvelopeV1 manifest_signature = 15;
 }
 
 message PersonalDbCommittedHeadRecord {
@@ -3355,7 +3492,7 @@ message PersonalDbCommittedHeadRecord {
     string updated_at = 11;
     string updated_by_node = 12;
     string head_hash = 13;
-    string head_signature = 14;
+    SignatureEnvelopeV1 head_signature = 14;
 }
 
 message PersonalDbSnapshotsHeadRecord {
@@ -3369,7 +3506,7 @@ message PersonalDbSnapshotsHeadRecord {
     string updated_at = 8;
     string updated_by_node = 9;
     string head_hash = 10;
-    string head_signature = 11;
+    SignatureEnvelopeV1 head_signature = 11;
 }
 
 message PersonalDbVoterAck {
@@ -3428,7 +3565,7 @@ message PersonalDbCommitCertificateRecord {
     string witness_node_id = 15;
     string witnessed_at = 16;
     string certificate_hash = 17;
-    string witness_signature = 18;
+    SignatureEnvelopeV1 witness_signature = 18;
 }
 
 message PersonalDbCatchUpRequest {

@@ -65,6 +65,37 @@ fn generated_proto_exports_core_service_types() {
     };
     assert_eq!(bind.expected_binding_generation, Some(1));
 
+    let member = proto::AuthzRelationSchema {
+        relation: "viewer".to_string(),
+        rules: Vec::new(),
+        member_kind: proto::AuthzSchemaMemberKind::DirectRelation as i32,
+        allowed_subjects: vec![proto::AuthzAllowedSubject {
+            selector_kind: proto::AuthzSubjectSelectorKind::AnyCanonicalId as i32,
+            subject_kind: "user".to_string(),
+            subject_id: String::new(),
+        }],
+    };
+    assert_eq!(member.allowed_subjects.len(), 1);
+
+    let batch = proto::WriteAuthzTuplesRequest {
+        mutations: vec![proto::AuthzTupleMutation {
+            namespace: "document".to_string(),
+            object_id: "doc-1".to_string(),
+            relation: "viewer".to_string(),
+            subject_kind: "user".to_string(),
+            subject_id: "alice".to_string(),
+            caveat_hash: String::new(),
+            operation: "add".to_string(),
+            reason: "grant access".to_string(),
+            scope: None,
+        }],
+        scope: None,
+        operation_id: Some("grant-doc-1".to_string()),
+        expected_revision: Some(41),
+    };
+    assert_eq!(batch.operation_id.as_deref(), Some("grant-doc-1"));
+    assert_eq!(batch.expected_revision, Some(41));
+
     let start = proto::StartSagaRequest {
         idempotency_key: "saga-idem".to_string(),
         realm_id: "realm".to_string(),
@@ -73,6 +104,15 @@ fn generated_proto_exports_core_service_types() {
         execution_policy: None,
     };
     assert_eq!(start.purpose, "client-test");
+
+    let append_record = proto::AppendStreamRecordInfo {
+        authenticated_principal: "tenant/7/principal/app-1".to_string(),
+        ..Default::default()
+    };
+    assert_eq!(
+        append_record.authenticated_principal,
+        "tenant/7/principal/app-1"
+    );
 }
 
 #[test]
@@ -200,6 +240,8 @@ fn write_options_helper_uses_execution_oneof() {
 #[test]
 fn packaged_proto_omits_internal_node_service() {
     let packaged_proto = include_str!("../proto/anvil.proto");
+    assert!(packaged_proto.contains("optional string operation_id = 3;"));
+    assert!(packaged_proto.contains("optional uint64 expected_revision = 4;"));
     assert!(!packaged_proto.contains("InternalAnvilService"));
     assert!(!packaged_proto.contains("InternalProxyService"));
     assert!(!packaged_proto.contains("PutShardRequest"));

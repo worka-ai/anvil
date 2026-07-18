@@ -257,6 +257,55 @@ async fn core_store_internal_control_records_written_by_store_are_binary_not_jso
 }
 
 #[tokio::test]
+async fn authenticated_append_principal_is_durable_and_idempotency_bound() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let store = CoreStore::new(storage).await.unwrap();
+    let stream_id = "tenant:t/bucket:b/authenticated-principal".to_string();
+    let append = AppendStreamRecord {
+        stream_id: stream_id.clone(),
+        partition_id: "tenant:t/bucket:b".to_string(),
+        record_kind: "producer.event".to_string(),
+        payload: b"payload".to_vec(),
+        content_type: Some("application/octet-stream".to_string()),
+        user_metadata_json: r#"{"authenticated_principal":"tenant/1/principal/spoofed"}"#
+            .to_string(),
+        fence: None,
+        transaction_id: None,
+        idempotency_key: Some("authenticated-principal-1".to_string()),
+    };
+
+    store
+        .append_stream_authenticated(append.clone(), "tenant/1/principal/producer-a")
+        .await
+        .unwrap();
+    let records = store
+        .read_stream(ReadStream {
+            stream_id: stream_id.clone(),
+            after_sequence: 0,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].authenticated_principal,
+        "tenant/1/principal/producer-a"
+    );
+    assert!(records[0].user_metadata_json.contains("spoofed"));
+
+    let error = store
+        .append_stream_authenticated(append, "tenant/1/principal/producer-b")
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("authenticated principal mismatch")
+    );
+}
+
+#[tokio::test]
 async fn large_stream_payloads_use_locator_rows_not_rocksdb_inline_payloads() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = Storage::new_at(tmp.path()).await.unwrap();
@@ -318,4 +367,41 @@ async fn large_stream_payloads_use_locator_rows_not_rocksdb_inline_payloads() {
         records[0].payload_hash,
         format!("sha256:{}", sha256_hex(&payload))
     );
+}
+
+#[tokio::test]
+async fn stream_reads_apply_after_sequence_and_limit_without_replaying_the_stream() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let store = CoreStore::new(storage).await.unwrap();
+    let stream_id = "tenant:t/bucket:b/bounded-stream-read".to_string();
+
+    for sequence in 1..=3 {
+        store
+            .append_stream(AppendStreamRecord {
+                stream_id: stream_id.clone(),
+                partition_id: "tenant:t/bucket:b".to_string(),
+                record_kind: "bounded.record".to_string(),
+                payload: format!("record-{sequence}").into_bytes(),
+                content_type: Some("text/plain".to_string()),
+                user_metadata_json: "{}".to_string(),
+                fence: None,
+                transaction_id: None,
+                idempotency_key: Some(format!("bounded-stream-read-{sequence}")),
+            })
+            .await
+            .unwrap();
+    }
+
+    let records = store
+        .read_stream(ReadStream {
+            stream_id,
+            after_sequence: 1,
+            limit: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].sequence, 2);
+    assert_eq!(records[0].payload, b"record-2");
 }

@@ -18,7 +18,7 @@ use tonic::Status;
 
 pub const APP_SUBJECT_KIND: &str = "app";
 pub const USERSET_SUBJECT_KIND: &str = "userset";
-pub const PUBLIC_APP_PRINCIPAL_ID: &str = "_anvil/public";
+pub const PUBLIC_APP_PRINCIPAL_ID: &str = crate::authz_schema_contract::PUBLIC_SUBJECT_ID;
 
 pub fn public_read_claims(tenant_id: i64) -> auth::Claims {
     auth::Claims {
@@ -939,7 +939,7 @@ pub async fn write_delegated_action_tuple(
             SYSTEM_STORAGE_TENANT_ID,
             &relation.namespace,
             &relation.object_id,
-            &relation.relation,
+            &format!("{}_grant", relation.relation),
             APP_SUBJECT_KIND,
             grantee_principal_id,
             "",
@@ -948,7 +948,7 @@ pub async fn write_delegated_action_tuple(
             reason,
         )
         .await
-        .map_err(|error| Status::internal(error.to_string()))?;
+        .map_err(authz_tuple_write_status)?;
     Ok(())
 }
 
@@ -980,7 +980,7 @@ pub async fn write_delegated_action_tuple_batch(
         mutations.push(AuthzTupleBatchMutation {
             namespace: relation.namespace,
             object_id: relation.object_id,
-            relation: relation.relation,
+            relation: format!("{}_grant", relation.relation),
             subject_kind: APP_SUBJECT_KIND.to_string(),
             subject_id: grantee_principal_id.to_string(),
             caveat_hash: String::new(),
@@ -992,8 +992,18 @@ pub async fn write_delegated_action_tuple_batch(
     persistence
         .write_authz_tuple_batch(SYSTEM_STORAGE_TENANT_ID, mutations, written_by)
         .await
-        .map_err(|error| Status::internal(error.to_string()))?;
+        .map_err(authz_tuple_write_status)?;
     Ok(())
+}
+
+fn authz_tuple_write_status(error: anyhow::Error) -> Status {
+    if let Some(contract) = error.chain().find_map(|cause| {
+        cause.downcast_ref::<crate::authz_schema_contract::AuthzSchemaContractError>()
+    }) {
+        Status::invalid_argument(contract.to_string())
+    } else {
+        Status::internal(error.to_string())
+    }
 }
 
 fn userset_subject(namespace: &str, object_id: &str, relation: &str) -> String {
@@ -1200,12 +1210,8 @@ pub async fn grant_storage_tenant_owner(
                     namespace: system_realm_namespace(SYSTEM_AUTHZ_REALM_NAMESPACE),
                     object_id: default_authz_realm_object_id.clone(),
                     relation: "parent_tenant".to_string(),
-                    subject_kind: USERSET_SUBJECT_KIND.to_string(),
-                    subject_id: userset_subject(
-                        SYSTEM_STORAGE_TENANT_NAMESPACE,
-                        &tenant_object_id,
-                        "manage_tenant",
-                    ),
+                    subject_kind: SYSTEM_STORAGE_TENANT_NAMESPACE.to_string(),
+                    subject_id: tenant_object_id.clone(),
                     caveat_hash: String::new(),
                     operation: "add".to_string(),
                     reason: reason.to_string(),
@@ -1243,12 +1249,8 @@ pub async fn grant_bucket_defaults(
                     namespace: system_realm_namespace(SYSTEM_BUCKET_NAMESPACE),
                     object_id: bucket_id.clone(),
                     relation: "parent_tenant".to_string(),
-                    subject_kind: USERSET_SUBJECT_KIND.to_string(),
-                    subject_id: userset_subject(
-                        SYSTEM_STORAGE_TENANT_NAMESPACE,
-                        &storage_tenant_object_id(bucket.tenant_id),
-                        "manage_tenant",
-                    ),
+                    subject_kind: SYSTEM_STORAGE_TENANT_NAMESPACE.to_string(),
+                    subject_id: storage_tenant_object_id(bucket.tenant_id),
                     caveat_hash: String::new(),
                     operation: "add".to_string(),
                     reason: reason.to_string(),
@@ -1310,12 +1312,8 @@ pub async fn grant_index_defaults(
                     namespace: system_realm_namespace(SYSTEM_INDEX_NAMESPACE),
                     object_id: index_object_id(bucket, index_name_or_id),
                     relation: "parent_bucket".to_string(),
-                    subject_kind: USERSET_SUBJECT_KIND.to_string(),
-                    subject_id: userset_subject(
-                        SYSTEM_BUCKET_NAMESPACE,
-                        &bucket_object_id(bucket),
-                        "manage_bucket",
-                    ),
+                    subject_kind: SYSTEM_BUCKET_NAMESPACE.to_string(),
+                    subject_id: bucket_object_id(bucket),
                     caveat_hash: String::new(),
                     operation: "add".to_string(),
                     reason: reason.to_string(),
@@ -1354,12 +1352,8 @@ pub async fn grant_personaldb_group_defaults(
                     namespace: system_realm_namespace(SYSTEM_PERSONALDB_GROUP_NAMESPACE),
                     object_id: object_id.clone(),
                     relation: "parent_tenant".to_string(),
-                    subject_kind: USERSET_SUBJECT_KIND.to_string(),
-                    subject_id: userset_subject(
-                        SYSTEM_STORAGE_TENANT_NAMESPACE,
-                        &storage_tenant_object_id(tenant_id),
-                        "manage_tenant",
-                    ),
+                    subject_kind: SYSTEM_STORAGE_TENANT_NAMESPACE.to_string(),
+                    subject_id: storage_tenant_object_id(tenant_id),
                     caveat_hash: String::new(),
                     operation: "add".to_string(),
                     reason: reason.to_string(),
@@ -1393,17 +1387,44 @@ pub async fn grant_object_defaults(
             &system_realm_namespace(SYSTEM_OBJECT_NAMESPACE),
             &object_object_id(bucket, object_key),
             "parent_bucket",
-            USERSET_SUBJECT_KIND,
-            &userset_subject(
-                SYSTEM_BUCKET_NAMESPACE,
-                &bucket_object_id(bucket),
-                "manage_bucket",
-            ),
+            SYSTEM_BUCKET_NAMESPACE,
+            &bucket_object_id(bucket),
             "",
             "add",
             "system",
             reason,
         )
+        .await?;
+    Ok(())
+}
+
+pub async fn grant_object_defaults_batch<'a>(
+    persistence: &Persistence,
+    objects: impl IntoIterator<Item = (&'a Bucket, &'a str)>,
+    reason: &str,
+) -> Result<()> {
+    let mutations = objects
+        .into_iter()
+        .map(|(bucket, object_key)| AuthzTupleBatchMutation {
+            namespace: system_realm_namespace(SYSTEM_OBJECT_NAMESPACE),
+            object_id: object_object_id(bucket, object_key),
+            relation: "parent_bucket".to_string(),
+            subject_kind: USERSET_SUBJECT_KIND.to_string(),
+            subject_id: userset_subject(
+                SYSTEM_BUCKET_NAMESPACE,
+                &bucket_object_id(bucket),
+                "manage_bucket",
+            ),
+            caveat_hash: String::new(),
+            operation: "add".to_string(),
+            reason: reason.to_string(),
+        })
+        .collect::<Vec<_>>();
+    if mutations.is_empty() {
+        return Ok(());
+    }
+    persistence
+        .write_authz_tuple_batch(SYSTEM_STORAGE_TENANT_ID, mutations, "system")
         .await?;
     Ok(())
 }
@@ -1425,12 +1446,8 @@ pub async fn grant_stream_defaults(
                     namespace: system_realm_namespace(SYSTEM_STREAM_NAMESPACE),
                     object_id: object_id.clone(),
                     relation: "parent_bucket".to_string(),
-                    subject_kind: USERSET_SUBJECT_KIND.to_string(),
-                    subject_id: userset_subject(
-                        SYSTEM_BUCKET_NAMESPACE,
-                        &bucket_object_id(bucket),
-                        "manage_bucket",
-                    ),
+                    subject_kind: SYSTEM_BUCKET_NAMESPACE.to_string(),
+                    subject_id: bucket_object_id(bucket),
                     caveat_hash: String::new(),
                     operation: "add".to_string(),
                     reason: reason.to_string(),
@@ -1469,12 +1486,8 @@ pub async fn grant_registry_namespace_defaults(
                     namespace: system_realm_namespace(SYSTEM_REGISTRY_NAMESPACE),
                     object_id: object_id.clone(),
                     relation: "parent_tenant".to_string(),
-                    subject_kind: USERSET_SUBJECT_KIND.to_string(),
-                    subject_id: userset_subject(
-                        SYSTEM_STORAGE_TENANT_NAMESPACE,
-                        &storage_tenant_object_id(tenant_id),
-                        "manage_tenant",
-                    ),
+                    subject_kind: SYSTEM_STORAGE_TENANT_NAMESPACE.to_string(),
+                    subject_id: storage_tenant_object_id(tenant_id),
                     caveat_hash: String::new(),
                     operation: "add".to_string(),
                     reason: reason.to_string(),
@@ -1508,12 +1521,8 @@ pub async fn grant_region_defaults(
             &system_realm_namespace(SYSTEM_REGION_NAMESPACE),
             &region_object_id(region),
             "system",
-            USERSET_SUBJECT_KIND,
-            &userset_subject(
-                crate::system_realm::SYSTEM_NAMESPACE,
-                crate::system_realm::SYSTEM_OBJECT_ID,
-                "manage_regions",
-            ),
+            crate::system_realm::SYSTEM_NAMESPACE,
+            crate::system_realm::SYSTEM_OBJECT_ID,
             "",
             "add",
             written_by,
@@ -1536,8 +1545,8 @@ pub async fn grant_cell_defaults(
             &system_realm_namespace(SYSTEM_CELL_NAMESPACE),
             &cell_object_id(region, cell_id),
             "parent_region",
-            USERSET_SUBJECT_KIND,
-            &userset_subject(SYSTEM_REGION_NAMESPACE, &region_object_id(region), "manage"),
+            SYSTEM_REGION_NAMESPACE,
+            &region_object_id(region),
             "",
             "add",
             written_by,
@@ -1561,12 +1570,8 @@ pub async fn grant_node_defaults(
             &system_realm_namespace(SYSTEM_NODE_NAMESPACE),
             &node_object_id(region, cell_id, node_id),
             "parent_cell",
-            USERSET_SUBJECT_KIND,
-            &userset_subject(
-                SYSTEM_CELL_NAMESPACE,
-                &cell_object_id(region, cell_id),
-                "manage",
-            ),
+            SYSTEM_CELL_NAMESPACE,
+            &cell_object_id(region, cell_id),
             "",
             "add",
             written_by,
@@ -1587,7 +1592,7 @@ pub async fn grant_internal_node_system_access(
             SYSTEM_STORAGE_TENANT_ID,
             &system_realm_namespace(SYSTEM_NAMESPACE),
             SYSTEM_OBJECT_ID,
-            "manage_nodes",
+            "manage_nodes_grant",
             APP_SUBJECT_KIND,
             node_id,
             "",
@@ -1611,12 +1616,8 @@ pub async fn grant_node_defaults_batch(
             namespace: system_realm_namespace(SYSTEM_NODE_NAMESPACE),
             object_id: node_object_id(region, cell_id, node_id),
             relation: "parent_cell".to_string(),
-            subject_kind: USERSET_SUBJECT_KIND.to_string(),
-            subject_id: userset_subject(
-                SYSTEM_CELL_NAMESPACE,
-                &cell_object_id(region, cell_id),
-                "manage",
-            ),
+            subject_kind: SYSTEM_CELL_NAMESPACE.to_string(),
+            subject_id: cell_object_id(region, cell_id),
             caveat_hash: String::new(),
             operation: "add".to_string(),
             reason: reason.to_string(),
@@ -1624,7 +1625,7 @@ pub async fn grant_node_defaults_batch(
         mutations.push(AuthzTupleBatchMutation {
             namespace: system_realm_namespace(SYSTEM_NAMESPACE),
             object_id: SYSTEM_OBJECT_ID.to_string(),
-            relation: "manage_nodes".to_string(),
+            relation: "manage_nodes_grant".to_string(),
             subject_kind: APP_SUBJECT_KIND.to_string(),
             subject_id: node_id.clone(),
             caveat_hash: String::new(),
@@ -1657,12 +1658,8 @@ pub async fn grant_authz_realm_defaults(
                     namespace: system_realm_namespace(SYSTEM_AUTHZ_REALM_NAMESPACE),
                     object_id: object_id.clone(),
                     relation: "parent_tenant".to_string(),
-                    subject_kind: USERSET_SUBJECT_KIND.to_string(),
-                    subject_id: userset_subject(
-                        SYSTEM_STORAGE_TENANT_NAMESPACE,
-                        &storage_tenant_object_id(tenant_id),
-                        "manage_tenant",
-                    ),
+                    subject_kind: SYSTEM_STORAGE_TENANT_NAMESPACE.to_string(),
+                    subject_id: storage_tenant_object_id(tenant_id),
                     caveat_hash: String::new(),
                     operation: "add".to_string(),
                     reason: reason.to_string(),

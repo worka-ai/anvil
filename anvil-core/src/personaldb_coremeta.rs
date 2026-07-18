@@ -645,15 +645,19 @@ fn validate_personaldb_scope(tenant_id: i64, group_id: &str) -> Result<()> {
     require_safe_component(group_id, "group_id")
 }
 
-fn personaldb_realm_id(tenant_id: i64) -> String {
+pub(crate) fn personaldb_realm_id(tenant_id: i64) -> String {
     format!("tenant:{tenant_id}")
 }
 
-fn personaldb_root_key_hash(tenant_id: i64, group_id: &str) -> String {
-    core_meta_root_key_hash(&format!("personaldb/{tenant_id}/{group_id}"))
+pub(crate) fn personaldb_root_anchor_key(tenant_id: i64, group_id: &str) -> String {
+    format!("personaldb/{tenant_id}/{group_id}")
 }
 
-fn tenant_id_from_realm(realm_id: &str) -> Result<i64> {
+pub(crate) fn personaldb_root_key_hash(tenant_id: i64, group_id: &str) -> String {
+    core_meta_root_key_hash(&personaldb_root_anchor_key(tenant_id, group_id))
+}
+
+pub(crate) fn tenant_id_from_realm(realm_id: &str) -> Result<i64> {
     let value = realm_id
         .strip_prefix("tenant:")
         .ok_or_else(|| anyhow!("PersonalDB CoreMeta realm is not tenant-scoped"))?;

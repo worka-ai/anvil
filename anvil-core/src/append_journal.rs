@@ -114,6 +114,8 @@ struct AppendStreamRecordProto {
     has_user_meta: bool,
     #[prost(string, tag = "10")]
     created_at: String,
+    #[prost(string, tag = "11")]
+    authenticated_principal: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -427,6 +429,7 @@ pub(crate) async fn append_stream_record_with_permit_in_partition(
     payload_size: i64,
     content_type: Option<String>,
     user_meta: Option<serde_json::Value>,
+    authenticated_principal: &str,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<AppendStreamRecordMutation> {
@@ -444,7 +447,7 @@ pub(crate) async fn append_stream_record_with_permit_in_partition(
         Some(partition_precondition),
         Some((tenant_id, bucket_id)),
         None,
-        None,
+        Some(authenticated_principal),
     )
     .await
 }
@@ -524,7 +527,7 @@ async fn append_stream_record_inner(
     partition_precondition: Option<CoreMutationPrecondition>,
     known_partition: Option<(i64, i64)>,
     transaction_id: Option<&str>,
-    transaction_principal: Option<&str>,
+    authenticated_principal: Option<&str>,
 ) -> Result<AppendStreamRecordMutation> {
     let (tenant_id, bucket_id) = if let Some((tenant_id, bucket_id)) = known_partition {
         (tenant_id, bucket_id)
@@ -542,7 +545,7 @@ async fn append_stream_record_inner(
         storage,
         tenant_id,
         bucket_id,
-        transaction_id.zip(transaction_principal),
+        transaction_id.zip(authenticated_principal),
     )
     .await?;
     if !state.streams.contains_key(&stream_row_id) {
@@ -565,6 +568,7 @@ async fn append_stream_record_inner(
         payload_size,
         content_type,
         user_meta,
+        authenticated_principal: authenticated_principal.unwrap_or_default().to_string(),
         created_at: Utc::now(),
     };
     let receipt = append_body(
@@ -577,7 +581,7 @@ async fn append_stream_record_inner(
         fence_token,
         partition_precondition,
         transaction_id,
-        transaction_principal,
+        authenticated_principal,
     )
     .await?;
     Ok(AppendStreamRecordMutation { record, receipt })
@@ -1010,7 +1014,7 @@ async fn append_body(
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
     transaction_id: Option<&str>,
-    transaction_principal: Option<&str>,
+    committed_by_principal: Option<&str>,
 ) -> Result<MetadataMutationReceipt> {
     let core_store = CoreStore::new(storage.clone()).await?;
     let stream_id = append_metadata_stream_id(tenant_id, bucket_id);
@@ -1029,7 +1033,7 @@ async fn append_body(
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("append-metadata:{tenant_id}:{bucket_id}:{mutation_id}")),
         scope_partition: partition_id.clone(),
-        committed_by_principal: transaction_principal
+        committed_by_principal: committed_by_principal
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| append_metadata_partition_principal(tenant_id, bucket_id)),
         preconditions: partition_precondition.into_iter().collect(),
@@ -1194,6 +1198,7 @@ fn record_to_proto(record: &AppendStreamRecord) -> Result<AppendStreamRecordProt
             .unwrap_or_default(),
         has_user_meta: record.user_meta.is_some(),
         created_at: record.created_at.to_rfc3339(),
+        authenticated_principal: record.authenticated_principal.clone(),
     })
 }
 
@@ -1215,6 +1220,7 @@ fn record_from_proto(proto: AppendStreamRecordProto) -> Result<AppendStreamRecor
         } else {
             None
         },
+        authenticated_principal: proto.authenticated_principal,
         created_at: chrono::DateTime::parse_from_rfc3339(&proto.created_at)?.with_timezone(&Utc),
     })
 }
@@ -1477,18 +1483,28 @@ mod tests {
             create_append_stream_with_permit(&storage, 1, 2, "bucket", "stream", &permit, KEY)
                 .await
                 .unwrap();
-        append_stream_record_with_permit(
+        append_stream_record_with_permit_in_partition(
             &storage,
+            1,
+            2,
             stream.stream.id,
             payload_ref("hash-a", 10),
             10,
             None,
             None,
+            "tenant/1/principal/producer-a",
             &permit,
             KEY,
         )
         .await
         .unwrap();
+        let records = list_append_stream_records(&storage, stream.stream.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            records[0].authenticated_principal,
+            "tenant/1/principal/producer-a"
+        );
         seal_append_stream_with_permit(&storage, stream.stream.id, "segment-a", &permit, KEY)
             .await
             .unwrap();
