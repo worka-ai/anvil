@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+command -v rg >/dev/null 2>&1 || { echo "ripgrep (rg) is required for this gate" >&2; exit 2; }
+
 # Journal mutation paths must not expose direct writers that bypass partition fencing.
 # Keep this list self-nonmatching by splitting sensitive function names below.
 files=(

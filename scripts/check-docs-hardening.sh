@@ -70,7 +70,7 @@ command_families = {
         'static-config','configure','bucket','object','auth','authz','audit','app','index','watch','personaldb','stream','lease','diagnostics','repair','host-alias','hf-key','hf-ingest'
     },
     'anvil-admin': {
-        'key','tenant','app','policy','secret-encryption-key','bucket','region','cell','node','routing','repair','diagnostics','audit','host-alias'
+        'key','tenant','app','policy','secret-encryption-key','personal-db-signing-key','bucket','region','cell','node','routing','repair','diagnostics','audit','host-alias'
     },
 }
 command_line = re.compile(r'^\s*(anvil-admin|anvil)\b(.*)$')

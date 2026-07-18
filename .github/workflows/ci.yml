@@ -49,7 +49,8 @@ jobs:
             libclang-dev \
             pkg-config \
             libssl-dev \
-            protobuf-compiler
+            protobuf-compiler \
+            ripgrep
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
@@ -105,7 +106,8 @@ jobs:
             libclang-dev \
             pkg-config \
             libssl-dev \
-            protobuf-compiler
+            protobuf-compiler \
+            ripgrep
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
@@ -156,7 +158,8 @@ jobs:
             libclang-dev \
             pkg-config \
             libssl-dev \
-            protobuf-compiler
+            protobuf-compiler \
+            ripgrep
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
@@ -200,7 +203,8 @@ jobs:
             libclang-dev \
             pkg-config \
             libssl-dev \
-            protobuf-compiler
+            protobuf-compiler \
+            ripgrep
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
