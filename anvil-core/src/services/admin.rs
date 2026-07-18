@@ -1973,205 +1973,24 @@ impl AdminService for AppState {
         &self,
         request: Request<ListAuditEventsRequest>,
     ) -> Result<Response<AuditEventsResponse>, Status> {
-        let principal = require_admin(&request, self, SystemAdminRelation::ViewAuditLog).await?;
-        let req = request.into_inner();
-        let request_id = require_request_id(&req.request_id)?.to_string();
-        let page = req.page.as_ref();
-        let limit = page_limit(page);
-        let mut events = admin_audit::list_audit_events(
-            &self.storage,
-            AuditEventFilter {
-                principal_id: none_if_empty(&req.principal_id),
-                resource_id: none_if_empty(&req.resource_id),
-                action: none_if_empty(&req.action),
-            },
-        )
-        .await
-        .map_err(|err| Status::internal(err.to_string()))?;
-        let revision = admin_cursor::collection_revision(
-            events
-                .iter()
-                .map(|event| {
-                    (
-                        audit_cursor_position(event),
-                        admin_audit::audit_event_revision_generation(event),
-                    )
-                })
-                .collect::<Vec<_>>()
-                .iter()
-                .map(|(position, generation)| (position.as_str(), *generation)),
-        );
-        let filters = [
-            ("principal_id", req.principal_id.as_str()),
-            ("resource_id", req.resource_id.as_str()),
-            ("action", req.action.as_str()),
-        ];
-        let binding = AdminCursorBinding {
-            scope: "admin.list_audit_events.v1",
-            filters: &filters,
-            principal: &principal,
-            limit,
-            revision: &revision,
-            sort: "created_at.audit_event_id.asc",
-        };
-        let cursor =
-            admin_cursor::decode_page_cursor(page, &binding, self.config.jwt_secret.as_bytes())?;
-        events.retain(|event| {
-            cursor
-                .as_deref()
-                .is_none_or(|cursor| audit_cursor_position(event).as_str() > cursor)
-        });
-        events.truncate(limit + 1);
-        let has_more = events.len() > limit;
-        if has_more {
-            events.truncate(limit);
-        }
-        let next_cursor = if has_more {
-            events.last().map_or(Ok(String::new()), |event| {
-                admin_cursor::encode_next_cursor(
-                    &audit_cursor_position(event),
-                    &binding,
-                    self.config.jwt_secret.as_bytes(),
-                )
-            })?
-        } else {
-            String::new()
-        };
-
-        Ok(Response::new(AuditEventsResponse {
-            request_id,
-            page: Some(PageResponse {
-                next_cursor,
-                has_more,
-            }),
-            events: events.into_iter().map(audit_event_to_proto).collect(),
-            data_source: "admin_audit_log".to_string(),
-        }))
+        read_handlers::list_audit_events(self, request).await
     }
 
     async fn list_storage_classes(
         &self,
         request: Request<ListStorageClassesRequest>,
     ) -> Result<Response<ListStorageClassesResponse>, Status> {
-        let _principal = require_admin(&request, self, SystemAdminRelation::ViewSystem).await?;
-        let req = request.into_inner();
-        let request_id = require_request_id(&req.request_id)?.to_string();
-        let catalog = self.core_store.storage_class_catalog();
-        let storage_classes = self
-            .core_store
-            .list_storage_classes()
-            .into_iter()
-            .filter(|class| req.include_operator_only || class.tenant_selectable)
-            .map(|class| storage_class_to_proto(&class, &catalog.default_class_id))
-            .collect();
-        Ok(Response::new(ListStorageClassesResponse {
-            request_id,
-            storage_classes,
-            default_class_id: catalog.default_class_id.clone(),
-        }))
+        read_handlers::list_storage_classes(self, request).await
     }
 
     async fn get_storage_class(
         &self,
         request: Request<GetStorageClassRequest>,
     ) -> Result<Response<StorageClassResponse>, Status> {
-        let _principal = require_admin(&request, self, SystemAdminRelation::ViewSystem).await?;
-        let req = request.into_inner();
-        let request_id = require_request_id(&req.request_id)?.to_string();
-        let class = self
-            .core_store
-            .get_storage_class(&req.class_id)
-            .map_err(|err| Status::not_found(err.to_string()))?;
-        Ok(Response::new(StorageClassResponse {
-            request_id,
-            storage_class: Some(storage_class_to_proto(
-                &class,
-                &self.core_store.storage_class_catalog().default_class_id,
-            )),
-        }))
+        read_handlers::get_storage_class(self, request).await
     }
 }
 
 mod helpers;
+mod read_handlers;
 use helpers::*;
-
-fn parse_personaldb_key_status(value: &str, allow_active: bool) -> Result<PublicKeyStatus, Status> {
-    let status = match value {
-        "active" if allow_active => PublicKeyStatus::Active,
-        "retiring" => PublicKeyStatus::Retiring,
-        "revoked_future" => PublicKeyStatus::RevokedFuture,
-        "compromised" => PublicKeyStatus::Compromised,
-        "active" => {
-            return Err(Status::invalid_argument(
-                "A non-active PersonalDB signing key cannot be reactivated",
-            ));
-        }
-        _ => {
-            return Err(Status::invalid_argument(
-                "PersonalDB signing key status must be active, retiring, revoked_future, or compromised",
-            ));
-        }
-    };
-    Ok(status)
-}
-
-fn personaldb_signing_key_to_proto(
-    record: PersonalDbSigningKeyPublicRecord,
-) -> PersonalDbSigningKeyRecord {
-    PersonalDbSigningKeyRecord {
-        key_id: record.trust_record.key_id.to_string(),
-        key_generation: record.trust_record.key_generation.get(),
-        purpose: record.trust_record.purpose.as_str().to_string(),
-        database_scopes: record
-            .trust_record
-            .database_scopes
-            .iter()
-            .map(|database_id| database_id.0.clone())
-            .collect(),
-        group_scopes: record.trust_record.group_scopes.clone(),
-        valid_from_log_index: record.trust_record.valid_from_log_index,
-        valid_until_log_index: record.trust_record.valid_until_log_index,
-        status: record.trust_record.status.as_str().to_string(),
-        public_key: record.trust_record.public_key.as_bytes().to_vec(),
-        created_at_unix_nanos: record.created_at_unix_nanos,
-        updated_at_unix_nanos: record.updated_at_unix_nanos,
-        created_by: record.created_audit.actor_id,
-        updated_by: record.updated_audit.actor_id,
-        record_revision: record.record_revision,
-    }
-}
-
-fn storage_class_to_proto(
-    class: &crate::core_store::CoreStorageClass,
-    default_class_id: &str,
-) -> StorageClassDescriptor {
-    StorageClassDescriptor {
-        class_id: class.class_id.clone(),
-        description: class.description.clone(),
-        metadata_profile_id: class.metadata_profile.profile_id.clone(),
-        metadata_replica_count: u32::from(class.metadata_profile.replica_count),
-        metadata_prepare_quorum: u32::from(class.metadata_profile.prepare_quorum),
-        metadata_certificate_persist_quorum: u32::from(
-            class.metadata_profile.certificate_persist_quorum,
-        ),
-        metadata_fsync_mode: class.metadata_profile.fsync_mode.clone(),
-        byte_profile_id: class.byte_profile.profile_id.clone(),
-        byte_codec_id: class.byte_profile.codec_id.clone(),
-        data_shards: u32::from(class.byte_profile.data_shards),
-        parity_shards: u32::from(class.byte_profile.parity_shards),
-        read_quorum: u32::from(class.byte_profile.read_quorum),
-        write_publish_threshold: u32::from(class.byte_profile.write_publish_threshold),
-        target_block_bytes: class.byte_profile.target_block_bytes,
-        max_shard_bytes: class.byte_profile.max_shard_bytes,
-        compression: class.byte_profile.compression.clone(),
-        encryption: class.byte_profile.encryption.clone(),
-        inline_payload_enabled: class.inline_payload_policy.enabled,
-        max_inline_payload_bytes: class.inline_payload_policy.max_raw_payload_bytes,
-        absolute_inline_record_max_bytes: class
-            .inline_payload_policy
-            .absolute_encoded_record_max_bytes,
-        min_cell_spread: u32::from(class.min_cell_spread),
-        tenant_selectable: class.tenant_selectable,
-        is_default: class.class_id == default_class_id,
-    }
-}

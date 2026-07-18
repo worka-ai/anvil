@@ -1166,17 +1166,20 @@ async fn core_store_recovery_finalises_a_materialised_batch_after_its_stream_adv
             unreachable!();
         };
         store
-            .append_stream_unlocked(AppendStreamRecord {
-                stream_id: stream_id.clone(),
-                partition_id: partition_id.clone(),
-                record_kind: record_kind.clone(),
-                payload: payload.clone(),
-                content_type: None,
-                user_metadata_json: "{}".to_string(),
-                fence: None,
-                transaction_id: Some(batch.transaction_id.clone()),
-                idempotency_key: idempotency_key.clone(),
-            })
+            .append_stream_unlocked_for_principal(
+                AppendStreamRecord {
+                    stream_id: stream_id.clone(),
+                    partition_id: partition_id.clone(),
+                    record_kind: record_kind.clone(),
+                    payload: payload.clone(),
+                    content_type: None,
+                    user_metadata_json: "{}".to_string(),
+                    fence: None,
+                    transaction_id: Some(batch.transaction_id.clone()),
+                    idempotency_key: idempotency_key.clone(),
+                },
+                batch.committed_by_principal.clone(),
+            )
             .await
             .unwrap();
     }

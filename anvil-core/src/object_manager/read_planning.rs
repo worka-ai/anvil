@@ -40,6 +40,7 @@ impl ObjectListingCandidateReader {
 pub(super) struct ObjectListingAuthzCandidateReader {
     pub(super) storage: crate::storage::Storage,
     pub(super) tenant_id: i64,
+    pub(super) claims: auth::Claims,
     pub(super) bucket: Bucket,
     pub(super) docs: Vec<ObjectListingPlanDoc>,
 }
@@ -61,12 +62,14 @@ impl ObjectListingAuthzCandidateReader {
     pub(super) fn new(
         storage: crate::storage::Storage,
         tenant_id: i64,
+        claims: auth::Claims,
         bucket: Bucket,
         docs: Vec<ObjectListingPlanDoc>,
     ) -> Self {
         Self {
             storage,
             tenant_id,
+            claims,
             bucket,
             docs,
         }
@@ -78,7 +81,23 @@ impl ObjectListingAuthzCandidateReader {
     ) -> AnyhowResult<ObjectListingAuthzAllowance> {
         let subject = object_listing_authz_subject(&request.subject);
         let mut object_ids = BTreeSet::new();
-        let mut bucket_wide = false;
+        let system_revision = i64::try_from(request.system_revision)
+            .map_err(|_| anyhow!("Invalid system authz revision"))?;
+        let bucket_wide = access_control::system_realm_relationship_allows(
+            &self.storage,
+            &self.claims,
+            crate::system_realm::SYSTEM_BUCKET_NAMESPACE,
+            &access_control::bucket_object_id(&self.bucket),
+            "get_object",
+            Some(system_revision),
+        )
+        .await?;
+        if bucket_wide {
+            return Ok(ObjectListingAuthzAllowance {
+                bucket_wide,
+                object_ids,
+            });
+        }
 
         let Some(segment) = crate::authz_segment::ensure_authz_tuple_segment_at_revision(
             &self.storage,
@@ -115,7 +134,10 @@ impl ObjectListingAuthzCandidateReader {
                 && row.relation == "get_object"
                 && row.object_id == bucket_object_id
             {
-                bucket_wide = true;
+                return Ok(ObjectListingAuthzAllowance {
+                    bucket_wide: true,
+                    object_ids,
+                });
             } else if row.namespace == object_namespace
                 && row.relation == request.relation
                 && row.object_id.starts_with(&format!("{}/", self.bucket.id))
@@ -456,5 +478,136 @@ pub(super) fn shape_object_version_listing(
         is_truncated,
         next_key_marker,
         next_version_id_marker,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bucket_wide_listing_does_not_materialize_an_authz_segment() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = crate::config::Config {
+            jwt_secret: "test-secret".into(),
+            anvil_secret_encryption_key:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            mesh_id: "object-list-authz-test".into(),
+            region: "test-region".into(),
+            storage_path: temp.path().to_string_lossy().into_owned(),
+            bootstrap_system_admin_subject_kind: "app".into(),
+            bootstrap_system_admin_subject_id: "system-admin".into(),
+            ..crate::config::Config::default()
+        };
+        let storage = crate::storage::Storage::new_at(temp.path()).await.unwrap();
+        let persistence = crate::persistence::Persistence::new(&config, None).unwrap();
+        crate::system_realm::ensure_bootstrapped(
+            &config,
+            &persistence,
+            &storage,
+            &config.secret_keyring().unwrap(),
+        )
+        .await
+        .unwrap();
+        persistence.create_region("test-region").await.unwrap();
+        let tenant = persistence
+            .create_tenant("object-list-tenant", "object-list-tenant")
+            .await
+            .unwrap();
+        let bucket = persistence
+            .create_bucket(tenant.id, "objects", "test-region")
+            .await
+            .unwrap();
+        let owner = auth::Claims {
+            sub: "tenant-owner".into(),
+            exp: usize::MAX,
+            tenant_id: tenant.id,
+            jti: None,
+        };
+        access_control::grant_storage_tenant_owner(
+            &persistence,
+            tenant.id,
+            &owner.sub,
+            "test",
+            "grant computed tenant ownership",
+        )
+        .await
+        .unwrap();
+        access_control::grant_bucket_defaults(
+            &persistence,
+            &bucket,
+            &owner.sub,
+            "test",
+            "connect bucket to tenant",
+        )
+        .await
+        .unwrap();
+        let revision = crate::authz_journal::latest_authz_revision(
+            &storage,
+            crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
+        )
+        .await
+        .unwrap() as u64;
+
+        assert!(
+            crate::authz_segment::existing_authz_tuple_segment_ref(
+                &storage,
+                crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
+                revision,
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let reader = ObjectListingAuthzCandidateReader::new(
+            storage.clone(),
+            crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
+            owner.clone(),
+            bucket.clone(),
+            Vec::new(),
+        );
+        let scope = CandidateSetScope {
+            root_key_hash: String::new(),
+            root_generation: 0,
+            index_id: String::new(),
+            index_generation: 0,
+            authz_realm_id: crate::system_realm::SYSTEM_REALM_ID.to_string(),
+            authz_scope_hash: String::new(),
+            authz_object_namespace: String::new(),
+            authz_relation: "get".into(),
+            authz_principal_hash: String::new(),
+            authz_revision: revision,
+            boundary_schema_generation_hash: String::new(),
+            predicate_hash: String::new(),
+            order_hash: String::new(),
+        };
+        let allowance = reader
+            .allowance(&AuthzCandidateRequest {
+                authz_scope: String::new(),
+                candidate_scope: scope,
+                partition_id: 0,
+                subject: format!("{}:{}", access_control::APP_SUBJECT_KIND, owner.sub),
+                relation: "get".into(),
+                object_namespace: access_control::system_realm_namespace(
+                    crate::system_realm::SYSTEM_OBJECT_NAMESPACE,
+                ),
+                revision,
+                system_revision: revision,
+                root_generation: 0,
+            })
+            .await
+            .unwrap();
+
+        assert!(allowance.bucket_wide);
+        assert!(allowance.object_ids.is_empty());
+        assert!(
+            crate::authz_segment::existing_authz_tuple_segment_ref(
+                &storage,
+                crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
+                revision,
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 }

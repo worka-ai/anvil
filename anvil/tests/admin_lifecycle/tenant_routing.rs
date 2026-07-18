@@ -132,7 +132,7 @@ async fn mesh_bucket_move_requires_routing_and_bucket_zanzibar_permissions() {
             anvil::system_realm::SYSTEM_STORAGE_TENANT_ID,
             &anvil::system_realm::system_namespace(),
             anvil::system_realm::SYSTEM_OBJECT_ID,
-            "manage_partitions",
+            "manage_partitions_grant",
             anvil::access_control::APP_SUBJECT_KIND,
             router_only,
             "",

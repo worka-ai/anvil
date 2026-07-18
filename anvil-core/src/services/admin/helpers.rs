@@ -1639,3 +1639,87 @@ pub(super) fn empty_to_none(value: String) -> Option<String> {
 pub(super) fn none_if_empty(value: &str) -> Option<&str> {
     if value.is_empty() { None } else { Some(value) }
 }
+
+pub(super) fn parse_personaldb_key_status(
+    value: &str,
+    allow_active: bool,
+) -> Result<PublicKeyStatus, Status> {
+    let status = match value {
+        "active" if allow_active => PublicKeyStatus::Active,
+        "retiring" => PublicKeyStatus::Retiring,
+        "revoked_future" => PublicKeyStatus::RevokedFuture,
+        "compromised" => PublicKeyStatus::Compromised,
+        "active" => {
+            return Err(Status::invalid_argument(
+                "A non-active PersonalDB signing key cannot be reactivated",
+            ));
+        }
+        _ => {
+            return Err(Status::invalid_argument(
+                "PersonalDB signing key status must be active, retiring, revoked_future, or compromised",
+            ));
+        }
+    };
+    Ok(status)
+}
+
+pub(super) fn personaldb_signing_key_to_proto(
+    record: PersonalDbSigningKeyPublicRecord,
+) -> PersonalDbSigningKeyRecord {
+    PersonalDbSigningKeyRecord {
+        key_id: record.trust_record.key_id.to_string(),
+        key_generation: record.trust_record.key_generation.get(),
+        purpose: record.trust_record.purpose.as_str().to_string(),
+        database_scopes: record
+            .trust_record
+            .database_scopes
+            .iter()
+            .map(|database_id| database_id.0.clone())
+            .collect(),
+        group_scopes: record.trust_record.group_scopes.clone(),
+        valid_from_log_index: record.trust_record.valid_from_log_index,
+        valid_until_log_index: record.trust_record.valid_until_log_index,
+        status: record.trust_record.status.as_str().to_string(),
+        public_key: record.trust_record.public_key.as_bytes().to_vec(),
+        created_at_unix_nanos: record.created_at_unix_nanos,
+        updated_at_unix_nanos: record.updated_at_unix_nanos,
+        created_by: record.created_audit.actor_id,
+        updated_by: record.updated_audit.actor_id,
+        record_revision: record.record_revision,
+    }
+}
+
+pub(super) fn storage_class_to_proto(
+    class: &crate::core_store::CoreStorageClass,
+    default_class_id: &str,
+) -> StorageClassDescriptor {
+    StorageClassDescriptor {
+        class_id: class.class_id.clone(),
+        description: class.description.clone(),
+        metadata_profile_id: class.metadata_profile.profile_id.clone(),
+        metadata_replica_count: u32::from(class.metadata_profile.replica_count),
+        metadata_prepare_quorum: u32::from(class.metadata_profile.prepare_quorum),
+        metadata_certificate_persist_quorum: u32::from(
+            class.metadata_profile.certificate_persist_quorum,
+        ),
+        metadata_fsync_mode: class.metadata_profile.fsync_mode.clone(),
+        byte_profile_id: class.byte_profile.profile_id.clone(),
+        byte_codec_id: class.byte_profile.codec_id.clone(),
+        data_shards: u32::from(class.byte_profile.data_shards),
+        parity_shards: u32::from(class.byte_profile.parity_shards),
+        read_quorum: u32::from(class.byte_profile.read_quorum),
+        write_publish_threshold: u32::from(class.byte_profile.write_publish_threshold),
+        target_block_bytes: class.byte_profile.target_block_bytes,
+        max_shard_bytes: class.byte_profile.max_shard_bytes,
+        compression: class.byte_profile.compression.clone(),
+        encryption: class.byte_profile.encryption.clone(),
+        inline_payload_enabled: class.inline_payload_policy.enabled,
+        max_inline_payload_bytes: class.inline_payload_policy.max_raw_payload_bytes,
+        absolute_inline_record_max_bytes: class
+            .inline_payload_policy
+            .absolute_encoded_record_max_bytes,
+        min_cell_spread: u32::from(class.min_cell_spread),
+        tenant_selectable: class.tenant_selectable,
+        is_default: class.class_id == default_class_id,
+    }
+}

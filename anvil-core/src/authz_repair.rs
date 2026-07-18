@@ -309,6 +309,7 @@ mod tests {
     async fn authz_repair_rebuilds_missing_derived_userset_index() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
+        bind_repair_test_schema(&storage, 42).await;
         let permit = ready_authz_permit(&storage, 42).await;
         write_tuple(&storage, &permit, "group", "eng", "member", "user", "alice").await;
         write_tuple(
@@ -364,6 +365,7 @@ mod tests {
     async fn authz_repair_reports_up_to_date_when_index_matches_tuple_log() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
+        bind_repair_test_schema(&storage, 42).await;
         let permit = ready_authz_permit(&storage, 42).await;
         write_tuple(&storage, &permit, "doc", "alpha", "viewer", "user", "alice").await;
         rebuild_derived_userset_index(&storage, 42, DEFAULT_DERIVED_USERSET_INDEX_ID)
@@ -392,6 +394,7 @@ mod tests {
     async fn authz_repair_detects_stale_derived_userset_index() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
+        bind_repair_test_schema(&storage, 42).await;
         let permit = ready_authz_permit(&storage, 42).await;
         write_tuple(&storage, &permit, "doc", "alpha", "viewer", "user", "alice").await;
         rebuild_derived_userset_index(&storage, 42, DEFAULT_DERIVED_USERSET_INDEX_ID)
@@ -463,6 +466,73 @@ mod tests {
         .unwrap()
         .write_permit()
         .unwrap()
+    }
+
+    async fn bind_repair_test_schema(storage: &Storage, tenant_id: i64) {
+        let schema = crate::authz_realm_schema::put_schema_revision(
+            storage,
+            tenant_id,
+            "repair-test-authz",
+            vec![
+                test_namespace("doc", &["viewer"]),
+                test_namespace("group", &["member"]),
+            ],
+            0,
+            "tester",
+            "bind repair test schema",
+        )
+        .await
+        .unwrap();
+        crate::authz_realm_schema::bind_schema(
+            storage,
+            tenant_id,
+            crate::authz_scope::DEFAULT_AUTHZ_REALM_ID,
+            schema.schema_ref,
+            None,
+            0,
+            "tester",
+            "bind repair test schema",
+        )
+        .await
+        .unwrap();
+    }
+
+    fn test_namespace(
+        namespace: &str,
+        relations: &[&str],
+    ) -> crate::anvil_api::AuthzNamespaceSchema {
+        crate::anvil_api::AuthzNamespaceSchema {
+            namespace: namespace.to_string(),
+            relations: relations
+                .iter()
+                .map(|relation| test_direct_relation(relation))
+                .collect(),
+            schema_json: String::new(),
+            schema_hash: String::new(),
+            schema_version: 0,
+            authz_revision: 0,
+            applied_at: String::new(),
+        }
+    }
+
+    fn test_direct_relation(relation: &str) -> crate::anvil_api::AuthzRelationSchema {
+        crate::anvil_api::AuthzRelationSchema {
+            relation: relation.to_string(),
+            rules: Vec::new(),
+            member_kind: crate::anvil_api::AuthzSchemaMemberKind::DirectRelation as i32,
+            allowed_subjects: vec![
+                test_allowed_subject("user"),
+                test_allowed_subject("userset"),
+            ],
+        }
+    }
+
+    fn test_allowed_subject(subject_kind: &str) -> crate::anvil_api::AuthzAllowedSubject {
+        crate::anvil_api::AuthzAllowedSubject {
+            selector_kind: crate::anvil_api::AuthzSubjectSelectorKind::AnyCanonicalId as i32,
+            subject_kind: subject_kind.to_string(),
+            subject_id: String::new(),
+        }
     }
 
     async fn write_tuple(

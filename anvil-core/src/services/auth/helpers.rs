@@ -313,45 +313,15 @@ pub(super) async fn emit_authz_tuple_write_side_effects(
 
 pub(super) async fn emit_authz_tuple_batch_side_effects(
     state: &AppState,
-    tenant_id: i64,
+    _tenant_id: i64,
     records: &[crate::persistence::AuthzTupleRecord],
 ) -> Result<(), Status> {
-    let Some(last_record) = records
-        .iter()
-        .max_by_key(|record| (record.revision, record.revision_ordinal))
-    else {
+    if records.is_empty() {
         return Ok(());
-    };
+    }
     for record in records {
         let _ = state.authz_watch_tx.send(record.clone());
     }
-    let derived = authz_userset_index::advance_derived_userset_index_from_batch(
-        &state.storage,
-        tenant_id,
-        authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID,
-        records,
-    )
-    .await
-    .map_err(|e| Status::internal(format!("{e:#}")))?;
-    let processed_revision = revision_to_u64(last_record.revision)?;
-    authz_derived_lag_watch::append_authz_derived_lag_watch_record(
-        &state.storage,
-        tenant_id,
-        u128::from(processed_revision),
-        mutation_id_from_record_hash(&last_record.record_hash),
-        authz_derived_lag_watch::AuthzDerivedLagWatchPayload {
-            derived_index_id: authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID.to_string(),
-            derived_index_kind: "userset".to_string(),
-            processed_revision: derived.processed_revision,
-            latest_revision: processed_revision,
-            source_cursor: u128::from(processed_revision),
-            source_manifest_hash: derived.source_records_hash,
-            generation: derived.generation,
-            emitted_at: chrono::Utc::now().to_rfc3339(),
-        },
-    )
-    .await
-    .map_err(|e| Status::internal(format!("{e:#}")))?;
     Ok(())
 }
 

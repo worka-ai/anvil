@@ -1,4 +1,7 @@
 use super::*;
+use anyhow::Context;
+
+const AUTHZ_MATERIALIZATION_DERIVED_INDEX_KIND: &str = "userset";
 
 impl Persistence {
     pub async fn hard_delete_object(&self, _object_id: i64) -> Result<()> {
@@ -91,6 +94,87 @@ impl Persistence {
             }
         }
         Err(last_error.unwrap_or_else(|| anyhow!("index build task enqueue retry exhausted")))
+    }
+
+    pub(crate) async fn enqueue_authz_materialization(
+        &self,
+        tenant_id: i64,
+        target_revision: u64,
+    ) -> Result<bool> {
+        let payload = serde_json::json!({
+            "tenant_id": tenant_id,
+            "target_revision": target_revision,
+        });
+        let _write_guard = self.task_queue_write_lock.lock().await;
+        let mut last_error = None;
+        for _ in 0..5 {
+            let permit = match self.task_queue_write_permit().await {
+                Ok(permit) => permit,
+                Err(error) if is_retryable_partition_fence_error(&error) => {
+                    last_error = Some(error);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match task_journal::enqueue_authz_materialization_task_with_permit(
+                &self.storage,
+                payload.clone(),
+                30,
+                &permit,
+                &self.partition_owner_signing_key,
+            )
+            .await
+            {
+                Ok(result) => {
+                    if result {
+                        self.notify_task_enqueued();
+                    }
+                    return Ok(result);
+                }
+                Err(error) if is_retryable_partition_fence_error(&error) => {
+                    last_error = Some(error);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("authz materialization enqueue retry exhausted")))
+    }
+
+    pub(crate) async fn run_authz_materialization_task(
+        &self,
+        tenant_id: i64,
+        requested_revision: u64,
+    ) -> Result<authz_journal::AuthzMaterializationOutcome> {
+        let latest_revision =
+            authz_journal::latest_authz_tuple_revision(&self.storage, tenant_id).await?;
+        let latest_revision = u64::try_from(latest_revision.max(0))
+            .context("authorization tuple revision exceeds supported range")?;
+        let target_revision = requested_revision.max(latest_revision);
+        let source_fence_token =
+            authz_journal::latest_authz_journal_fence_token(&self.storage, tenant_id).await?;
+
+        let outcome = authz_journal::materialize_authz_derived_state_at_revision(
+            &self.storage,
+            tenant_id,
+            target_revision,
+            source_fence_token,
+        )
+        .await?;
+
+        let latest_after =
+            authz_journal::latest_authz_tuple_revision(&self.storage, tenant_id).await?;
+        let latest_after = u64::try_from(latest_after.max(0))
+            .context("authorization tuple revision exceeds supported range")?;
+        append_authz_materialization_lag_watch(&self.storage, tenant_id, latest_after, &outcome)
+            .await?;
+        if latest_after > outcome.processed_revision {
+            self.enqueue_authz_materialization(tenant_id, latest_after)
+                .await?;
+        }
+
+        Ok(outcome)
     }
 
     pub async fn acquire_task_execution_lease(
@@ -253,6 +337,17 @@ impl Persistence {
                     partition_id: hex::encode(crate::formats::hash32(
                         format!("tenant/{tenant_id}/bucket/{bucket_id}/index/{index_id}")
                             .as_bytes(),
+                    )),
+                    source_cursor,
+                })
+            }
+            crate::tasks::TaskType::AuthzMaterialization => {
+                let tenant_id = task_payload_i64(task, "tenant_id")?;
+                let source_cursor = task_payload_u128(task, "target_revision")?;
+                Ok(TaskLeaseTarget {
+                    partition_family: "authz_materialization".to_string(),
+                    partition_id: hex::encode(crate::formats::hash32(
+                        format!("tenant/{tenant_id}/authz").as_bytes(),
                     )),
                     source_cursor,
                 })
@@ -606,4 +701,59 @@ impl Persistence {
     )> {
         hf_journal::status_summary(&self.storage, id).await
     }
+}
+
+async fn append_authz_materialization_lag_watch(
+    storage: &Storage,
+    tenant_id: i64,
+    latest_revision: u64,
+    outcome: &authz_journal::AuthzMaterializationOutcome,
+) -> Result<()> {
+    let derived_index_id = crate::authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID.to_string();
+    if let Some(latest_event) =
+        crate::authz_derived_lag_watch::latest_authz_derived_lag_watch_event(
+            storage,
+            tenant_id,
+            &derived_index_id,
+        )
+        .await?
+        && latest_event.payload.processed_revision >= outcome.processed_revision
+    {
+        return Ok(());
+    }
+    crate::authz_derived_lag_watch::append_authz_derived_lag_watch_record(
+        storage,
+        tenant_id,
+        u128::from(outcome.processed_revision),
+        authz_materialization_mutation_id(
+            tenant_id,
+            outcome.processed_revision,
+            &outcome.source_records_hash,
+        ),
+        crate::authz_derived_lag_watch::AuthzDerivedLagWatchPayload {
+            derived_index_id,
+            derived_index_kind: AUTHZ_MATERIALIZATION_DERIVED_INDEX_KIND.to_string(),
+            processed_revision: outcome.processed_revision,
+            latest_revision,
+            source_cursor: u128::from(outcome.processed_revision),
+            source_manifest_hash: outcome.source_records_hash.clone(),
+            generation: outcome.generation,
+            emitted_at: Utc::now().to_rfc3339(),
+        },
+    )
+    .await
+}
+
+fn authz_materialization_mutation_id(
+    tenant_id: i64,
+    processed_revision: u64,
+    source_records_hash: &str,
+) -> [u8; 16] {
+    let hash = crate::formats::hash32(
+        format!("authz-materialization:{tenant_id}:{processed_revision}:{source_records_hash}")
+            .as_bytes(),
+    );
+    let mut mutation_id = [0; 16];
+    mutation_id.copy_from_slice(&hash[..16]);
+    mutation_id
 }

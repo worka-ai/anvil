@@ -12,6 +12,8 @@ fn test_config(storage_path: &std::path::Path) -> Config {
         public_api_addr: "test-node".to_string(),
         api_listen_addr: "127.0.0.1:0".to_string(),
         region: "test-region".to_string(),
+        bootstrap_system_admin_subject_kind: "app".to_string(),
+        bootstrap_system_admin_subject_id: "admin-principal".to_string(),
         storage_path: storage_path.to_string_lossy().to_string(),
         ..Config::default()
     }
@@ -25,6 +27,14 @@ async fn seeded_core_store_link() -> (TempDir, ObjectManager, Bucket, Object, Ob
     let storage = Storage::new_at(&config.storage_path).await.unwrap();
     let core_store = CoreStore::new(storage.clone()).await.unwrap();
     let persistence = Persistence::new(&config, None).unwrap();
+    system_realm::ensure_bootstrapped(
+        &config,
+        &persistence,
+        &storage,
+        &config.secret_keyring().unwrap(),
+    )
+    .await
+    .unwrap();
     persistence.create_region("test-region").await.unwrap();
     let tenant = persistence
         .create_tenant("tenant-a", "tenant-a")
@@ -72,36 +82,6 @@ async fn seeded_core_store_link() -> (TempDir, ObjectManager, Bucket, Object, Ob
     .await
     .unwrap();
 
-    persistence
-        .write_authz_tuple(
-            system_realm::SYSTEM_STORAGE_TENANT_ID,
-            &access_control::system_realm_namespace(system_realm::SYSTEM_BUCKET_NAMESPACE),
-            &access_control::bucket_object_id(&bucket),
-            "put_object",
-            access_control::APP_SUBJECT_KIND,
-            &claims.sub,
-            "",
-            "add",
-            "test",
-            "object manager direct put seed",
-        )
-        .await
-        .unwrap();
-    persistence
-        .write_authz_tuple(
-            system_realm::SYSTEM_STORAGE_TENANT_ID,
-            &access_control::system_realm_namespace(system_realm::SYSTEM_BUCKET_NAMESPACE),
-            &access_control::bucket_object_id(&bucket),
-            "get_object",
-            access_control::APP_SUBJECT_KIND,
-            access_control::PUBLIC_APP_PRINCIPAL_ID,
-            "",
-            "add",
-            "test",
-            "object manager direct public read seed",
-        )
-        .await
-        .unwrap();
     let (watch_tx, _) = tokio::sync::broadcast::channel(8);
     let manager = ObjectManager::new(
         persistence.clone(),
@@ -195,6 +175,14 @@ async fn seeded_object_manager(
     let storage = Storage::new_at(&config.storage_path).await.unwrap();
     let core_store = CoreStore::new(storage.clone()).await.unwrap();
     let persistence = Persistence::new(&config, None).unwrap();
+    system_realm::ensure_bootstrapped(
+        &config,
+        &persistence,
+        &storage,
+        &config.secret_keyring().unwrap(),
+    )
+    .await
+    .unwrap();
     persistence.create_region("test-region").await.unwrap();
     let tenant = persistence
         .create_tenant("tenant-a", "tenant-a")
@@ -228,23 +216,6 @@ async fn seeded_object_manager(
     )
     .await
     .unwrap();
-    for relation in ["put_object", "get_object", "delete_object"] {
-        persistence
-            .write_authz_tuple(
-                system_realm::SYSTEM_STORAGE_TENANT_ID,
-                &access_control::system_realm_namespace(system_realm::SYSTEM_BUCKET_NAMESPACE),
-                &access_control::bucket_object_id(&bucket),
-                relation,
-                access_control::APP_SUBJECT_KIND,
-                &claims.sub,
-                "",
-                "add",
-                "test",
-                "object manager dedupe direct bucket permission",
-            )
-            .await
-            .unwrap();
-    }
     let (watch_tx, _) = tokio::sync::broadcast::channel(8);
     let manager = ObjectManager::new(
         persistence,

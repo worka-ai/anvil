@@ -139,6 +139,7 @@ enum TaskTypeProto {
     IndexBuild = 4,
     RebalanceShard = 5,
     HfIngestion = 6,
+    AuthzMaterialization = 7,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
@@ -309,6 +310,56 @@ pub(crate) async fn enqueue_index_build_task_with_permit(
     .map(|_| true)
 }
 
+pub(crate) async fn enqueue_authz_materialization_task_with_permit(
+    storage: &Storage,
+    payload: JsonValue,
+    priority: i32,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<bool> {
+    require_task_queue_permit(permit)?;
+    let partition_precondition =
+        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    validate_authz_materialization_payload(&payload)?;
+    let state = read_task_queue_state(storage).await?;
+    let now = Utc::now();
+    let requested_revision = json_u128(&payload, "target_revision")
+        .ok_or_else(|| anyhow!("authz materialization target_revision must be nonnegative"))?;
+    let existing = state.authz_materialization_tasks_for_payload(&payload);
+    if existing.iter().any(|task| {
+        matches!(task.status, TaskStatus::Pending | TaskStatus::Failed)
+            && task.priority == priority
+            && json_u128(&task.payload, "target_revision").unwrap_or(0) >= requested_revision
+    }) {
+        return Ok(false);
+    }
+    for task in existing {
+        if matches!(task.status, TaskStatus::Pending | TaskStatus::Failed) {
+            append_task_event(
+                storage,
+                TaskJournalBody::StatusUpdated {
+                    task_id: task.id,
+                    status: TaskStatus::Completed,
+                    updated_at: now,
+                },
+                permit.fence_token,
+                Some(partition_precondition.clone()),
+            )
+            .await?;
+        }
+    }
+    enqueue_task_inner(
+        storage,
+        TaskType::AuthzMaterialization,
+        payload,
+        priority,
+        permit.fence_token,
+        Some(partition_precondition),
+    )
+    .await
+    .map(|_| true)
+}
+
 async fn enqueue_task_inner(
     storage: &Storage,
     task_type: TaskType,
@@ -410,7 +461,9 @@ async fn claim_pending_tasks_inner(
     let state = read_task_queue_state(storage).await?;
     let now = Utc::now();
     let running_index_build_keys = state.running_index_build_keys();
+    let running_authz_materialization_keys = state.running_authz_materialization_keys();
     let mut selected_index_build_keys = BTreeSet::new();
+    let mut selected_authz_materialization_keys = BTreeSet::new();
     let mut tasks = state
         .tasks
         .values()
@@ -432,11 +485,23 @@ async fn claim_pending_tasks_inner(
         if selected.len() >= limit {
             break;
         }
-        if let Some(key) = index_build_key(&task.payload) {
+        if task.task_type == TaskType::IndexBuild
+            && let Some(key) = index_build_key(&task.payload)
+        {
             if running_index_build_keys.contains(&key) || selected_index_build_keys.contains(&key) {
                 continue;
             }
             selected_index_build_keys.insert(key);
+        }
+        if task.task_type == TaskType::AuthzMaterialization
+            && let Some(key) = authz_materialization_key(&task.payload)
+        {
+            if running_authz_materialization_keys.contains(&key)
+                || selected_authz_materialization_keys.contains(&key)
+            {
+                continue;
+            }
+            selected_authz_materialization_keys.insert(key);
         }
         selected.push(task);
     }
@@ -1143,6 +1208,7 @@ fn task_type_to_proto(task_type: TaskType) -> TaskTypeProto {
         TaskType::IndexBuild => TaskTypeProto::IndexBuild,
         TaskType::RebalanceShard => TaskTypeProto::RebalanceShard,
         TaskType::HFIngestion => TaskTypeProto::HfIngestion,
+        TaskType::AuthzMaterialization => TaskTypeProto::AuthzMaterialization,
     }
 }
 
@@ -1158,6 +1224,7 @@ fn task_type_from_proto_i32(value: i32) -> Result<TaskType> {
             TaskTypeProto::IndexBuild => TaskType::IndexBuild,
             TaskTypeProto::RebalanceShard => TaskType::RebalanceShard,
             TaskTypeProto::HfIngestion => TaskType::HFIngestion,
+            TaskTypeProto::AuthzMaterialization => TaskType::AuthzMaterialization,
         },
     )
 }
@@ -1324,6 +1391,30 @@ impl TaskQueueState {
         tasks
     }
 
+    fn authz_materialization_tasks_for_payload(&self, payload: &JsonValue) -> Vec<TaskRecord> {
+        let Some(key) = authz_materialization_key(payload) else {
+            return Vec::new();
+        };
+        let mut tasks = self
+            .tasks
+            .values()
+            .filter(|task| {
+                task.task_type == TaskType::AuthzMaterialization
+                    && matches!(task.status, TaskStatus::Pending | TaskStatus::Failed)
+                    && authz_materialization_key(&task.payload).as_ref() == Some(&key)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        tasks.sort_by(|left, right| {
+            json_u128(&left.payload, "target_revision")
+                .unwrap_or(0)
+                .cmp(&json_u128(&right.payload, "target_revision").unwrap_or(0))
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        tasks
+    }
+
     fn running_index_build_keys(&self) -> BTreeSet<IndexBuildKey> {
         self.tasks
             .values()
@@ -1331,6 +1422,17 @@ impl TaskQueueState {
                 task.task_type == TaskType::IndexBuild && task.status == TaskStatus::Running
             })
             .filter_map(|task| index_build_key(&task.payload))
+            .collect()
+    }
+
+    fn running_authz_materialization_keys(&self) -> BTreeSet<AuthzMaterializationKey> {
+        self.tasks
+            .values()
+            .filter(|task| {
+                task.task_type == TaskType::AuthzMaterialization
+                    && task.status == TaskStatus::Running
+            })
+            .filter_map(|task| authz_materialization_key(&task.payload))
             .collect()
     }
 }
@@ -1341,6 +1443,11 @@ struct IndexBuildKey {
     bucket_id: i64,
     index_id: i64,
     index_version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct AuthzMaterializationKey {
+    tenant_id: i64,
 }
 
 fn validate_index_build_payload(payload: &JsonValue) -> Result<()> {
@@ -1360,6 +1467,21 @@ fn index_build_key(payload: &JsonValue) -> Option<IndexBuildKey> {
         bucket_id: json_i64(payload, "bucket_id")?,
         index_id: json_i64(payload, "index_id")?,
         index_version: json_i64(payload, "index_version")?,
+    })
+}
+
+fn validate_authz_materialization_payload(payload: &JsonValue) -> Result<()> {
+    authz_materialization_key(payload)
+        .ok_or_else(|| anyhow!("authz materialization payload must include tenant_id"))?;
+    json_u128(payload, "target_revision").ok_or_else(|| {
+        anyhow!("authz materialization payload must include nonnegative target_revision")
+    })?;
+    Ok(())
+}
+
+fn authz_materialization_key(payload: &JsonValue) -> Option<AuthzMaterializationKey> {
+    Some(AuthzMaterializationKey {
+        tenant_id: json_i64(payload, "tenant_id")?,
     })
 }
 
@@ -1417,493 +1539,4 @@ fn require_task_queue_permit(permit: &PartitionWritePermit) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-    use tempfile::tempdir;
-
-    const KEY: &[u8] = b"task queue partition owner key";
-
-    #[tokio::test]
-    async fn task_journal_claims_and_reads_corestore_current_state() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-
-        enqueue_task(
-            &storage,
-            TaskType::DeleteBucket,
-            json!({"bucket_id": 7}),
-            100,
-        )
-        .await
-        .unwrap();
-        enqueue_task(
-            &storage,
-            TaskType::DeleteObject,
-            json!({"object_id": 9}),
-            10,
-        )
-        .await
-        .unwrap();
-
-        let claimed = claim_pending_tasks(&storage, 1).await.unwrap();
-        assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].id, 2);
-        assert_eq!(claimed[0].status, TaskStatus::Running);
-
-        fail_task(&storage, claimed[0].id, "boom").await.unwrap();
-        update_task_status(&storage, 1, TaskStatus::Completed)
-            .await
-            .unwrap();
-
-        let tasks = list_tasks(&storage).await.unwrap();
-        assert_eq!(tasks.len(), 2);
-        assert_eq!(tasks[0].status, TaskStatus::Completed);
-        assert_eq!(tasks[1].status, TaskStatus::Failed);
-        assert_eq!(tasks[1].attempts, 1);
-        assert_eq!(tasks[1].last_error.as_deref(), Some("boom"));
-    }
-
-    #[tokio::test]
-    async fn task_live_state_reads_coremeta_current_rows_without_audit_payloads() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let now = Utc::now();
-        let task = TaskRecord {
-            id: 42,
-            task_type: TaskType::ObjectMetadataCompaction,
-            payload: json!({"bucket_id": 7}),
-            priority: 50,
-            status: TaskStatus::Pending,
-            attempts: 0,
-            last_error: None,
-            scheduled_at: now,
-            created_at: now,
-            updated_at: now,
-        };
-        let meta = CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
-        write_task_current_row(
-            &storage,
-            &meta,
-            &TaskCurrentCoreMetaRow {
-                task,
-                generation: 1,
-                transaction_id: "task-current-row-only-42".to_string(),
-                created_at_unix_nanos: current_unix_nanos().unwrap(),
-            },
-            None,
-        )
-        .await
-        .unwrap();
-
-        assert!(read_task_journal_bodies(&storage).await.unwrap().is_empty());
-        let tasks = list_tasks(&storage).await.unwrap();
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].id, 42);
-        assert_eq!(tasks[0].payload, json!({"bucket_id": 7}));
-    }
-
-    #[tokio::test]
-    async fn task_live_state_does_not_replay_tampered_audit_payload() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-
-        enqueue_task(
-            &storage,
-            TaskType::DeleteBucket,
-            json!({"bucket_id": 7}),
-            100,
-        )
-        .await
-        .unwrap();
-
-        CoreStore::new(storage.clone())
-            .await
-            .unwrap()
-            .corrupt_stream_record_payload_for_test(&task_queue_stream_id(), 1)
-            .unwrap();
-
-        let tasks = list_tasks(&storage).await.unwrap();
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].task_type, TaskType::DeleteBucket);
-
-        let err = read_task_journal_bodies(&storage)
-            .await
-            .expect_err("tampered task queue audit history must still fail closed");
-        assert!(!err.to_string().is_empty());
-    }
-
-    #[tokio::test]
-    pub(crate) async fn task_journal_with_permit_writes_fenced_protobuf_payloads() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let owner = ready_owner(&storage, "node-a").await;
-        let permit = owner.write_permit().unwrap();
-
-        enqueue_task_with_permit(
-            &storage,
-            TaskType::DeleteBucket,
-            json!({"bucket_id": 7}),
-            100,
-            &permit,
-            KEY,
-        )
-        .await
-        .unwrap();
-        let claimed = claim_pending_tasks_with_permit(&storage, 1, &permit, KEY)
-            .await
-            .unwrap();
-        update_task_status_with_permit(
-            &storage,
-            claimed[0].id,
-            TaskStatus::Completed,
-            &permit,
-            KEY,
-        )
-        .await
-        .unwrap();
-
-        let fences = read_task_journal_payload_fences(&storage).await.unwrap();
-        assert_eq!(fences.len(), 3);
-        assert!(fences.iter().all(|fence| *fence == permit.fence_token));
-    }
-
-    #[tokio::test]
-    pub(crate) async fn task_journal_deduplicates_live_tasks_but_allows_new_after_completion() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let owner = ready_owner(&storage, "node-a").await;
-        let permit = owner.write_permit().unwrap();
-        let payload = json!({"bucket_id": 7});
-
-        assert!(
-            enqueue_task_if_absent_with_permit(
-                &storage,
-                TaskType::ObjectMetadataCompaction,
-                payload.clone(),
-                50,
-                &permit,
-                KEY,
-            )
-            .await
-            .unwrap()
-        );
-        assert!(
-            !enqueue_task_if_absent_with_permit(
-                &storage,
-                TaskType::ObjectMetadataCompaction,
-                payload.clone(),
-                50,
-                &permit,
-                KEY,
-            )
-            .await
-            .unwrap()
-        );
-        assert_eq!(list_tasks(&storage).await.unwrap().len(), 1);
-
-        let claimed = claim_pending_tasks_with_permit(&storage, 1, &permit, KEY)
-            .await
-            .unwrap();
-        update_task_status_with_permit(
-            &storage,
-            claimed[0].id,
-            TaskStatus::Completed,
-            &permit,
-            KEY,
-        )
-        .await
-        .unwrap();
-        assert!(
-            enqueue_task_if_absent_with_permit(
-                &storage,
-                TaskType::ObjectMetadataCompaction,
-                payload,
-                50,
-                &permit,
-                KEY,
-            )
-            .await
-            .unwrap()
-        );
-        assert_eq!(list_tasks(&storage).await.unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn task_journal_supersedes_pending_index_build_tasks_by_index_identity() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let owner = ready_owner(&storage, "node-a").await;
-        let permit = owner.write_permit().unwrap();
-        let payload_cursor_2 = json!({
-            "tenant_id": 1,
-            "bucket_id": 7,
-            "index_id": 9,
-            "index_version": 3,
-            "source_cursor": 2,
-        });
-        let payload_cursor_5 = json!({
-            "tenant_id": 1,
-            "bucket_id": 7,
-            "index_id": 9,
-            "index_version": 3,
-            "source_cursor": 5,
-        });
-
-        assert!(
-            enqueue_index_build_task_with_permit(&storage, payload_cursor_2, 40, &permit, KEY,)
-                .await
-                .unwrap()
-        );
-        assert!(
-            enqueue_index_build_task_with_permit(&storage, payload_cursor_5, 40, &permit, KEY,)
-                .await
-                .unwrap(),
-            "newer cursor should supersede the pending task with admitted task events"
-        );
-        let tasks = list_tasks(&storage).await.unwrap();
-        assert_eq!(tasks.len(), 2);
-        assert_eq!(tasks[0].status, TaskStatus::Completed);
-        assert_eq!(tasks[0].payload["source_cursor"], json!(2));
-        assert_eq!(tasks[1].status, TaskStatus::Pending);
-        assert_eq!(tasks[1].payload["source_cursor"], json!(5));
-
-        assert!(
-            !enqueue_index_build_task_with_permit(
-                &storage,
-                json!({
-                    "tenant_id": 1,
-                    "bucket_id": 7,
-                    "index_id": 9,
-                    "index_version": 3,
-                    "source_cursor": 4,
-                }),
-                40,
-                &permit,
-                KEY,
-            )
-            .await
-            .unwrap(),
-            "older cursor is already covered by the pending build"
-        );
-
-        let claimed = claim_pending_tasks_with_permit(&storage, 10, &permit, KEY)
-            .await
-            .unwrap();
-        assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].payload["source_cursor"], json!(5));
-
-        for body in read_task_journal_bodies(&storage).await.unwrap() {
-            assert!(
-                matches!(
-                    body,
-                    TaskJournalBody::Enqueued { .. }
-                        | TaskJournalBody::Claimed { .. }
-                        | TaskJournalBody::StatusUpdated { .. }
-                        | TaskJournalBody::Failed { .. }
-                ),
-                "unexpected task queue event: {body:?}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn task_journal_serializes_running_and_followup_index_builds() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let owner = ready_owner(&storage, "node-a").await;
-        let permit = owner.write_permit().unwrap();
-        let payload_cursor_2 = json!({
-            "tenant_id": 1,
-            "bucket_id": 7,
-            "index_id": 9,
-            "index_version": 3,
-            "source_cursor": 2,
-        });
-        let payload_cursor_8 = json!({
-            "tenant_id": 1,
-            "bucket_id": 7,
-            "index_id": 9,
-            "index_version": 3,
-            "source_cursor": 8,
-        });
-
-        enqueue_index_build_task_with_permit(&storage, payload_cursor_2, 40, &permit, KEY)
-            .await
-            .unwrap();
-        let first_claim = claim_pending_tasks_with_permit(&storage, 10, &permit, KEY)
-            .await
-            .unwrap();
-        assert_eq!(first_claim.len(), 1);
-        assert_eq!(first_claim[0].payload["source_cursor"], json!(2));
-
-        enqueue_index_build_task_with_permit(&storage, payload_cursor_8, 40, &permit, KEY)
-            .await
-            .unwrap();
-        let blocked_by_running = claim_pending_tasks_with_permit(&storage, 10, &permit, KEY)
-            .await
-            .unwrap();
-        assert!(
-            blocked_by_running.is_empty(),
-            "pending follow-up for the same index must not run beside an active build"
-        );
-
-        update_task_status_with_permit(
-            &storage,
-            first_claim[0].id,
-            TaskStatus::Completed,
-            &permit,
-            KEY,
-        )
-        .await
-        .unwrap();
-        let followup = claim_pending_tasks_with_permit(&storage, 10, &permit, KEY)
-            .await
-            .unwrap();
-        assert_eq!(followup.len(), 1);
-        assert_eq!(followup[0].payload["source_cursor"], json!(8));
-    }
-
-    #[tokio::test]
-    pub(crate) async fn task_journal_reclaims_failed_tasks_after_retry_delay() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let owner = ready_owner(&storage, "node-a").await;
-        let permit = owner.write_permit().unwrap();
-
-        enqueue_task_with_permit(
-            &storage,
-            TaskType::DeleteBucket,
-            json!({"bucket_id": 7}),
-            100,
-            &permit,
-            KEY,
-        )
-        .await
-        .unwrap();
-        let first_claim = claim_pending_tasks_with_permit(&storage, 1, &permit, KEY)
-            .await
-            .unwrap();
-        fail_task_with_permit(&storage, first_claim[0].id, "try again", &permit, KEY)
-            .await
-            .unwrap();
-        let not_ready = claim_pending_tasks_with_permit(&storage, 1, &permit, KEY)
-            .await
-            .unwrap();
-        assert!(not_ready.is_empty());
-
-        let mut state = read_task_queue_state(&storage).await.unwrap();
-        let task = state.tasks.get_mut(&first_claim[0].id).unwrap();
-        task.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
-        let partition_precondition = partition_write_precondition(&storage, &permit, KEY)
-            .await
-            .unwrap();
-        append_task_event(
-            &storage,
-            TaskJournalBody::Failed {
-                task_id: task.id,
-                error: task.last_error.clone().unwrap(),
-                attempts: task.attempts,
-                scheduled_at: task.scheduled_at,
-                updated_at: Utc::now(),
-            },
-            permit.fence_token,
-            Some(partition_precondition),
-        )
-        .await
-        .unwrap();
-
-        let retried = claim_pending_tasks_with_permit(&storage, 1, &permit, KEY)
-            .await
-            .unwrap();
-        assert_eq!(retried.len(), 1);
-        assert_eq!(retried[0].id, first_claim[0].id);
-        assert_eq!(retried[0].status, TaskStatus::Running);
-        assert_eq!(retried[0].attempts, 1);
-    }
-
-    #[tokio::test]
-    pub(crate) async fn task_journal_with_permit_rejects_stale_fence() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let owner = ready_owner(&storage, "node-a").await;
-        let stale_permit = owner.write_permit().unwrap();
-        let newer = ready_owner(&storage, "node-b").await;
-        assert!(newer.fence_token > stale_permit.fence_token);
-
-        let err = enqueue_task_with_permit(
-            &storage,
-            TaskType::DeleteBucket,
-            json!({"bucket_id": 7}),
-            100,
-            &stale_permit,
-            KEY,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("write permit owner is not current")
-        );
-    }
-
-    #[tokio::test]
-    pub(crate) async fn task_journal_batch_rejects_stale_partition_precondition() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let owner = ready_owner(&storage, "node-a").await;
-        let stale_permit = owner.write_permit().unwrap();
-        enqueue_task_with_permit(
-            &storage,
-            TaskType::DeleteBucket,
-            json!({"bucket_id": 7}),
-            100,
-            &stale_permit,
-            KEY,
-        )
-        .await
-        .unwrap();
-        let stale_precondition = partition_write_precondition(&storage, &stale_permit, KEY)
-            .await
-            .unwrap();
-        let newer = ready_owner(&storage, "node-b").await;
-        assert!(newer.fence_token > stale_permit.fence_token);
-
-        let err = append_task_event(
-            &storage,
-            TaskJournalBody::StatusUpdated {
-                task_id: 1,
-                status: TaskStatus::Completed,
-                updated_at: Utc::now(),
-            },
-            stale_permit.fence_token,
-            Some(stale_precondition),
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("target mismatch")
-                || err.to_string().contains("generation mismatch"),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    async fn ready_owner(
-        storage: &Storage,
-        owner_node_id: &str,
-    ) -> crate::partition_fence::PartitionOwnerState {
-        let family = "task_queue".to_string();
-        let id = hex::encode(task_queue_partition_id());
-        crate::partition_fence::ready_partition_owner_for_test(
-            storage,
-            family,
-            id,
-            owner_node_id,
-            0,
-            hex::encode([0; 32]),
-            hex::encode([1; 32]),
-            KEY,
-        )
-        .await
-    }
-}
+mod tests;

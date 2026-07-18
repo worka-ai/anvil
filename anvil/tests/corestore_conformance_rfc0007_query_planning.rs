@@ -155,10 +155,12 @@ fn query_planner_forbids_unbounded_index_candidates_before_range_plans() {
 fn authz_writer_segments_are_live_query_candidate_sources() {
     let journal = repo_file("anvil-core/src/authz_journal.rs");
     let segment = repo_file("anvil-core/src/authz_segment.rs");
+    let persistence_tasks = repo_file("anvil-core/src/persistence/tasks.rs");
+    let worker = repo_file("anvil-core/src/worker.rs");
 
     for expected in [
         "record_authz_materialization_deferred(",
-        "advance_derived_userset_index_from_batch",
+        "materialize_authz_derived_state_at_revision",
         "read_all_authz_tuple_records_from_journal(storage, tenant_id)",
         "write_authz_tuple_segment_with_derived",
     ] {
@@ -173,6 +175,18 @@ fn authz_writer_segments_are_live_query_candidate_sources() {
             "tuple writes must not synchronously materialize authz segments: {forbidden}"
         );
     }
+    assert!(
+        persistence_tasks.contains("enqueue_authz_materialization("),
+        "authz tuple writes must schedule persistent materialization work"
+    );
+    assert!(
+        persistence_tasks.contains("run_authz_materialization_task("),
+        "background worker must have a durable authz materialization task body"
+    );
+    assert!(
+        worker.contains("TaskType::AuthzMaterialization"),
+        "worker must execute authz materialization tasks"
+    );
 
     for expected in [
         "TABLE_AUTHZ_SCHEMA_DESCRIPTOR",

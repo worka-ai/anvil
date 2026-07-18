@@ -339,6 +339,7 @@ async fn execute_task_with_lease(
             handle_object_metadata_compaction(persistence, task).await?
         }
         TaskType::IndexBuild => handle_index_build(persistence, task).await?,
+        TaskType::AuthzMaterialization => handle_authz_materialization(persistence, task).await?,
         TaskType::HFIngestion => {
             handle_hf_ingestion(persistence, object_manager, task, keyring).await?
         }
@@ -349,6 +350,32 @@ async fn execute_task_with_lease(
     persistence
         .checkpoint_task_execution_lease(&lease, lease.source_cursor)
         .await?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthzMaterializationPayload {
+    tenant_id: i64,
+    target_revision: u64,
+}
+
+async fn handle_authz_materialization(
+    persistence: &Persistence,
+    task: &Task,
+) -> anyhow::Result<()> {
+    let payload: AuthzMaterializationPayload = serde_json::from_value(task.payload.clone())?;
+    let outcome = persistence
+        .run_authz_materialization_task(payload.tenant_id, payload.target_revision)
+        .await?;
+    info!(
+        tenant_id = payload.tenant_id,
+        requested_revision = payload.target_revision,
+        processed_revision = outcome.processed_revision,
+        source_record_count = outcome.source_record_count,
+        generation = outcome.generation,
+        segment_ref = %outcome.segment_ref,
+        "Authorization materialization task completed"
+    );
     Ok(())
 }
 
