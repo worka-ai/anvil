@@ -178,6 +178,35 @@ async fn latest_authz_revision_uses_the_journal_head_not_a_tuple_scan() {
 }
 
 #[tokio::test]
+async fn current_permission_uses_the_materialized_userset_index() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let record = record(1, "add");
+    test_append_authz_tuple_record_unfenced(&storage, &record)
+        .await
+        .unwrap();
+
+    // Current rows are a rebuildable projection. Permission checks should use
+    // the revision-bound userset index rather than scanning that projection.
+    CoreMetaStore::open(storage.core_store_meta_path())
+        .unwrap()
+        .delete(
+            CF_AUTHZ,
+            TABLE_AUTHZ_TUPLE_PAGE_ROW,
+            &authz_tuple_current_row_key(&record).unwrap(),
+        )
+        .unwrap();
+
+    assert!(
+        resolve_current_permission(
+            &storage, 42, "document", "alpha", "viewer", "user", "alice", ""
+        )
+        .await
+        .unwrap()
+    );
+}
+
+#[tokio::test]
 async fn missing_authz_segments_materialize_only_the_requested_revision() {
     let temp = tempdir().unwrap();
     let storage = Storage::new_at(temp.path()).await.unwrap();
