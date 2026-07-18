@@ -1,4 +1,9 @@
 use crate::authz_coremeta_payload::{decode_authz_payload_row, encode_authz_payload_row};
+use crate::authz_realm_schema;
+use crate::authz_schema_contract::{
+    AuthzSchemaContractError, AuthzTupleShape, validate_tuple_batch,
+};
+use crate::authz_scope::{DEFAULT_AUTHZ_REALM_ID, split_realm_namespace};
 use crate::authz_segment;
 use crate::authz_userset_index::{
     AuthzDerivedUsersetEntry, DEFAULT_DERIVED_USERSET_INDEX_ID,
@@ -21,6 +26,7 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
+mod idempotency;
 pub(crate) mod resolver;
 
 const AUTHZ_TUPLE_JOURNAL_BODY_SCHEMA: &str = "anvil.authz_tuple.journal_body.v1";
@@ -123,6 +129,7 @@ struct AuthzTupleCurrentRowProto {
     record: Option<AuthzTupleRecordProto>,
 }
 
+#[derive(Clone, Copy)]
 pub struct AuthzTupleWrite<'a> {
     pub tenant_id: i64,
     pub namespace: &'a str,
@@ -163,6 +170,8 @@ pub(crate) async fn write_authz_tuple_with_permit(
     validate_optional_caveat_hash(input.caveat_hash)?;
     let write_lock = authz_tuple_write_lock(input.tenant_id)?;
     let _guard = write_lock.lock().await;
+    let schema_binding_precondition =
+        validate_writes_against_bound_schema(storage, std::slice::from_ref(&input), None).await?;
     let partition_precondition =
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     write_authz_tuple_inner(
@@ -170,6 +179,7 @@ pub(crate) async fn write_authz_tuple_with_permit(
         input,
         permit.fence_token,
         Some(partition_precondition),
+        schema_binding_precondition,
     )
     .await
 }
@@ -193,6 +203,8 @@ pub(crate) async fn write_authz_tuple_batch_with_permit(
     }
     let write_lock = authz_tuple_write_lock(tenant_id)?;
     let _guard = write_lock.lock().await;
+    let schema_binding_precondition =
+        validate_writes_against_bound_schema(storage, &inputs, None).await?;
     let partition_precondition =
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     write_authz_tuple_batch_inner(
@@ -200,8 +212,113 @@ pub(crate) async fn write_authz_tuple_batch_with_permit(
         inputs,
         permit.fence_token,
         Some(partition_precondition),
+        schema_binding_precondition,
     )
     .await
+}
+
+pub(crate) async fn replay_authz_tuple_batch(
+    storage: &Storage,
+    inputs: &[AuthzTupleWrite<'_>],
+    options: &crate::persistence::AuthzTupleBatchWriteOptions,
+) -> Result<Option<crate::persistence::AuthzTupleBatchWriteOutcome>> {
+    idempotency::replay(storage, inputs, options).await
+}
+
+pub(crate) async fn write_authz_tuple_batch_conditionally_with_permit(
+    storage: &Storage,
+    inputs: Vec<AuthzTupleWrite<'_>>,
+    options: &crate::persistence::AuthzTupleBatchWriteOptions,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<crate::persistence::AuthzTupleBatchWriteOutcome> {
+    let Some(first) = inputs.first() else {
+        return Err(anyhow!("authz tuple batch must not be empty"));
+    };
+    let tenant_id = first.tenant_id;
+    require_authz_permit(tenant_id, permit)?;
+    for input in &inputs {
+        if input.tenant_id != tenant_id {
+            return Err(anyhow!("authz tuple batch must target one tenant"));
+        }
+        validate_optional_caveat_hash(input.caveat_hash)?;
+    }
+    if let Some(operation_id) = options.operation_id.as_deref() {
+        idempotency::validate_operation_id(operation_id)?;
+    }
+    let write_lock = authz_tuple_write_lock(tenant_id)?;
+    let _guard = write_lock.lock().await;
+    let partition_precondition =
+        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    write_authz_tuple_batch_conditionally_inner(
+        storage,
+        inputs,
+        options,
+        permit.fence_token,
+        Some(partition_precondition),
+    )
+    .await
+}
+
+pub(crate) fn validate_authz_batch_operation_id(operation_id: &str) -> Result<()> {
+    idempotency::validate_operation_id(operation_id)
+}
+
+async fn validate_writes_against_bound_schema(
+    storage: &Storage,
+    inputs: &[AuthzTupleWrite<'_>],
+    expected_realm_id: Option<&str>,
+) -> Result<crate::persistence::AuthzSchemaBindingPrecondition> {
+    let first = inputs
+        .first()
+        .ok_or_else(|| anyhow!("authz tuple batch must not be empty"))?;
+    let realm_id = split_realm_namespace(first.namespace)
+        .map(|(realm_id, _)| realm_id)
+        .unwrap_or_else(|| DEFAULT_AUTHZ_REALM_ID.to_string());
+    if expected_realm_id.is_some_and(|expected| expected != realm_id) {
+        return Err(AuthzSchemaContractError::new(
+            "authorization tuple scope does not match the conditional batch realm",
+        )
+        .into());
+    }
+    let snapshot =
+        authz_realm_schema::read_bound_schema_snapshot(storage, first.tenant_id, &realm_id).await?;
+    let schema = snapshot.schema.as_ref().ok_or_else(|| {
+        AuthzSchemaContractError::new(format!(
+            "authorization realm {realm_id} has no bound schema revision"
+        ))
+    })?;
+    let tuples = inputs
+        .iter()
+        .map(|input| AuthzTupleShape {
+            namespace: input.namespace,
+            object_id: input.object_id,
+            relation: input.relation,
+            subject_kind: input.subject_kind,
+            subject_id: input.subject_id,
+            operation: input.operation,
+        })
+        .collect::<Vec<_>>();
+    validate_tuple_batch(&schema.namespaces, &realm_id, &tuples)?;
+    Ok(snapshot.binding_precondition)
+}
+
+fn handle_schema_fenced_write_result(
+    storage: &Storage,
+    schema_binding_precondition: &crate::persistence::AuthzSchemaBindingPrecondition,
+    result: Result<()>,
+) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(_)
+            if !idempotency::schema_binding_is_current(storage, schema_binding_precondition)? =>
+        {
+            Err(anyhow!(
+                crate::persistence::AuthzTupleBatchWriteError::SchemaBindingChanged
+            ))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn write_authz_tuple_inner(
@@ -209,6 +326,7 @@ async fn write_authz_tuple_inner(
     input: AuthzTupleWrite<'_>,
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
+    schema_binding_precondition: crate::persistence::AuthzSchemaBindingPrecondition,
 ) -> Result<AuthzTupleRecord> {
     validate_optional_caveat_hash(input.caveat_hash)?;
     let revision = latest_authz_revision(storage, input.tenant_id)
@@ -216,7 +334,15 @@ async fn write_authz_tuple_inner(
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("authz revision overflow"))?;
     let record = build_authz_tuple_record(input, revision, 0)?;
-    append_authz_tuple_record_inner(storage, &record, fence_token, partition_precondition).await?;
+    let write_result = append_authz_tuple_record_inner(
+        storage,
+        &record,
+        fence_token,
+        partition_precondition,
+        Some(&schema_binding_precondition),
+    )
+    .await;
+    handle_schema_fenced_write_result(storage, &schema_binding_precondition, write_result)?;
     Ok(record)
 }
 
@@ -225,6 +351,7 @@ async fn write_authz_tuple_batch_inner(
     inputs: Vec<AuthzTupleWrite<'_>>,
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
+    schema_binding_precondition: crate::persistence::AuthzSchemaBindingPrecondition,
 ) -> Result<Vec<AuthzTupleRecord>> {
     let tenant_id = inputs
         .first()
@@ -242,15 +369,88 @@ async fn write_authz_tuple_batch_inner(
             u32::try_from(idx).context("authz tuple batch ordinal overflow")?,
         )?);
     }
-    append_authz_tuple_batch_inner(
+    let write_result = append_authz_tuple_batch_inner(
         storage,
         tenant_id,
         &records,
         fence_token,
         partition_precondition,
+        None,
+        Some(&schema_binding_precondition),
+    )
+    .await;
+    handle_schema_fenced_write_result(storage, &schema_binding_precondition, write_result)?;
+    Ok(records)
+}
+
+async fn write_authz_tuple_batch_conditionally_inner(
+    storage: &Storage,
+    inputs: Vec<AuthzTupleWrite<'_>>,
+    options: &crate::persistence::AuthzTupleBatchWriteOptions,
+    fence_token: u64,
+    partition_precondition: Option<CoreMutationPrecondition>,
+) -> Result<crate::persistence::AuthzTupleBatchWriteOutcome> {
+    if let Some(replay) = idempotency::replay(storage, &inputs, options).await? {
+        return Ok(replay);
+    }
+    let schema_binding_precondition = validate_writes_against_bound_schema(
+        storage,
+        &inputs,
+        Some(options.authz_realm_id.as_str()),
     )
     .await?;
-    Ok(records)
+    let tenant_id = inputs
+        .first()
+        .ok_or_else(|| anyhow!("authz tuple batch must not be empty"))?
+        .tenant_id;
+    let current_revision = latest_authz_revision(storage, tenant_id).await?;
+    if let Some(expected) = options.expected_revision
+        && expected != current_revision
+    {
+        return Err(anyhow!(
+            crate::persistence::AuthzTupleBatchWriteError::RevisionConflict {
+                expected,
+                actual: current_revision,
+            }
+        ));
+    }
+    let revision = current_revision
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("authz revision overflow"))?;
+    let mut records = Vec::with_capacity(inputs.len());
+    for (idx, input) in inputs.iter().copied().enumerate() {
+        records.push(build_authz_tuple_record(
+            input,
+            revision,
+            u32::try_from(idx).context("authz tuple batch ordinal overflow")?,
+        )?);
+    }
+    let receipt = idempotency::prepare_receipt(&inputs, options, &records)?;
+    let write_result = append_authz_tuple_batch_inner(
+        storage,
+        tenant_id,
+        &records,
+        fence_token,
+        partition_precondition,
+        receipt.as_ref(),
+        Some(&schema_binding_precondition),
+    )
+    .await;
+    if let Err(error) = write_result {
+        if let Some(replay) = idempotency::replay(storage, &inputs, options).await? {
+            return Ok(replay);
+        }
+        if !idempotency::schema_binding_is_current(storage, &schema_binding_precondition)? {
+            return Err(anyhow!(
+                crate::persistence::AuthzTupleBatchWriteError::SchemaBindingChanged
+            ));
+        }
+        return Err(error);
+    }
+    Ok(crate::persistence::AuthzTupleBatchWriteOutcome {
+        records,
+        replayed: false,
+    })
 }
 
 fn build_authz_tuple_record(
@@ -298,7 +498,7 @@ pub(crate) async fn test_append_authz_tuple_record_unfenced(
     storage: &Storage,
     record: &AuthzTupleRecord,
 ) -> Result<()> {
-    append_authz_tuple_record_inner(storage, record, 0, None).await
+    append_authz_tuple_record_inner(storage, record, 0, None, None).await
 }
 
 #[cfg(test)]
@@ -316,6 +516,7 @@ pub(crate) async fn append_authz_tuple_record_with_permit(
         record,
         permit.fence_token,
         Some(partition_precondition),
+        None,
     )
     .await
 }
@@ -325,6 +526,7 @@ async fn append_authz_tuple_record_inner(
     record: &AuthzTupleRecord,
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
+    schema_binding_precondition: Option<&crate::persistence::AuthzSchemaBindingPrecondition>,
 ) -> Result<()> {
     let core_store = CoreStore::new(storage.clone()).await?;
     let stream_id = authz_tuple_stream_id(record.tenant_id);
@@ -337,7 +539,10 @@ async fn append_authz_tuple_record_inner(
             transaction_id: format!("authz-tuple:{}", record.mutation_id),
             scope_partition: partition_id.clone(),
             committed_by_principal: authz_partition_principal(record.tenant_id),
-            preconditions: partition_precondition.into_iter().collect(),
+            preconditions: partition_precondition
+                .into_iter()
+                .chain(schema_binding_precondition.map(idempotency::schema_binding_precondition))
+                .collect(),
             operations: vec![CoreMutationOperation::StreamAppend {
                 partition_id,
                 stream_id,
@@ -373,6 +578,8 @@ async fn append_authz_tuple_batch_inner(
     records: &[AuthzTupleRecord],
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
+    idempotency_receipt: Option<&idempotency::PreparedAuthzIdempotencyReceipt>,
+    schema_binding_precondition: Option<&crate::persistence::AuthzSchemaBindingPrecondition>,
 ) -> Result<()> {
     if records.is_empty() {
         return Err(anyhow!("authz tuple batch must not be empty"));
@@ -392,19 +599,35 @@ async fn append_authz_tuple_batch_inner(
 
     let partition_id = hex::encode(authz_partition_id(tenant_id));
     let step_started_at = std::time::Instant::now();
+    let transaction_id = idempotency_receipt
+        .map(|receipt| receipt.transaction_id.clone())
+        .unwrap_or_else(|| format!("authz-tuple-batch:{tenant_id}:{revision}"));
+    let mut preconditions = partition_precondition.into_iter().collect::<Vec<_>>();
+    if let Some(schema_binding_precondition) = schema_binding_precondition {
+        preconditions.push(idempotency::schema_binding_precondition(
+            schema_binding_precondition,
+        ));
+    }
+    if let Some(receipt) = idempotency_receipt {
+        preconditions.push(idempotency::receipt_precondition(receipt));
+    }
+    let mut operations = vec![CoreMutationOperation::StreamAppend {
+        partition_id: partition_id.clone(),
+        stream_id,
+        record_kind: AUTHZ_TUPLE_BATCH_RECORD_KIND.to_string(),
+        payload,
+        idempotency_key: Some(transaction_id.clone()),
+    }];
+    if let Some(receipt) = idempotency_receipt {
+        operations.push(idempotency::receipt_operation(&partition_id, receipt));
+    }
     core_store
         .commit_mutation_batch(CoreMutationBatch {
-            transaction_id: format!("authz-tuple-batch:{tenant_id}:{revision}"),
-            scope_partition: partition_id.clone(),
+            transaction_id,
+            scope_partition: partition_id,
             committed_by_principal: authz_partition_principal(tenant_id),
-            preconditions: partition_precondition.into_iter().collect(),
-            operations: vec![CoreMutationOperation::StreamAppend {
-                partition_id,
-                stream_id,
-                record_kind: AUTHZ_TUPLE_BATCH_RECORD_KIND.to_string(),
-                payload,
-                idempotency_key: Some(format!("authz-tuple-batch:{tenant_id}:{revision}")),
-            }],
+            preconditions,
+            operations,
         })
         .await?;
     crate::emit_test_timing(
@@ -1421,6 +1644,20 @@ async fn read_all_authz_tuple_records_from_journal(
             _ => {}
         }
     }
+    Ok(records)
+}
+
+async fn read_authz_tuple_records_at_revision_from_journal(
+    storage: &Storage,
+    tenant_id: i64,
+    revision: i64,
+) -> Result<Vec<AuthzTupleRecord>> {
+    let mut records = read_all_authz_tuple_records_from_journal(storage, tenant_id)
+        .await?
+        .into_iter()
+        .filter(|record| record.revision == revision)
+        .collect::<Vec<_>>();
+    records.sort_by_key(|record| record.revision_ordinal);
     Ok(records)
 }
 

@@ -63,6 +63,7 @@ pub const TABLE_BOUNDARY_VALUE_ROW: u16 = 0x8402;
 pub const TABLE_BOUNDARY_MIGRATION_ROW: u16 = 0x8403;
 pub const TABLE_AUTHZ_SCHEMA_ROW: u16 = 0x8501;
 pub const TABLE_AUTHZ_TUPLE_PAGE_ROW: u16 = 0x8502;
+pub const TABLE_AUTHZ_IDEMPOTENCY_RECEIPT_ROW: u16 = 0x8503;
 pub const TABLE_PERSONALDB_GROUP_ROW: u16 = 0x8601;
 pub const TABLE_PERSONALDB_DATA_LOCATOR_ROW: u16 = 0x8602;
 pub const TABLE_PERSONALDB_PROPOSAL_CLAIM_ROW: u16 = 0x8603;
@@ -1455,7 +1456,9 @@ fn table_spec(table_id: u16) -> Result<CoreMetaTableSpec> {
                 max_payload_bytes: CORE_META_MAX_VALUE_BYTES,
             }
         }
-        TABLE_AUTHZ_SCHEMA_ROW | TABLE_AUTHZ_TUPLE_PAGE_ROW => CoreMetaTableSpec {
+        TABLE_AUTHZ_SCHEMA_ROW
+        | TABLE_AUTHZ_TUPLE_PAGE_ROW
+        | TABLE_AUTHZ_IDEMPOTENCY_RECEIPT_ROW => CoreMetaTableSpec {
             cf: CF_AUTHZ,
             max_payload_bytes: CORE_META_MAX_VALUE_BYTES,
         },
@@ -1757,6 +1760,7 @@ fn expected_schema_markers(table_id: u16) -> Option<&'static [&'static str]> {
             "anvil.authz.coremeta_payload_row.v1",
             "anvil.authz.derived_userset_index_row.v1",
         ]),
+        TABLE_AUTHZ_IDEMPOTENCY_RECEIPT_ROW => Some(&["anvil.authz.idempotency_receipt.v1"]),
         TABLE_GATEWAY_METADATA_ROW => Some(&["anvil.gateway.coremeta_record.v1"]),
         TABLE_GIT_SOURCE_MANIFEST_ROW => Some(&["anvil.coremeta.git_source_manifest.v1"]),
         TABLE_MESH_NODE_ROW => Some(&[
