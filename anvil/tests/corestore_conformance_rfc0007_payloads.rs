@@ -487,7 +487,7 @@ fn personaldb_control_envelope_and_certificate_records_are_not_json() {
             "PersonalDbSnapshotManifestHashProto",
             "PersonalDbCommitCertificateHashProto",
             "encode_deterministic_proto(",
-            "commit_certificate_hash_proto(certificate)",
+            "commit_certificate_hash_proto(",
         ],
     );
     assert_contains_none(
