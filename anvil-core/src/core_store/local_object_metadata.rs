@@ -122,61 +122,65 @@ impl CoreStore {
         let payload = encode_object_metadata_row_at_generation(object, root_generation)?;
         let counter_payload =
             self.object_id_counter_payload_at_generation(bucket, object.id, root_generation)?;
-        self.commit_coremeta_batch_by_embedded_roots(
-            &object.mutation_id.to_string(),
-            &[
-                CoreMetaBatchOp {
-                    cf: CF_OBJECT_HEADS,
-                    table_id: TABLE_OBJECT_HEAD_ROW,
-                    tuple_key: &current_key,
-                    common: None,
-                    kind: CoreMetaBatchOpKind::Put(&payload),
-                },
-                CoreMetaBatchOp {
-                    cf: CF_OBJECT_VERSIONS,
-                    table_id: TABLE_OBJECT_VERSION_META_ROW,
-                    tuple_key: &version_key,
-                    common: None,
-                    kind: CoreMetaBatchOpKind::Put(&payload),
-                },
-                CoreMetaBatchOp {
-                    cf: CF_OBJECT_HEADS,
-                    table_id: TABLE_OBJECT_HEAD_ROW,
-                    tuple_key: &current_list_key,
-                    common: None,
-                    kind: CoreMetaBatchOpKind::Put(&payload),
-                },
-                CoreMetaBatchOp {
-                    cf: CF_OBJECT_VERSIONS,
-                    table_id: TABLE_OBJECT_VERSION_META_ROW,
-                    tuple_key: &version_list_key,
-                    common: None,
-                    kind: CoreMetaBatchOpKind::Put(&payload),
-                },
-                CoreMetaBatchOp {
-                    cf: CF_OBJECT_HEADS,
-                    table_id: TABLE_OBJECT_HEAD_ROW,
-                    tuple_key: &current_history_key,
-                    common: None,
-                    kind: CoreMetaBatchOpKind::Put(&payload),
-                },
-                CoreMetaBatchOp {
-                    cf: CF_OBJECT_VERSIONS,
-                    table_id: TABLE_OBJECT_VERSION_META_ROW,
-                    tuple_key: &version_history_key,
-                    common: None,
-                    kind: CoreMetaBatchOpKind::Put(&payload),
-                },
-                CoreMetaBatchOp {
-                    cf: CF_OBJECT_VERSIONS,
-                    table_id: TABLE_OBJECT_VERSION_META_ROW,
-                    tuple_key: &counter_key,
-                    common: None,
-                    kind: CoreMetaBatchOpKind::Put(&counter_payload),
-                },
-            ],
-        )
-        .await?;
+        let transaction_id = object.mutation_id.to_string();
+        let mut owned_ops = vec![
+            OwnedCoreMetaBatchOp::Put {
+                cf: CF_OBJECT_HEADS,
+                table_id: TABLE_OBJECT_HEAD_ROW,
+                tuple_key: current_key,
+                payload: payload.clone(),
+                common: None,
+            },
+            OwnedCoreMetaBatchOp::Put {
+                cf: CF_OBJECT_VERSIONS,
+                table_id: TABLE_OBJECT_VERSION_META_ROW,
+                tuple_key: version_key,
+                payload: payload.clone(),
+                common: None,
+            },
+            OwnedCoreMetaBatchOp::Put {
+                cf: CF_OBJECT_HEADS,
+                table_id: TABLE_OBJECT_HEAD_ROW,
+                tuple_key: current_list_key,
+                payload: payload.clone(),
+                common: None,
+            },
+            OwnedCoreMetaBatchOp::Put {
+                cf: CF_OBJECT_VERSIONS,
+                table_id: TABLE_OBJECT_VERSION_META_ROW,
+                tuple_key: version_list_key,
+                payload: payload.clone(),
+                common: None,
+            },
+            OwnedCoreMetaBatchOp::Put {
+                cf: CF_OBJECT_HEADS,
+                table_id: TABLE_OBJECT_HEAD_ROW,
+                tuple_key: current_history_key,
+                payload: payload.clone(),
+                common: None,
+            },
+            OwnedCoreMetaBatchOp::Put {
+                cf: CF_OBJECT_VERSIONS,
+                table_id: TABLE_OBJECT_VERSION_META_ROW,
+                tuple_key: version_history_key,
+                payload,
+                common: None,
+            },
+            OwnedCoreMetaBatchOp::Put {
+                cf: CF_OBJECT_VERSIONS,
+                table_id: TABLE_OBJECT_VERSION_META_ROW,
+                tuple_key: counter_key,
+                payload: counter_payload,
+                common: None,
+            },
+        ];
+        owned_ops.extend(
+            self.payload_reference_put_ops_for_object(bucket, object, &transaction_id)
+                .await?,
+        );
+        let ops = borrow_owned_coremeta_batch_ops(&owned_ops);
+        self.commit_coremeta_batch_by_embedded_roots(&transaction_id, &ops)
+            .await?;
         drop(_guard);
         if let Some(data_target) = object_data_target_from_shard_map(object.shard_map.as_ref())? {
             let boundary_values = match &data_target {
@@ -673,101 +677,93 @@ impl CoreStore {
         let version_history_key =
             object_version_history_key(bucket, object_key, version_id, root_generation);
 
-        let mut ops = vec![
-            CoreMetaBatchOp {
+        let mut owned_ops = vec![
+            OwnedCoreMetaBatchOp::Delete {
                 cf: CF_OBJECT_VERSIONS,
                 table_id: TABLE_OBJECT_VERSION_META_ROW,
-                tuple_key: &version_key,
+                tuple_key: version_key,
                 common: None,
-                kind: CoreMetaBatchOpKind::Delete,
             },
-            CoreMetaBatchOp {
+            OwnedCoreMetaBatchOp::Delete {
                 cf: CF_OBJECT_VERSIONS,
                 table_id: TABLE_OBJECT_VERSION_META_ROW,
-                tuple_key: &version_list_key,
+                tuple_key: version_list_key,
                 common: None,
-                kind: CoreMetaBatchOpKind::Delete,
             },
-            CoreMetaBatchOp {
+            OwnedCoreMetaBatchOp::Put {
                 cf: CF_OBJECT_VERSIONS,
                 table_id: TABLE_OBJECT_VERSION_META_ROW,
-                tuple_key: &version_history_key,
+                tuple_key: version_history_key,
+                payload: tombstone_payload.clone(),
                 common: None,
-                kind: CoreMetaBatchOpKind::Put(&tombstone_payload),
             },
         ];
-        let mut current_history_key_holder = None;
         if deleted_is_current {
             if let Some(replacement_payload) = replacement_payload.as_ref() {
                 let replacement_version = replacement
                     .as_ref()
                     .map(|object| object.version_id)
                     .unwrap_or(version_id);
-                current_history_key_holder = Some(object_current_history_key(
+                let current_history_key = object_current_history_key(
                     bucket,
                     object_key,
                     root_generation,
                     replacement_version,
-                ));
-                let current_history_key = current_history_key_holder.as_ref().unwrap();
-                ops.push(CoreMetaBatchOp {
+                );
+                owned_ops.push(OwnedCoreMetaBatchOp::Put {
                     cf: CF_OBJECT_HEADS,
                     table_id: TABLE_OBJECT_HEAD_ROW,
-                    tuple_key: &current_key,
+                    tuple_key: current_key.clone(),
+                    payload: replacement_payload.clone(),
                     common: None,
-                    kind: CoreMetaBatchOpKind::Put(replacement_payload),
                 });
-                ops.push(CoreMetaBatchOp {
+                owned_ops.push(OwnedCoreMetaBatchOp::Put {
                     cf: CF_OBJECT_HEADS,
                     table_id: TABLE_OBJECT_HEAD_ROW,
-                    tuple_key: &current_list_key,
+                    tuple_key: current_list_key.clone(),
+                    payload: replacement_payload.clone(),
                     common: None,
-                    kind: CoreMetaBatchOpKind::Put(replacement_payload),
                 });
-                ops.push(CoreMetaBatchOp {
+                owned_ops.push(OwnedCoreMetaBatchOp::Put {
                     cf: CF_OBJECT_HEADS,
                     table_id: TABLE_OBJECT_HEAD_ROW,
-                    tuple_key: &current_history_key,
+                    tuple_key: current_history_key.clone(),
+                    payload: replacement_payload.clone(),
                     common: None,
-                    kind: CoreMetaBatchOpKind::Put(replacement_payload),
                 });
             } else {
-                current_history_key_holder = Some(object_current_history_key(
-                    bucket,
-                    object_key,
-                    root_generation,
-                    version_id,
-                ));
-                let current_history_key = current_history_key_holder.as_ref().unwrap();
-                ops.push(CoreMetaBatchOp {
+                let current_history_key =
+                    object_current_history_key(bucket, object_key, root_generation, version_id);
+                owned_ops.push(OwnedCoreMetaBatchOp::Delete {
                     cf: CF_OBJECT_HEADS,
                     table_id: TABLE_OBJECT_HEAD_ROW,
-                    tuple_key: &current_key,
+                    tuple_key: current_key.clone(),
                     common: None,
-                    kind: CoreMetaBatchOpKind::Delete,
                 });
-                ops.push(CoreMetaBatchOp {
+                owned_ops.push(OwnedCoreMetaBatchOp::Delete {
                     cf: CF_OBJECT_HEADS,
                     table_id: TABLE_OBJECT_HEAD_ROW,
-                    tuple_key: &current_list_key,
+                    tuple_key: current_list_key.clone(),
                     common: None,
-                    kind: CoreMetaBatchOpKind::Delete,
                 });
-                ops.push(CoreMetaBatchOp {
+                owned_ops.push(OwnedCoreMetaBatchOp::Put {
                     cf: CF_OBJECT_HEADS,
                     table_id: TABLE_OBJECT_HEAD_ROW,
-                    tuple_key: &current_history_key,
+                    tuple_key: current_history_key.clone(),
+                    payload: tombstone_payload.clone(),
                     common: None,
-                    kind: CoreMetaBatchOpKind::Put(&tombstone_payload),
                 });
             }
         }
 
-        self.commit_coremeta_batch_by_embedded_roots(
-            &format!("delete-object-version:{version_id}"),
-            &ops,
-        )
-        .await?;
+        let transaction_id = format!("delete-object-version:{version_id}");
+        owned_ops.extend(
+            self.payload_reference_delete_ops_for_object(bucket, &original, &transaction_id)
+                .await?,
+        );
+        let ops = borrow_owned_coremeta_batch_ops(&owned_ops);
+        self.commit_coremeta_batch_by_embedded_roots(&transaction_id, &ops)
+            .await?;
         Ok(())
     }
 

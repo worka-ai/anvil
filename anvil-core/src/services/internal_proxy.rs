@@ -3,7 +3,7 @@ use crate::anvil_api::*;
 use crate::object_manager::{
     ObjectLinkReadMode, ObjectReadConsistency, ObjectWriteOptions, ObjectWriteVisibility,
 };
-use crate::{AppState, access_control, auth, permissions::AnvilAction};
+use crate::{AppState, auth, system_realm};
 use futures_util::StreamExt;
 use http::HeaderValue;
 use tokio::sync::mpsc;
@@ -330,20 +330,18 @@ fn proxy_header(name: &str, value: &[u8]) -> ProxyHeader {
 async fn validate_internal_proxy_claims(
     state: &AppState,
     claims: &auth::Claims,
-    header: &ProxyRequestHeader,
+    _header: &ProxyRequestHeader,
 ) -> Result<(), Status> {
-    let resource = format!(
-        "tenant/{}/bucket/{}/{}",
-        header.tenant_id, header.bucket_name, header.object_key
-    );
-    access_control::require_action(
+    system_realm::check_admin_relation(
         &state.storage,
-        &state.persistence,
+        &state.config.mesh_id,
         claims,
-        AnvilAction::InternalProxyObject,
-        &resource,
+        system_realm::SystemAdminRelation::ManageNodes,
     )
     .await
+    .map_err(|error| Status::internal(error.to_string()))?
+    .then_some(())
+    .ok_or_else(|| Status::permission_denied("system realm manage_nodes relation required"))
 }
 
 fn decode_proxy_authz_context(header: &ProxyRequestHeader) -> Result<auth::Claims, Status> {

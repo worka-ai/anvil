@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 use std::collections::{BTreeSet, HashSet};
 use std::net::SocketAddr;
 use std::ops::Deref;

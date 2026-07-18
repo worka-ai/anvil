@@ -31,10 +31,11 @@ use super::meta::{
     TABLE_CORE_FENCE_ROW, TABLE_EXPLICIT_TRANSACTION_ROW, TABLE_INLINE_MANIFEST_BODY_ROW,
     TABLE_INLINE_PAYLOAD_ROW, TABLE_LANDED_BYTE_REF_ROW, TABLE_MATERIALISATION_CURSOR_ROW,
     TABLE_NODE_SIGNING_KEYPAIR_ROW, TABLE_OBJECT_HEAD_ROW, TABLE_OBJECT_VERSION_META_ROW,
-    TABLE_PENDING_MUTATION_ROW, TABLE_QUORUM_PROFILE_CURRENT_ROW, TABLE_ROOT_CACHE_ROW,
-    TABLE_ROOT_CATALOG_CURRENT_ROW, TABLE_STREAM_HEAD_ROW, TABLE_STREAM_IDEMPOTENCY_ROW,
-    TABLE_STREAM_RECORD_INDEX_ROW, TABLE_TRANSACTION_COMMIT_EVIDENCE_ROW,
-    TABLE_TRANSACTION_LOCATOR_ROW, canonical_coremeta_cf_name, core_meta_committed_row_common,
+    TABLE_PENDING_MUTATION_ROW, TABLE_QUORUM_PROFILE_CURRENT_ROW, TABLE_REFCOUNT_ROW,
+    TABLE_ROOT_CACHE_ROW, TABLE_ROOT_CATALOG_CURRENT_ROW, TABLE_STREAM_HEAD_ROW,
+    TABLE_STREAM_IDEMPOTENCY_ROW, TABLE_STREAM_RECORD_INDEX_ROW,
+    TABLE_TRANSACTION_COMMIT_EVIDENCE_ROW, TABLE_TRANSACTION_LOCATOR_ROW,
+    canonical_coremeta_cf_name, core_meta_committed_row_common,
     core_meta_locator_from_manifest_locator, core_meta_locator_to_manifest_locator,
     core_meta_payload_digest, core_meta_pending_row_common, core_meta_root_key_hash,
     core_meta_row_common_from_payload, core_meta_tuple_key, encode_core_meta_inline_payload_row,
@@ -820,6 +821,8 @@ mod local_logical_file_path;
 mod local_logical_files;
 #[path = "local_object_metadata.rs"]
 mod local_object_metadata;
+#[path = "local_refcounts.rs"]
+mod local_refcounts;
 pub(crate) use self::local_codec::{decode_core_object_ref_target, encode_core_object_ref_target};
 pub(crate) use self::local_coremeta_quorum::commit_coremeta_batch_for_storage;
 pub(crate) use self::local_io::{record_corestore_trace_event, write_file_atomic};
