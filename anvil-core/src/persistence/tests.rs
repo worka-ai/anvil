@@ -30,6 +30,242 @@ fn model_manifest() -> crate::anvil_api::ModelManifest {
     }
 }
 
+fn test_authz_relation(name: &str) -> crate::anvil_api::AuthzRelationSchema {
+    crate::anvil_api::AuthzRelationSchema {
+        relation: name.to_string(),
+        rules: Vec::new(),
+        member_kind: crate::anvil_api::AuthzSchemaMemberKind::DirectRelation as i32,
+        allowed_subjects: vec![crate::anvil_api::AuthzAllowedSubject {
+            selector_kind: crate::anvil_api::AuthzSubjectSelectorKind::AnyCanonicalId as i32,
+            subject_kind: "user".to_string(),
+            subject_id: String::new(),
+        }],
+    }
+}
+
+async fn bind_persistence_test_authz_schema(persistence: &Persistence, tenant_id: i64) {
+    let schema = crate::authz_realm_schema::put_schema_revision(
+        &persistence.storage,
+        tenant_id,
+        "persistence-test-authz",
+        vec![
+            crate::anvil_api::AuthzNamespaceSchema {
+                namespace: "document".to_string(),
+                relations: vec![test_authz_relation("reader"), test_authz_relation("viewer")],
+                schema_json: String::new(),
+                schema_hash: String::new(),
+                schema_version: 0,
+                authz_revision: 0,
+                applied_at: String::new(),
+            },
+            crate::anvil_api::AuthzNamespaceSchema {
+                namespace: "object".to_string(),
+                relations: vec![test_authz_relation("reader")],
+                schema_json: String::new(),
+                schema_hash: String::new(),
+                schema_version: 0,
+                authz_revision: 0,
+                applied_at: String::new(),
+            },
+        ],
+        0,
+        "test",
+        "bind persistence test schema",
+    )
+    .await
+    .unwrap();
+    crate::authz_realm_schema::bind_schema(
+        &persistence.storage,
+        tenant_id,
+        crate::authz_scope::DEFAULT_AUTHZ_REALM_ID,
+        schema.schema_ref,
+        None,
+        0,
+        "test",
+        "bind persistence test schema",
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn authz_tuple_write_enqueues_materialization_and_task_builds_derived_index() {
+    let temp = tempdir().unwrap();
+    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    bind_persistence_test_authz_schema(&persistence, 1).await;
+
+    let record = persistence
+        .write_authz_tuple(
+            1,
+            "document",
+            "doc-a",
+            "reader",
+            "user",
+            "alice",
+            "",
+            "add",
+            "test",
+            "grant reader",
+        )
+        .await
+        .unwrap();
+
+    let tasks = persistence.list_tasks().await.unwrap();
+    let materialization = tasks
+        .iter()
+        .find(|task| task.task_type == crate::tasks::TaskType::AuthzMaterialization)
+        .expect("authz write should enqueue persistent materialization task");
+    assert_eq!(materialization.payload["tenant_id"], json!(1));
+    assert_eq!(
+        materialization.payload["target_revision"],
+        json!(record.revision)
+    );
+
+    assert_eq!(
+        crate::authz_userset_index::lookup_derived_userset_index_at_revision(
+            &persistence.storage,
+            1,
+            crate::authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID,
+            "document",
+            "doc-a",
+            "reader",
+            "user",
+            "alice",
+            "",
+            record.revision as u64,
+        )
+        .await
+        .unwrap(),
+        None
+    );
+
+    let outcome = persistence
+        .run_authz_materialization_task(1, record.revision as u64)
+        .await
+        .unwrap();
+    assert_eq!(outcome.processed_revision, record.revision as u64);
+    assert_eq!(
+        crate::authz_userset_index::lookup_derived_userset_index_at_revision(
+            &persistence.storage,
+            1,
+            crate::authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID,
+            "document",
+            "doc-a",
+            "reader",
+            "user",
+            "alice",
+            "",
+            record.revision as u64,
+        )
+        .await
+        .unwrap(),
+        Some(true)
+    );
+    let lag = crate::authz_derived_lag_watch::latest_authz_derived_lag_watch_event(
+        &persistence.storage,
+        1,
+        crate::authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID,
+    )
+    .await
+    .unwrap()
+    .expect("authz materialization should publish lag catch-up event");
+    assert_eq!(lag.payload.processed_revision, record.revision as u64);
+    assert_eq!(lag.payload.latest_revision, record.revision as u64);
+}
+
+#[tokio::test]
+async fn authz_materialization_job_latency_with_retained_history_perf() {
+    if std::env::var_os("ANVIL_RUN_AUTHZ_JOB_PERF").is_none() {
+        return;
+    }
+
+    let retained = std::env::var("ANVIL_AUTHZ_PERF_SEED")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(100);
+    let temp = tempdir().unwrap();
+    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    bind_persistence_test_authz_schema(&persistence, 42).await;
+
+    let seed_started = std::time::Instant::now();
+    for idx in 0..retained {
+        persistence
+            .write_authz_tuple(
+                42,
+                "document",
+                &format!("seed-{idx}"),
+                "reader",
+                "user",
+                "alice",
+                "",
+                "add",
+                "bench",
+                "seed retained tuple history",
+            )
+            .await
+            .unwrap();
+    }
+    let seed_elapsed = seed_started.elapsed();
+
+    let write_started = std::time::Instant::now();
+    let record = persistence
+        .write_authz_tuple(
+            42,
+            "document",
+            "measured",
+            "reader",
+            "user",
+            "alice",
+            "",
+            "add",
+            "bench",
+            "measured retained tuple write",
+        )
+        .await
+        .unwrap();
+    let write_elapsed = write_started.elapsed();
+
+    let immediate_check_ms =
+        measure_authz_permission_checks(&persistence.storage, 42, record.revision).await;
+    let materialize_started = std::time::Instant::now();
+    let outcome = persistence
+        .run_authz_materialization_task(42, record.revision as u64)
+        .await
+        .unwrap();
+    let materialize_elapsed = materialize_started.elapsed();
+    assert_eq!(outcome.processed_revision, record.revision as u64);
+    let post_materialization_check_ms =
+        measure_authz_permission_checks(&persistence.storage, 42, record.revision).await;
+
+    eprintln!(
+        "[authz-job-perf] retained={retained} seed_ms={} measured_write_ms={} immediate_check_ms={:?} materialize_job_ms={} post_materialization_check_ms={:?}",
+        seed_elapsed.as_millis(),
+        write_elapsed.as_millis(),
+        immediate_check_ms,
+        materialize_elapsed.as_millis(),
+        post_materialization_check_ms,
+    );
+}
+
+async fn measure_authz_permission_checks(
+    storage: &crate::storage::Storage,
+    tenant_id: i64,
+    revision: i64,
+) -> Vec<u128> {
+    let mut check_elapsed_ms = Vec::new();
+    for _ in 0..10 {
+        let check_started = std::time::Instant::now();
+        let allowed = crate::authz_journal::resolve_permission_at_revision(
+            storage, tenant_id, "document", "measured", "reader", "user", "alice", "", revision,
+        )
+        .await
+        .unwrap();
+        check_elapsed_ms.push(check_started.elapsed().as_millis());
+        assert!(allowed);
+    }
+    check_elapsed_ms
+}
+
 #[tokio::test]
 async fn empty_bucket_index_build_materialises_an_empty_typed_json_segment() {
     let temp = tempdir().unwrap();
@@ -828,6 +1064,7 @@ async fn persistence_replays_anvil_owned_state_after_fresh_instance_body() {
         .create_tenant("tenant-a", "unused")
         .await
         .unwrap();
+    bind_persistence_test_authz_schema(&persistence, tenant.id).await;
     let app = persistence
         .create_app(tenant.id, "app-a", "client-a", b"encrypted-secret")
         .await
@@ -1141,7 +1378,17 @@ async fn persistence_replays_anvil_owned_state_after_fresh_instance_body() {
             .revision,
         authz.revision
     );
-    assert_eq!(replayed.list_tasks().await.unwrap().len(), 1);
+    let replayed_tasks = replayed.list_tasks().await.unwrap();
+    assert_eq!(replayed_tasks.len(), 2);
+    assert!(
+        replayed_tasks
+            .iter()
+            .any(|task| task.task_type == crate::tasks::TaskType::DeleteBucket)
+    );
+    assert!(replayed_tasks.iter().any(|task| {
+        task.task_type == crate::tasks::TaskType::AuthzMaterialization
+            && task.payload["target_revision"] == json!(authz.revision)
+    }));
     assert!(
         replayed
             .get_model_artifact("artifact-a")
@@ -1561,6 +1808,7 @@ async fn persistence_global_journal_writes_use_current_fence_tokens() {
         let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
 
         persistence.create_region("local").await.unwrap();
+        bind_persistence_test_authz_schema(&persistence, 1).await;
         let bucket = persistence
             .create_bucket(1, "bucket-a", "local")
             .await

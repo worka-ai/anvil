@@ -7,6 +7,7 @@ pub enum TaskType {
     IndexBuild,
     RebalanceShard,
     HFIngestion,
+    AuthzMaterialization,
 }
 
 impl TaskType {
@@ -18,6 +19,7 @@ impl TaskType {
             Self::IndexBuild => "INDEX_BUILD",
             Self::RebalanceShard => "REBALANCE_SHARD",
             Self::HFIngestion => "HF_INGESTION",
+            Self::AuthzMaterialization => "AUTHZ_MATERIALIZATION",
         }
     }
 }
