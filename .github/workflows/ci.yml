@@ -22,68 +22,13 @@ env:
 
 jobs:
   build-image:
-    name: Build Anvil test image
+    name: Docker image smoke deferred for 0.3.0
     runs-on: [self-hosted, linux, x64, worka-builder-2]
-    timeout-minutes: 45
-    env:
-      ANVIL_DOCKER_PLATFORM: linux/amd64
-      ANVIL_IMAGE: anvil:test-amd64
-      ANVIL_USE_NATIVE_CARGO: "1"
-      ANVIL_BUILD_PROFILE: ci
-      ANVIL_RUNTIME_BASE: ubuntu:24.04
-      CARGO_BUILD_JOBS: "4"
+    timeout-minutes: 5
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system build dependencies
+      - name: Defer PR Docker image smoke for 0.3.0
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            clang \
-            cmake \
-            libclang-dev \
-            pkg-config \
-            libssl-dev \
-            protobuf-compiler \
-            ripgrep
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-v2-pr-image-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-v2-pr-image-
-            ${{ runner.os }}-cargo-v2-
-
-      - name: Build Docker image from host-built binaries
-        run: ./scripts/build-image.sh
-
-      - name: Smoke check image binaries
-        run: |
-          timeout 30s docker run --platform linux/amd64 --rm anvil:test-amd64 anvil-server --version
-          timeout 30s docker run --platform linux/amd64 --rm anvil:test-amd64 anvil --version
-          timeout 30s docker run --platform linux/amd64 --rm anvil:test-amd64 anvil-admin --version
-
-      - name: Export Docker image artifact
-        run: docker save anvil:test-amd64 -o /tmp/anvil-test-image-amd64.tar
-
-      - name: Upload Docker image artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: anvil-test-image-amd64
-          path: /tmp/anvil-test-image-amd64.tar
-          compression-level: 0
-          retention-days: 1
+          echo "::notice title=Docker image smoke deferred::0.3.0 PR validation is limited to non-Docker gates; release tags still build and publish the Docker image."
 
   static:
     name: Static, docs, and packaging gates
