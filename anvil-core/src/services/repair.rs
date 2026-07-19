@@ -151,13 +151,38 @@ impl RepairService for AppState {
 
         let findings = self
             .persistence
-            .list_repair_findings(&req.scope_kind, &req.scope_id, req.limit as usize)
+            .list_repair_findings(&req.scope_kind, &req.scope_id, usize::MAX)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
-            .iter()
-            .map(repair_finding_record)
-            .collect();
-        Ok(Response::new(ListRepairFindingsResponse { findings }))
+            .into_iter()
+            .map(|finding| repair_finding_record(&finding))
+            .collect::<Vec<_>>();
+        let filters = [
+            ("scope_kind", req.scope_kind.as_str()),
+            ("scope_id", req.scope_id.as_str()),
+        ];
+        let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
+        let (findings, page) = crate::services::collection_cursor::paginate(
+            findings,
+            req.page.as_ref(),
+            "anvil.RepairService/ListRepairFindings",
+            &filters,
+            &principal_scope,
+            "finding_id.asc",
+            self.config.jwt_secret.as_bytes(),
+            |finding| finding.finding_id.as_str(),
+            |finding| {
+                crate::services::collection_cursor::content_generation(&[
+                    finding.status.as_bytes(),
+                    finding.severity.as_bytes(),
+                    &finding.created_at_nanos.to_le_bytes(),
+                ])
+            },
+        )?;
+        Ok(Response::new(ListRepairFindingsResponse {
+            findings,
+            page: Some(page),
+        }))
     }
 
     async fn repair_authz_derived_index(

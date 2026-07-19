@@ -361,7 +361,7 @@ impl AuthService for AppState {
             .get::<auth::Claims>()
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
-        let _ = request.into_inner();
+        let req = request.into_inner();
         require_app_management_permission(self, &claims, AnvilAction::AppRead).await?;
         let applications = self
             .persistence
@@ -375,8 +375,28 @@ impl AuthService for AppState {
                 app_name: app.name,
                 client_id: app.client_id,
             })
-            .collect();
-        Ok(Response::new(ListApplicationsResponse { applications }))
+            .collect::<Vec<_>>();
+        let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
+        let (applications, page) = crate::services::collection_cursor::paginate(
+            applications,
+            req.page.as_ref(),
+            "anvil.AuthService/ListApplications",
+            &[],
+            &principal_scope,
+            "app_name.asc",
+            self.config.jwt_secret.as_bytes(),
+            |app| app.app_name.as_str(),
+            |app| {
+                crate::services::collection_cursor::content_generation(&[
+                    app.app_id.as_bytes(),
+                    app.client_id.as_bytes(),
+                ])
+            },
+        )?;
+        Ok(Response::new(ListApplicationsResponse {
+            applications,
+            page: Some(page),
+        }))
     }
 
     async fn grant_access(
@@ -514,6 +534,8 @@ impl AuthService for AppState {
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
+        let revision_generation = u64::try_from(revision)
+            .map_err(|_| Status::internal("authorization revision is negative"))?;
         let grant_rows = authz_journal::read_current_authz_tuples_at_revision(
             &self.storage,
             SYSTEM_STORAGE_TENANT_ID,
@@ -529,10 +551,27 @@ impl AuthService for AppState {
         .map_err(|e| Status::internal(e.to_string()))?;
         let mut grants = Vec::with_capacity(grant_rows.len());
         for grant in grant_rows {
-            grants.push(public_access_grant_record(self, &app, grant).await?);
+            let grant = public_access_grant_record(self, &app, grant).await?;
+            let key = format!("{}\0{}\0{}", grant.app_id, grant.action, grant.resource);
+            grants.push((key, grant));
         }
-
-        Ok(Response::new(ListAccessGrantsResponse { grants }))
+        let filters = [("app", req.app.as_str())];
+        let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
+        let (grants, page) = crate::services::collection_cursor::paginate(
+            grants,
+            req.page.as_ref(),
+            "anvil.AuthService/ListAccessGrants",
+            &filters,
+            &principal_scope,
+            "app_id.action.resource.asc",
+            self.config.jwt_secret.as_bytes(),
+            |grant| grant.0.as_str(),
+            |_| revision_generation,
+        )?;
+        Ok(Response::new(ListAccessGrantsResponse {
+            grants: grants.into_iter().map(|(_, grant)| grant).collect(),
+            page: Some(page),
+        }))
     }
 
     async fn set_public_access(
@@ -728,20 +767,27 @@ impl AuthService for AppState {
                 &req.caveat_hash,
             ],
         );
-        let page_token = parse_authz_page_token(
-            &req.page_token,
-            claims.tenant_id,
-            &filter_hash,
-            self.config.jwt_secret.as_bytes(),
-        )?;
-        let response_revision = match page_token.as_ref() {
-            Some(token) => token.revision,
+        let page_size = normalize_page_size(req.page_size)?;
+        let response_revision = match authz_page_token_revision(&req.page_token)? {
+            Some(revision) => revision,
             None => {
                 let consistency = AuthzConsistency::from_request(&req.consistency, &req.zookie)?;
                 resolve_authz_response_revision(&self.storage, claims.tenant_id, consistency)
                     .await?
             }
         };
+        let page_binding = AuthzPageBinding {
+            tenant_id: claims.tenant_id,
+            principal_id: &claims.sub,
+            revision: response_revision,
+            filter_hash: &filter_hash,
+            page_size,
+        };
+        let page_token = parse_authz_page_token(
+            &req.page_token,
+            &page_binding,
+            self.config.jwt_secret.as_bytes(),
+        )?;
         let records = authz_journal::read_current_authz_tuples_at_revision(
             &self.storage,
             claims.tenant_id,
@@ -763,12 +809,20 @@ impl AuthService for AppState {
         let records = filter_records_for_realm(records, &scope.authz_realm_id);
         let (records, next_page_token) = paginate_authz(
             records,
-            req.page_size,
-            page_token.as_ref().map(|token| token.offset).unwrap_or(0),
-            claims.tenant_id,
-            response_revision,
-            &filter_hash,
+            page_token.as_ref().map(|token| token.position.as_str()),
+            &page_binding,
             self.config.jwt_secret.as_bytes(),
+            |record| {
+                format!(
+                    "{}\0{}\0{}\0{}\0{}\0{}",
+                    record.namespace,
+                    record.object_id,
+                    record.relation,
+                    record.subject_kind,
+                    record.subject_id,
+                    record.caveat_hash
+                )
+            },
         )?;
 
         Ok(Response::new(ReadAuthzTuplesResponse {
@@ -868,20 +922,27 @@ impl AuthService for AppState {
                 &req.caveat_hash,
             ],
         );
-        let page_token = parse_authz_page_token(
-            &req.page_token,
-            claims.tenant_id,
-            &filter_hash,
-            self.config.jwt_secret.as_bytes(),
-        )?;
-        let response_revision = match page_token.as_ref() {
-            Some(token) => token.revision,
+        let page_size = normalize_page_size(req.page_size)?;
+        let response_revision = match authz_page_token_revision(&req.page_token)? {
+            Some(revision) => revision,
             None => {
                 let consistency = AuthzConsistency::from_request(&req.consistency, &req.zookie)?;
                 resolve_authz_response_revision(&self.storage, claims.tenant_id, consistency)
                     .await?
             }
         };
+        let page_binding = AuthzPageBinding {
+            tenant_id: claims.tenant_id,
+            principal_id: &claims.sub,
+            revision: response_revision,
+            filter_hash: &filter_hash,
+            page_size,
+        };
+        let page_token = parse_authz_page_token(
+            &req.page_token,
+            &page_binding,
+            self.config.jwt_secret.as_bytes(),
+        )?;
         let object_ids = authz_journal::list_current_authz_objects_at_revision(
             &self.storage,
             claims.tenant_id,
@@ -896,12 +957,10 @@ impl AuthService for AppState {
         .map_err(|e| Status::internal(e.to_string()))?;
         let (object_ids, next_page_token) = paginate_authz(
             object_ids,
-            req.page_size,
-            page_token.as_ref().map(|token| token.offset).unwrap_or(0),
-            claims.tenant_id,
-            response_revision,
-            &filter_hash,
+            page_token.as_ref().map(|token| token.position.as_str()),
+            &page_binding,
             self.config.jwt_secret.as_bytes(),
+            Clone::clone,
         )?;
 
         Ok(Response::new(ListAuthzObjectsResponse {
@@ -945,20 +1004,27 @@ impl AuthService for AppState {
                 &req.subject_kind,
             ],
         );
-        let page_token = parse_authz_page_token(
-            &req.page_token,
-            claims.tenant_id,
-            &filter_hash,
-            self.config.jwt_secret.as_bytes(),
-        )?;
-        let response_revision = match page_token.as_ref() {
-            Some(token) => token.revision,
+        let page_size = normalize_page_size(req.page_size)?;
+        let response_revision = match authz_page_token_revision(&req.page_token)? {
+            Some(revision) => revision,
             None => {
                 let consistency = AuthzConsistency::from_request(&req.consistency, &req.zookie)?;
                 resolve_authz_response_revision(&self.storage, claims.tenant_id, consistency)
                     .await?
             }
         };
+        let page_binding = AuthzPageBinding {
+            tenant_id: claims.tenant_id,
+            principal_id: &claims.sub,
+            revision: response_revision,
+            filter_hash: &filter_hash,
+            page_size,
+        };
+        let page_token = parse_authz_page_token(
+            &req.page_token,
+            &page_binding,
+            self.config.jwt_secret.as_bytes(),
+        )?;
         let subjects = authz_journal::list_current_authz_subjects_at_revision(
             &self.storage,
             claims.tenant_id,
@@ -972,12 +1038,15 @@ impl AuthService for AppState {
         .map_err(|e| Status::internal(e.to_string()))?;
         let (subjects, next_page_token) = paginate_authz(
             subjects,
-            req.page_size,
-            page_token.as_ref().map(|token| token.offset).unwrap_or(0),
-            claims.tenant_id,
-            response_revision,
-            &filter_hash,
+            page_token.as_ref().map(|token| token.position.as_str()),
+            &page_binding,
             self.config.jwt_secret.as_bytes(),
+            |subject| {
+                format!(
+                    "{}\0{}\0{}",
+                    subject.subject_kind, subject.subject_id, subject.caveat_hash
+                )
+            },
         )?;
 
         Ok(Response::new(ListAuthzSubjectsResponse {

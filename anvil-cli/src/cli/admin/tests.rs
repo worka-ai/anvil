@@ -600,7 +600,7 @@ fn routing_commands_parse_family_and_mutation_context() {
         "list",
         "--family",
         "bucket-locator",
-        "--limit",
+        "--page-size",
         "25",
     ])
     .unwrap();
@@ -611,7 +611,7 @@ fn routing_commands_parse_family_and_mutation_context() {
         panic!("expected routing list command");
     };
     assert_eq!(family.unwrap().to_proto(), 3);
-    assert_eq!(page.limit, Some(25));
+    assert_eq!(page.page_size, Some(25));
 
     let repair_cli = TestAdminCli::try_parse_from([
         "admin",
@@ -698,7 +698,7 @@ fn repair_diagnostics_and_audit_commands_parse() {
         "releases",
         "--severity",
         "warning",
-        "--limit",
+        "--page-size",
         "10",
     ])
     .unwrap();
@@ -722,7 +722,7 @@ fn repair_diagnostics_and_audit_commands_parse() {
     assert_eq!(tenant_id.as_deref(), Some("acme"));
     assert_eq!(bucket_name.as_deref(), Some("releases"));
     assert_eq!(severity.as_deref(), Some("warning"));
-    assert_eq!(page.limit, Some(10));
+    assert_eq!(page.page_size, Some(10));
 
     let audit_cli = TestAdminCli::try_parse_from([
         "admin",
@@ -940,8 +940,8 @@ async fn admin_repair_diagnostics_and_audit_handlers_return_structured_responses
                     index_name: String::new(),
                     severity: String::new(),
                     page: Some(api::PageRequest {
-                        cursor: String::new(),
-                        limit: 5,
+                        page_token: String::new(),
+                        page_size: 5,
                     }),
                 },
                 &token,
@@ -954,7 +954,7 @@ async fn admin_repair_diagnostics_and_audit_handlers_return_structured_responses
     assert_eq!(diagnostics.request_id, "req-admin-diagnostics");
     assert_eq!(diagnostics.data_source, "index_diagnostic_journal");
     assert!(diagnostics.diagnostics.is_empty());
-    assert!(!diagnostics.page.unwrap().has_more);
+    assert!(diagnostics.page.unwrap().next_page_token.is_empty());
 
     let audit = client
         .list_audit_events(
@@ -965,8 +965,8 @@ async fn admin_repair_diagnostics_and_audit_handlers_return_structured_responses
                     resource_id: String::new(),
                     action: "admin.repair.run".to_string(),
                     page: Some(api::PageRequest {
-                        cursor: String::new(),
-                        limit: 5,
+                        page_token: String::new(),
+                        page_size: 5,
                     }),
                 },
                 &token,
@@ -981,7 +981,7 @@ async fn admin_repair_diagnostics_and_audit_handlers_return_structured_responses
     assert_eq!(audit.events.len(), 1);
     assert_eq!(audit.events[0].request_id, "req-admin-directory-repair");
     assert_eq!(audit.events[0].action, "admin.repair.run");
-    assert!(!audit.page.unwrap().has_more);
+    assert!(audit.page.unwrap().next_page_token.is_empty());
 }
 
 #[tokio::test]

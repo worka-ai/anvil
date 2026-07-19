@@ -86,9 +86,11 @@ impl BucketService for AppState {
         let claims = request
             .extensions()
             .get::<auth::Claims>()
+            .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
 
-        let buckets = self.bucket_manager.list_buckets(claims).await?;
+        let buckets = self.bucket_manager.list_buckets(&claims).await?;
 
         let response_buckets: Vec<crate::anvil_api::Bucket> = buckets
             .into_iter()
@@ -102,12 +104,33 @@ impl BucketService for AppState {
             })
             .collect();
 
+        let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
+        let (response_buckets, page) = crate::services::collection_cursor::paginate(
+            response_buckets,
+            req.page.as_ref(),
+            "anvil.BucketService/ListBuckets",
+            &[],
+            &principal_scope,
+            "bucket_name.asc",
+            self.config.jwt_secret.as_bytes(),
+            |bucket| bucket.name.as_str(),
+            |bucket| {
+                crate::services::collection_cursor::content_generation(&[
+                    bucket.creation_date.as_bytes(),
+                    bucket.region.as_bytes(),
+                    &[u8::from(bucket.is_public_read)],
+                    &bucket.bucket_id.to_le_bytes(),
+                ])
+            },
+        )?;
+
         tracing::debug!(
             "[service] EXITING list_buckets, found {} buckets",
             response_buckets.len()
         );
         Ok(Response::new(ListBucketsResponse {
             buckets: response_buckets,
+            page: Some(page),
         }))
     }
 

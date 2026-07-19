@@ -285,8 +285,28 @@ impl IndexService for AppState {
         .into_iter()
         .map(|event| index_record_from_event(&event))
         .collect::<Result<Vec<_>, _>>()?;
+        let include_disabled = req.include_disabled.to_string();
+        let filters = [
+            ("bucket_name", req.bucket_name.as_str()),
+            ("include_disabled", include_disabled.as_str()),
+        ];
+        let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
+        let (indexes, page) = crate::services::collection_cursor::paginate(
+            indexes,
+            req.page.as_ref(),
+            "anvil.IndexService/ListIndexes",
+            &filters,
+            &principal_scope,
+            "name.asc",
+            self.config.jwt_secret.as_bytes(),
+            |index| index.name.as_str(),
+            |index| index.version,
+        )?;
 
-        Ok(Response::new(ListIndexesResponse { indexes }))
+        Ok(Response::new(ListIndexesResponse {
+            indexes,
+            page: Some(page),
+        }))
     }
 
     async fn query_index(
@@ -657,11 +677,37 @@ impl IndexService for AppState {
         let bucket = self
             .get_index_bucket(claims.tenant_id, &req.bucket_name)
             .await?;
-        let after_cursor = i64::try_from(req.after_cursor)
-            .map_err(|_| Status::invalid_argument("after_cursor exceeds supported range"))?;
-        let limit = i32::try_from(req.limit)
-            .map_err(|_| Status::invalid_argument("limit exceeds supported range"))?;
-        let diagnostics = self
+        let page_size = crate::services::collection_cursor::page_size(req.page.as_ref())?;
+        let filters = [
+            ("bucket_name", req.bucket_name.as_str()),
+            ("index_name", req.index_name.as_str()),
+            ("severity", req.severity.as_str()),
+        ];
+        let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
+        let revision = format!("append-only:{}:{}", claims.tenant_id, bucket.id);
+        let binding = crate::services::collection_cursor::CollectionCursorBinding {
+            service_method: "anvil.IndexService/ListIndexDiagnostics",
+            filters: &filters,
+            principal_scope: &principal_scope,
+            page_size,
+            revision: &revision,
+            sort: "cursor.asc",
+        };
+        let after_cursor = crate::services::collection_cursor::decode_page_token(
+            req.page.as_ref(),
+            &binding,
+            self.config.jwt_secret.as_bytes(),
+        )?
+        .map(|cursor| {
+            cursor
+                .parse::<i64>()
+                .map_err(|_| Status::invalid_argument("invalid diagnostic cursor"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+        let query_limit = i32::try_from(page_size + 1)
+            .map_err(|_| Status::invalid_argument("page_size exceeds supported range"))?;
+        let mut diagnostics = self
             .persistence
             .list_index_diagnostics(
                 claims.tenant_id,
@@ -669,14 +715,36 @@ impl IndexService for AppState {
                 &req.index_name,
                 &req.severity,
                 after_cursor,
-                limit,
+                query_limit,
             )
             .await
-            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let has_more = diagnostics.len() > page_size;
+        if has_more {
+            diagnostics.truncate(page_size);
+        }
+        let next_page_token = if has_more {
+            let position = diagnostics
+                .last()
+                .ok_or_else(|| Status::internal("diagnostic page is unexpectedly empty"))?
+                .id
+                .to_string();
+            crate::services::collection_cursor::encode_next_page_token(
+                &position,
+                &binding,
+                self.config.jwt_secret.as_bytes(),
+            )?
+        } else {
+            String::new()
+        };
+        let diagnostics = diagnostics
             .into_iter()
             .map(index_diagnostic_record)
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(Response::new(ListIndexDiagnosticsResponse { diagnostics }))
+        Ok(Response::new(ListIndexDiagnosticsResponse {
+            diagnostics,
+            page: Some(PageResponse { next_page_token }),
+        }))
     }
 }

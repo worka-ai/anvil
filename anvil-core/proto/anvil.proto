@@ -103,13 +103,12 @@ message AdminError {
 }
 
 message PageRequest {
-  string cursor = 1;
-  uint32 limit = 2;
+  uint32 page_size = 1;
+  string page_token = 2;
 }
 
 message PageResponse {
-  string next_cursor = 1;
-  bool has_more = 2;
+  string next_page_token = 1;
 }
 
 message StorageClassDescriptor {
@@ -141,12 +140,14 @@ message StorageClassDescriptor {
 message ListStorageClassesRequest {
   string request_id = 1;
   bool include_operator_only = 2;
+  PageRequest page = 3;
 }
 
 message ListStorageClassesResponse {
   string request_id = 1;
   repeated StorageClassDescriptor storage_classes = 2;
   string default_class_id = 3;
+  PageResponse page = 4;
 }
 
 message GetStorageClassRequest {
@@ -416,7 +417,7 @@ message ImportPersonalDbSigningKeyRequest {
   string status = 10;
 }
 
-message ListPersonalDbSigningKeysRequest {}
+message ListPersonalDbSigningKeysRequest { PageRequest page = 1; }
 
 message SetPersonalDbSigningKeyStatusRequest {
   AdminRequestContext context = 1;
@@ -451,6 +452,7 @@ message PersonalDbSigningKeyResponse {
 
 message ListPersonalDbSigningKeysResponse {
   repeated PersonalDbSigningKeyRecord keys = 1;
+  PageResponse page = 2;
 }
 
 message CreateBucketAdminRequest {
@@ -885,7 +887,7 @@ message DeleteBucketRequest {
 
 message DeleteBucketResponse {}
 
-message ListBucketsRequest {}
+message ListBucketsRequest { PageRequest page = 1; }
 
 message Bucket {
     string name = 1;
@@ -898,6 +900,7 @@ message Bucket {
 
 message ListBucketsResponse {
     repeated Bucket buckets = 1;
+    PageResponse page = 2;
 }
 
 message GetBucketPolicyRequest {
@@ -1005,10 +1008,12 @@ message PutGitPackResponse {
 message GetGitObjectRequest {
     string repository_id = 1;
     string object_id = 2;
+    PageRequest page = 3;
 }
 
 message GetGitObjectResponse {
     repeated GitBlobLocation locations = 1;
+    PageResponse page = 2;
 }
 
 message GetGitBlobByPathRequest {
@@ -1025,11 +1030,12 @@ message ListGitTreeRequest {
     string repository_id = 1;
     string commit_id = 2;
     string prefix = 3;
-    uint32 limit = 4;
+    PageRequest page = 4;
 }
 
 message ListGitTreeResponse {
     repeated GitTreeEntryRecord entries = 1;
+    PageResponse page = 2;
 }
 
 message GitBlobLocation {
@@ -1100,6 +1106,7 @@ message DropIndexResponse {}
 message ListIndexesRequest {
     string bucket_name = 1;
     bool include_disabled = 2;
+    PageRequest page = 3;
 }
 
 message IndexDefinitionRecord {
@@ -1123,6 +1130,7 @@ message IndexDefinitionResponse {
 
 message ListIndexesResponse {
     repeated IndexDefinitionRecord indexes = 1;
+    PageResponse page = 2;
 }
 
 message QueryIndexRequest {
@@ -1228,9 +1236,8 @@ message WatchIndexPartitionResponse {
 message ListIndexDiagnosticsRequest {
     string bucket_name = 1;
     string index_name = 2;
-    uint64 after_cursor = 3;
-    uint32 limit = 4;
-    string severity = 5;
+    string severity = 3;
+    PageRequest page = 4;
 }
 
 message IndexDiagnosticRecord {
@@ -1248,6 +1255,7 @@ message IndexDiagnosticRecord {
 
 message ListIndexDiagnosticsResponse {
     repeated IndexDiagnosticRecord diagnostics = 1;
+    PageResponse page = 2;
 }
 
 message RepairIndexRequest {
@@ -1320,11 +1328,12 @@ message RepairPersonalDbLogChainResponse {
 message ListRepairFindingsRequest {
     string scope_kind = 1;
     string scope_id = 2;
-    uint32 limit = 3;
+    PageRequest page = 3;
 }
 
 message ListRepairFindingsResponse {
     repeated RepairFindingRecord findings = 1;
+    PageResponse page = 2;
 }
 
 message RepairFindingRecord {
@@ -2517,11 +2526,13 @@ message MoveBucketRequest {
 
 message GetPartitionMapRequest {
     string scope = 1;
+    PageRequest page = 2;
 }
 
 message PartitionMap {
     uint64 epoch = 1;
     repeated string partition_rows = 2;
+    PageResponse page = 3;
 }
 
 message PutPackageBlobRequest {
@@ -2817,14 +2828,17 @@ message CreateHfKeyResponse {
 }
 message DeleteHfKeyRequest { string name = 1; }
 message DeleteHfKeyResponse {}
-message ListHfKeysRequest {}
+message ListHfKeysRequest { PageRequest page = 1; }
 message HfKey {
   string name = 1;
   string note = 2;
   string created_at = 3;
   string updated_at = 4;
 }
-message ListHfKeysResponse { repeated HfKey keys = 1; }
+message ListHfKeysResponse {
+  repeated HfKey keys = 1;
+  PageResponse page = 2;
+}
 
 // Ingestion (public API, policy enforced)
 service HfIngestionService {
@@ -2894,7 +2908,7 @@ message DeleteApplicationCredentialResponse {
   string app_id = 2;
 }
 
-message ListApplicationsRequest {}
+message ListApplicationsRequest { PageRequest page = 1; }
 
 message ApplicationDescriptor {
   string tenant_id = 1;
@@ -2905,6 +2919,7 @@ message ApplicationDescriptor {
 
 message ListApplicationsResponse {
   repeated ApplicationDescriptor applications = 1;
+  PageResponse page = 2;
 }
 
 message GrantAccessRequest {
@@ -2932,10 +2947,12 @@ message AccessGrantRecord {
 
 message ListAccessGrantsRequest {
   string app = 1;
+  PageRequest page = 2;
 }
 
 message ListAccessGrantsResponse {
   repeated AccessGrantRecord grants = 1;
+  PageResponse page = 2;
 }
 
 message SetPublicAccessRequest {

@@ -632,8 +632,10 @@ async fn wait_for_index_diagnostic(
                     bucket_name: bucket_name.to_string(),
                     index_name: index_name.to_string(),
                     severity: severity.to_string(),
-                    after_cursor: 0,
-                    limit: 10,
+                    page: Some(anvil::anvil_api::PageRequest {
+                        page_size: 10,
+                        page_token: String::new(),
+                    }),
                 },
                 token,
             ))

@@ -429,20 +429,39 @@ impl AdminService for AppState {
         &self,
         request: Request<ListPersonalDbSigningKeysRequest>,
     ) -> Result<Response<ListPersonalDbSigningKeysResponse>, Status> {
-        let _principal = require_admin(
+        let principal = require_admin(
             &request,
             self,
             SystemAdminRelation::ManagePersonalDbSigningKeys,
         )
         .await?;
+        let req = request.into_inner();
         let keys = self
             .personaldb_signing_key_store
             .list_public_records()
             .map_err(|err| Status::internal(err.to_string()))?
             .into_iter()
             .map(personaldb_signing_key_to_proto)
-            .collect();
-        Ok(Response::new(ListPersonalDbSigningKeysResponse { keys }))
+            .collect::<Vec<_>>();
+        let principal_scope = format!(
+            "admin:{}/tenant:{}",
+            principal.principal_id, principal.tenant_id
+        );
+        let (keys, page) = crate::services::collection_cursor::paginate(
+            keys,
+            req.page.as_ref(),
+            "anvil.AdminService/ListPersonalDbSigningKeys",
+            &[],
+            &principal_scope,
+            "key_id.asc",
+            self.config.jwt_secret.as_bytes(),
+            |key| key.key_id.as_str(),
+            |key| key.record_revision,
+        )?;
+        Ok(Response::new(ListPersonalDbSigningKeysResponse {
+            keys,
+            page: Some(page),
+        }))
     }
 
     async fn set_personal_db_signing_key_status(
@@ -770,7 +789,7 @@ impl AdminService for AppState {
             require_admin(&request, self, SystemAdminRelation::ManageHostAliases).await?;
         let req = request.into_inner();
         let page = req.page.as_ref();
-        let limit = page_limit(page);
+        let limit = page_limit(page)?;
         let mut host_aliases = self
             .persistence
             .list_host_alias_descriptors(none_if_empty(&req.region))
@@ -820,8 +839,7 @@ impl AdminService for AppState {
 
         Ok(Response::new(ListHostAliasesResponse {
             page: Some(PageResponse {
-                next_cursor,
-                has_more,
+                next_page_token: next_cursor,
             }),
             host_aliases: host_aliases
                 .into_iter()
@@ -1077,7 +1095,7 @@ impl AdminService for AppState {
         let principal = require_admin(&request, self, SystemAdminRelation::ManageRegions).await?;
         let req = request.into_inner();
         let page = req.page.as_ref();
-        let limit = page_limit(page);
+        let limit = page_limit(page)?;
         let mut regions = self
             .persistence
             .list_region_descriptors()
@@ -1126,8 +1144,7 @@ impl AdminService for AppState {
         };
         Ok(Response::new(ListRegionsResponse {
             page: Some(PageResponse {
-                next_cursor,
-                has_more,
+                next_page_token: next_cursor,
             }),
             regions,
         }))
@@ -1287,7 +1304,7 @@ impl AdminService for AppState {
         let req = request.into_inner();
         let region_filter = none_if_empty(&req.region);
         let page = req.page.as_ref();
-        let limit = page_limit(page);
+        let limit = page_limit(page)?;
         let mut cells = self
             .persistence
             .list_cell_descriptors(region_filter)
@@ -1345,8 +1362,7 @@ impl AdminService for AppState {
         };
         Ok(Response::new(ListCellsResponse {
             page: Some(PageResponse {
-                next_cursor,
-                has_more,
+                next_page_token: next_cursor,
             }),
             cells,
         }))
@@ -1625,7 +1641,7 @@ impl AdminService for AppState {
         let principal = require_admin(&request, self, SystemAdminRelation::ManageNodes).await?;
         let req = request.into_inner();
         let page = req.page.as_ref();
-        let limit = page_limit(page);
+        let limit = page_limit(page)?;
         let mut nodes = self
             .persistence
             .list_node_descriptors(none_if_empty(&req.region), none_if_empty(&req.cell_id))
@@ -1678,8 +1694,7 @@ impl AdminService for AppState {
         };
         Ok(Response::new(ListNodesResponse {
             page: Some(PageResponse {
-                next_cursor,
-                has_more,
+                next_page_token: next_cursor,
             }),
             nodes,
         }))
@@ -1693,7 +1708,7 @@ impl AdminService for AppState {
         let req = request.into_inner();
         let family = routing_record_family_from_proto(req.family)?;
         let page = req.page.as_ref();
-        let limit = page_limit(page);
+        let limit = page_limit(page)?;
         let mut records = self
             .persistence
             .list_mesh_routing_records(family)
@@ -1745,8 +1760,7 @@ impl AdminService for AppState {
 
         Ok(Response::new(ListRoutingRecordsResponse {
             page: Some(PageResponse {
-                next_cursor,
-                has_more,
+                next_page_token: next_cursor,
             }),
             records,
         }))
@@ -1838,135 +1852,7 @@ impl AdminService for AppState {
         &self,
         request: Request<ListDiagnosticsRequest>,
     ) -> Result<Response<DiagnosticsResponse>, Status> {
-        let principal = require_admin(&request, self, SystemAdminRelation::ViewDiagnostics).await?;
-        let req = request.into_inner();
-        let request_id = require_request_id(&req.request_id)?.to_string();
-        let page = req.page.as_ref();
-        let limit = page_limit(page);
-        let source = req.source.trim();
-
-        if !req.severity.trim().is_empty() {
-            validate_diagnostic_severity(&req.severity)?;
-        }
-
-        let mut diagnostics = Vec::new();
-
-        if source.is_empty() || source == "index" || source == "index_diagnostic_journal" {
-            if req.tenant_id.trim().is_empty() || req.bucket_name.trim().is_empty() {
-                if source == "index" || source == "index_diagnostic_journal" {
-                    return Err(Status::invalid_argument(
-                        "tenant_id and bucket_name are required for index diagnostics",
-                    ));
-                }
-            } else {
-                let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
-                let bucket = self
-                    .persistence
-                    .get_bucket_by_name(tenant_id, &req.bucket_name)
-                    .await
-                    .map_err(|err| Status::internal(err.to_string()))?
-                    .ok_or_else(|| Status::not_found("Bucket not found"))?;
-                diagnostics.extend(
-                    self.persistence
-                        .list_index_diagnostics(
-                            tenant_id,
-                            bucket.id,
-                            &req.index_name,
-                            &req.severity,
-                            0,
-                            i32::MAX,
-                        )
-                        .await
-                        .map_err(|err| Status::internal(err.to_string()))?
-                        .into_iter()
-                        .map(index_diagnostic_to_admin_record)
-                        .collect::<Result<Vec<_>, _>>()?,
-                );
-            }
-        }
-
-        if source.is_empty() || source == "mesh" || source == "mesh_lifecycle" {
-            diagnostics.extend(mesh_lifecycle_diagnostics(self).await?);
-        }
-
-        if source.is_empty() || source == "mesh" || source == "mesh_routing_projection" {
-            diagnostics.extend(mesh_routing_projection_diagnostics(self).await?);
-        }
-
-        if !req.severity.trim().is_empty() {
-            diagnostics.retain(|diagnostic| diagnostic.severity == req.severity);
-        }
-        diagnostics
-            .sort_by(|left, right| diagnostic_position(left).cmp(&diagnostic_position(right)));
-
-        let positions = diagnostics
-            .iter()
-            .map(|diagnostic| (diagnostic_position(diagnostic), diagnostic.cursor))
-            .collect::<Vec<_>>();
-        let revision = admin_cursor::collection_revision(
-            positions
-                .iter()
-                .map(|(position, cursor)| (position.as_str(), *cursor)),
-        );
-        let filters = [
-            ("source", source),
-            ("tenant_id", req.tenant_id.trim()),
-            ("bucket_name", req.bucket_name.trim()),
-            ("index_name", req.index_name.trim()),
-            ("severity", req.severity.trim()),
-        ];
-        let binding = AdminCursorBinding {
-            scope: "admin.list_diagnostics.v1",
-            filters: &filters,
-            principal: &principal,
-            limit,
-            revision: &revision,
-            sort: "source.cursor.id.asc",
-        };
-        let cursor =
-            admin_cursor::decode_page_cursor(page, &binding, self.config.jwt_secret.as_bytes())?;
-        let mut diagnostics = diagnostics
-            .into_iter()
-            .filter(|diagnostic| {
-                cursor
-                    .as_deref()
-                    .is_none_or(|cursor| diagnostic_position(diagnostic).as_str() > cursor)
-            })
-            .take(limit + 1)
-            .collect::<Vec<_>>();
-        let has_more = diagnostics.len() > limit;
-        if has_more {
-            diagnostics.truncate(limit);
-        }
-        let next_cursor = if has_more {
-            diagnostics.last().map_or(Ok(String::new()), |diagnostic| {
-                admin_cursor::encode_next_cursor(
-                    &diagnostic_position(diagnostic),
-                    &binding,
-                    self.config.jwt_secret.as_bytes(),
-                )
-            })?
-        } else {
-            String::new()
-        };
-
-        Ok(Response::new(DiagnosticsResponse {
-            request_id,
-            page: Some(PageResponse {
-                next_cursor,
-                has_more,
-            }),
-            diagnostics,
-            data_source: if source.is_empty() {
-                "combined".to_string()
-            } else if source == "index" {
-                "index_diagnostic_journal".to_string()
-            } else if source == "mesh" {
-                "mesh".to_string()
-            } else {
-                source.to_string()
-            },
-        }))
+        read_handlers::list_diagnostics(self, request).await
     }
 
     async fn list_audit_events(

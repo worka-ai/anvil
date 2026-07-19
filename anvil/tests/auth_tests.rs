@@ -77,7 +77,7 @@ async fn grpc_error_responses_include_server_request_id() {
 
     let mut bucket_client = BucketServiceClient::connect(grpc_addr).await.unwrap();
     let err = bucket_client
-        .list_buckets(Request::new(ListBucketsRequest {}))
+        .list_buckets(Request::new(ListBucketsRequest { page: None }))
         .await
         .expect_err("unauthenticated request must fail");
 

@@ -70,7 +70,7 @@ async fn list_contains_bucket(
 ) -> bool {
     let list_res = client
         .list_buckets(authenticated(
-            Request::new(ListBucketsRequest {}),
+            Request::new(ListBucketsRequest { page: None }),
             &actor.token,
         ))
         .await
@@ -137,7 +137,7 @@ async fn concurrent_bucket_creates_allocate_unique_ids() {
         .unwrap();
     let listed = client
         .list_buckets(authenticated(
-            Request::new(ListBucketsRequest {}),
+            Request::new(ListBucketsRequest { page: None }),
             &actor.token,
         ))
         .await
@@ -392,7 +392,7 @@ async fn test_list_buckets() {
 
     let list_res = bucket_client
         .list_buckets(authenticated(
-            Request::new(ListBucketsRequest {}),
+            Request::new(ListBucketsRequest { page: None }),
             &actor.token,
         ))
         .await

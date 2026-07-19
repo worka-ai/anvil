@@ -948,7 +948,10 @@ async fn test_repair_authz_derived_index_rebuilds_from_tuple_log() {
     let mut list_findings = Request::new(ListRepairFindingsRequest {
         scope_kind: "authz".to_string(),
         scope_id: "tenant-1".to_string(),
-        limit: 10,
+        page: Some(anvil::anvil_api::PageRequest {
+            page_size: 10,
+            page_token: String::new(),
+        }),
     });
     add_bearer(&mut list_findings, &token);
     let findings = repair_client

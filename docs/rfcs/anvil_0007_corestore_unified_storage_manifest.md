@@ -5219,13 +5219,32 @@ service MeshControlService {
 ### 20.0a Bounded Collection and Pagination Contract
 
 Every public RPC that can return a collection whose cardinality may grow after
-deployment MUST accept `page_size` and `page_token` and MUST return
-`next_page_token`. This includes administrative collections, buckets, indexes,
-applications, credentials, policies, Git trees, object links, host aliases,
-diagnostics, audit events, repair findings, registry versions, tensors,
-authorization objects/subjects/tuples, PersonalDB keys/projections, and any
-future collection. A `limit` field is equivalent to `page_size` only when the
-response also provides a continuation token.
+deployment MUST accept `PageRequest page` and MUST return `PageResponse page`.
+This includes administrative collections, buckets, indexes, applications,
+credentials, policies, Git trees and object locations, object links, host
+aliases, diagnostics, audit events, repair findings, registry versions,
+tensors, authorization objects/subjects/tuples, PersonalDB keys/projections,
+and any future collection. A standalone `limit` field is forbidden for such a
+collection. Operation receipts and validation diagnostics whose maximum count
+is bounded by a separately bounded request are not collection APIs.
+
+The shared public messages are:
+
+```protobuf
+message PageRequest {
+  uint32 page_size = 1;
+  string page_token = 2;
+}
+
+message PageResponse {
+  string next_page_token = 1;
+}
+```
+
+The request field MAY be absent. An absent request or `page_size = 0` means the
+default page size; zero never means unlimited. The response field is always
+present. An empty `next_page_token` means the current page exhausted the
+collection at its bound revision.
 
 Defaults and bounds are normative unless a protocol such as S3 defines a lower
 maximum:
@@ -5236,21 +5255,25 @@ minimum page_size = 1
 maximum page_size = 1000
 ```
 
-The server rejects zero only when the individual protocol does not define zero
-as "use default"; it always rejects values above the maximum. An RPC with an
-unbounded repeated response and no continuation mechanism is forbidden.
+The server always rejects values above the maximum. Protocol-specific lower
+maximums are permitted, but protocol-specific unlimited values are not. An RPC
+with an unbounded repeated response and no continuation mechanism is forbidden.
 
 Page tokens use the signed contract in section 22.5 and bind at least:
 
 - service and method;
 - canonical filter/predicate/order hash;
-- last physical CoreMeta or writer-index key;
-- committed root/index generation;
+- last physical CoreMeta or writer-index key, never a row offset;
+- committed root, collection-head, or index generation that fixes the page
+  view;
 - authorization revision and principal scope hash;
 - page-size ceiling and token expiry.
 
 The next page seeks immediately after the stored physical key. It MUST NOT load
-the preceding collection, recompute a full sort, or use an offset. Collection
+the preceding collection, hash or sort the complete collection, or use an
+offset. Mutable collection writers atomically update a point-readable
+collection head in the same CoreMeta transaction as the row mutation. The head
+generation fixes the page view and is embedded in the token. Collection
 implementations stop after obtaining `page_size + 1` eligible rows, except that
 authorization may require bounded candidate windows until a full authorized
 page is assembled. Every response records rows visited and bytes decoded so a

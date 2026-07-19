@@ -177,13 +177,48 @@ impl GitSourceService for AppState {
         let index = self
             .latest_git_source_index(&claims, &req.repository_id)
             .await?;
+        let generation = index.header.generation;
         let locations = git_source_query::get_git_object(&index, &object_id)
             .map_err(|err| Status::invalid_argument(err.to_string()))?
             .into_iter()
             .map(git_blob_location)
             .collect::<Result<Vec<_>, _>>()?;
+        let locations = locations
+            .into_iter()
+            .map(|location| {
+                (
+                    format!(
+                        "{}\0{}\0{}",
+                        location.commit_id, location.tree_path, location.blob_start
+                    ),
+                    location,
+                )
+            })
+            .collect::<Vec<_>>();
+        let filters = [
+            ("repository_id", req.repository_id.as_str()),
+            ("object_id", req.object_id.as_str()),
+        ];
+        let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
+        let (locations, page) = crate::services::collection_cursor::paginate(
+            locations,
+            req.page.as_ref(),
+            "anvil.GitSourceService/GetGitObject",
+            &filters,
+            &principal_scope,
+            "commit_id.tree_path.blob_start.asc",
+            self.config.jwt_secret.as_bytes(),
+            |location| location.0.as_str(),
+            |_| generation,
+        )?;
 
-        Ok(Response::new(GetGitObjectResponse { locations }))
+        Ok(Response::new(GetGitObjectResponse {
+            locations: locations
+                .into_iter()
+                .map(|(_, location)| location)
+                .collect(),
+            page: Some(page),
+        }))
     }
 
     async fn get_git_blob_by_path(
@@ -219,19 +254,34 @@ impl GitSourceService for AppState {
         let index = self
             .latest_git_source_index(&claims, &req.repository_id)
             .await?;
-        let mut entries = git_source_query::list_git_tree(&index, &commit_id, &req.prefix)
+        let generation = index.header.generation;
+        let entries = git_source_query::list_git_tree(&index, &commit_id, &req.prefix)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        let limit = usize::try_from(req.limit)
-            .map_err(|_| Status::invalid_argument("limit exceeds supported range"))?;
-        if limit > 0 && entries.len() > limit {
-            entries.truncate(limit);
-        }
+        let entries = entries
+            .into_iter()
+            .map(git_tree_entry_record)
+            .collect::<Result<Vec<_>, _>>()?;
+        let filters = [
+            ("repository_id", req.repository_id.as_str()),
+            ("commit_id", req.commit_id.as_str()),
+            ("prefix", req.prefix.as_str()),
+        ];
+        let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
+        let (entries, page) = crate::services::collection_cursor::paginate(
+            entries,
+            req.page.as_ref(),
+            "anvil.GitSourceService/ListGitTree",
+            &filters,
+            &principal_scope,
+            "tree_path.asc",
+            self.config.jwt_secret.as_bytes(),
+            |entry| entry.tree_path.as_str(),
+            |_| generation,
+        )?;
 
         Ok(Response::new(ListGitTreeResponse {
-            entries: entries
-                .into_iter()
-                .map(git_tree_entry_record)
-                .collect::<Result<Vec<_>, _>>()?,
+            entries,
+            page: Some(page),
         }))
     }
 

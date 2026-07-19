@@ -244,6 +244,7 @@ pub(super) async fn handle_mesh_command(
                 client.get_partition_map(with_auth(
                     api::GetPartitionMapRequest {
                         scope: scope.clone().unwrap_or_default(),
+                        page: None,
                     },
                     token,
                 )?),

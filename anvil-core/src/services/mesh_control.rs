@@ -395,6 +395,7 @@ impl MeshControlService for AppState {
         request: Request<GetPartitionMapRequest>,
     ) -> Result<Response<PartitionMap>, Status> {
         require_mesh_admin(&request, self, SystemAdminRelation::ViewSystem).await?;
+        let claims = admin_claims(&request)?;
         let req = request.into_inner();
         let mut rows = Vec::new();
         rows.extend(
@@ -439,9 +440,26 @@ impl MeshControlService for AppState {
         if !req.scope.is_empty() {
             rows.retain(|row| row.contains(&req.scope));
         }
+        let epoch = crate::services::collection_cursor::collection_revision(
+            rows.iter().map(|row| (row.as_str(), 0)),
+        );
+        let filters = [("scope", req.scope.as_str())];
+        let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
+        let (rows, page) = crate::services::collection_cursor::paginate(
+            rows,
+            req.page.as_ref(),
+            "anvil.MeshControlService/GetPartitionMap",
+            &filters,
+            &principal_scope,
+            "partition_row.asc",
+            self.config.jwt_secret.as_bytes(),
+            String::as_str,
+            |_| 0,
+        )?;
         Ok(Response::new(PartitionMap {
-            epoch: rows.len() as u64,
+            epoch: crate::services::collection_cursor::content_generation(&[epoch.as_bytes()]),
             partition_rows: rows,
+            page: Some(page),
         }))
     }
 }

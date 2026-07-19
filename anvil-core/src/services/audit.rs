@@ -25,7 +25,7 @@ impl AuditService for AppState {
             "tenant",
         )
         .await?;
-        let limit = page_limit(req.page.as_ref());
+        let limit = crate::services::collection_cursor::page_size(req.page.as_ref())?;
         let filter = tenant_audit::TenantAuditEventFilter {
             principal_id: none_if_empty(&req.principal_id),
             resource_id: none_if_empty(&req.resource_id),
@@ -67,8 +67,7 @@ impl AuditService for AppState {
         Ok(Response::new(AuditEventsResponse {
             request_id: req.request_id,
             page: Some(PageResponse {
-                next_cursor,
-                has_more,
+                next_page_token: next_cursor,
             }),
             events: events.into_iter().map(audit_event_to_proto).collect(),
             data_source: "tenant_audit_log".to_string(),
@@ -109,10 +108,6 @@ pub(crate) async fn record_tenant_audit_event(
     Ok(audit_event_id)
 }
 
-fn page_limit(page: Option<&PageRequest>) -> usize {
-    page.map(|page| page.limit).unwrap_or(100).clamp(1, 1000) as usize
-}
-
 fn none_if_empty(value: &str) -> Option<&str> {
     let value = value.trim();
     if value.is_empty() { None } else { Some(value) }
@@ -140,7 +135,7 @@ fn decode_tenant_audit_cursor(
     key: &[u8],
 ) -> Result<Option<String>, Status> {
     let Some(cursor) = page
-        .map(|page| page.cursor.trim())
+        .map(|page| page.page_token.trim())
         .filter(|value| !value.is_empty())
     else {
         return Ok(None);

@@ -927,7 +927,10 @@ async fn test_repair_rebuilds_missing_full_text_segment_from_base_journal() {
             ListRepairFindingsRequest {
                 scope_kind: "bucket".to_string(),
                 scope_id: format!("tenant-{tenant_id}-bucket-{}", bucket.id),
-                limit: 10,
+                page: Some(anvil::anvil_api::PageRequest {
+                    page_size: 10,
+                    page_token: String::new(),
+                }),
             },
             &token,
         ))

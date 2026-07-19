@@ -3,6 +3,7 @@ pub(crate) mod admin_cursor;
 pub mod audit;
 pub mod auth;
 pub mod bucket;
+pub(crate) mod collection_cursor;
 pub mod coordination;
 pub mod corestore_internal;
 pub mod git_source;

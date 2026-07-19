@@ -84,7 +84,7 @@ impl api::hugging_face_key_service_server::HuggingFaceKeyService for AppState {
         &self,
         request: Request<api::ListHfKeysRequest>,
     ) -> Result<Response<api::ListHfKeysResponse>, Status> {
-        let (_metadata, extensions, _req) = request.into_parts();
+        let (_metadata, extensions, req) = request.into_parts();
         let claims = auth::try_get_claims_from_extensions(&extensions)
             .ok_or_else(|| Status::unauthenticated("Missing authentication claims"))?;
         access_control::require_action(
@@ -115,7 +115,27 @@ impl api::hugging_face_key_service_server::HuggingFaceKeyService for AppState {
             })
             .collect();
 
-        Ok(Response::new(api::ListHfKeysResponse { keys }))
+        let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
+        let (keys, page) = crate::services::collection_cursor::paginate(
+            keys,
+            req.page.as_ref(),
+            "anvil.HfKeyService/ListKeys",
+            &[],
+            &principal_scope,
+            "name.asc",
+            self.config.jwt_secret.as_bytes(),
+            |key| key.name.as_str(),
+            |key| {
+                crate::services::collection_cursor::content_generation(&[
+                    key.note.as_bytes(),
+                    key.updated_at.as_bytes(),
+                ])
+            },
+        )?;
+        Ok(Response::new(api::ListHfKeysResponse {
+            keys,
+            page: Some(page),
+        }))
     }
 }
 
