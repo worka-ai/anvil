@@ -626,23 +626,28 @@ impl Persistence {
         .await
     }
 
-    pub async fn list_repair_findings(
+    pub fn repair_finding_scope_revision(&self, scope_kind: &str, scope_id: &str) -> Result<u64> {
+        repair_finding::repair_finding_scope_revision(&self.storage, scope_kind, scope_id)
+    }
+
+    pub async fn page_repair_findings(
         &self,
         scope_kind: &str,
         scope_id: &str,
+        after_revision: u64,
+        through_revision: u64,
         limit: usize,
     ) -> Result<Vec<repair_finding::RepairFinding>> {
-        let mut findings = repair_finding::list_repair_findings(
+        repair_finding::page_repair_findings(
             &self.storage,
             scope_kind,
             scope_id,
+            after_revision,
+            through_revision,
+            limit,
             &self.partition_owner_signing_key,
         )
-        .await?;
-        if limit > 0 && findings.len() > limit {
-            findings.truncate(limit);
-        }
-        Ok(findings)
+        .await
     }
 
     pub async fn repair_authz_derived_userset_index(

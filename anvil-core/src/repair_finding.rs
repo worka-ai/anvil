@@ -1,7 +1,8 @@
 use crate::{
     core_store::{
         CF_MESH, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaRowCommonProto, CoreMetaStore,
-        CoreMetaTuplePart, TABLE_REPAIR_FINDING_ROW, commit_coremeta_batch_for_storage,
+        CoreMetaTuplePart, TABLE_REPAIR_FINDING_HEAD_ROW, TABLE_REPAIR_FINDING_ID_ROW,
+        TABLE_REPAIR_FINDING_ROW, commit_coremeta_batch_for_storage,
         core_meta_committed_row_common, core_meta_root_key_hash, core_meta_tuple_key,
         decode_deterministic_proto, encode_deterministic_proto,
     },
@@ -14,9 +15,19 @@ use hmac::{Hmac, Mac};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock, Mutex as StdMutex, Weak},
+};
+use tokio::sync::Mutex;
 
 type HmacSha256 = Hmac<Sha256>;
-const REPAIR_FINDING_REF_PREFIX: &str = "repair_finding:";
+const REPAIR_FINDING_HEAD_SCHEMA: &str = "anvil.repair.finding_head.v1";
+const REPAIR_FINDING_ID_SCHEMA: &str = "anvil.repair.finding_id.v1";
+const REPAIR_FINDING_PAGE_MAX: usize = 1000;
+
+static REPAIR_FINDING_WRITE_LOCKS: LazyLock<StdMutex<HashMap<String, Weak<Mutex<()>>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RepairFindingSeverity {
@@ -71,6 +82,7 @@ pub struct RepairFinding {
     pub proposed_action: RepairActionKind,
     pub evidence: serde_json::Value,
     pub created_at_nanos: i64,
+    pub scope_revision: u64,
     pub finding_hash: Option<String>,
     pub finding_signature: Option<String>,
 }
@@ -187,6 +199,44 @@ struct RepairFindingProto {
     finding_hash: Option<String>,
     #[prost(string, optional, tag = "17")]
     finding_signature: Option<String>,
+    #[prost(uint64, tag = "18")]
+    scope_revision: u64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct RepairFindingHeadProto {
+    #[prost(message, optional, tag = "1")]
+    common: Option<CoreMetaRowCommonProto>,
+    #[prost(string, tag = "2")]
+    schema: String,
+    #[prost(string, tag = "3")]
+    scope_kind: String,
+    #[prost(string, tag = "4")]
+    scope_id: String,
+    #[prost(uint64, tag = "5")]
+    revision: u64,
+    #[prost(uint64, tag = "6")]
+    finding_count: u64,
+    #[prost(string, tag = "7")]
+    last_finding_id: String,
+    #[prost(string, tag = "8")]
+    last_finding_hash: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct RepairFindingIdProto {
+    #[prost(message, optional, tag = "1")]
+    common: Option<CoreMetaRowCommonProto>,
+    #[prost(string, tag = "2")]
+    schema: String,
+    #[prost(string, tag = "3")]
+    scope_kind: String,
+    #[prost(string, tag = "4")]
+    scope_id: String,
+    #[prost(string, tag = "5")]
+    finding_id: String,
+    #[prost(uint64, tag = "6")]
+    revision: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -264,6 +314,31 @@ pub async fn write_repair_finding(
     let metric_scope_kind = finding.scope_kind.clone();
     let metric_status = repair_finding_status_name(finding.status);
     let metric_severity = repair_finding_severity_name(finding.severity);
+    let write_lock = repair_finding_write_lock(&finding.scope_kind, &finding.scope_id);
+    let _guard = write_lock.lock().await;
+    if let Some(existing) = read_repair_finding(
+        storage,
+        &finding.scope_kind,
+        &finding.scope_id,
+        &finding.finding_id,
+        signing_key,
+    )
+    .await?
+    {
+        if finding_matches_write(&existing, &finding) {
+            return Ok(existing);
+        }
+        return Err(anyhow!(
+            "repair finding id already names different immutable content"
+        ));
+    }
+    let current_head = read_repair_finding_head(storage, &finding.scope_kind, &finding.scope_id)?;
+    let scope_revision = current_head
+        .as_ref()
+        .map(|head| head.revision)
+        .unwrap_or_default()
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("repair finding scope revision overflow"))?;
     let sealed = RepairFinding {
         format_version: 1,
         finding_id: finding.finding_id,
@@ -279,11 +354,12 @@ pub async fn write_repair_finding(
         proposed_action: finding.proposed_action,
         evidence: finding.evidence,
         created_at_nanos: finding.created_at_nanos,
+        scope_revision,
         finding_hash: None,
         finding_signature: None,
     }
     .seal(signing_key)?;
-    write_repair_finding_ref(storage, &sealed).await?;
+    write_repair_finding_records(storage, &sealed, current_head.as_ref()).await?;
     crate::perf::record_repair_duration(
         sealed.code.as_str(),
         sealed.scope_kind.as_str(),
@@ -306,14 +382,20 @@ pub async fn read_repair_finding(
     finding_id: &str,
     signing_key: &[u8],
 ) -> Result<Option<RepairFinding>> {
-    let Some(finding) = read_repair_finding_ref(
-        storage,
-        &repair_finding_ref_name(scope_kind, scope_id, finding_id)?,
-    )
-    .await?
-    else {
+    require_safe_component(scope_kind, "scope_kind")?;
+    require_safe_component(scope_id, "scope_id")?;
+    require_safe_component(finding_id, "finding_id")?;
+    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
+    let id_key = repair_finding_id_tuple_key(scope_kind, scope_id, finding_id)?;
+    let Some(id_bytes) = meta.get(CF_MESH, TABLE_REPAIR_FINDING_ID_ROW, &id_key)? else {
         return Ok(None);
     };
+    let id_row = decode_repair_finding_id(&id_bytes, scope_kind, scope_id, finding_id)?;
+    let tuple_key = repair_finding_tuple_key(scope_kind, scope_id, id_row.revision)?;
+    let bytes = meta
+        .get(CF_MESH, TABLE_REPAIR_FINDING_ROW, &tuple_key)?
+        .ok_or_else(|| anyhow!("repair finding id row points to a missing revision"))?;
+    let finding = decode_repair_finding(&bytes)?;
     finding.verify(signing_key)?;
     if finding.scope_kind != scope_kind
         || finding.scope_id != scope_id
@@ -324,41 +406,67 @@ pub async fn read_repair_finding(
     Ok(Some(finding))
 }
 
-pub async fn list_repair_findings(
+pub fn repair_finding_scope_revision(
     storage: &Storage,
     scope_kind: &str,
     scope_id: &str,
+) -> Result<u64> {
+    Ok(read_repair_finding_head(storage, scope_kind, scope_id)?
+        .map(|head| head.revision)
+        .unwrap_or_default())
+}
+
+pub async fn page_repair_findings(
+    storage: &Storage,
+    scope_kind: &str,
+    scope_id: &str,
+    after_revision: u64,
+    through_revision: u64,
+    limit: usize,
     signing_key: &[u8],
 ) -> Result<Vec<RepairFinding>> {
-    let mut findings = Vec::new();
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
-    for record in meta.scan_prefix(
-        CF_MESH,
-        TABLE_REPAIR_FINDING_ROW,
-        &repair_finding_tuple_prefix(scope_kind, scope_id)?,
-    )? {
-        let finding = decode_repair_finding(&record.payload)?;
-        finding.verify(signing_key)?;
-        if finding.scope_kind != scope_kind || finding.scope_id != scope_id {
-            return Err(anyhow!("repair finding ref scope mismatch"));
-        }
-        findings.push(finding);
+    if !(1..=REPAIR_FINDING_PAGE_MAX + 1).contains(&limit) {
+        return Err(anyhow!(
+            "repair finding page limit must be between 1 and {}",
+            REPAIR_FINDING_PAGE_MAX + 1
+        ));
     }
-    findings.sort_by(|left, right| {
-        left.created_at_nanos
-            .cmp(&right.created_at_nanos)
-            .then(left.finding_id.cmp(&right.finding_id))
-    });
-    let open_depth = findings
-        .iter()
-        .filter(|finding| {
-            matches!(
-                finding.status,
-                RepairFindingStatus::Open | RepairFindingStatus::RequiresOperatorReview
-            )
-        })
-        .count() as u64;
-    crate::perf::record_repair_queue_depth(scope_kind, "local", "local", open_depth);
+    let head_before = repair_finding_scope_revision(storage, scope_kind, scope_id)?;
+    if head_before != through_revision {
+        return Err(anyhow!("repair finding collection revision changed"));
+    }
+    if after_revision >= through_revision || through_revision == 0 {
+        return Ok(Vec::new());
+    }
+
+    let start_revision = after_revision + 1;
+    let mut findings = CoreMetaStore::open(storage.core_store_meta_path())?
+        .scan_range_inclusive(
+            CF_MESH,
+            TABLE_REPAIR_FINDING_ROW,
+            &repair_finding_tuple_key(scope_kind, scope_id, start_revision)?,
+            &repair_finding_tuple_key(scope_kind, scope_id, through_revision)?,
+            limit,
+        )?
+        .into_iter()
+        .map(|record| decode_repair_finding(&record.payload))
+        .collect::<Result<Vec<_>>>()?;
+    for finding in &findings {
+        finding.verify(signing_key)?;
+        if finding.scope_kind != scope_kind
+            || finding.scope_id != scope_id
+            || finding.scope_revision <= after_revision
+            || finding.scope_revision > through_revision
+        {
+            return Err(anyhow!("repair finding page scope mismatch"));
+        }
+    }
+    findings.sort_by_key(|finding| finding.scope_revision);
+    if repair_finding_scope_revision(storage, scope_kind, scope_id)? != through_revision {
+        return Err(anyhow!(
+            "repair finding collection changed during page read"
+        ));
+    }
     Ok(findings)
 }
 
@@ -391,6 +499,7 @@ fn validate_write(finding: &RepairFindingWrite) -> Result<()> {
         proposed_action: finding.proposed_action,
         evidence: finding.evidence.clone(),
         created_at_nanos: finding.created_at_nanos,
+        scope_revision: 1,
         finding_hash: None,
         finding_signature: None,
     };
@@ -419,6 +528,9 @@ fn validate_unsigned_finding(finding: &RepairFinding) -> Result<()> {
     validate_repair_action(finding.proposed_action)?;
     if finding.created_at_nanos < 0 {
         return Err(anyhow!("repair finding timestamp must be nonnegative"));
+    }
+    if finding.scope_revision == 0 {
+        return Err(anyhow!("repair finding scope revision must be nonzero"));
     }
     Ok(())
 }
@@ -497,44 +609,165 @@ fn require_safe_component(value: &str, field: &'static str) -> Result<()> {
     Ok(())
 }
 
-async fn write_repair_finding_ref(storage: &Storage, finding: &RepairFinding) -> Result<()> {
-    let tuple_key =
-        repair_finding_tuple_key(&finding.scope_kind, &finding.scope_id, &finding.finding_id)?;
-    let payload = encode_repair_finding(finding)?;
-    let op = CoreMetaBatchOp {
-        cf: CF_MESH,
-        table_id: TABLE_REPAIR_FINDING_ROW,
-        tuple_key: &tuple_key,
-        common: None,
-        kind: CoreMetaBatchOpKind::Put(&payload),
-    };
+async fn write_repair_finding_records(
+    storage: &Storage,
+    finding: &RepairFinding,
+    current_head: Option<&RepairFindingHeadProto>,
+) -> Result<()> {
+    let finding_key = repair_finding_tuple_key(
+        &finding.scope_kind,
+        &finding.scope_id,
+        finding.scope_revision,
+    )?;
+    let id_key =
+        repair_finding_id_tuple_key(&finding.scope_kind, &finding.scope_id, &finding.finding_id)?;
+    let head_key = repair_finding_head_tuple_key(&finding.scope_kind, &finding.scope_id)?;
+    let finding_payload = encode_repair_finding(finding)?;
+    let common = repair_finding_common(finding)?;
+    let id_payload = encode_deterministic_proto(&RepairFindingIdProto {
+        common: Some(common.clone()),
+        schema: REPAIR_FINDING_ID_SCHEMA.to_string(),
+        scope_kind: finding.scope_kind.clone(),
+        scope_id: finding.scope_id.clone(),
+        finding_id: finding.finding_id.clone(),
+        revision: finding.scope_revision,
+    });
+    let head_payload = encode_deterministic_proto(&RepairFindingHeadProto {
+        common: Some(common),
+        schema: REPAIR_FINDING_HEAD_SCHEMA.to_string(),
+        scope_kind: finding.scope_kind.clone(),
+        scope_id: finding.scope_id.clone(),
+        revision: finding.scope_revision,
+        finding_count: current_head
+            .map(|head| head.finding_count)
+            .unwrap_or_default()
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("repair finding count overflow"))?,
+        last_finding_id: finding.finding_id.clone(),
+        last_finding_hash: finding
+            .finding_hash
+            .clone()
+            .ok_or_else(|| anyhow!("sealed repair finding is missing hash"))?,
+    });
+    let operations = [
+        CoreMetaBatchOp {
+            cf: CF_MESH,
+            table_id: TABLE_REPAIR_FINDING_ROW,
+            tuple_key: &finding_key,
+            common: None,
+            kind: CoreMetaBatchOpKind::Put(&finding_payload),
+        },
+        CoreMetaBatchOp {
+            cf: CF_MESH,
+            table_id: TABLE_REPAIR_FINDING_ID_ROW,
+            tuple_key: &id_key,
+            common: None,
+            kind: CoreMetaBatchOpKind::Put(&id_payload),
+        },
+        CoreMetaBatchOp {
+            cf: CF_MESH,
+            table_id: TABLE_REPAIR_FINDING_HEAD_ROW,
+            tuple_key: &head_key,
+            common: None,
+            kind: CoreMetaBatchOpKind::Put(&head_payload),
+        },
+    ];
     commit_coremeta_batch_for_storage(
         storage,
         &format!(
             "repair-finding:{}:{}:{}",
             finding.scope_kind, finding.scope_id, finding.finding_id
         ),
-        &[op],
+        &operations,
     )
     .await?;
     Ok(())
 }
 
-async fn read_repair_finding_ref(
+fn read_repair_finding_head(
     storage: &Storage,
-    ref_name: &str,
-) -> Result<Option<RepairFinding>> {
-    let (scope_kind, scope_id, finding_id) = parse_repair_finding_ref_name(ref_name)?;
-    let tuple_key = repair_finding_tuple_key(&scope_kind, &scope_id, &finding_id)?;
+    scope_kind: &str,
+    scope_id: &str,
+) -> Result<Option<RepairFindingHeadProto>> {
+    let key = repair_finding_head_tuple_key(scope_kind, scope_id)?;
     let Some(bytes) = CoreMetaStore::open(storage.core_store_meta_path())?.get(
         CF_MESH,
-        TABLE_REPAIR_FINDING_ROW,
-        &tuple_key,
+        TABLE_REPAIR_FINDING_HEAD_ROW,
+        &key,
     )?
     else {
         return Ok(None);
     };
-    Ok(Some(decode_repair_finding(&bytes)?))
+    let head = decode_deterministic_proto::<RepairFindingHeadProto>(&bytes, "repair finding head")?;
+    validate_repair_finding_head(&head, scope_kind, scope_id)?;
+    Ok(Some(head))
+}
+
+fn decode_repair_finding_id(
+    bytes: &[u8],
+    scope_kind: &str,
+    scope_id: &str,
+    finding_id: &str,
+) -> Result<RepairFindingIdProto> {
+    let row = decode_deterministic_proto::<RepairFindingIdProto>(bytes, "repair finding id")?;
+    if row.schema != REPAIR_FINDING_ID_SCHEMA
+        || row.scope_kind != scope_kind
+        || row.scope_id != scope_id
+        || row.finding_id != finding_id
+        || row.revision == 0
+    {
+        return Err(anyhow!("repair finding id row scope mismatch"));
+    }
+    validate_repair_common(
+        row.common
+            .as_ref()
+            .ok_or_else(|| anyhow!("repair finding id row missing CoreMeta common fields"))?,
+        scope_kind,
+        scope_id,
+        row.revision,
+    )?;
+    if !row
+        .common
+        .as_ref()
+        .is_some_and(|common| common.transaction_id.ends_with(&format!("/{finding_id}")))
+    {
+        return Err(anyhow!("repair finding id transaction mismatch"));
+    }
+    Ok(row)
+}
+
+fn validate_repair_finding_head(
+    head: &RepairFindingHeadProto,
+    scope_kind: &str,
+    scope_id: &str,
+) -> Result<()> {
+    if head.schema != REPAIR_FINDING_HEAD_SCHEMA
+        || head.scope_kind != scope_kind
+        || head.scope_id != scope_id
+        || head.revision == 0
+        || head.finding_count == 0
+        || head.finding_count != head.revision
+    {
+        return Err(anyhow!("repair finding head row is invalid"));
+    }
+    require_safe_component(&head.last_finding_id, "last_finding_id")?;
+    validate_hex32(&head.last_finding_hash, "last_finding_hash")?;
+    validate_repair_common(
+        head.common
+            .as_ref()
+            .ok_or_else(|| anyhow!("repair finding head missing CoreMeta common fields"))?,
+        scope_kind,
+        scope_id,
+        head.revision,
+    )?;
+    if !head.common.as_ref().is_some_and(|common| {
+        common
+            .transaction_id
+            .ends_with(&format!("/{}", head.last_finding_id))
+    }) {
+        return Err(anyhow!("repair finding head transaction mismatch"));
+    }
+    Ok(())
 }
 
 fn encode_repair_finding(finding: &RepairFinding) -> Result<Vec<u8>> {
@@ -569,6 +802,7 @@ fn repair_finding_to_proto(finding: &RepairFinding) -> Result<RepairFindingProto
         created_at_nanos: finding.created_at_nanos,
         finding_hash: finding.finding_hash.clone(),
         finding_signature: finding.finding_signature.clone(),
+        scope_revision: finding.scope_revision,
     })
 }
 
@@ -602,6 +836,7 @@ fn repair_finding_from_proto(proto: RepairFindingProto) -> Result<RepairFinding>
                 .ok_or_else(|| anyhow!("repair finding missing evidence"))?,
         )?,
         created_at_nanos: proto.created_at_nanos,
+        scope_revision: proto.scope_revision,
         finding_hash: proto.finding_hash,
         finding_signature: proto.finding_signature,
     })
@@ -613,7 +848,7 @@ fn repair_finding_common(finding: &RepairFinding) -> Result<CoreMetaRowCommonPro
     Ok(core_meta_committed_row_common(
         format!("repair/{}/{}", finding.scope_kind, finding.scope_id),
         repair_finding_root_key_hash(&finding.scope_kind, &finding.scope_id),
-        created_at_unix_nanos,
+        finding.scope_revision,
         format!("{}/{}", finding.repair_task_id, finding.finding_id),
         created_at_unix_nanos,
     ))
@@ -623,14 +858,38 @@ fn validate_repair_finding_common(
     proto: &RepairFindingProto,
     common: &CoreMetaRowCommonProto,
 ) -> Result<()> {
-    if common.realm_id != format!("repair/{}/{}", proto.scope_kind, proto.scope_id) {
-        return Err(anyhow!("repair finding CoreMeta realm mismatch"));
-    }
-    if common.root_key_hash != repair_finding_root_key_hash(&proto.scope_kind, &proto.scope_id) {
-        return Err(anyhow!("repair finding CoreMeta root mismatch"));
-    }
+    validate_repair_common(
+        common,
+        &proto.scope_kind,
+        &proto.scope_id,
+        proto.scope_revision,
+    )?;
     if common.transaction_id != format!("{}/{}", proto.repair_task_id, proto.finding_id) {
         return Err(anyhow!("repair finding CoreMeta transaction mismatch"));
+    }
+    if common.created_at_unix_nanos
+        != u64::try_from(proto.created_at_nanos)
+            .map_err(|_| anyhow!("repair finding timestamp must be nonnegative"))?
+    {
+        return Err(anyhow!("repair finding CoreMeta timestamp mismatch"));
+    }
+    Ok(())
+}
+
+fn validate_repair_common(
+    common: &CoreMetaRowCommonProto,
+    scope_kind: &str,
+    scope_id: &str,
+    revision: u64,
+) -> Result<()> {
+    if common.realm_id != format!("repair/{scope_kind}/{scope_id}") {
+        return Err(anyhow!("repair finding CoreMeta realm mismatch"));
+    }
+    if common.root_key_hash != repair_finding_root_key_hash(scope_kind, scope_id) {
+        return Err(anyhow!("repair finding CoreMeta root mismatch"));
+    }
+    if common.root_generation != revision {
+        return Err(anyhow!("repair finding CoreMeta generation mismatch"));
     }
     if common.visibility_state_enum() != crate::core_store::CoreMetaVisibilityState::Committed {
         return Err(anyhow!("repair finding CoreMeta row is not committed"));
@@ -874,61 +1133,75 @@ fn json_value_from_proto(proto: RepairJsonValueProto) -> Result<serde_json::Valu
     }
 }
 
-fn repair_finding_ref_prefix(scope_kind: &str, scope_id: &str) -> Result<String> {
-    require_safe_component(scope_kind, "scope_kind")?;
-    require_safe_component(scope_id, "scope_id")?;
-    Ok(format!(
-        "{REPAIR_FINDING_REF_PREFIX}scope_kind:{scope_kind}:scope_id:{scope_id}:finding:"
-    ))
+fn repair_finding_write_lock(scope_kind: &str, scope_id: &str) -> Arc<Mutex<()>> {
+    let key = format!("{scope_kind}\0{scope_id}");
+    let mut locks = REPAIR_FINDING_WRITE_LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
 }
 
-fn repair_finding_ref_name(scope_kind: &str, scope_id: &str, finding_id: &str) -> Result<String> {
-    require_safe_component(finding_id, "finding_id")?;
-    Ok(format!(
-        "{}{finding_id}",
-        repair_finding_ref_prefix(scope_kind, scope_id)?
-    ))
+fn finding_matches_write(finding: &RepairFinding, write: &RepairFindingWrite) -> bool {
+    finding.finding_id == write.finding_id
+        && finding.scope_kind == write.scope_kind
+        && finding.scope_id == write.scope_id
+        && finding.repair_task_id == write.repair_task_id
+        && finding.lease_fence_token == write.lease_fence_token
+        && finding.severity == write.severity
+        && finding.status == write.status
+        && finding.code == write.code
+        && finding.message == write.message
+        && finding.subjects == write.subjects
+        && finding.proposed_action == write.proposed_action
+        && finding.evidence == write.evidence
+        && finding.created_at_nanos == write.created_at_nanos
 }
 
-fn repair_finding_tuple_prefix(scope_kind: &str, scope_id: &str) -> Result<Vec<u8>> {
+fn repair_finding_tuple_key(
+    scope_kind: &str,
+    scope_id: &str,
+    scope_revision: u64,
+) -> Result<Vec<u8>> {
     require_safe_component(scope_kind, "scope_kind")?;
     require_safe_component(scope_id, "scope_id")?;
+    if scope_revision == 0 {
+        return Err(anyhow!("repair finding scope revision must be nonzero"));
+    }
     core_meta_tuple_key(&[
-        CoreMetaTuplePart::Utf8("repair_finding"),
         CoreMetaTuplePart::Utf8(scope_kind),
         CoreMetaTuplePart::Utf8(scope_id),
+        CoreMetaTuplePart::U64(scope_revision),
     ])
 }
 
-fn repair_finding_tuple_key(scope_kind: &str, scope_id: &str, finding_id: &str) -> Result<Vec<u8>> {
+fn repair_finding_id_tuple_key(
+    scope_kind: &str,
+    scope_id: &str,
+    finding_id: &str,
+) -> Result<Vec<u8>> {
     require_safe_component(scope_kind, "scope_kind")?;
     require_safe_component(scope_id, "scope_id")?;
     require_safe_component(finding_id, "finding_id")?;
     core_meta_tuple_key(&[
-        CoreMetaTuplePart::Utf8("repair_finding"),
         CoreMetaTuplePart::Utf8(scope_kind),
         CoreMetaTuplePart::Utf8(scope_id),
         CoreMetaTuplePart::Utf8(finding_id),
     ])
 }
 
-fn parse_repair_finding_ref_name(ref_name: &str) -> Result<(String, String, String)> {
-    let parts = ref_name.split(':').collect::<Vec<_>>();
-    if parts.len() != 7
-        || parts[0] != REPAIR_FINDING_REF_PREFIX.trim_end_matches(':')
-        || parts[1] != "scope_kind"
-        || parts[3] != "scope_id"
-        || parts[5] != "finding"
-    {
-        return Err(anyhow!(
-            "repair finding CoreMeta ref name has invalid shape"
-        ));
-    }
-    Ok((
-        parts[2].to_string(),
-        parts[4].to_string(),
-        parts[6].to_string(),
-    ))
+fn repair_finding_head_tuple_key(scope_kind: &str, scope_id: &str) -> Result<Vec<u8>> {
+    require_safe_component(scope_kind, "scope_kind")?;
+    require_safe_component(scope_id, "scope_id")?;
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(scope_kind),
+        CoreMetaTuplePart::Utf8(scope_id),
+    ])
 }
 
 #[cfg(test)]
@@ -939,7 +1212,7 @@ mod tests {
     const KEY: &[u8] = b"repair finding signing key";
 
     #[tokio::test]
-    async fn repair_findings_write_read_and_list() {
+    async fn repair_findings_write_point_indexes_and_bounded_pages() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let first = write_repair_finding(&storage, finding("finding-001", 10), KEY)
@@ -948,12 +1221,25 @@ mod tests {
         let second = write_repair_finding(&storage, finding("finding-002", 20), KEY)
             .await
             .unwrap();
-        let tuple_key =
-            repair_finding_tuple_key("bucket", "tenant-1-bucket-2", "finding-001").unwrap();
+        assert_eq!(first.scope_revision, 1);
+        assert_eq!(second.scope_revision, 2);
+        let tuple_key = repair_finding_tuple_key("bucket", "tenant-1-bucket-2", 1).unwrap();
+        let id_key =
+            repair_finding_id_tuple_key("bucket", "tenant-1-bucket-2", "finding-001").unwrap();
+        let head_key = repair_finding_head_tuple_key("bucket", "tenant-1-bucket-2").unwrap();
+        let meta = CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
         assert!(
-            CoreMetaStore::open(storage.core_store_meta_path())
+            meta.get(CF_MESH, TABLE_REPAIR_FINDING_ROW, &tuple_key)
                 .unwrap()
-                .get(CF_MESH, TABLE_REPAIR_FINDING_ROW, &tuple_key)
+                .is_some()
+        );
+        assert!(
+            meta.get(CF_MESH, TABLE_REPAIR_FINDING_ID_ROW, &id_key)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            meta.get(CF_MESH, TABLE_REPAIR_FINDING_HEAD_ROW, &head_key)
                 .unwrap()
                 .is_some()
         );
@@ -965,10 +1251,80 @@ mod tests {
             first
         );
         assert_eq!(
-            list_repair_findings(&storage, "bucket", "tenant-1-bucket-2", KEY)
+            page_repair_findings(&storage, "bucket", "tenant-1-bucket-2", 0, 2, 1, KEY)
                 .await
                 .unwrap(),
-            vec![first, second]
+            vec![first.clone()]
+        );
+        assert_eq!(
+            page_repair_findings(&storage, "bucket", "tenant-1-bucket-2", 1, 2, 1, KEY)
+                .await
+                .unwrap(),
+            vec![second]
+        );
+        assert!(
+            page_repair_findings(&storage, "bucket", "tenant-1-bucket-2", 2, 2, 1, KEY)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_finding_ids_are_immutable_and_idempotent() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let write = finding("finding-001", 10);
+        let first = write_repair_finding(&storage, write.clone(), KEY)
+            .await
+            .unwrap();
+        assert_eq!(
+            write_repair_finding(&storage, write.clone(), KEY)
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            repair_finding_scope_revision(&storage, "bucket", "tenant-1-bucket-2").unwrap(),
+            1
+        );
+
+        let mut conflicting = write;
+        conflicting.message = "different immutable content".to_string();
+        assert!(
+            write_repair_finding(&storage, conflicting, KEY)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("different immutable content")
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_finding_pages_reject_a_changed_scope_revision() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        write_repair_finding(&storage, finding("finding-001", 10), KEY)
+            .await
+            .unwrap();
+        write_repair_finding(&storage, finding("finding-002", 20), KEY)
+            .await
+            .unwrap();
+        let first_page =
+            page_repair_findings(&storage, "bucket", "tenant-1-bucket-2", 0, 2, 1, KEY)
+                .await
+                .unwrap();
+        assert_eq!(first_page[0].scope_revision, 1);
+
+        write_repair_finding(&storage, finding("finding-003", 30), KEY)
+            .await
+            .unwrap();
+        assert!(
+            page_repair_findings(&storage, "bucket", "tenant-1-bucket-2", 1, 2, 1, KEY)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("revision changed")
         );
     }
 
@@ -979,8 +1335,7 @@ mod tests {
         write_repair_finding(&storage, finding("finding-001", 10), KEY)
             .await
             .unwrap();
-        let tuple_key =
-            repair_finding_tuple_key("bucket", "tenant-1-bucket-2", "finding-001").unwrap();
+        let tuple_key = repair_finding_tuple_key("bucket", "tenant-1-bucket-2", 1).unwrap();
         let meta = CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
         let mut value = meta
             .get(CF_MESH, TABLE_REPAIR_FINDING_ROW, &tuple_key)
@@ -996,8 +1351,16 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(repair_finding_ref_name("../bucket", "scope", "finding").is_err());
-        assert!(repair_finding_ref_name("bucket", "scope", "../finding").is_err());
+        assert!(
+            read_repair_finding(&storage, "../bucket", "scope", "finding", KEY)
+                .await
+                .is_err()
+        );
+        assert!(
+            read_repair_finding(&storage, "bucket", "scope", "../finding", KEY)
+                .await
+                .is_err()
+        );
     }
 
     #[test]

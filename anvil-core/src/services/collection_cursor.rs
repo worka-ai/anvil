@@ -354,6 +354,17 @@ mod tests {
                 .code(),
             Code::InvalidArgument
         );
+
+        let changed_revision = CollectionCursorBinding {
+            revision: "root:10",
+            ..binding
+        };
+        assert_eq!(
+            decode_page_token(Some(&page), &changed_revision, b"test-key")
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
     }
 
     #[test]

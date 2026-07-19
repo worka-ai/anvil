@@ -149,39 +149,81 @@ impl RepairService for AppState {
         )
         .await?;
 
-        let findings = self
+        let page_size = crate::services::collection_cursor::page_size(req.page.as_ref())?;
+        let revision = self
             .persistence
-            .list_repair_findings(&req.scope_kind, &req.scope_id, usize::MAX)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .into_iter()
-            .map(|finding| repair_finding_record(&finding))
-            .collect::<Vec<_>>();
+            .repair_finding_scope_revision(&req.scope_kind, &req.scope_id)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let revision_text = revision.to_string();
         let filters = [
             ("scope_kind", req.scope_kind.as_str()),
             ("scope_id", req.scope_id.as_str()),
         ];
         let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
-        let (findings, page) = crate::services::collection_cursor::paginate(
-            findings,
+        let binding = crate::services::collection_cursor::CollectionCursorBinding {
+            service_method: "anvil.RepairService/ListRepairFindings",
+            filters: &filters,
+            principal_scope: &principal_scope,
+            page_size,
+            revision: &revision_text,
+            sort: "scope_revision.asc",
+        };
+        let after_revision = crate::services::collection_cursor::decode_page_token(
             req.page.as_ref(),
-            "anvil.RepairService/ListRepairFindings",
-            &filters,
-            &principal_scope,
-            "finding_id.asc",
+            &binding,
             self.config.jwt_secret.as_bytes(),
-            |finding| finding.finding_id.as_str(),
-            |finding| {
-                crate::services::collection_cursor::content_generation(&[
-                    finding.status.as_bytes(),
-                    finding.severity.as_bytes(),
-                    &finding.created_at_nanos.to_le_bytes(),
-                ])
-            },
-        )?;
+        )?
+        .map(|position| {
+            position
+                .parse::<u64>()
+                .map_err(|_| Status::invalid_argument("invalid page_token"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+        let mut findings = self
+            .persistence
+            .page_repair_findings(
+                &req.scope_kind,
+                &req.scope_id,
+                after_revision,
+                revision,
+                page_size + 1,
+            )
+            .await
+            .map_err(|error| {
+                if error.to_string().contains("revision changed")
+                    || error.to_string().contains("changed during page read")
+                {
+                    Status::aborted("repair finding collection changed; restart pagination")
+                } else {
+                    Status::internal(error.to_string())
+                }
+            })?;
+        let has_more = findings.len() > page_size;
+        if has_more {
+            findings.truncate(page_size);
+        }
+        let next_page_token = if has_more {
+            let position = findings
+                .last()
+                .ok_or_else(|| Status::internal("repair finding page is unexpectedly empty"))?
+                .scope_revision
+                .to_string();
+            crate::services::collection_cursor::encode_next_page_token(
+                &position,
+                &binding,
+                self.config.jwt_secret.as_bytes(),
+            )?
+        } else {
+            String::new()
+        };
+        let findings = findings
+            .into_iter()
+            .map(|finding| repair_finding_record(&finding))
+            .collect();
         Ok(Response::new(ListRepairFindingsResponse {
             findings,
-            page: Some(page),
+            page: Some(PageResponse { next_page_token }),
         }))
     }
 

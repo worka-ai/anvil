@@ -607,6 +607,9 @@ Initial CoreMeta table registry:
 | `0x8702` | `cf_registry` | `realm / registry_kind / blob_hash` | `RegistryBlobLocatorRow` | committed root generation only |
 | `0x8801` | `cf_mesh` | `region / cell / node_id` | `MeshNodeRow` | committed mesh root generation only |
 | `0x8802` | `cf_mesh` | `partition_id / epoch` | `MeshPartitionRow` | committed mesh root generation only |
+| `0x8803` | `cf_mesh` | `scope_kind / scope_id / scope_revision` | `RepairFindingRow` | immutable finding at the committed repair-scope generation |
+| `0x880a` | `cf_mesh` | `scope_kind / scope_id` | `RepairFindingHeadRow` | current repair-scope revision point lookup |
+| `0x880b` | `cf_mesh` | `scope_kind / scope_id / finding_id` | `RepairFindingIdRow` | immutable finding-id-to-revision point lookup |
 | `0x8d01` | `cf_mesh` | `principal_or_node_id / key_id` | `NodeSigningKeyRow` | committed mesh root generation only |
 | `0x8901` | `cf_leases_fences` | `realm / lease_id` | `LeaseFenceRow` | committed root generation only |
 | `0x8a01` | `cf_materialisation` | `node_id / materialisation_epoch` | `MaterialisationCursorRow` | local committed metadata |
@@ -948,6 +951,71 @@ message MeshPartitionRow {
   repeated string root_key_ranges = 6;
   uint64 fence_token = 7;
 }
+
+message RepairFindingRow {
+  CoreMetaRowCommon common = 1;
+  uint32 format_version = 2;
+  string finding_id = 3;
+  string scope_kind = 4;
+  string scope_id = 5;
+  string repair_task_id = 6;
+  uint64 lease_fence_token = 7;
+  RepairFindingSeverity severity = 8;
+  RepairFindingStatus status = 9;
+  string code = 10;
+  string message = 11;
+  repeated RepairSubjectRef subjects = 12;
+  RepairActionKind proposed_action = 13;
+  RepairJsonValue evidence = 14;
+  int64 created_at_nanos = 15;
+  optional string finding_hash = 16;
+  optional string finding_signature = 17;
+  uint64 scope_revision = 18;
+}
+
+message RepairFindingHeadRow {
+  CoreMetaRowCommon common = 1;
+  string schema = 2; // "anvil.repair.finding_head.v1"
+  string scope_kind = 3;
+  string scope_id = 4;
+  uint64 revision = 5;
+  uint64 finding_count = 6;
+  string last_finding_id = 7;
+  string last_finding_hash = 8;
+}
+
+message RepairFindingIdRow {
+  CoreMetaRowCommon common = 1;
+  string schema = 2; // "anvil.repair.finding_id.v1"
+  string scope_kind = 3;
+  string scope_id = 4;
+  string finding_id = 5;
+  uint64 revision = 6;
+}
+
+`RepairFindingRow`, its `RepairFindingIdRow`, and the replacement
+`RepairFindingHeadRow` MUST be committed in one repair-scope root transaction.
+The transaction assigns the next contiguous `scope_revision`; that revision is
+both the finding tuple suffix and `CoreMetaRowCommon.root_generation` on all
+three rows. Finding ids are immutable. An exact retry returns the existing
+finding without advancing the head, while a different payload under an existing
+id fails. The table id already identifies each row family, so tuple keys MUST
+NOT include redundant literal row-kind prefixes.
+
+Repair findings are listed only through the revision-bound operation:
+
+```text
+PageRepairFindings(scope_kind, scope_id, after_revision,
+                   through_revision, page_size)
+  -> findings, next_revision?
+```
+
+`page_size` MUST be in `1..=1000`. The first page reads the point head and binds
+the cursor token to that revision. Each page seeks directly to
+`after_revision + 1`, stops at `through_revision`, and reads no more than
+`page_size + 1` rows. If the scope head changes, an old token is rejected and
+the caller restarts. Point reads by `finding_id` use `RepairFindingIdRow`; they
+MUST NOT scan the finding history.
 
 message NodeSigningKeyRow {
   CoreMetaRowCommon common = 1;
@@ -3666,7 +3734,7 @@ node_table                      -> NodeRow, key (region_id, cell_id, node_id, ef
 partition_map_table             -> PartitionMapRow, key (partition_id, owner_epoch)
 root_owner_epoch_table          -> RootOwnerEpochRow, key (root_key_hash, owner_epoch)
 lifecycle_event_table           -> LifecycleEventRow, key (event_id)
-repair_finding_table            -> RepairFindingRow, key (finding_id)
+repair_finding_table            -> RepairFindingRow, key (scope_kind, scope_id, scope_revision)
 anti_entropy_checkpoint_table   -> AntiEntropyCheckpointRow, key (partition_id, scanner_node_id)
 ```
 

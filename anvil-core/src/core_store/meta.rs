@@ -92,6 +92,8 @@ pub const TABLE_CONTROL_CURRENT_ROW: u16 = 0x8806;
 pub const TABLE_SYSTEM_BOOTSTRAP_MARKER_ROW: u16 = 0x8807;
 pub const TABLE_ROOT_CATALOG_CURRENT_ROW: u16 = 0x8808;
 pub const TABLE_QUORUM_PROFILE_CURRENT_ROW: u16 = 0x8809;
+pub const TABLE_REPAIR_FINDING_HEAD_ROW: u16 = 0x880a;
+pub const TABLE_REPAIR_FINDING_ID_ROW: u16 = 0x880b;
 pub const TABLE_OWNERSHIP_FENCE_ROW: u16 = 0x8901;
 pub const TABLE_PARTITION_OWNER_ROW: u16 = 0x8902;
 pub const TABLE_TASK_LEASE_ROW: u16 = 0x8903;
@@ -1388,6 +1390,8 @@ fn table_spec(table_id: u16) -> Result<CoreMetaTableSpec> {
         TABLE_MESH_NODE_ROW
         | TABLE_MESH_PARTITION_ROW
         | TABLE_REPAIR_FINDING_ROW
+        | TABLE_REPAIR_FINDING_HEAD_ROW
+        | TABLE_REPAIR_FINDING_ID_ROW
         | TABLE_BUCKET_CURRENT_BY_NAME_ROW
         | TABLE_BUCKET_CURRENT_BY_ID_ROW
         | TABLE_CONTROL_CURRENT_ROW
@@ -1697,6 +1701,8 @@ fn expected_schema_markers(table_id: u16) -> Option<&'static [&'static str]> {
         TABLE_QUORUM_PROFILE_CURRENT_ROW => {
             Some(&["anvil.control.current.v1", "anvil.core.quorum_profile.v1"])
         }
+        TABLE_REPAIR_FINDING_HEAD_ROW => Some(&["anvil.repair.finding_head.v1"]),
+        TABLE_REPAIR_FINDING_ID_ROW => Some(&["anvil.repair.finding_id.v1"]),
         TABLE_TASK_CURRENT_ROW => Some(&["anvil.core.task_current.v1"]),
         TABLE_CORE_FENCE_ROW => Some(&["anvil.control.current.v1", "anvil.core.fence.v1"]),
         TABLE_MATERIALISATION_CURSOR_ROW => Some(&[
