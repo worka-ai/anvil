@@ -6,14 +6,18 @@ pub(super) async fn next_group_root_generation(
     tenant_id: i64,
     database_id: &str,
 ) -> Result<u64> {
-    let root_key_hash = personaldb_root_key_hash(tenant_id, database_id);
-    CoreMetaStore::open(storage.core_store_meta_path())?
-        .scan_all_encoded_rows()?
-        .into_iter()
-        .filter(|row| row.root_key_hash == root_key_hash)
-        .map(|row| row.root_generation)
-        .max()
-        .ok_or_else(|| anyhow!("PersonalDB group root has no committed rows"))?
+    let anchor_key = personaldb_root_anchor_key(tenant_id, database_id);
+    let anchor = CoreStore::new(storage.clone())
+        .await?
+        .read_internal_root_anchor(&anchor_key, 1)
+        .await
+        .context("read PersonalDB group root anchor")?;
+    let expected_root_key_hash = personaldb_root_key_hash(tenant_id, database_id);
+    if anchor.root_key_hash != expected_root_key_hash {
+        bail!("PersonalDB group root anchor scope mismatch");
+    }
+    anchor
+        .generation
         .checked_add(1)
         .ok_or_else(|| anyhow!("PersonalDB group root generation overflow"))
 }

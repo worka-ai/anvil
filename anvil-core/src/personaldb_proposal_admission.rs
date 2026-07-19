@@ -17,8 +17,8 @@ use crate::{
     personaldb_commit_store::{decode_commit_certificate, encode_commit_certificate},
     personaldb_control::{PersonalDbCommitCertificate, validate_commit_certificate_unsigned},
     personaldb_coremeta::{
-        personaldb_partition_id, personaldb_realm_id, personaldb_root_key_hash,
-        tenant_id_from_realm,
+        personaldb_partition_id, personaldb_realm_id, personaldb_root_anchor_key,
+        personaldb_root_key_hash, tenant_id_from_realm,
     },
     personaldb_heads::{
         PersonalDbCommittedHead, decode_committed_head, encode_committed_head,
