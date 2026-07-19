@@ -113,6 +113,7 @@ pub(crate) const CORE_META_MAX_INLINE_PAYLOAD_BYTES: usize = 32 * 1024;
 pub(crate) const CORE_META_INLINE_MANIFEST_BODY_MAX_BYTES: usize = 32 * 1024;
 pub(crate) const CORE_META_STREAM_RECORD_INDEX_MAX_PAYLOAD_BYTES: usize = 16 * 1024;
 const CORE_META_OBJECT_VERSION_MAX_PAYLOAD_BYTES: usize = CORE_META_MAX_VALUE_BYTES;
+pub(crate) const CORE_META_MAX_SCAN_PAGE_ROWS: usize = 4096;
 
 static META_DB_CACHE: LazyLock<StdMutex<BTreeMap<PathBuf, Weak<DB>>>> =
     LazyLock::new(|| StdMutex::new(BTreeMap::new()));
@@ -539,6 +540,77 @@ impl CoreMetaStore {
         Ok(records)
     }
 
+    pub fn scan_prefix_page(
+        &self,
+        cf: &'static str,
+        table_id: u16,
+        tuple_prefix: &[u8],
+        after_tuple_key: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<CoreMetaRecord>> {
+        validate_scan_limit(limit)?;
+        validate_meta_payload(cf, table_id, 0)?;
+        let prefix = core_meta_key(table_id, 0, tuple_prefix)?;
+        let upper_bound = exclusive_prefix_successor(&prefix)
+            .context("CoreMeta prefix has no finite exclusive upper bound")?;
+        let after_key = after_tuple_key
+            .map(|tuple_key| core_meta_key(table_id, 0, tuple_key))
+            .transpose()?;
+        if after_key
+            .as_ref()
+            .is_some_and(|after_key| !after_key.starts_with(&prefix))
+        {
+            bail!("CoreMeta page position is outside the requested prefix");
+        }
+
+        let start_key = after_key.as_ref().unwrap_or(&prefix);
+        let cf_name = cf;
+        let cf = self.cf(cf_name)?;
+        let mut read_options = ReadOptions::default();
+        read_options.set_iterate_lower_bound(start_key.clone());
+        read_options.set_iterate_upper_bound(upper_bound);
+        let iter = self.db.iterator_cf_opt(
+            &cf,
+            read_options,
+            IteratorMode::From(start_key, Direction::Forward),
+        );
+        let mut records = Vec::with_capacity(limit);
+        let mut scanned = 0_u64;
+        let mut bytes = 0_u64;
+        let started_at = Instant::now();
+        for item in iter {
+            let (key, value) = item?;
+            if !key.starts_with(&prefix) {
+                bail!("bounded CoreMeta prefix iterator returned an out-of-range key");
+            }
+            scanned = scanned.saturating_add(1);
+            bytes = bytes.saturating_add((key.len() + value.len()) as u64);
+            if after_key
+                .as_ref()
+                .is_some_and(|after_key| key.as_ref() <= after_key.as_slice())
+            {
+                continue;
+            }
+            let _ = decode_core_meta_tuple_key(&key)?;
+            records.push(CoreMetaRecord {
+                key: key.to_vec(),
+                payload: decode_envelope(cf_name, table_id, &value)?,
+            });
+            if records.len() == limit {
+                break;
+            }
+        }
+        crate::perf::record_coremeta_duration(
+            "scan_prefix_page",
+            cf_name,
+            table_id,
+            scanned,
+            bytes,
+            started_at.elapsed(),
+        );
+        Ok(records)
+    }
+
     pub fn scan_range_inclusive(
         &self,
         cf: &'static str,
@@ -547,9 +619,7 @@ impl CoreMetaStore {
         end_tuple_key: &[u8],
         limit: usize,
     ) -> Result<Vec<CoreMetaRecord>> {
-        if limit == 0 {
-            bail!("CoreMeta range scan limit must be nonzero");
-        }
+        validate_scan_limit(limit)?;
         validate_meta_payload(cf, table_id, 0)?;
         let start_key = core_meta_key(table_id, 0, start_tuple_key)?;
         let end_key = core_meta_key(table_id, 0, end_tuple_key)?;
@@ -606,6 +676,7 @@ impl CoreMetaStore {
         end_tuple_key: &[u8],
         limit: usize,
     ) -> Result<Vec<CoreMetaRecord>> {
+        validate_scan_limit(limit)?;
         validate_meta_payload(cf, table_id, 0)?;
         let start_key = core_meta_key(table_id, 0, start_tuple_key)?;
         let end_key = core_meta_key(table_id, 0, end_tuple_key)?;
@@ -627,7 +698,6 @@ impl CoreMetaStore {
         let mut records = Vec::new();
         let mut scanned = 0_u64;
         let mut bytes = 0_u64;
-        let scan_limit = limit.max(1);
         let started_at = Instant::now();
         for item in iter {
             let (key, value) = item?;
@@ -640,7 +710,7 @@ impl CoreMetaStore {
                 key: key.to_vec(),
                 payload: decode_envelope(cf_name, table_id, &value)?,
             });
-            if records.len() >= scan_limit {
+            if records.len() >= limit {
                 break;
             }
         }
@@ -1370,6 +1440,13 @@ fn validate_meta_payload(cf: &str, table_id: u16, payload_len: usize) -> Result<
             "CoreStore metadata table {table_id:#06x} payload is {payload_len} bytes, exceeding {} bytes",
             spec.max_payload_bytes
         );
+    }
+    Ok(())
+}
+
+fn validate_scan_limit(limit: usize) -> Result<()> {
+    if !(1..=CORE_META_MAX_SCAN_PAGE_ROWS).contains(&limit) {
+        bail!("CoreMeta scan limit must be between 1 and {CORE_META_MAX_SCAN_PAGE_ROWS}");
     }
     Ok(())
 }
