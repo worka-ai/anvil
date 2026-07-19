@@ -206,7 +206,6 @@ pub(super) async fn write_authz_tuple_record(
         )
         .await
         .map_err(authz_tuple_write_status)?;
-    emit_authz_tuple_write_side_effects(state, claims.tenant_id, &record).await?;
     Ok(record)
 }
 
@@ -303,28 +302,6 @@ pub(super) fn authz_tuple_write_status(error: anyhow::Error) -> Status {
     authz_tuple_batch_write_status(error)
 }
 
-pub(super) async fn emit_authz_tuple_write_side_effects(
-    state: &AppState,
-    tenant_id: i64,
-    record: &crate::persistence::AuthzTupleRecord,
-) -> Result<(), Status> {
-    emit_authz_tuple_batch_side_effects(state, tenant_id, std::slice::from_ref(record)).await
-}
-
-pub(super) async fn emit_authz_tuple_batch_side_effects(
-    state: &AppState,
-    _tenant_id: i64,
-    records: &[crate::persistence::AuthzTupleRecord],
-) -> Result<(), Status> {
-    if records.is_empty() {
-        return Ok(());
-    }
-    for record in records {
-        let _ = state.authz_watch_tx.send(record.clone());
-    }
-    Ok(())
-}
-
 pub(super) async fn check_permission_response(
     state: &AppState,
     claims: &auth::Claims,
@@ -360,7 +337,7 @@ pub(super) async fn check_permission_response(
         response_revision,
     )
     .await
-    .map_err(|e| Status::internal(format!("{e:#}")))?;
+    .map_err(crate::services::authz_status::consistency_status)?;
 
     Ok(CheckPermissionResponse {
         allowed,
@@ -392,6 +369,37 @@ pub(super) async fn resolve_authz_response_revision(
         AuthzConsistency::Exact(revision) => revision,
         AuthzConsistency::Latest | AuthzConsistency::AtLeast(_) => latest_revision,
     })
+}
+
+pub(super) async fn require_current_authz_list_revision(
+    storage: &crate::storage::Storage,
+    tenant_id: i64,
+    requested_revision: i64,
+) -> Result<(), Status> {
+    let current_revision = authz_journal::latest_authz_revision(storage, tenant_id)
+        .await
+        .map_err(|error| Status::internal(format!("{error:#}")))?;
+    if current_revision != requested_revision {
+        return Err(Status::failed_precondition(format!(
+            "AuthzRevisionUnavailable: historical authz list reads are not supported; current revision is {current_revision}, requested {requested_revision}"
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn authz_projection_page_status(
+    error: authz_journal::AuthzProjectionPageError,
+) -> Status {
+    let message = error.to_string();
+    match error {
+        authz_journal::AuthzProjectionPageError::RevisionMismatch { .. } => {
+            Status::failed_precondition(message)
+        }
+        authz_journal::AuthzProjectionPageError::InvalidPageSize => {
+            Status::invalid_argument(message)
+        }
+        authz_journal::AuthzProjectionPageError::Internal(_) => Status::internal(message),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -518,6 +526,9 @@ pub(super) fn optional_str(value: &str) -> Option<&str> {
 
 const AUTHZ_PAGE_TOKEN_VERSION: u8 = 1;
 const AUTHZ_PAGE_TOKEN_TTL_SECONDS: u64 = 15 * 60;
+const MAX_AUTHZ_PAGE_TOKEN_ENCODED_BYTES: usize = 128 * 1024;
+pub(super) const MAX_AUTHZ_PAGE_POSITION_BYTES: usize = u16::MAX as usize;
+const MAX_AUTHZ_PAGE_POSITION_TEXT_BYTES: usize = ((MAX_AUTHZ_PAGE_POSITION_BYTES + 2) / 3) * 4;
 
 pub(super) struct AuthzPageBinding<'a> {
     pub tenant_id: i64,
@@ -525,38 +536,6 @@ pub(super) struct AuthzPageBinding<'a> {
     pub revision: i64,
     pub filter_hash: &'a str,
     pub page_size: usize,
-}
-
-pub(super) fn paginate_authz<T>(
-    mut values: Vec<T>,
-    after: Option<&str>,
-    binding: &AuthzPageBinding<'_>,
-    signing_key: &[u8],
-    key: impl Fn(&T) -> String,
-) -> Result<(Vec<T>, String), Status> {
-    values.sort_by_key(|value| key(value));
-    let start = after
-        .map(|position| values.partition_point(|value| key(value).as_str() <= position))
-        .unwrap_or_default();
-    let mut page = values
-        .into_iter()
-        .skip(start)
-        .take(binding.page_size + 1)
-        .collect::<Vec<_>>();
-    let has_more = page.len() > binding.page_size;
-    if has_more {
-        page.truncate(binding.page_size);
-    }
-    let next_page_token = if has_more {
-        let position = page
-            .last()
-            .map(&key)
-            .ok_or_else(|| Status::internal("authz page is unexpectedly empty"))?;
-        encode_authz_page_token(binding, &position, signing_key)?
-    } else {
-        String::new()
-    };
-    Ok((page, next_page_token))
 }
 
 #[derive(Debug, Clone)]
@@ -602,6 +581,9 @@ pub(super) fn parse_authz_page_token(
     if value.is_empty() {
         return Ok(None);
     }
+    if value.len() > MAX_AUTHZ_PAGE_TOKEN_ENCODED_BYTES {
+        return Err(Status::invalid_argument("Invalid authz page token"));
+    }
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(value)
         .map_err(|_| Status::invalid_argument("Invalid authz page token"))?;
@@ -618,6 +600,8 @@ pub(super) fn parse_authz_page_token(
         || token.filter_hash != binding.filter_hash
         || token.principal_hash != authz_page_principal_hash(binding.principal_id)
         || token.page_size != binding.page_size
+        || token.position.is_empty()
+        || token.position.len() > MAX_AUTHZ_PAGE_POSITION_TEXT_BYTES
         || token.expires_at_unix_seconds < authz_page_now()?
     {
         return Err(Status::invalid_argument(
@@ -635,6 +619,9 @@ pub(super) fn authz_page_token_revision(value: &str) -> Result<Option<i64>, Stat
     if value.is_empty() {
         return Ok(None);
     }
+    if value.len() > MAX_AUTHZ_PAGE_TOKEN_ENCODED_BYTES {
+        return Err(Status::invalid_argument("Invalid authz page token"));
+    }
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(value)
         .map_err(|_| Status::invalid_argument("Invalid authz page token"))?;
@@ -651,6 +638,11 @@ pub(super) fn encode_authz_page_token(
     position: &str,
     signing_key: &[u8],
 ) -> Result<String, Status> {
+    if position.is_empty() || position.len() > MAX_AUTHZ_PAGE_POSITION_TEXT_BYTES {
+        return Err(Status::internal(
+            "authz page position is outside supported bounds",
+        ));
+    }
     let mut token = AuthzPageToken {
         version: AUTHZ_PAGE_TOKEN_VERSION,
         tenant_id: binding.tenant_id,
@@ -665,6 +657,34 @@ pub(super) fn encode_authz_page_token(
     token.signature = sign_authz_page_token(&token, signing_key)?;
     let bytes = crate::core_store::encode_deterministic_proto(&authz_page_token_to_proto(&token)?);
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+pub(super) fn encode_authz_page_position(position: &[u8]) -> Result<String, Status> {
+    if position.is_empty() || position.len() > MAX_AUTHZ_PAGE_POSITION_BYTES {
+        return Err(Status::internal(
+            "authz binary page position is outside supported bounds",
+        ));
+    }
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(position))
+}
+
+pub(super) fn decode_authz_page_position(
+    position: Option<&str>,
+) -> Result<Option<Vec<u8>>, Status> {
+    position
+        .map(|position| {
+            if position.is_empty() || position.len() > MAX_AUTHZ_PAGE_POSITION_TEXT_BYTES {
+                return Err(Status::invalid_argument("Invalid authz page token"));
+            }
+            let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(position)
+                .map_err(|_| Status::invalid_argument("Invalid authz page token"))?;
+            if decoded.is_empty() || decoded.len() > MAX_AUTHZ_PAGE_POSITION_BYTES {
+                return Err(Status::invalid_argument("Invalid authz page token"));
+            }
+            Ok(decoded)
+        })
+        .transpose()
 }
 
 fn authz_page_token_to_proto(token: &AuthzPageToken) -> Result<AuthzPageTokenProto, Status> {

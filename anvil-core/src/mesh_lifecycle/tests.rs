@@ -707,6 +707,11 @@ async fn append_control_record(
     sequence: u64,
     digest: ControlRecordDigest,
 ) {
+    let cursor =
+        crate::mesh_control_stream::control_stream_append_cursor(storage, stream_family, partition)
+            .await
+            .unwrap();
+    assert_eq!(cursor.sequence.get(), sequence);
     let header_proto = crate::mesh_control_stream::encode_control_mutation_header(
         crate::mesh_control_stream::ControlMutationHeaderInput {
             schema: "anvil.mesh.control_mutation.v1",
@@ -723,6 +728,7 @@ async fn append_control_record(
             idempotency_key: Some("idem-a"),
             record_digest: &digest,
             created_at: "2026-07-02T00:00:00Z",
+            byte_offset: cursor.byte_offset,
         },
     );
     crate::mesh_control_stream::append_control_stream_frame(
@@ -771,6 +777,14 @@ async fn append_lifecycle_descriptor<T: record_proto::LifecycleControlPayload>(
     descriptor: &T,
 ) {
     let partition = lifecycle_control_partition(stream_family, record_key);
+    let cursor = crate::mesh_control_stream::control_stream_append_cursor(
+        storage,
+        stream_family,
+        &partition,
+    )
+    .await
+    .unwrap();
+    assert_eq!(cursor.sequence.get(), sequence);
     let payload_proto =
         record_proto::encode_lifecycle_control_payload(descriptor, stream_family).unwrap();
     let digest = ControlRecordDigest::blake3(&payload_proto);
@@ -790,6 +804,7 @@ async fn append_lifecycle_descriptor<T: record_proto::LifecycleControlPayload>(
             idempotency_key: Some("idem-a"),
             record_digest: &digest,
             created_at: "2026-07-02T00:00:00Z",
+            byte_offset: cursor.byte_offset,
         },
     );
     crate::mesh_control_stream::append_control_stream_frame(

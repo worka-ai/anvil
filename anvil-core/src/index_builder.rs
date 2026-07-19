@@ -380,15 +380,6 @@ pub async fn build_full_text_index(
         partition_owner_signing_key,
     )
     .await?;
-    let watch_cursor = next_index_watch_cursor(
-        storage,
-        index.tenant_id,
-        index.bucket_id,
-        &index_storage_id,
-        &partition_id,
-        source_cursor.max(u128::from(generation)),
-    )
-    .await?;
     let watch_payload = IndexPartitionWatchPayload {
         index_id: index_storage_id.clone(),
         index_kind: index.kind.clone(),
@@ -418,7 +409,6 @@ pub async fn build_full_text_index(
         index.tenant_id,
         index.bucket_id,
         &partition_id,
-        watch_cursor,
         *uuid::Uuid::new_v4().as_bytes(),
         latest_authz_revision_for_documents(&owned_documents),
         watch_payload,
@@ -547,15 +537,6 @@ pub async fn build_typed_json_index(
         partition_owner_signing_key,
     )
     .await?;
-    let watch_cursor = next_index_watch_cursor(
-        storage,
-        index.tenant_id,
-        index.bucket_id,
-        &index_storage_id,
-        &partition_id,
-        source_cursor.max(u128::from(generation)),
-    )
-    .await?;
     let watch_payload = IndexPartitionWatchPayload {
         index_id: index_storage_id.clone(),
         index_kind: index.kind.clone(),
@@ -585,7 +566,6 @@ pub async fn build_typed_json_index(
         index.tenant_id,
         index.bucket_id,
         &partition_id,
-        watch_cursor,
         *uuid::Uuid::new_v4().as_bytes(),
         latest_authz_revision_for_typed_rows(&rows),
         watch_payload,
@@ -710,15 +690,6 @@ pub async fn build_metadata_backed_index(
         partition_owner_signing_key,
     )
     .await?;
-    let watch_cursor = next_index_watch_cursor(
-        storage,
-        index.tenant_id,
-        index.bucket_id,
-        &index_storage_id,
-        &partition_id,
-        source_cursor.max(u128::from(generation)),
-    )
-    .await?;
     let watch_payload = IndexPartitionWatchPayload {
         index_id: index_storage_id.clone(),
         index_kind: index.kind.clone(),
@@ -748,7 +719,6 @@ pub async fn build_metadata_backed_index(
         index.tenant_id,
         index.bucket_id,
         &partition_id,
-        watch_cursor,
         *uuid::Uuid::new_v4().as_bytes(),
         latest_authz_revision_for_typed_rows(&rows),
         watch_payload,
@@ -1053,15 +1023,6 @@ async fn build_vector_index_with_policy(
         partition_owner_signing_key,
     )
     .await?;
-    let watch_cursor = next_index_watch_cursor(
-        storage,
-        index.tenant_id,
-        index.bucket_id,
-        &index_storage_id,
-        &partition_id,
-        source_cursor.max(u128::from(generation)),
-    )
-    .await?;
     let watch_payload = IndexPartitionWatchPayload {
         index_id: index_storage_id.clone(),
         index_kind: outcome_kind.to_string(),
@@ -1091,7 +1052,6 @@ async fn build_vector_index_with_policy(
         index.tenant_id,
         index.bucket_id,
         &partition_id,
-        watch_cursor,
         *uuid::Uuid::new_v4().as_bytes(),
         latest_authz_revision_for_vectors(&vector_documents),
         watch_payload,
@@ -1335,26 +1295,6 @@ async fn acquire_index_partition_watch_authority(
         fence: outcome.record.fence,
         resource_id,
     })
-}
-
-async fn next_index_watch_cursor(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-    index_storage_id: &str,
-    partition_id: &str,
-    preferred_cursor: u128,
-) -> Result<u128> {
-    let latest = index_partition_watch::latest_index_partition_watch_cursor(
-        storage,
-        tenant_id,
-        bucket_id,
-        index_storage_id,
-        partition_id,
-    )
-    .await?
-    .unwrap_or(0);
-    Ok(preferred_cursor.max(latest.saturating_add(1)))
 }
 
 #[derive(Debug, Clone)]

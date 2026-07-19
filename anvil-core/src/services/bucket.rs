@@ -238,41 +238,34 @@ impl BucketService for AppState {
         .await?;
         let after_cursor = i64::try_from(req.after_cursor)
             .map_err(|_| Status::invalid_argument("after_cursor exceeds supported range"))?;
-        let snapshot = bucket_journal::list_bucket_metadata_events(
-            &self.storage,
-            claims.tenant_id,
-            &req.bucket_name,
-            after_cursor,
-            1000,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-        let mut live = self.bucket_watch_tx.subscribe();
+        let stream_id = bucket_journal::tenant_bucket_metadata_stream_id(claims.tenant_id);
+        let mut live = self.storage.subscribe_stream(&stream_id);
+        let storage = self.storage.clone();
+        let tenant_id = claims.tenant_id;
+        let bucket_name = req.bucket_name;
 
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
             let mut last_cursor = after_cursor;
-            for event in snapshot {
-                last_cursor = last_cursor.max(event.id);
-                if tx
-                    .send(bucket_metadata_event_response(&event))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-
             loop {
-                match live.recv().await {
-                    Ok(event) => {
-                        if event.tenant_id != claims.tenant_id
-                            || event.id <= last_cursor
-                            || (!req.bucket_name.is_empty() && event.bucket_name != req.bucket_name)
-                        {
-                            continue;
+                loop {
+                    let page = match bucket_journal::list_bucket_metadata_event_page(
+                        &storage,
+                        tenant_id,
+                        &bucket_name,
+                        last_cursor,
+                        256,
+                    )
+                    .await
+                    {
+                        Ok(page) => page,
+                        Err(error) => {
+                            let _ = tx.send(Err(Status::internal(error.to_string()))).await;
+                            return;
                         }
-                        last_cursor = event.id;
+                    };
+                    let previous_cursor = last_cursor;
+                    for event in page.events {
                         if tx
                             .send(bucket_metadata_event_response(&event))
                             .await
@@ -281,14 +274,14 @@ impl BucketService for AppState {
                             return;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let _ = tx
-                            .send(Err(Status::data_loss(
-                                "Bucket metadata watch fell behind retained live event window",
-                            )))
-                            .await;
-                        return;
+                    last_cursor = page.next_cursor;
+                    if !page.has_more || last_cursor == previous_cursor {
+                        break;
                     }
+                }
+
+                match live.recv().await {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
@@ -462,7 +455,6 @@ impl AppState {
                 "bucket metadata journal event type differs from service hint"
             );
         }
-        let _ = self.bucket_watch_tx.send(event.clone());
         Ok(event)
     }
 }

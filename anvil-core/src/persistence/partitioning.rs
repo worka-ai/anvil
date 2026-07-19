@@ -8,6 +8,8 @@ use tokio::sync::Mutex as TokioMutex;
 
 const PARTITION_OWNER_ACQUIRE_LOCK_STRIPES: usize = 256;
 const PARTITION_OWNER_ACQUIRE_ATTEMPTS: usize = 32;
+const MESH_ROUTING_PAGE_SIZE: usize = 512;
+const MESH_ROUTING_ADMIN_RESULT_CAP: usize = 100_000;
 
 static PARTITION_OWNER_ACQUIRE_LOCKS: LazyLock<Vec<TokioMutex<()>>> = LazyLock::new(|| {
     (0..PARTITION_OWNER_ACQUIRE_LOCK_STRIPES)
@@ -42,7 +44,6 @@ impl Persistence {
             core_store: Arc::new(OnceCell::new()),
             event_publisher,
             task_notify: Arc::new(Notify::new()),
-            task_queue_write_lock: Arc::new(TokioMutex::new(())),
             mesh_id: nonempty_or(&config.mesh_id, "default"),
             region: nonempty_or(&config.region, "default"),
             cell_id: nonempty_or(&config.cell_id, "default"),
@@ -246,7 +247,38 @@ impl Persistence {
         &self,
         family_filter: Option<mesh_directory::RoutingRecordFamily>,
     ) -> Result<Vec<mesh_directory::RoutingRecordDescriptor>> {
-        Ok(mesh_directory::list_routing_records(&self.storage, family_filter).await?)
+        let families = family_filter
+            .map(|family| vec![family])
+            .unwrap_or_else(|| mesh_directory::RoutingRecordFamily::all().to_vec());
+        let mut records = Vec::new();
+        for family in families {
+            let mut after_tuple_key = None;
+            loop {
+                let page = mesh_directory::page_projected_routing_records(
+                    &self.storage,
+                    family,
+                    after_tuple_key.as_deref(),
+                    MESH_ROUTING_PAGE_SIZE,
+                )
+                .await?;
+                if records.len().saturating_add(page.records.len())
+                    > MESH_ROUTING_ADMIN_RESULT_CAP
+                {
+                    return Err(anyhow!(
+                        "mesh routing admin result exceeds bounded cap of {MESH_ROUTING_ADMIN_RESULT_CAP} records"
+                    ));
+                }
+                records.extend(page.records);
+                let Some(next_tuple_key) = page.next_tuple_key else {
+                    break;
+                };
+                if after_tuple_key.as_ref() == Some(&next_tuple_key) {
+                    return Err(anyhow!("mesh routing page cursor did not advance"));
+                }
+                after_tuple_key = Some(next_tuple_key);
+            }
+        }
+        Ok(records)
     }
 
     pub async fn diagnose_mesh_routing_projection(
@@ -259,24 +291,57 @@ impl Persistence {
             .map(|family| vec![family])
             .unwrap_or_else(|| mesh_directory::RoutingRecordFamily::all().to_vec())
         {
-            for record in
-                mesh_directory::list_projected_routing_records(&self.storage, family).await?
-            {
-                by_stream
-                    .entry((record.family, record.partition.clone()))
-                    .or_default()
-                    .push(mesh_control_stream::ControlProjectionRecord::new(
-                        record.record_key,
-                        record.generation,
-                        record.payload_json.into_bytes(),
+            let mut after_tuple_key = None;
+            let mut record_count = 0_usize;
+            loop {
+                let page = mesh_directory::page_projected_routing_records(
+                    &self.storage,
+                    family,
+                    after_tuple_key.as_deref(),
+                    MESH_ROUTING_PAGE_SIZE,
+                )
+                .await?;
+                record_count = record_count.saturating_add(page.records.len());
+                if record_count > MESH_ROUTING_ADMIN_RESULT_CAP {
+                    return Err(anyhow!(
+                        "mesh routing diagnostic exceeds bounded cap of {MESH_ROUTING_ADMIN_RESULT_CAP} records"
                     ));
+                }
+                for record in page.records {
+                    by_stream
+                        .entry((record.family, record.partition.clone()))
+                        .or_default()
+                        .push(mesh_control_stream::ControlProjectionRecord::new(
+                            record.record_key,
+                            record.generation,
+                            record.payload_json.into_bytes(),
+                        ));
+                }
+                let Some(next_tuple_key) = page.next_tuple_key else {
+                    break;
+                };
+                if after_tuple_key.as_ref() == Some(&next_tuple_key) {
+                    return Err(anyhow!("mesh routing diagnostic cursor did not advance"));
+                }
+                after_tuple_key = Some(next_tuple_key);
             }
             let stream_family = family.stream_family();
-            for partition in
-                mesh_control_stream::list_control_stream_partitions(&self.storage, stream_family)
-                    .await?
-            {
-                by_stream.entry((family, partition)).or_default();
+            let mut cursor = None;
+            loop {
+                let page = mesh_control_stream::list_control_stream_partitions_page(
+                    &self.storage,
+                    stream_family,
+                    cursor.as_deref(),
+                    256,
+                )
+                .await?;
+                for partition in page.partitions {
+                    by_stream.entry((family, partition)).or_default();
+                }
+                let Some(next) = page.next_stream_id else {
+                    break;
+                };
+                cursor = Some(next);
             }
         }
 
@@ -313,6 +378,11 @@ impl Persistence {
         .ok_or_else(|| {
             anyhow!("no control stream mutation found for {stream_family}/{partition}/{record_key}")
         })?;
+        if record.deleted {
+            return Err(anyhow!(
+                "latest control stream mutation deletes {stream_family}/{partition}/{record_key}"
+            ));
+        }
         mesh_directory::rebuild_routing_record_projection_from_payload(
             &self.storage,
             family,
@@ -450,18 +520,34 @@ impl Persistence {
         &self,
         region: &str,
     ) -> Result<Vec<mesh_directory::BucketLocatorDescriptor>> {
-        let records = mesh_directory::list_routing_records(
-            &self.storage,
-            Some(mesh_directory::RoutingRecordFamily::BucketLocator),
-        )
-        .await?;
         let mut locators = Vec::new();
-        for record in records {
-            let locator: mesh_directory::BucketLocatorDescriptor =
-                serde_json::from_str(&record.payload_json)?;
-            if locator.home_region.as_str() == region {
-                locators.push(locator);
+        let mut after_tuple_key = None;
+        loop {
+            let page = mesh_directory::page_bucket_locators(
+                &self.storage,
+                after_tuple_key.as_deref(),
+                MESH_ROUTING_PAGE_SIZE,
+            )
+            .await?;
+            if locators.len().saturating_add(page.locators.len())
+                > MESH_ROUTING_ADMIN_RESULT_CAP
+            {
+                return Err(anyhow!(
+                    "regional bucket locator result exceeds bounded cap of {MESH_ROUTING_ADMIN_RESULT_CAP} records"
+                ));
             }
+            locators.extend(
+                page.locators
+                    .into_iter()
+                    .filter(|locator| locator.home_region.as_str() == region),
+            );
+            let Some(next_tuple_key) = page.next_tuple_key else {
+                break;
+            };
+            if after_tuple_key.as_ref() == Some(&next_tuple_key) {
+                return Err(anyhow!("bucket locator page cursor did not advance"));
+            }
+            after_tuple_key = Some(next_tuple_key);
         }
         Ok(locators)
     }

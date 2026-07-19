@@ -1,5 +1,6 @@
 use super::*;
 use prost::Message;
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, PartialEq, Message)]
 struct TestFullTextDocumentTableProto {
@@ -30,39 +31,92 @@ fn derived_index_proof_head_tuple_key(index_id: &str) -> Vec<u8> {
     .unwrap()
 }
 
-fn index_segment_tuple_key(record: &anvil::index_coremeta::IndexSegmentCoreMetaRecord) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&5u16.to_le_bytes());
-    push_index_tuple_str(&mut out, "index_segment");
-    push_index_tuple_str(&mut out, &record.index_id);
-    push_index_tuple_str(&mut out, &record.index_kind);
-    out.push(0x03);
-    out.push(0);
-    out.extend_from_slice(&8u16.to_le_bytes());
-    out.extend_from_slice(&record.generation.to_le_bytes());
-    push_index_tuple_str(&mut out, &record.segment_hash);
-    out
-}
+fn index_segment_tuple_keys(
+    record: &anvil::index_coremeta::IndexSegmentCoreMetaRecord,
+) -> Vec<Vec<u8>> {
+    use anvil::core_store::{CoreMetaTuplePart, core_meta_tuple_key};
 
-fn push_index_tuple_str(out: &mut Vec<u8>, value: &str) {
-    out.push(0x01);
-    out.push(0);
-    out.extend_from_slice(&(value.len() as u16).to_le_bytes());
-    out.extend_from_slice(value.as_bytes());
+    let segment_ref_hash = format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(record.segment_ref.as_bytes()))
+    );
+    [
+        vec![
+            CoreMetaTuplePart::Utf8("index_segment"),
+            CoreMetaTuplePart::Utf8(&record.index_id),
+            CoreMetaTuplePart::Utf8(&record.index_kind),
+            CoreMetaTuplePart::U64(record.generation),
+            CoreMetaTuplePart::Utf8(&record.segment_hash),
+        ],
+        vec![
+            CoreMetaTuplePart::Utf8("index_segment_latest"),
+            CoreMetaTuplePart::Utf8(&record.index_id),
+        ],
+        vec![
+            CoreMetaTuplePart::Utf8("index_segment_family_latest"),
+            CoreMetaTuplePart::Utf8(&record.index_id),
+            CoreMetaTuplePart::Utf8(&record.writer_family),
+        ],
+        vec![
+            CoreMetaTuplePart::Utf8("index_segment_generation"),
+            CoreMetaTuplePart::Utf8(&record.index_id),
+            CoreMetaTuplePart::Utf8(&record.writer_family),
+            CoreMetaTuplePart::U64(record.generation),
+        ],
+        vec![
+            CoreMetaTuplePart::Utf8("index_segment_ref"),
+            CoreMetaTuplePart::Utf8(&record.index_id),
+            CoreMetaTuplePart::Hash(&segment_ref_hash),
+        ],
+    ]
+    .into_iter()
+    .map(|parts| core_meta_tuple_key(&parts).unwrap())
+    .collect()
 }
 
 fn delete_index_segment_coremeta_row(
     storage: &anvil::storage::Storage,
     record: &anvil::index_coremeta::IndexSegmentCoreMetaRecord,
 ) {
-    anvil::core_store::CoreMetaStore::open(storage.core_store_meta_path())
-        .unwrap()
-        .delete(
-            anvil::core_store::CF_INDEX_ROWS,
-            anvil::core_store::TABLE_INDEX_ROW,
-            &index_segment_tuple_key(record),
+    let store = anvil::core_store::CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
+    for tuple_key in index_segment_tuple_keys(record) {
+        store
+            .delete(
+                anvil::core_store::CF_INDEX_ROWS,
+                anvil::core_store::TABLE_INDEX_ROW,
+                &tuple_key,
+            )
+            .unwrap();
+    }
+}
+
+fn collect_index_segments_for_test(
+    storage: &anvil::storage::Storage,
+    index_id: &str,
+) -> Vec<anvil::index_coremeta::IndexSegmentCoreMetaRecord> {
+    let mut cursor = None;
+    let mut records = Vec::new();
+    loop {
+        let page = anvil::index_coremeta::page_index_segment_coremeta_records(
+            storage,
+            index_id,
+            cursor.as_deref(),
+            256,
         )
         .unwrap();
+        records.extend(page.records);
+        let Some(next_cursor) = page.next_tuple_key else {
+            break;
+        };
+        assert!(
+            cursor
+                .as_ref()
+                .is_none_or(|current| current.as_slice() < next_cursor.as_slice()),
+            "index segment page cursor must advance"
+        );
+        cursor = Some(next_cursor);
+    }
+    records
 }
 
 #[tokio::test]
@@ -383,9 +437,10 @@ async fn test_full_text_index_build_uses_source_cursor_snapshot() {
     )
     .await;
     let source_cursor = persistence
-        .list_tasks()
+        .list_tasks_page(None, 1_000)
         .await
         .unwrap()
+        .tasks
         .into_iter()
         .find(|task| {
             task.task_type == anvil::tasks::TaskType::IndexBuild
@@ -407,9 +462,10 @@ async fn test_full_text_index_build_uses_source_cursor_snapshot() {
     )
     .await;
     let index_tasks = persistence
-        .list_tasks()
+        .list_tasks_page(None, 1_000)
         .await
         .unwrap()
+        .tasks
         .into_iter()
         .filter(|task| {
             task.task_type == anvil::tasks::TaskType::IndexBuild
@@ -574,9 +630,10 @@ async fn test_index_build_requires_current_rfc_ownership_fence() {
     )
     .await;
     let source_cursor = persistence
-        .list_tasks()
+        .list_tasks_page(None, 1_000)
         .await
         .unwrap()
+        .tasks
         .into_iter()
         .find(|task| {
             task.task_type == anvil::tasks::TaskType::IndexBuild
@@ -680,9 +737,10 @@ async fn test_index_enqueue_rebuilds_when_checkpoint_exists_but_proof_is_missing
     .await;
 
     let initial_task = persistence
-        .list_tasks()
+        .list_tasks_page(None, 1_000)
         .await
         .unwrap()
+        .tasks
         .into_iter()
         .find(|task| {
             task.task_type == anvil::tasks::TaskType::IndexBuild
@@ -743,9 +801,10 @@ async fn test_index_enqueue_rebuilds_when_checkpoint_exists_but_proof_is_missing
         "missing proof must schedule a rebuild even when checkpoint cursor is current"
     );
     let rebuild_task = persistence
-        .list_tasks()
+        .list_tasks_page(None, 1_000)
         .await
         .unwrap()
+        .tasks
         .into_iter()
         .find(|task| {
             task.task_type == anvil::tasks::TaskType::IndexBuild
@@ -848,13 +907,9 @@ async fn test_repair_rebuilds_missing_full_text_segment_from_base_journal() {
     .unwrap()
     .expect("proof exists before deleting segment");
     assert!(!proof.segment_hashes.is_empty());
-    for segment in anvil::index_coremeta::list_index_segment_coremeta_records(
-        &cluster.states[0].storage,
-        &index_storage_id,
-    )
-    .unwrap()
-    .into_iter()
-    .filter(|record| record.index_kind == "full_text")
+    for segment in collect_index_segments_for_test(&cluster.states[0].storage, &index_storage_id)
+        .into_iter()
+        .filter(|record| record.index_kind == "full_text")
     {
         delete_index_segment_coremeta_row(&cluster.states[0].storage, &segment);
     }
@@ -1024,13 +1079,9 @@ async fn test_repair_rebuilds_missing_vector_segment_from_base_journal() {
     .unwrap()
     .expect("proof exists before deleting segment");
     assert!(!proof.segment_hashes.is_empty());
-    for segment in anvil::index_coremeta::list_index_segment_coremeta_records(
-        &cluster.states[0].storage,
-        &index_storage_id,
-    )
-    .unwrap()
-    .into_iter()
-    .filter(|record| record.index_kind == "vector")
+    for segment in collect_index_segments_for_test(&cluster.states[0].storage, &index_storage_id)
+        .into_iter()
+        .filter(|record| record.index_kind == "vector")
     {
         delete_index_segment_coremeta_row(&cluster.states[0].storage, &segment);
     }

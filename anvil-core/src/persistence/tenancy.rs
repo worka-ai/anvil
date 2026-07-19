@@ -1,14 +1,5 @@
 use super::*;
 use prost::Message;
-use std::sync::LazyLock;
-use tokio::sync::Mutex as TokioMutex;
-
-static CONTROL_PLANE_MUTATION_LOCK: LazyLock<TokioMutex<()>> =
-    LazyLock::new(|| TokioMutex::new(()));
-// The active global bucket-partition owner sequences numeric bucket IDs locally.
-// Ownership fences reject concurrent allocators on other nodes.
-static BUCKET_ID_ALLOCATION_LOCK: LazyLock<TokioMutex<()>> = LazyLock::new(|| TokioMutex::new(()));
-
 #[derive(Clone, PartialEq, Message)]
 struct ActiveIndexPolicySnapshotProto {
     #[prost(message, repeated, tag = "1")]
@@ -31,9 +22,19 @@ impl Persistence {
     }
 
     pub async fn list_tenants(&self) -> Result<Vec<Tenant>> {
-        Ok(control_journal::read_control_state(&self.storage)
-            .await?
-            .tenants())
+        let revision = control_journal::current_control_collection_revision(&self.storage).await?;
+        let mut cursor = None;
+        let mut tenants = Vec::new();
+        loop {
+            let page =
+                control_journal::page_tenants(&self.storage, &revision, cursor.as_deref(), 512)
+                    .await?;
+            tenants.extend(page.tenants);
+            let Some(next) = page.next_tuple_key else {
+                return Ok(tenants);
+            };
+            cursor = Some(next);
+        }
     }
 
     pub async fn get_app_by_client_id(&self, client_id: &str) -> Result<Option<AppDetails>> {
@@ -41,7 +42,6 @@ impl Persistence {
     }
 
     pub async fn create_tenant(&self, name: &str, idempotency_key: &str) -> Result<Tenant> {
-        let _guard = CONTROL_PLANE_MUTATION_LOCK.lock().await;
         let permit = self.control_write_permit().await?;
         let tenant = control_journal::create_tenant_with_permit(
             &self.storage,
@@ -62,7 +62,6 @@ impl Persistence {
         client_id: &str,
         encrypted_secret: &[u8],
     ) -> Result<App> {
-        let _guard = CONTROL_PLANE_MUTATION_LOCK.lock().await;
         let permit = self.control_write_permit().await?;
         control_journal::create_app_with_permit(
             &self.storage,
@@ -85,9 +84,24 @@ impl Persistence {
     }
 
     pub async fn list_apps_for_tenant(&self, tenant_id: i64) -> Result<Vec<App>> {
-        Ok(control_journal::read_control_state(&self.storage)
-            .await?
-            .apps_for_tenant(tenant_id))
+        let revision = control_journal::current_control_collection_revision(&self.storage).await?;
+        let mut cursor = None;
+        let mut apps = Vec::new();
+        loop {
+            let page = control_journal::page_apps_for_tenant(
+                &self.storage,
+                tenant_id,
+                &revision,
+                cursor.as_deref(),
+                512,
+            )
+            .await?;
+            apps.extend(page.apps);
+            let Some(next) = page.next_tuple_key else {
+                return Ok(apps);
+            };
+            cursor = Some(next);
+        }
     }
 
     pub async fn page_apps_for_tenant(
@@ -108,7 +122,6 @@ impl Persistence {
     }
 
     pub async fn update_app_secret(&self, app_id: i64, new_encrypted_secret: &[u8]) -> Result<()> {
-        let _guard = CONTROL_PLANE_MUTATION_LOCK.lock().await;
         let permit = self.control_write_permit().await?;
         control_journal::update_app_secret_with_permit(
             &self.storage,
@@ -121,7 +134,6 @@ impl Persistence {
     }
 
     pub async fn delete_app(&self, app_id: i64) -> Result<()> {
-        let _guard = CONTROL_PLANE_MUTATION_LOCK.lock().await;
         let permit = self.control_write_permit().await?;
         control_journal::delete_app_with_permit(
             &self.storage,
@@ -152,12 +164,6 @@ impl Persistence {
             "persistence.create_bucket ensure_new_writable_placement",
             step_start.elapsed(),
         );
-        let allocation_start = std::time::Instant::now();
-        let _allocation_guard = BUCKET_ID_ALLOCATION_LOCK.lock().await;
-        crate::emit_test_timing(
-            "persistence.create_bucket bucket_id_allocation_lock",
-            allocation_start.elapsed(),
-        );
         let step_start = std::time::Instant::now();
         if bucket_journal::read_current_bucket(&self.storage, tenant_id, name)
             .await
@@ -170,21 +176,6 @@ impl Persistence {
         }
         crate::emit_test_timing(
             "persistence.create_bucket read_current_bucket",
-            step_start.elapsed(),
-        );
-        let step_start = std::time::Instant::now();
-        let bucket = Bucket {
-            id: bucket_journal::next_bucket_id(&self.storage)
-                .await
-                .map_err(|e| tonic::Status::internal(e.to_string()))?,
-            tenant_id,
-            name: name.to_string(),
-            region: region.to_string(),
-            created_at: Utc::now(),
-            is_public_read: false,
-        };
-        crate::emit_test_timing(
-            "persistence.create_bucket next_bucket_id",
             step_start.elapsed(),
         );
         let tenant_permit = async {
@@ -208,6 +199,25 @@ impl Persistence {
         let (tenant_permit, global_permit) = tokio::join!(tenant_permit, global_permit);
         let tenant_permit = tenant_permit.map_err(|e| tonic::Status::internal(e.to_string()))?;
         let global_permit = global_permit.map_err(|e| tonic::Status::internal(e.to_string()))?;
+        let step_start = std::time::Instant::now();
+        let bucket = Bucket {
+            id: bucket_journal::reserve_next_bucket_id_with_permit(
+                &self.storage,
+                &global_permit,
+                &self.partition_owner_signing_key,
+            )
+            .await
+            .map_err(|e| tonic::Status::internal(e.to_string()))?,
+            tenant_id,
+            name: name.to_string(),
+            region: region.to_string(),
+            created_at: Utc::now(),
+            is_public_read: false,
+        };
+        crate::emit_test_timing(
+            "persistence.create_bucket reserve_bucket_id",
+            step_start.elapsed(),
+        );
         let step_start = std::time::Instant::now();
         bucket_journal::append_bucket_mutation_with_permits(
             &self.storage,
@@ -339,50 +349,6 @@ impl Persistence {
             return Ok(false);
         }
         Ok(true)
-    }
-
-    pub async fn create_bucket_metadata_event(
-        &self,
-        tenant_id: i64,
-        bucket: &Bucket,
-        event_type: &str,
-        bucket_metadata: JsonValue,
-    ) -> Result<BucketMetadataEvent> {
-        bucket_journal::latest_bucket_metadata_event(&self.storage, tenant_id, &bucket.name)
-            .await?
-            .ok_or_else(|| {
-                anyhow!(
-                    "bucket metadata event not found after {event_type}: {}",
-                    bucket_metadata
-                )
-            })
-    }
-
-    pub async fn list_bucket_metadata_events(
-        &self,
-        tenant_id: i64,
-        bucket_id: i64,
-        after_cursor: i64,
-        limit: i32,
-    ) -> Result<Vec<BucketMetadataEvent>> {
-        bucket_journal::list_bucket_metadata_events_by_bucket_id(
-            &self.storage,
-            tenant_id,
-            bucket_id,
-            after_cursor,
-            if limit == 0 {
-                1000
-            } else {
-                limit.max(1) as usize
-            },
-        )
-        .await
-    }
-
-    pub async fn list_buckets_for_tenant(&self, tenant_id: i64) -> Result<Vec<Bucket>> {
-        let mut buckets = bucket_journal::read_current_buckets(&self.storage, tenant_id).await?;
-        buckets.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(buckets)
     }
 
     pub async fn active_index_policy_snapshot_hash(

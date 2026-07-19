@@ -181,7 +181,7 @@ fn install_bootstrap_lifecycle_projection_state(
     let prefix = lifecycle_projection_row_prefix()?;
     let mut delete_rows = Vec::new();
     for table_id in [TABLE_MESH_PARTITION_ROW, TABLE_MESH_NODE_ROW] {
-        for row in store.scan_coremeta_prefix(CF_MESH, table_id, &prefix)? {
+        for row in scan_lifecycle_projection_rows(store, table_id, &prefix)? {
             let projection = record_proto::decode_lifecycle_projection_row(&row.payload)?;
             let (kind, record_key) = lifecycle_projection_descriptor_key(&projection)?;
             let tuple_key = lifecycle_projection_row_key(kind, &record_key)?;

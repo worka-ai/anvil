@@ -552,49 +552,73 @@ impl AuthService for AppState {
         let req = request.into_inner();
         require_app_management_permission(self, &claims, AnvilAction::PolicyRead).await?;
         let app = app_in_claims_tenant(self, claims.tenant_id, &req.app).await?;
-        let revision = authz_journal::latest_authz_revision(
-            &self.storage,
-            crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-        let revision_generation = u64::try_from(revision)
-            .map_err(|_| Status::internal("authorization revision is negative"))?;
-        let grant_rows = authz_journal::read_current_authz_tuples_at_revision(
+        let page_size = crate::services::collection_cursor::page_size(req.page.as_ref())?;
+        let supplied_page_token = req
+            .page
+            .as_ref()
+            .map(|page| page.page_token.as_str())
+            .unwrap_or_default();
+        let revision = match authz_page_token_revision(supplied_page_token)? {
+            Some(revision) => revision,
+            None => authz_journal::latest_authz_revision(
+                &self.storage,
+                crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
+            )
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?,
+        };
+        let filter_hash =
+            authz_page_filter_hash("list_access_grants", &[req.app.as_str(), "subject_order"]);
+        let binding = AuthzPageBinding {
+            tenant_id: claims.tenant_id,
+            principal_id: &claims.sub,
+            revision,
+            filter_hash: &filter_hash,
+            page_size,
+        };
+        let token = parse_authz_page_token(
+            supplied_page_token,
+            &binding,
+            self.config.jwt_secret.as_bytes(),
+        )?;
+        require_current_authz_list_revision(&self.storage, SYSTEM_STORAGE_TENANT_ID, revision)
+            .await?;
+        let after_tuple_key =
+            decode_authz_page_position(token.as_ref().map(|token| token.position.as_str()))?;
+        let grant_page = authz_journal::page_current_authz_tuples(
             &self.storage,
             SYSTEM_STORAGE_TENANT_ID,
-            authz_journal::AuthzTupleFilter {
+            &authz_journal::AuthzTupleFilter {
+                realm_id: Some(SYSTEM_REALM_ID.to_string()),
                 subject_kind: Some(access_control::APP_SUBJECT_KIND.to_string()),
                 subject_id: Some(app.id.to_string()),
                 caveat_hash: Some(String::new()),
                 ..authz_journal::AuthzTupleFilter::default()
             },
             revision,
+            after_tuple_key.as_deref(),
+            page_size,
         )
         .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-        let mut grants = Vec::with_capacity(grant_rows.len());
-        for grant in grant_rows {
-            let grant = public_access_grant_record(self, &app, grant).await?;
-            let key = format!("{}\0{}\0{}", grant.app_id, grant.action, grant.resource);
-            grants.push((key, grant));
+        .map_err(authz_projection_page_status)?;
+        let mut grants = Vec::with_capacity(grant_page.records.len());
+        for grant in grant_page.records {
+            grants.push(public_access_grant_record(self, &app, grant).await?);
         }
-        let filters = [("app", req.app.as_str())];
-        let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
-        let (grants, page) = crate::services::collection_cursor::paginate(
-            grants,
-            req.page.as_ref(),
-            "anvil.AuthService/ListAccessGrants",
-            &filters,
-            &principal_scope,
-            "app_id.action.resource.asc",
-            self.config.jwt_secret.as_bytes(),
-            |grant| grant.0.as_str(),
-            |_| revision_generation,
-        )?;
+        let next_page_token = grant_page
+            .next_tuple_key
+            .as_deref()
+            .map(encode_authz_page_position)
+            .transpose()?
+            .as_deref()
+            .map(|position| {
+                encode_authz_page_token(&binding, position, self.config.jwt_secret.as_bytes())
+            })
+            .transpose()?
+            .unwrap_or_default();
         Ok(Response::new(ListAccessGrantsResponse {
-            grants: grants.into_iter().map(|(_, grant)| grant).collect(),
-            page: Some(page),
+            grants,
+            page: Some(PageResponse { next_page_token }),
         }))
     }
 
@@ -745,9 +769,6 @@ impl AuthService for AppState {
             )
             .await
             .map_err(authz_tuple_batch_write_status)?;
-        if !outcome.replayed {
-            emit_authz_tuple_batch_side_effects(self, claims.tenant_id, &outcome.records).await?;
-        }
         Ok(Response::new(write_authz_tuple_batch_response(
             &outcome.records,
         )?))
@@ -789,6 +810,11 @@ impl AuthService for AppState {
                 &req.subject_kind,
                 &req.subject_id,
                 &req.caveat_hash,
+                if req.subject_kind.is_empty() {
+                    "object_order"
+                } else {
+                    "subject_order"
+                },
             ],
         );
         let page_size = normalize_page_size(req.page_size)?;
@@ -812,45 +838,50 @@ impl AuthService for AppState {
             &page_binding,
             self.config.jwt_secret.as_bytes(),
         )?;
-        let records = authz_journal::read_current_authz_tuples_at_revision(
+        require_current_authz_list_revision(&self.storage, claims.tenant_id, response_revision)
+            .await?;
+        let after_tuple_key =
+            decode_authz_page_position(page_token.as_ref().map(|token| token.position.as_str()))?;
+        let page = authz_journal::page_current_authz_tuples(
             &self.storage,
             claims.tenant_id,
-            authz_journal::AuthzTupleFilter {
+            &authz_journal::AuthzTupleFilter {
+                realm_id: Some(scope.authz_realm_id.clone()),
                 namespace: optional_filter_value(encode_optional_realm_namespace(
                     &scope.authz_realm_id,
                     &req.namespace,
                 )),
                 object_id: optional_filter_value(req.object_id),
                 relation: optional_filter_value(req.relation),
+                subject_id: optional_filter_value(encode_userset_subject_realm(
+                    &scope.authz_realm_id,
+                    &req.subject_kind,
+                    &req.subject_id,
+                )),
                 subject_kind: optional_filter_value(req.subject_kind),
-                subject_id: optional_filter_value(req.subject_id),
                 caveat_hash: optional_filter_value(req.caveat_hash),
             },
             response_revision,
+            after_tuple_key.as_deref(),
+            page_size,
         )
         .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-        let records = filter_records_for_realm(records, &scope.authz_realm_id);
-        let (records, next_page_token) = paginate_authz(
-            records,
-            page_token.as_ref().map(|token| token.position.as_str()),
-            &page_binding,
-            self.config.jwt_secret.as_bytes(),
-            |record| {
-                format!(
-                    "{}\0{}\0{}\0{}\0{}\0{}",
-                    record.namespace,
-                    record.object_id,
-                    record.relation,
-                    record.subject_kind,
-                    record.subject_id,
-                    record.caveat_hash
-                )
-            },
-        )?;
+        .map_err(authz_projection_page_status)?;
+        let next_page_token = page
+            .next_tuple_key
+            .as_deref()
+            .map(encode_authz_page_position)
+            .transpose()?
+            .as_deref()
+            .map(|position| {
+                encode_authz_page_token(&page_binding, position, self.config.jwt_secret.as_bytes())
+            })
+            .transpose()?
+            .unwrap_or_default();
 
         Ok(Response::new(ReadAuthzTuplesResponse {
-            tuples: records
+            tuples: page
+                .records
                 .into_iter()
                 .map(|record| authz_tuple_response_for_realm(&record, &scope.authz_realm_id))
                 .collect::<Result<Vec<_>, _>>()?,
@@ -967,7 +998,9 @@ impl AuthService for AppState {
             &page_binding,
             self.config.jwt_secret.as_bytes(),
         )?;
-        let object_ids = authz_journal::list_current_authz_objects_at_revision(
+        require_current_authz_list_revision(&self.storage, claims.tenant_id, response_revision)
+            .await?;
+        let page = authz_journal::list_current_authz_objects_page(
             &self.storage,
             claims.tenant_id,
             &encode_realm_namespace(&scope.authz_realm_id, &req.namespace),
@@ -976,19 +1009,22 @@ impl AuthService for AppState {
             &req.subject_id,
             &req.caveat_hash,
             response_revision,
+            page_token.as_ref().map(|token| token.position.as_str()),
+            page_size,
         )
         .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-        let (object_ids, next_page_token) = paginate_authz(
-            object_ids,
-            page_token.as_ref().map(|token| token.position.as_str()),
-            &page_binding,
-            self.config.jwt_secret.as_bytes(),
-            Clone::clone,
-        )?;
+        .map_err(crate::services::authz_status::consistency_status)?;
+        let next_page_token = page
+            .next_object_id
+            .as_deref()
+            .map(|position| {
+                encode_authz_page_token(&page_binding, position, self.config.jwt_secret.as_bytes())
+            })
+            .transpose()?
+            .unwrap_or_default();
 
         Ok(Response::new(ListAuthzObjectsResponse {
-            object_ids,
+            object_ids: page.object_ids,
             revision: revision_to_u64(response_revision)?,
             zookie: zookie(response_revision),
             next_page_token,
@@ -1049,7 +1085,9 @@ impl AuthService for AppState {
             &page_binding,
             self.config.jwt_secret.as_bytes(),
         )?;
-        let subjects = authz_journal::list_current_authz_subjects_at_revision(
+        require_current_authz_list_revision(&self.storage, claims.tenant_id, response_revision)
+            .await?;
+        let page = authz_journal::list_current_authz_subjects_page(
             &self.storage,
             claims.tenant_id,
             &encode_realm_namespace(&scope.authz_realm_id, &req.namespace),
@@ -1057,24 +1095,23 @@ impl AuthService for AppState {
             &req.relation,
             optional_str(req.subject_kind.as_str()),
             response_revision,
+            page_token.as_ref().map(|token| token.position.as_str()),
+            page_size,
         )
         .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-        let (subjects, next_page_token) = paginate_authz(
-            subjects,
-            page_token.as_ref().map(|token| token.position.as_str()),
-            &page_binding,
-            self.config.jwt_secret.as_bytes(),
-            |subject| {
-                format!(
-                    "{}\0{}\0{}",
-                    subject.subject_kind, subject.subject_id, subject.caveat_hash
-                )
-            },
-        )?;
+        .map_err(crate::services::authz_status::consistency_status)?;
+        let next_page_token = page
+            .next_subject_position
+            .as_deref()
+            .map(|position| {
+                encode_authz_page_token(&page_binding, position, self.config.jwt_secret.as_bytes())
+            })
+            .transpose()?
+            .unwrap_or_default();
 
         Ok(Response::new(ListAuthzSubjectsResponse {
-            subjects: subjects
+            subjects: page
+                .subjects
                 .into_iter()
                 .map(|subject| AuthzSubject {
                     subject_id: decode_userset_subject_realm(
@@ -1298,7 +1335,6 @@ impl AuthService for AppState {
             authz_namespace_watch::append_authz_namespace_watch_record(
                 &self.storage,
                 claims.tenant_id,
-                u128::from(record.schema_version),
                 mutation_id_from_record_hash(&record.record_hash),
                 authz_namespace_watch::AuthzNamespaceWatchPayload {
                     namespace: record.namespace.clone(),
@@ -1372,7 +1408,21 @@ impl AuthService for AppState {
         )
         .await?;
         let records = if req.namespace.is_empty() {
-            authz_schema::list_authz_namespace_schemas(&self.storage, claims.tenant_id).await
+            let page = authz_schema::page_authz_namespace_schemas(
+                &self.storage,
+                claims.tenant_id,
+                None,
+                authz_schema::AUTHZ_NAMESPACE_SCHEMA_PAGE_MAX,
+            )
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+            if page.next_tuple_key.is_some() {
+                return Err(Status::resource_exhausted(format!(
+                    "authorization schema contains more than {} namespaces; request one namespace",
+                    authz_schema::AUTHZ_NAMESPACE_SCHEMA_PAGE_MAX
+                )));
+            }
+            page.records
         } else {
             authz_schema::read_authz_namespace_schema(
                 &self.storage,
@@ -1381,8 +1431,8 @@ impl AuthService for AppState {
             )
             .await
             .map(|record| record.into_iter().collect())
-        }
-        .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|error| Status::internal(error.to_string()))?
+        };
         let schema_version = records
             .iter()
             .map(|record| record.schema_version)
@@ -1416,50 +1466,34 @@ impl AuthService for AppState {
         .await?;
         let after_revision = i64::try_from(req.after_revision)
             .map_err(|_| Status::invalid_argument("after_revision exceeds supported range"))?;
-        let mut live = self.authz_watch_tx.subscribe();
-        let snapshot = authz_journal::list_authz_tuple_log(
-            &self.storage,
-            claims.tenant_id,
-            after_revision,
-            &encode_optional_realm_namespace(&scope.authz_realm_id, &req.namespace),
-            1000,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+        let stream_id = authz_journal::authz_tuple_stream_id(claims.tenant_id);
+        let mut live = self.storage.subscribe_stream(&stream_id);
+        let storage = self.storage.clone();
+        let tenant_id = claims.tenant_id;
+        let namespace = encode_optional_realm_namespace(&scope.authz_realm_id, &req.namespace);
 
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
             let mut last_revision = after_revision;
-            for record in snapshot {
-                last_revision = last_revision.max(record.revision);
-                if tx
-                    .send(Ok(authz_tuple_log_response_for_realm(
-                        &record,
-                        &scope.authz_realm_id,
-                    )))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-
             loop {
-                match live.recv().await {
-                    Ok(record) => {
-                        if record.tenant_id != claims.tenant_id
-                            || record.revision <= last_revision
-                            || !record_belongs_to_realm(&record, &scope.authz_realm_id)
-                            || (!req.namespace.is_empty()
-                                && record.namespace
-                                    != encode_realm_namespace(
-                                        &scope.authz_realm_id,
-                                        &req.namespace,
-                                    ))
-                        {
-                            continue;
+                loop {
+                    let page = match authz_journal::list_authz_tuple_log_page(
+                        &storage,
+                        tenant_id,
+                        last_revision,
+                        &namespace,
+                        256,
+                    )
+                    .await
+                    {
+                        Ok(page) => page,
+                        Err(error) => {
+                            let _ = tx.send(Err(Status::internal(error.to_string()))).await;
+                            return;
                         }
-                        last_revision = record.revision;
+                    };
+                    let previous_revision = last_revision;
+                    for record in page.records {
                         if tx
                             .send(Ok(authz_tuple_log_response_for_realm(
                                 &record,
@@ -1471,14 +1505,14 @@ impl AuthService for AppState {
                             return;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let _ = tx
-                            .send(Err(Status::data_loss(
-                                "Authz tuple watch fell behind retained live event window",
-                            )))
-                            .await;
-                        return;
+                    last_revision = page.next_revision;
+                    if !page.has_more || last_revision == previous_revision {
+                        break;
                     }
+                }
+
+                match live.recv().await {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
@@ -1510,59 +1544,52 @@ impl AuthService for AppState {
         .await?;
 
         let after_cursor = join_u128(req.after_cursor_low, req.after_cursor_high);
-        let snapshot = authz_namespace_watch::list_authz_namespace_watch_events(
-            &self.storage,
+        let stream_id = authz_namespace_watch::authz_namespace_watch_stream_id(
             claims.tenant_id,
             &req.namespace,
-            after_cursor,
-            1000,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-
+        );
+        let mut live = self.storage.subscribe_stream(&stream_id);
         let storage = self.storage.clone();
         let namespace = req.namespace;
         let tenant_id = claims.tenant_id;
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
             let mut last_cursor = after_cursor;
-            for event in snapshot {
-                last_cursor = last_cursor.max(event.cursor);
-                if tx
-                    .send(Ok(authz_namespace_watch_response(event)))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-
             loop {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                let events = match authz_namespace_watch::list_authz_namespace_watch_events(
-                    &storage,
-                    tenant_id,
-                    &namespace,
-                    last_cursor,
-                    1000,
-                )
-                .await
-                {
-                    Ok(events) => events,
-                    Err(err) => {
-                        let _ = tx.send(Err(Status::internal(err.to_string()))).await;
-                        return;
-                    }
-                };
-                for event in events {
-                    last_cursor = last_cursor.max(event.cursor);
-                    if tx
-                        .send(Ok(authz_namespace_watch_response(event)))
-                        .await
-                        .is_err()
+                loop {
+                    let page = match authz_namespace_watch::list_authz_namespace_watch_event_page(
+                        &storage,
+                        tenant_id,
+                        &namespace,
+                        last_cursor,
+                        256,
+                    )
+                    .await
                     {
-                        return;
+                        Ok(page) => page,
+                        Err(error) => {
+                            let _ = tx.send(Err(Status::internal(error.to_string()))).await;
+                            return;
+                        }
+                    };
+                    let previous_cursor = last_cursor;
+                    for event in page.events {
+                        if tx
+                            .send(Ok(authz_namespace_watch_response(event)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
+                    last_cursor = page.next_cursor;
+                    if !page.has_more || last_cursor == previous_cursor {
+                        break;
+                    }
+                }
+                match live.recv().await {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
         });
@@ -1593,59 +1620,53 @@ impl AuthService for AppState {
         .await?;
 
         let after_cursor = join_u128(req.after_cursor_low, req.after_cursor_high);
-        let snapshot = authz_derived_lag_watch::list_authz_derived_lag_watch_events(
-            &self.storage,
+        let stream_id = authz_derived_lag_watch::authz_derived_lag_watch_stream_id(
             claims.tenant_id,
             &req.derived_index_id,
-            after_cursor,
-            1000,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-
+        );
+        let mut live = self.storage.subscribe_stream(&stream_id);
         let storage = self.storage.clone();
         let derived_index_id = req.derived_index_id;
         let tenant_id = claims.tenant_id;
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
             let mut last_cursor = after_cursor;
-            for event in snapshot {
-                last_cursor = last_cursor.max(event.cursor);
-                if tx
-                    .send(Ok(authz_derived_lag_watch_response(event)))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-
             loop {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                let events = match authz_derived_lag_watch::list_authz_derived_lag_watch_events(
-                    &storage,
-                    tenant_id,
-                    &derived_index_id,
-                    last_cursor,
-                    1000,
-                )
-                .await
-                {
-                    Ok(events) => events,
-                    Err(err) => {
-                        let _ = tx.send(Err(Status::internal(err.to_string()))).await;
-                        return;
-                    }
-                };
-                for event in events {
-                    last_cursor = last_cursor.max(event.cursor);
-                    if tx
-                        .send(Ok(authz_derived_lag_watch_response(event)))
+                loop {
+                    let page =
+                        match authz_derived_lag_watch::list_authz_derived_lag_watch_event_page(
+                            &storage,
+                            tenant_id,
+                            &derived_index_id,
+                            last_cursor,
+                            256,
+                        )
                         .await
-                        .is_err()
-                    {
-                        return;
+                        {
+                            Ok(page) => page,
+                            Err(error) => {
+                                let _ = tx.send(Err(Status::internal(error.to_string()))).await;
+                                return;
+                            }
+                        };
+                    let previous_cursor = last_cursor;
+                    for event in page.events {
+                        if tx
+                            .send(Ok(authz_derived_lag_watch_response(event)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
+                    last_cursor = page.next_cursor;
+                    if !page.has_more || last_cursor == previous_cursor {
+                        break;
+                    }
+                }
+                match live.recv().await {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
         });
