@@ -16,7 +16,6 @@ impl Persistence {
         payload: JsonValue,
         priority: i32,
     ) -> Result<()> {
-        let _write_guard = self.task_queue_write_lock.lock().await;
         let permit = self.task_queue_write_permit().await?;
         task_journal::enqueue_task_with_permit(
             &self.storage,
@@ -37,7 +36,6 @@ impl Persistence {
         payload: JsonValue,
         priority: i32,
     ) -> Result<bool> {
-        let _write_guard = self.task_queue_write_lock.lock().await;
         let permit = self.task_queue_write_permit().await?;
         let enqueued = task_journal::enqueue_task_if_absent_with_permit(
             &self.storage,
@@ -59,7 +57,6 @@ impl Persistence {
         payload: JsonValue,
         priority: i32,
     ) -> Result<bool> {
-        let _write_guard = self.task_queue_write_lock.lock().await;
         let mut last_error = None;
         for _ in 0..5 {
             let permit = match self.task_queue_write_permit().await {
@@ -105,7 +102,6 @@ impl Persistence {
             "tenant_id": tenant_id,
             "target_revision": target_revision,
         });
-        let _write_guard = self.task_queue_write_lock.lock().await;
         let mut last_error = None;
         for _ in 0..5 {
             let permit = match self.task_queue_write_permit().await {
@@ -372,7 +368,6 @@ impl Persistence {
     }
 
     pub async fn claim_pending_tasks(&self, limit: i64) -> Result<Vec<TaskRecord>> {
-        let _write_guard = self.task_queue_write_lock.lock().await;
         let mut last_error = None;
         for _ in 0..5 {
             let permit = match self.task_queue_write_permit().await {
@@ -407,8 +402,12 @@ impl Persistence {
         task_journal::has_due_tasks(&self.storage).await
     }
 
-    pub async fn list_tasks(&self) -> Result<Vec<TaskRecord>> {
-        task_journal::list_tasks(&self.storage).await
+    pub async fn list_tasks_page(
+        &self,
+        after_tuple_key: Option<&[u8]>,
+        page_size: usize,
+    ) -> Result<TaskPage> {
+        task_journal::list_tasks_page(&self.storage, after_tuple_key, page_size).await
     }
 
     pub async fn update_task_status(
@@ -416,7 +415,6 @@ impl Persistence {
         task_id: i64,
         status: crate::tasks::TaskStatus,
     ) -> Result<()> {
-        let _write_guard = self.task_queue_write_lock.lock().await;
         let mut last_error = None;
         for _ in 0..5 {
             let permit = match self.task_queue_write_permit().await {
@@ -449,7 +447,6 @@ impl Persistence {
     }
 
     pub async fn fail_task(&self, task_id: i64, error: &str) -> Result<()> {
-        let _write_guard = self.task_queue_write_lock.lock().await;
         let mut last_error = None;
         for _ in 0..5 {
             let permit = match self.task_queue_write_permit().await {
@@ -529,8 +526,12 @@ impl Persistence {
         hf_journal::get_key_encrypted_by_id(&self.storage, tenant_id, id).await
     }
 
-    pub(crate) async fn hf_list_encrypted_keys(&self) -> Result<Vec<HfKey>> {
-        hf_journal::list_encrypted_keys(&self.storage).await
+    pub(crate) async fn hf_list_encrypted_key_page(
+        &self,
+        after_cursor: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<hf_journal::HfKeyPage> {
+        hf_journal::list_encrypted_key_page(&self.storage, after_cursor, limit).await
     }
 
     pub async fn hf_update_key_encrypted(&self, id: i64, token_encrypted: &[u8]) -> Result<()> {
@@ -545,11 +546,13 @@ impl Persistence {
         .await
     }
 
-    pub async fn hf_list_keys(
+    pub async fn hf_list_key_page(
         &self,
         tenant_id: i64,
-    ) -> Result<Vec<(String, Option<String>, DateTime<Utc>, DateTime<Utc>)>> {
-        hf_journal::list_keys(&self.storage, tenant_id).await
+        after_cursor: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<hf_journal::HfKeyPage> {
+        hf_journal::list_key_page(&self.storage, tenant_id, after_cursor, limit).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -669,37 +672,42 @@ impl Persistence {
         .await
     }
 
-    pub async fn hf_get_ingestion_items(
+    pub async fn hf_list_stored_ingestion_item_page(
         &self,
         ingestion_id: i64,
-    ) -> Result<Vec<(String, Option<i64>, Option<String>, Option<DateTime<Utc>>)>> {
-        hf_journal::get_ingestion_items(&self.storage, ingestion_id).await
+        after_cursor: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<hf_journal::HfStoredItemPage> {
+        hf_journal::list_stored_ingestion_item_page(
+            &self.storage,
+            ingestion_id,
+            after_cursor,
+            limit,
+        )
+        .await
     }
 
-    pub async fn hf_get_all_items_for_prefix(
+    pub async fn hf_list_stored_target_item_page(
         &self,
         tenant_id: i64,
         bucket: &str,
         prefix: &str,
-    ) -> Result<Vec<(String, Option<i64>, Option<String>, Option<DateTime<Utc>>)>> {
-        hf_journal::get_all_items_for_prefix(&self.storage, tenant_id, bucket, prefix).await
+        after_cursor: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<hf_journal::HfStoredItemPage> {
+        hf_journal::list_stored_target_item_page(
+            &self.storage,
+            tenant_id,
+            bucket,
+            prefix,
+            after_cursor,
+            limit,
+        )
+        .await
     }
 
-    pub async fn hf_status_summary(
-        &self,
-        id: i64,
-    ) -> Result<(
-        String,
-        i64,
-        i64,
-        i64,
-        i64,
-        Option<String>,
-        Option<DateTime<Utc>>,
-        Option<DateTime<Utc>>,
-        DateTime<Utc>,
-    )> {
-        hf_journal::status_summary(&self.storage, id).await
+    pub async fn hf_get_ingestion_status(&self, id: i64) -> Result<hf_journal::HfIngestionStatus> {
+        hf_journal::get_ingestion_status(&self.storage, id).await
     }
 }
 
@@ -724,7 +732,6 @@ async fn append_authz_materialization_lag_watch(
     crate::authz_derived_lag_watch::append_authz_derived_lag_watch_record(
         storage,
         tenant_id,
-        u128::from(outcome.processed_revision),
         authz_materialization_mutation_id(
             tenant_id,
             outcome.processed_revision,

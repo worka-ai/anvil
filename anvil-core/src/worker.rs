@@ -14,9 +14,7 @@ use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
 use std::boxed::Box;
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
-use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -24,6 +22,8 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tonic::Status;
 use tracing::{debug, error, info, warn};
+
+mod hf_index;
 
 type Task = crate::persistence::TaskRecord;
 
@@ -269,52 +269,60 @@ pub async fn run(
 
 async fn recover_interrupted_tasks(persistence: &Persistence) -> Result<()> {
     let node_id = persistence.owner_node_id();
-    let interrupted = persistence
-        .list_tasks()
-        .await?
-        .into_iter()
-        .filter(|task| task.status == TaskStatus::Running)
-        .collect::<Vec<_>>();
     let mut recovered = 0_usize;
+    let mut after_tuple_key = None;
 
-    for task in interrupted {
-        let lease = match persistence.read_task_execution_lease(task.id).await {
-            Ok(lease) => lease,
-            Err(error) => {
+    loop {
+        let page = persistence
+            .list_tasks_page(after_tuple_key.as_deref(), 256)
+            .await?;
+        for task in page
+            .tasks
+            .into_iter()
+            .filter(|task| task.status == TaskStatus::Running)
+        {
+            let lease = match persistence.read_task_execution_lease(task.id).await {
+                Ok(lease) => lease,
+                Err(error) => {
+                    warn!(
+                        task_id = task.id,
+                        %error,
+                        "Failed to inspect an interrupted background task lease"
+                    );
+                    continue;
+                }
+            };
+            if lease
+                .as_ref()
+                .is_some_and(|lease| lease.owner_node_id() != node_id)
+            {
+                continue;
+            }
+            if let Err(error) = persistence
+                .fail_task(
+                    task.id,
+                    "background worker restarted before task completion",
+                )
+                .await
+            {
                 warn!(
                     task_id = task.id,
                     %error,
-                    "Failed to inspect an interrupted background task lease"
+                    "Failed to recover an interrupted background task"
                 );
                 continue;
             }
-        };
-        if lease
-            .as_ref()
-            .is_some_and(|lease| lease.owner_node_id() != node_id)
-        {
-            continue;
-        }
-        if let Err(error) = persistence
-            .fail_task(
-                task.id,
-                "background worker restarted before task completion",
-            )
-            .await
-        {
+            recovered = recovered.saturating_add(1);
             warn!(
                 task_id = task.id,
-                %error,
-                "Failed to recover an interrupted background task"
+                task_type = ?task.task_type,
+                "Recovered an interrupted background task"
             );
-            continue;
         }
-        recovered = recovered.saturating_add(1);
-        warn!(
-            task_id = task.id,
-            task_type = ?task.task_type,
-            "Recovered an interrupted background task"
-        );
+        let Some(next) = page.next_tuple_key else {
+            break;
+        };
+        after_tuple_key = Some(next);
     }
 
     if recovered > 0 {
@@ -679,47 +687,18 @@ async fn handle_hf_ingestion(
             format!("{}/anvil-index.json", target_prefix.trim_end_matches('/'))
         };
 
-        let mut file_map = HashMap::new();
-
-        // Fetch ALL items for this target (from past and current jobs) to build a complete index
-        let all_items = persistence
-            .hf_get_all_items_for_prefix(tenant_id, &target_bucket, &target_prefix)
-            .await?;
-
-        for (path, size_opt, etag_opt, finished_at_opt) in all_items {
-            let mut meta = json!({});
-            if let Some(s) = size_opt {
-                meta["size"] = json!(s);
-            }
-            if let Some(e) = etag_opt {
-                meta["etag"] = json!(e);
-            }
-            if let Some(f) = finished_at_opt {
-                meta["last_modified"] = json!(f.to_rfc3339());
-            }
-            // Insert will overwrite existing entries, so later jobs (ordered by finished_at) win.
-            file_map.insert(path, meta);
-        }
-
-        let mut total_bytes = 0;
-        for meta in file_map.values() {
-            if let Some(s) = meta.get("size").and_then(|v| v.as_i64()) {
-                total_bytes += s;
-            }
-        }
-
-        let index_json = json!({
-            "meta": {
-                "source_repo": repo_str,
-                "revision": revision,
-                "generated_at": chrono::Utc::now().to_rfc3339(),
-                "total_files": file_map.len(),
-                "total_bytes": total_bytes
-            },
-            "files": file_map,
-        });
-
-        let index_content_data = serde_json::to_vec_pretty(&index_json)?;
+        // The index output is necessarily proportional to the target contents,
+        // but paging and streaming keep memory independent of target cardinality.
+        let index_path = hf_index::write_target_index(
+            persistence,
+            tenant_id,
+            &target_bucket,
+            &target_prefix,
+            &repo_str,
+            &revision,
+            cache_dir.path(),
+        )
+        .await?;
         info!(index_key = %index_key, "Uploading anvil-index.json");
 
         // Upload index file, using retry logic adapted from above for robustness
@@ -727,12 +706,12 @@ async fn handle_hf_ingestion(
         loop {
             attempt += 1;
             info!("Putting anvil-index.json, attempt {}", attempt);
-            let current_index_content = index_content_data.clone();
+            let index_file = tokio::fs::File::open(&index_path).await?;
             let index_stream: Pin<
                 Box<dyn Stream<Item = Result<Vec<u8>, Status>> + Send + 'static>,
             > = Box::pin(
-                futures_util::stream::once(async move { Ok(current_index_content) })
-                    .map(|item: Result<Vec<u8>, Infallible>| item.map_err(|e| match e {})),
+                tokio_util::io::ReaderStream::new(index_file)
+                    .map(|result| result.map(|bytes| bytes.to_vec()).map_err(Status::internal)),
             );
 
             let res: Result<Object, Status> = object_manager
@@ -839,7 +818,7 @@ mod tests {
     use chrono::Utc;
     use std::collections::HashMap;
     use tempfile::tempdir;
-    use tokio::sync::{RwLock, broadcast};
+    use tokio::sync::RwLock;
 
     fn test_config(storage_path: &std::path::Path) -> Config {
         Config {
@@ -902,7 +881,11 @@ mod tests {
 
         recover_interrupted_tasks(&persistence).await.unwrap();
 
-        let tasks = persistence.list_tasks().await.unwrap();
+        let tasks = persistence
+            .list_tasks_page(None, 1_000)
+            .await
+            .unwrap()
+            .tasks;
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].status, TaskStatus::Failed);
         assert_eq!(tasks[0].attempts, 1);
@@ -930,7 +913,11 @@ mod tests {
 
         recover_interrupted_tasks(&persistence).await.unwrap();
 
-        let tasks = persistence.list_tasks().await.unwrap();
+        let tasks = persistence
+            .list_tasks_page(None, 1_000)
+            .await
+            .unwrap()
+            .tasks;
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].status, TaskStatus::Failed);
     }
@@ -982,7 +969,6 @@ mod tests {
             .unwrap();
         let cluster_state: ClusterState = Arc::new(RwLock::new(HashMap::new()));
         let jwt_manager = Arc::new(JwtManager::new(config.jwt_secret.clone()));
-        let (watch_tx, _watch_rx) = broadcast::channel(16);
         let object_manager = ObjectManager::new(
             persistence.clone(),
             storage.clone(),
@@ -990,7 +976,6 @@ mod tests {
             config.region.clone(),
             config.cross_region_routing_policy,
             hex::decode(&config.anvil_secret_encryption_key).unwrap(),
-            watch_tx,
             crate::observability::Observability::default(),
         );
         let keyring = Arc::new(config.secret_keyring().unwrap());
