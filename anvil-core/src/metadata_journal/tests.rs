@@ -125,6 +125,46 @@ async fn append_object_mutation_writes_direct_metadata_and_directory_records() {
 }
 
 #[tokio::test]
+async fn object_metadata_journal_reads_bounded_cursor_pages() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let bucket = sample_bucket();
+    for (id, key) in [(1, "docs/a.txt"), (2, "docs/b.txt")] {
+        append_object_mutation(
+            &storage,
+            &bucket,
+            &sample_object(id, key, false),
+            ObjectJournalMutation::Put,
+        )
+        .await
+        .unwrap();
+    }
+
+    let core_store = CoreStore::new(storage.clone()).await.unwrap();
+    let stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
+    let first = read_metadata_journal_records_page(&core_store, &stream_id, 0, 3)
+        .await
+        .unwrap();
+    assert_eq!(first.records.len(), 3);
+    assert_eq!(first.next_sequence, 3);
+    assert!(first.has_more);
+    let second =
+        read_metadata_journal_records_page(&core_store, &stream_id, first.next_sequence, 3)
+            .await
+            .unwrap();
+    assert_eq!(second.records.len(), 1);
+    assert_eq!(second.records[0].partition_sequence, 4);
+    assert!(!second.has_more);
+    assert!(
+        read_metadata_journal_records_page(&core_store, &stream_id, 0, 0)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("page size")
+    );
+}
+
+#[tokio::test]
 async fn object_metadata_source_checkpoint_uses_stream_metadata() {
     let temp = tempdir().unwrap();
     let storage = Storage::new_at(temp.path()).await.unwrap();
@@ -293,7 +333,8 @@ async fn object_metadata_corestore_batch_rejects_stale_partition_precondition() 
     .unwrap_err();
     assert!(
         rejected.to_string().contains("target mismatch")
-            || rejected.to_string().contains("generation mismatch"),
+            || rejected.to_string().contains("generation mismatch")
+            || rejected.to_string().contains("precondition failed"),
         "unexpected error: {rejected:?}"
     );
 

@@ -12,10 +12,7 @@ pub(super) async fn materialize_object_metadata_projection(
         }
         ObjectJournalMutation::DeleteVersion => {
             core_store
-                .record_object_metadata_mutation_id(bucket, object.id)
-                .await?;
-            core_store
-                .delete_object_version_metadata(bucket, &object.key, object.version_id)
+                .delete_object_version_metadata(bucket, object)
                 .await?;
         }
     }

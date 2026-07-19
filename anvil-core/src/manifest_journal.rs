@@ -1,9 +1,8 @@
 use crate::core_store::{
-    CF_OBJECT_HEADS, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaStore, CoreMetaTuplePart,
-    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreStore, CoreTransaction,
-    CoreTransactionUpdate, TABLE_MANIFEST_CAS_CURRENT_ROW, commit_coremeta_batch_for_storage,
-    core_meta_committed_row_common, core_meta_payload_digest, core_meta_root_key_hash,
-    core_meta_tuple_key,
+    CF_OBJECT_HEADS, CoreMetaStore, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation,
+    CoreMutationPrecondition, CoreStore, CoreTransaction, CoreTransactionUpdate,
+    TABLE_MANIFEST_CAS_CURRENT_ROW, core_meta_committed_row_common, core_meta_payload_digest,
+    core_meta_root_key_hash, core_meta_tuple_key,
 };
 use crate::formats::{Hash32, hash32};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
@@ -236,10 +235,8 @@ async fn current_revision(
     object_key: &str,
     transaction: Option<(&str, &str)>,
 ) -> Result<i64> {
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
     let payload = manifest_current_payload_for_optional_transaction(
         storage,
-        &meta,
         tenant_id,
         bucket_id,
         object_key,
@@ -262,7 +259,6 @@ async fn append_manifest(
     transaction_principal: Option<&str>,
 ) -> Result<MetadataMutationReceipt> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
     let stream_id = manifest_cas_stream_id(body.tenant_id, body.bucket_id);
     let mutation_id = uuid::Uuid::new_v4();
     let staged_transaction = transaction_id.is_some();
@@ -277,7 +273,6 @@ async fn append_manifest(
     let partition_id = hex::encode(manifest_cas_partition_id(body.tenant_id, body.bucket_id));
     let current_payload = manifest_current_payload_for_optional_transaction(
         storage,
-        &meta,
         body.tenant_id,
         body.bucket_id,
         &body.object_key,
@@ -354,18 +349,28 @@ async fn read_manifest_bodies(
     bucket_id: i64,
 ) -> Result<Vec<ManifestBody>> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    let records = core_store
-        .read_stream(crate::core_store::ReadStream {
-            stream_id: manifest_cas_stream_id(tenant_id, bucket_id),
-            after_sequence: 0,
-            limit: 0,
-        })
-        .await?;
-    records
-        .into_iter()
-        .filter(|record| record.record_kind == "manifest_cas")
-        .map(|record| decode_manifest_body(&record.payload))
-        .collect()
+    let stream_id = manifest_cas_stream_id(tenant_id, bucket_id);
+    let mut after_sequence = 0;
+    let mut bodies = Vec::new();
+    loop {
+        let page = core_store
+            .read_stream_page(crate::core_store::ReadStream {
+                stream_id: stream_id.clone(),
+                after_sequence,
+                limit: 256,
+            })
+            .await?;
+        for record in page.records {
+            if record.record_kind == "manifest_cas" {
+                bodies.push(decode_manifest_body(&record.payload)?);
+            }
+        }
+        if !page.has_more {
+            break;
+        }
+        after_sequence = page.next_sequence;
+    }
+    Ok(bodies)
 }
 
 pub async fn materialize_committed_manifest_cas_transaction(
@@ -412,17 +417,19 @@ pub async fn materialize_committed_manifest_cas_transaction(
                 transaction.transaction_id
             ));
         }
-        if let Some(current) =
-            read_manifest_current_row(&meta, tenant_id, bucket_id, &body.object_key)?
-            && current.revision == body.revision
-            && current.manifest_hash == body.manifest_hash
-        {
-            materialized += 1;
-            continue;
+        let current = read_manifest_current_row(&meta, tenant_id, bucket_id, &body.object_key)?
+            .ok_or_else(|| {
+                anyhow!(
+                    "manifest CAS transaction {} committed without its current projection",
+                    transaction.transaction_id
+                )
+            })?;
+        if current.revision != body.revision || current.manifest_hash != body.manifest_hash {
+            return Err(anyhow!(
+                "manifest CAS transaction {} current projection does not match committed stream record",
+                transaction.transaction_id
+            ));
         }
-        let row_update = manifest_current_row_update(&meta, &body, &transaction.transaction_id)?;
-        write_manifest_current_row(storage, &meta, &row_update.row, &row_update.precondition)
-            .await?;
         materialized += 1;
     }
     Ok(materialized)
@@ -453,17 +460,28 @@ pub(crate) async fn read_manifest_frame_fences_for_test(
     bucket_id: i64,
 ) -> Result<Vec<u64>> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    Ok(core_store
-        .read_stream(crate::core_store::ReadStream {
-            stream_id: manifest_cas_stream_id(tenant_id, bucket_id),
-            after_sequence: 0,
-            limit: 0,
-        })
-        .await?
-        .into_iter()
-        .filter(|record| record.record_kind == "manifest_cas")
-        .map(|record| decode_manifest_body_fence(&record.payload))
-        .collect::<Result<Vec<_>>>()?)
+    let stream_id = manifest_cas_stream_id(tenant_id, bucket_id);
+    let mut after_sequence = 0;
+    let mut fences = Vec::new();
+    loop {
+        let page = core_store
+            .read_stream_page(crate::core_store::ReadStream {
+                stream_id: stream_id.clone(),
+                after_sequence,
+                limit: 256,
+            })
+            .await?;
+        for record in page.records {
+            if record.record_kind == "manifest_cas" {
+                fences.push(decode_manifest_body_fence(&record.payload)?);
+            }
+        }
+        if !page.has_more {
+            break;
+        }
+        after_sequence = page.next_sequence;
+    }
+    Ok(fences)
 }
 
 fn encode_manifest_body(
@@ -525,16 +543,6 @@ struct ManifestCurrentRowUpdate {
     row: ManifestCurrentRow,
 }
 
-fn manifest_current_row_update(
-    meta: &CoreMetaStore,
-    body: &ManifestBody,
-    transaction_id: &str,
-) -> Result<ManifestCurrentRowUpdate> {
-    let current_payload =
-        read_manifest_current_payload(meta, body.tenant_id, body.bucket_id, &body.object_key)?;
-    manifest_current_row_update_from_payload(body, transaction_id, current_payload)
-}
-
 fn manifest_current_row_update_from_payload(
     body: &ManifestBody,
     transaction_id: &str,
@@ -575,19 +583,19 @@ fn manifest_current_row_update_from_payload(
 
 async fn manifest_current_payload_for_optional_transaction(
     storage: &Storage,
-    meta: &CoreMetaStore,
     tenant_id: i64,
     bucket_id: i64,
     object_key: &str,
     transaction: Option<(&str, &str)>,
 ) -> Result<Option<Vec<u8>>> {
     let key = manifest_current_row_key(tenant_id, bucket_id, object_key)?;
-    let mut current = meta.get(CF_OBJECT_HEADS, TABLE_MANIFEST_CAS_CURRENT_ROW, &key)?;
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let mut current =
+        core_store.read_coremeta_row(CF_OBJECT_HEADS, TABLE_MANIFEST_CAS_CURRENT_ROW, &key)?;
     let Some((transaction_id, transaction_principal)) = transaction else {
         return Ok(current);
     };
-    let transaction = CoreStore::new(storage.clone())
-        .await?
+    let transaction = core_store
         .read_explicit_transaction_for_principal(transaction_id, transaction_principal)
         .await?;
     for update in transaction.visible_updates {
@@ -649,69 +657,6 @@ fn read_manifest_current_row(
         return Err(anyhow!("manifest CAS current CoreMeta row scope mismatch"));
     }
     Ok(Some(row))
-}
-
-async fn write_manifest_current_row(
-    storage: &Storage,
-    meta: &CoreMetaStore,
-    row: &ManifestCurrentRow,
-    precondition: &CoreMutationPrecondition,
-) -> Result<()> {
-    validate_manifest_current_precondition(meta, precondition)?;
-    let key = manifest_current_row_key(row.tenant_id, row.bucket_id, &row.object_key)?;
-    let payload = encode_manifest_current_row(row)?;
-    let op = CoreMetaBatchOp {
-        cf: CF_OBJECT_HEADS,
-        table_id: TABLE_MANIFEST_CAS_CURRENT_ROW,
-        tuple_key: &key,
-        common: None,
-        kind: CoreMetaBatchOpKind::Put(&payload),
-    };
-    commit_coremeta_batch_for_storage(
-        storage,
-        &format!(
-            "manifest-current:{}:{}:{}",
-            row.tenant_id, row.bucket_id, row.revision
-        ),
-        &[op],
-    )
-    .await?;
-    Ok(())
-}
-
-fn validate_manifest_current_precondition(
-    meta: &CoreMetaStore,
-    precondition: &CoreMutationPrecondition,
-) -> Result<()> {
-    let CoreMutationPrecondition::CoreMetaRow {
-        cf,
-        table_id,
-        tuple_key,
-        expected_payload_hash,
-        require_absent,
-        require_present,
-    } = precondition
-    else {
-        return Err(anyhow!(
-            "manifest current writer received unsupported precondition"
-        ));
-    };
-    let current = meta.get_named(cf, *table_id, tuple_key)?;
-    if *require_absent && current.is_some() {
-        return Err(anyhow!("manifest current CoreMeta row must be absent"));
-    }
-    if *require_present && current.is_none() {
-        return Err(anyhow!("manifest current CoreMeta row must be present"));
-    }
-    if let (Some(expected), Some(current)) = (expected_payload_hash.as_ref(), current.as_ref()) {
-        let actual = core_meta_payload_digest(*table_id, current);
-        if actual != *expected {
-            return Err(anyhow!(
-                "manifest current CoreMeta row payload hash mismatch"
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn encode_manifest_current_row(row: &ManifestCurrentRow) -> Result<Vec<u8>> {
@@ -981,7 +926,9 @@ mod tests {
         .unwrap_err();
         let message = err.to_string();
         assert!(
-            message.contains("generation mismatch") || message.contains("target mismatch"),
+            message.contains("generation mismatch")
+                || message.contains("target mismatch")
+                || message.contains("precondition failed"),
             "unexpected stale precondition error: {message}"
         );
 

@@ -144,23 +144,33 @@ async fn write_activation_checkpoint_from_existing_streams(
         .map(|family| family.stream_family())
         .chain(anvil::mesh_lifecycle::lifecycle_control_stream_families().into_iter());
     for stream_family in stream_families {
-        let partitions = anvil::mesh_control_stream::list_control_stream_partitions(
+        let partitions = anvil::mesh_control_stream::list_control_stream_partitions_page(
             &node.state.storage,
             stream_family,
+            None,
+            1_024,
         )
         .await
         .unwrap();
-        for partition in partitions {
-            let log = anvil::mesh_control_stream::read_control_stream_log(
+        assert!(partitions.next_stream_id.is_none());
+        for partition in partitions.partitions {
+            let cursor = anvil::mesh_control_stream::control_stream_append_cursor(
                 &node.state.storage,
                 stream_family,
                 &partition,
             )
             .await
             .unwrap();
-            let Some(record) = log.records.last() else {
-                continue;
-            };
+            let log = anvil::mesh_control_stream::read_control_stream_page(
+                &node.state.storage,
+                stream_family,
+                &partition,
+                cursor.sequence.get().saturating_sub(2),
+                1,
+            )
+            .await
+            .unwrap();
+            let record = log.records.last().unwrap();
             anvil::mesh_control_stream::write_control_checkpoint(
                 &node.state.storage,
                 &anvil::mesh_control_stream::ControlCheckpointRecord::new(

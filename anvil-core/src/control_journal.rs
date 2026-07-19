@@ -1,7 +1,8 @@
 use crate::core_store::{
     CF_MESH, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-    CoreStore, TABLE_CONTROL_CURRENT_ROW, core_meta_committed_row_common,
-    core_meta_record_tuple_key, core_meta_root_key_hash, core_meta_tuple_key,
+    CoreStore, CoreTransactionState, TABLE_CONTROL_CURRENT_ROW, core_meta_committed_row_common,
+    core_meta_payload_digest, core_meta_record_tuple_key, core_meta_root_key_hash,
+    core_meta_tuple_key, is_retryable_mutation_conflict,
 };
 use crate::formats::{Hash32, hash32};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
@@ -15,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const CONTROL_EVENT_SCHEMA: &str = "anvil.control.event.v1";
 const CONTROL_CURRENT_SCHEMA: &str = "anvil.control.current.v1";
 const CONTROL_CURRENT_TARGET_MAX_BYTES: usize = 32 * 1024;
+const CONTROL_MUTATION_MAX_ATTEMPTS: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ControlEventBody {
@@ -85,11 +87,14 @@ struct StoredControlApp {
     client_secret_encrypted: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
-pub struct CurrentAppPage {
-    pub apps: Vec<App>,
-    pub next_tuple_key: Option<Vec<u8>>,
-}
+mod current;
+
+pub use current::{
+    CurrentAppPage, CurrentRegionPage, CurrentTenantPage, current_control_collection_revision,
+    page_apps_for_tenant, page_regions, page_tenants, read_app_by_id, read_app_by_tenant_name,
+    read_app_details_by_client_id, read_control_state, read_tenant_by_name,
+};
+use current::{read_id_allocator, read_region_active, read_stored_app};
 
 #[derive(Clone, PartialEq, Message)]
 struct ControlEventProto {
@@ -290,274 +295,6 @@ impl ControlState {
     }
 }
 
-pub async fn read_control_state(storage: &Storage) -> Result<ControlState> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    read_control_state_from_coremeta_rows(&core_store)
-}
-
-pub async fn read_tenant_by_name(storage: &Storage, name: &str) -> Result<Option<Tenant>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let Some(payload) = core_store.read_coremeta_row(
-        CF_MESH,
-        TABLE_CONTROL_CURRENT_ROW,
-        &tenant_name_tuple_key(name)?,
-    )?
-    else {
-        return Ok(None);
-    };
-    match decode_control_current_row(&payload)? {
-        ControlCurrentRecord::Tenant {
-            id,
-            name: stored_name,
-            active,
-        } if stored_name == name => Ok(active.then_some(Tenant {
-            id,
-            name: stored_name,
-        })),
-        ControlCurrentRecord::Tenant { .. } => {
-            bail!("control tenant-name row does not match its key")
-        }
-        _ => bail!("control tenant-name row contains a different record type"),
-    }
-}
-
-pub async fn read_app_by_id(storage: &Storage, app_id: i64) -> Result<Option<App>> {
-    let Some(app) = read_stored_app(storage, &app_id_tuple_key(app_id)?).await? else {
-        return Ok(None);
-    };
-    if app.id != app_id {
-        bail!("control app-id row does not match its key");
-    }
-    Ok(Some(app_record(&app)))
-}
-
-pub async fn read_app_by_tenant_name(
-    storage: &Storage,
-    tenant_id: i64,
-    name: &str,
-) -> Result<Option<App>> {
-    let Some(app) = read_stored_app(storage, &app_tenant_name_tuple_key(tenant_id, name)?).await?
-    else {
-        return Ok(None);
-    };
-    if app.tenant_id != tenant_id || app.name != name {
-        bail!("control tenant-app row does not match its key");
-    }
-    Ok(Some(app_record(&app)))
-}
-
-pub async fn read_app_details_by_client_id(
-    storage: &Storage,
-    client_id: &str,
-) -> Result<Option<AppDetails>> {
-    let Some(app) = read_stored_app(storage, &app_client_id_tuple_key(client_id)?).await? else {
-        return Ok(None);
-    };
-    if app.client_id != client_id {
-        bail!("control app-client row does not match its key");
-    }
-    Ok(Some(AppDetails {
-        id: app.id,
-        tenant_id: app.tenant_id,
-        client_secret_encrypted: app.client_secret_encrypted,
-    }))
-}
-
-pub async fn current_control_collection_revision(storage: &Storage) -> Result<String> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let Some(payload) = core_store.read_coremeta_row(
-        CF_MESH,
-        TABLE_CONTROL_CURRENT_ROW,
-        &control_revision_tuple_key()?,
-    )?
-    else {
-        return Ok("0".to_string());
-    };
-    match decode_control_current_row(&payload)? {
-        ControlCurrentRecord::Revision { revision } => Ok(revision.to_string()),
-        _ => bail!("control revision key contains a different record type"),
-    }
-}
-
-pub async fn page_apps_for_tenant(
-    storage: &Storage,
-    tenant_id: i64,
-    expected_revision: &str,
-    after_tuple_key: Option<&[u8]>,
-    page_size: usize,
-) -> Result<CurrentAppPage> {
-    if !(1..=1000).contains(&page_size) {
-        bail!("application page size must be between 1 and 1000");
-    }
-    if current_control_collection_revision(storage).await? != expected_revision {
-        bail!("application collection revision changed");
-    }
-
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let prefix = app_tenant_name_tuple_prefix(tenant_id)?;
-    let mut rows = core_store.scan_coremeta_prefix_page(
-        CF_MESH,
-        TABLE_CONTROL_CURRENT_ROW,
-        &prefix,
-        after_tuple_key,
-        page_size + 1,
-    )?;
-    let has_more = rows.len() > page_size;
-    if has_more {
-        rows.truncate(page_size);
-    }
-    let next_tuple_key = if has_more {
-        Some(
-            core_meta_record_tuple_key(
-                &rows
-                    .last()
-                    .ok_or_else(|| anyhow!("application page continuation has no last row"))?
-                    .key,
-            )?
-            .to_vec(),
-        )
-    } else {
-        None
-    };
-    let mut apps = Vec::with_capacity(rows.len());
-    for row in rows {
-        match decode_control_current_row(&row.payload)? {
-            ControlCurrentRecord::App {
-                id,
-                tenant_id: row_tenant_id,
-                name,
-                client_id,
-                active: true,
-                ..
-            } if row_tenant_id == tenant_id => apps.push(App {
-                id,
-                name,
-                client_id,
-            }),
-            ControlCurrentRecord::App { .. } => {
-                bail!("tenant application collection contains an invalid row")
-            }
-            _ => bail!("tenant application collection contains a different record type"),
-        }
-    }
-    if current_control_collection_revision(storage).await? != expected_revision {
-        bail!("application collection changed during page read");
-    }
-    Ok(CurrentAppPage {
-        apps,
-        next_tuple_key,
-    })
-}
-
-async fn read_stored_app(storage: &Storage, tuple_key: &[u8]) -> Result<Option<StoredControlApp>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let Some(payload) =
-        core_store.read_coremeta_row(CF_MESH, TABLE_CONTROL_CURRENT_ROW, tuple_key)?
-    else {
-        return Ok(None);
-    };
-    match decode_control_current_row(&payload)? {
-        ControlCurrentRecord::App {
-            id,
-            tenant_id,
-            name,
-            client_id,
-            client_secret_encrypted,
-            active: true,
-        } => Ok(Some(StoredControlApp {
-            id,
-            tenant_id,
-            name,
-            client_id,
-            client_secret_encrypted,
-        })),
-        ControlCurrentRecord::App { active: false, .. } => Ok(None),
-        _ => bail!("control application row contains a different record type"),
-    }
-}
-
-fn read_control_state_from_coremeta_rows(core_store: &CoreStore) -> Result<ControlState> {
-    let mut state = ControlState::default();
-
-    if let Some(value) = core_store.read_coremeta_row(
-        CF_MESH,
-        TABLE_CONTROL_CURRENT_ROW,
-        &id_allocator_tuple_key()?,
-    )? {
-        match decode_control_current_row(&value)? {
-            ControlCurrentRecord::IdAllocator { max_allocated_id } => {
-                state.next_id = max_allocated_id;
-            }
-            _ => bail!("control id allocator row contains a different record type"),
-        }
-    }
-
-    for row in core_store.scan_coremeta_prefix(
-        CF_MESH,
-        TABLE_CONTROL_CURRENT_ROW,
-        &region_tuple_prefix()?,
-    )? {
-        match decode_control_current_row(&row.payload)? {
-            ControlCurrentRecord::Region { name, active } => {
-                if active {
-                    state.regions.insert(name);
-                }
-            }
-            _ => bail!("control region row contains a different record type"),
-        }
-    }
-
-    for row in core_store.scan_coremeta_prefix(
-        CF_MESH,
-        TABLE_CONTROL_CURRENT_ROW,
-        &tenant_id_tuple_prefix()?,
-    )? {
-        match decode_control_current_row(&row.payload)? {
-            ControlCurrentRecord::Tenant { id, name, active } => {
-                state.next_id = state.next_id.max(id);
-                if active {
-                    state.tenants.insert(id, Tenant { id, name });
-                }
-            }
-            _ => bail!("control tenant row contains a different record type"),
-        }
-    }
-
-    for row in core_store.scan_coremeta_prefix(
-        CF_MESH,
-        TABLE_CONTROL_CURRENT_ROW,
-        &app_id_tuple_prefix()?,
-    )? {
-        match decode_control_current_row(&row.payload)? {
-            ControlCurrentRecord::App {
-                id,
-                tenant_id,
-                name,
-                client_id,
-                client_secret_encrypted,
-                active,
-            } => {
-                state.next_id = state.next_id.max(id);
-                if active {
-                    state.apps.insert(
-                        id,
-                        StoredControlApp {
-                            id,
-                            tenant_id,
-                            name,
-                            client_id,
-                            client_secret_encrypted,
-                        },
-                    );
-                }
-            }
-            _ => bail!("control app row contains a different record type"),
-        }
-    }
-
-    Ok(state)
-}
-
 #[cfg(test)]
 async fn create_region(storage: &Storage, name: &str) -> Result<bool> {
     create_region_inner(storage, name, 0, None).await
@@ -569,15 +306,27 @@ pub(crate) async fn create_region_with_permit(
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<bool> {
-    let partition_precondition =
-        control_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    create_region_inner(
-        storage,
-        name,
-        permit.fence_token,
-        Some(partition_precondition),
-    )
-    .await
+    for attempt in 0..CONTROL_MUTATION_MAX_ATTEMPTS {
+        let partition_precondition =
+            control_write_precondition(storage, permit, partition_owner_signing_key).await?;
+        match create_region_inner(
+            storage,
+            name,
+            permit.fence_token,
+            Some(partition_precondition),
+        )
+        .await
+        {
+            Err(error)
+                if is_retryable_mutation_conflict(&error)
+                    && attempt + 1 < CONTROL_MUTATION_MAX_ATTEMPTS =>
+            {
+                tokio::task::yield_now().await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("control mutation retry loop always returns")
 }
 
 async fn create_region_inner(
@@ -587,8 +336,7 @@ async fn create_region_inner(
     partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<bool> {
     require_nonempty(name, "region")?;
-    let state = read_control_state(storage).await?;
-    if state.regions.contains(name) {
+    if read_region_active(storage, name).await? {
         return Ok(false);
     }
     append_control_event(
@@ -618,15 +366,27 @@ pub(crate) async fn create_tenant_with_permit(
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<Tenant> {
-    let partition_precondition =
-        control_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    create_tenant_inner(
-        storage,
-        name,
-        permit.fence_token,
-        Some(partition_precondition),
-    )
-    .await
+    for attempt in 0..CONTROL_MUTATION_MAX_ATTEMPTS {
+        let partition_precondition =
+            control_write_precondition(storage, permit, partition_owner_signing_key).await?;
+        match create_tenant_inner(
+            storage,
+            name,
+            permit.fence_token,
+            Some(partition_precondition),
+        )
+        .await
+        {
+            Err(error)
+                if is_retryable_mutation_conflict(&error)
+                    && attempt + 1 < CONTROL_MUTATION_MAX_ATTEMPTS =>
+            {
+                tokio::task::yield_now().await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("control mutation retry loop always returns")
 }
 
 async fn create_tenant_inner(
@@ -636,12 +396,14 @@ async fn create_tenant_inner(
     partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<Tenant> {
     require_nonempty(name, "tenant")?;
-    let state = read_control_state(storage).await?;
-    if let Some(existing) = state.tenant_by_name(name) {
+    if let Some(existing) = read_tenant_by_name(storage, name).await? {
         return Ok(existing);
     }
     let tenant = Tenant {
-        id: state.allocate_id(),
+        id: read_id_allocator(storage)
+            .await?
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("control id allocator overflow"))?,
         name: name.to_string(),
     };
     append_control_event(
@@ -696,18 +458,30 @@ pub(crate) async fn create_app_with_permit(
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<App> {
-    let partition_precondition =
-        control_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    create_app_inner(
-        storage,
-        tenant_id,
-        name,
-        client_id,
-        encrypted_secret,
-        permit.fence_token,
-        Some(partition_precondition),
-    )
-    .await
+    for attempt in 0..CONTROL_MUTATION_MAX_ATTEMPTS {
+        let partition_precondition =
+            control_write_precondition(storage, permit, partition_owner_signing_key).await?;
+        match create_app_inner(
+            storage,
+            tenant_id,
+            name,
+            client_id,
+            encrypted_secret,
+            permit.fence_token,
+            Some(partition_precondition),
+        )
+        .await
+        {
+            Err(error)
+                if is_retryable_mutation_conflict(&error)
+                    && attempt + 1 < CONTROL_MUTATION_MAX_ATTEMPTS =>
+            {
+                tokio::task::yield_now().await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("control mutation retry loop always returns")
 }
 
 async fn create_app_inner(
@@ -721,16 +495,23 @@ async fn create_app_inner(
 ) -> Result<App> {
     require_nonempty(name, "app")?;
     require_nonempty(client_id, "client_id")?;
-    let state = read_control_state(storage).await?;
-    if state
-        .apps
-        .values()
-        .any(|app| app.tenant_id == tenant_id && app.name == name)
+    if read_app_by_tenant_name(storage, tenant_id, name)
+        .await?
+        .is_some()
     {
         return Err(anyhow!("app already exists"));
     }
+    if read_app_details_by_client_id(storage, client_id)
+        .await?
+        .is_some()
+    {
+        return Err(anyhow!("app client_id already exists"));
+    }
     let app = App {
-        id: state.allocate_id(),
+        id: read_id_allocator(storage)
+            .await?
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("control id allocator overflow"))?,
         name: name.to_string(),
         client_id: client_id.to_string(),
     };
@@ -775,16 +556,28 @@ pub(crate) async fn update_app_secret_with_permit(
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
-    let partition_precondition =
-        control_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    update_app_secret_inner(
-        storage,
-        app_id,
-        encrypted_secret,
-        permit.fence_token,
-        Some(partition_precondition),
-    )
-    .await
+    for attempt in 0..CONTROL_MUTATION_MAX_ATTEMPTS {
+        let partition_precondition =
+            control_write_precondition(storage, permit, partition_owner_signing_key).await?;
+        match update_app_secret_inner(
+            storage,
+            app_id,
+            encrypted_secret,
+            permit.fence_token,
+            Some(partition_precondition),
+        )
+        .await
+        {
+            Err(error)
+                if is_retryable_mutation_conflict(&error)
+                    && attempt + 1 < CONTROL_MUTATION_MAX_ATTEMPTS =>
+            {
+                tokio::task::yield_now().await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("control mutation retry loop always returns")
 }
 
 async fn update_app_secret_inner(
@@ -794,10 +587,8 @@ async fn update_app_secret_inner(
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
-    let state = read_control_state(storage).await?;
-    let existing = state
-        .apps
-        .get(&app_id)
+    let existing = read_stored_app(storage, &app_id_tuple_key(app_id)?)
+        .await?
         .ok_or_else(|| anyhow!("app not found"))?;
     append_control_event(
         storage,
@@ -808,8 +599,8 @@ async fn update_app_secret_inner(
         vec![ControlCurrentRecord::App {
             id: existing.id,
             tenant_id: existing.tenant_id,
-            name: existing.name.clone(),
-            client_id: existing.client_id.clone(),
+            name: existing.name,
+            client_id: existing.client_id,
             client_secret_encrypted: encrypted_secret.to_vec(),
             active: true,
         }],
@@ -825,15 +616,27 @@ pub(crate) async fn delete_app_with_permit(
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
-    let partition_precondition =
-        control_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    delete_app_inner(
-        storage,
-        app_id,
-        permit.fence_token,
-        Some(partition_precondition),
-    )
-    .await
+    for attempt in 0..CONTROL_MUTATION_MAX_ATTEMPTS {
+        let partition_precondition =
+            control_write_precondition(storage, permit, partition_owner_signing_key).await?;
+        match delete_app_inner(
+            storage,
+            app_id,
+            permit.fence_token,
+            Some(partition_precondition),
+        )
+        .await
+        {
+            Err(error)
+                if is_retryable_mutation_conflict(&error)
+                    && attempt + 1 < CONTROL_MUTATION_MAX_ATTEMPTS =>
+            {
+                tokio::task::yield_now().await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("control mutation retry loop always returns")
 }
 
 async fn delete_app_inner(
@@ -842,10 +645,8 @@ async fn delete_app_inner(
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
-    let state = read_control_state(storage).await?;
-    let existing = state
-        .apps
-        .get(&app_id)
+    let existing = read_stored_app(storage, &app_id_tuple_key(app_id)?)
+        .await?
         .ok_or_else(|| anyhow!("app not found"))?;
     append_control_event(
         storage,
@@ -853,9 +654,9 @@ async fn delete_app_inner(
         vec![ControlCurrentRecord::App {
             id: app_id,
             tenant_id: existing.tenant_id,
-            name: existing.name.clone(),
-            client_id: existing.client_id.clone(),
-            client_secret_encrypted: existing.client_secret_encrypted.clone(),
+            name: existing.name,
+            client_id: existing.client_id,
+            client_secret_encrypted: existing.client_secret_encrypted,
             active: false,
         }],
         fence_token,
@@ -874,6 +675,19 @@ async fn append_control_event(
     let core_store = CoreStore::new(storage.clone()).await?;
     let mutation_id = uuid::Uuid::new_v4();
     let row_generation = current_unix_nanos();
+    let stream_precondition = core_store
+        .stream_head_precondition(&control_plane_stream_id())
+        .await?;
+    let CoreMutationPrecondition::StreamHead {
+        expected_last_sequence,
+        ..
+    } = &stream_precondition
+    else {
+        unreachable!("stream_head_precondition must return StreamHead");
+    };
+    let next_revision = expected_last_sequence
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("control journal revision overflow"))?;
     let payload = encode_control_event_body(&event, fence_token, mutation_id)?;
     let partition_id = hex::encode(control_partition_id());
     let mut operations = Vec::new();
@@ -886,11 +700,46 @@ async fn append_control_event(
     }
     operations.extend(control_current_updates(
         ControlCurrentRecord::Revision {
-            revision: row_generation,
+            revision: next_revision,
         },
         &mutation_id.to_string(),
         row_generation,
     )?);
+    let mut preconditions: Vec<_> = partition_precondition.into_iter().collect();
+    let mut projection_keys = BTreeSet::new();
+    for operation in &operations {
+        let tuple_key = match operation {
+            CoreMutationOperation::CoreMetaPut {
+                cf,
+                table_id,
+                tuple_key,
+                ..
+            }
+            | CoreMutationOperation::CoreMetaDelete {
+                cf,
+                table_id,
+                tuple_key,
+                ..
+            } if cf == CF_MESH && *table_id == TABLE_CONTROL_CURRENT_ROW => tuple_key,
+            _ => continue,
+        };
+        if !projection_keys.insert(tuple_key.clone()) {
+            bail!("control mutation contains duplicate projection row updates");
+        }
+        let current =
+            core_store.read_coremeta_row(CF_MESH, TABLE_CONTROL_CURRENT_ROW, tuple_key)?;
+        preconditions.push(CoreMutationPrecondition::CoreMetaRow {
+            cf: CF_MESH.to_string(),
+            table_id: TABLE_CONTROL_CURRENT_ROW,
+            tuple_key: tuple_key.clone(),
+            expected_payload_hash: current
+                .as_ref()
+                .map(|payload| core_meta_payload_digest(TABLE_CONTROL_CURRENT_ROW, payload)),
+            require_absent: current.is_none(),
+            require_present: current.is_some(),
+        });
+    }
+    preconditions.push(stream_precondition);
     operations.push(CoreMutationOperation::StreamAppend {
         partition_id: partition_id.clone(),
         stream_id: control_plane_stream_id(),
@@ -898,19 +747,27 @@ async fn append_control_event(
         payload,
         idempotency_key: Some(format!("control-plane:{mutation_id}")),
     });
-    core_store
+    let receipt = core_store
         .commit_mutation_batch(CoreMutationBatch {
             transaction_id: format!("control-plane:{mutation_id}"),
             scope_partition: partition_id,
             committed_by_principal: control_partition_principal(),
-            preconditions: partition_precondition.into_iter().collect(),
+            preconditions,
             operations,
         })
         .await?;
+    if receipt.state != CoreTransactionState::Committed {
+        bail!(
+            "control mutation failed to commit: {}",
+            receipt
+                .finalisation_error
+                .as_deref()
+                .unwrap_or("unknown finalisation failure")
+        );
+    }
     Ok(())
 }
 
-#[cfg(test)]
 #[cfg(test)]
 async fn read_control_journal_bodies(storage: &Storage) -> Result<Vec<ControlEventBody>> {
     let core_store = CoreStore::new(storage.clone()).await?;
@@ -921,19 +778,25 @@ async fn read_control_journal_bodies(storage: &Storage) -> Result<Vec<ControlEve
 async fn read_control_journal_bodies_from_store(
     core_store: &CoreStore,
 ) -> Result<Vec<ControlEventBody>> {
-    let records = core_store
-        .read_stream(crate::core_store::ReadStream {
-            stream_id: control_plane_stream_id(),
-            after_sequence: 0,
-            limit: 0,
-        })
-        .await?;
+    let mut after_sequence = 0;
     let mut bodies = Vec::new();
-    for record in records {
-        if record.record_kind != "control_plane" {
-            continue;
+    loop {
+        let page = core_store
+            .read_stream_page(crate::core_store::ReadStream {
+                stream_id: control_plane_stream_id(),
+                after_sequence,
+                limit: 256,
+            })
+            .await?;
+        for record in page.records {
+            if record.record_kind == "control_plane" {
+                bodies.push(decode_control_event_body(&record.payload)?);
+            }
         }
-        bodies.push(decode_control_event_body(&record.payload)?);
+        if !page.has_more {
+            break;
+        }
+        after_sequence = page.next_sequence;
     }
     Ok(bodies)
 }
@@ -1119,7 +982,6 @@ fn decode_control_event_body(bytes: &[u8]) -> Result<ControlEventBody> {
     }
 }
 
-#[cfg(test)]
 #[cfg(test)]
 fn decode_control_event_body_fence(bytes: &[u8]) -> Result<u64> {
     let proto = ControlEventProto::decode(bytes)?;
@@ -1385,17 +1247,27 @@ fn control_partition_principal() -> String {
 #[cfg(test)]
 pub(crate) async fn read_control_frame_fences_for_test(storage: &Storage) -> Result<Vec<u64>> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    Ok(core_store
-        .read_stream(crate::core_store::ReadStream {
-            stream_id: control_plane_stream_id(),
-            after_sequence: 0,
-            limit: 0,
-        })
-        .await?
-        .into_iter()
-        .filter(|record| record.record_kind == "control_plane")
-        .map(|record| decode_control_event_body_fence(&record.payload))
-        .collect::<Result<Vec<_>>>()?)
+    let mut after_sequence = 0;
+    let mut fences = Vec::new();
+    loop {
+        let page = core_store
+            .read_stream_page(crate::core_store::ReadStream {
+                stream_id: control_plane_stream_id(),
+                after_sequence,
+                limit: 256,
+            })
+            .await?;
+        for record in page.records {
+            if record.record_kind == "control_plane" {
+                fences.push(decode_control_event_body_fence(&record.payload)?);
+            }
+        }
+        if !page.has_more {
+            break;
+        }
+        after_sequence = page.next_sequence;
+    }
+    Ok(fences)
 }
 
 async fn control_write_precondition(
@@ -1692,6 +1564,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_control_mutations_retry_without_process_global_serialization() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let owner = ready_owner(&storage, "node-a").await;
+        let permit = owner.write_permit().unwrap();
+        let mut writes = Vec::new();
+        for index in 0..16 {
+            let storage = storage.clone();
+            let permit = permit.clone();
+            writes.push(tokio::spawn(async move {
+                create_tenant_with_permit(&storage, &format!("tenant-{index:02}"), &permit, KEY)
+                    .await
+            }));
+        }
+
+        let mut ids = BTreeSet::new();
+        for write in writes {
+            ids.insert(write.await.unwrap().unwrap().id);
+        }
+        assert_eq!(ids.len(), 16);
+        assert_eq!(
+            read_control_state(&storage).await.unwrap().tenants().len(),
+            16
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_app_client_id_claim_allows_only_one_owner() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let owner = ready_owner(&storage, "node-a").await;
+        let permit = owner.write_permit().unwrap();
+        let tenant = create_tenant_with_permit(&storage, "default", &permit, KEY)
+            .await
+            .unwrap();
+
+        let left = create_app_with_permit(
+            &storage,
+            tenant.id,
+            "left",
+            "shared-client",
+            b"left-secret",
+            &permit,
+            KEY,
+        );
+        let right = create_app_with_permit(
+            &storage,
+            tenant.id,
+            "right",
+            "shared-client",
+            b"right-secret",
+            &permit,
+            KEY,
+        );
+        let (left, right) = tokio::join!(left, right);
+
+        assert_ne!(left.is_ok(), right.is_ok());
+        assert!(
+            left.as_ref()
+                .err()
+                .or_else(|| right.as_ref().err())
+                .unwrap()
+                .to_string()
+                .contains("client_id already exists")
+        );
+        assert!(
+            read_app_details_by_client_id(&storage, "shared-client")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     pub(crate) async fn control_journal_with_permit_writes_fenced_payloads_and_current_rows() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
@@ -1766,7 +1712,9 @@ mod tests {
         .unwrap_err();
         let message = err.to_string();
         assert!(
-            message.contains("generation mismatch") || message.contains("target mismatch"),
+            message.contains("generation mismatch")
+                || message.contains("target mismatch")
+                || message.contains("precondition failed"),
             "unexpected stale precondition error: {message}"
         );
 
