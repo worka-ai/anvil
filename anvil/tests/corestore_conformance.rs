@@ -643,14 +643,15 @@ fn rfc_0007_task_live_state_is_not_replayed_from_task_audit_history() {
 fn rfc_0007_object_metadata_live_state_uses_coremeta_rows() {
     let metadata = production_source("anvil-core/src/metadata_journal.rs")
         + &production_source("anvil-core/src/metadata_journal/transaction_projection.rs");
-    let coremeta = production_source("anvil-core/src/core_store/local_object_metadata.rs");
+    let coremeta = production_source("anvil-core/src/core_store/local_object_metadata.rs")
+        + &production_source("anvil-core/src/core_store/local_object_metadata/projections.rs");
 
     assert_source_contains_all(
         "object metadata live-state CoreMeta implementation",
         &metadata,
         &[
             "put_object_metadata(bucket, object)",
-            "record_object_metadata_mutation_id(bucket, object.id)",
+            "delete_object_version_metadata(bucket, object)",
             "read_current_object_metadata(bucket, object_key)",
             "read_object_version_metadata(bucket, object_key, version_id)",
             "read_object_version_metadata_by_id(bucket, version_id)",
@@ -667,18 +668,28 @@ fn rfc_0007_object_metadata_live_state_uses_coremeta_rows() {
             "CF_OBJECT_VERSIONS",
             "TABLE_OBJECT_VERSION_META_ROW",
             "object-id-counter",
+            "object-version-id",
+            "object-page-current",
+            "object-page-version",
+            "scan_prefix_page",
+            "scan_range_reverse_inclusive",
         ],
     );
 
     for forbidden in [
         "parse_current_object_ref_target",
         "current object ref points at missing metadata stream record",
+        "record_object_metadata_mutation_id",
     ] {
         assert!(
             !metadata.contains(forbidden),
             "object metadata live state must not retain stream/segment replay path: {forbidden}"
         );
     }
+    assert!(
+        !coremeta.contains(".scan_prefix("),
+        "object metadata projections must use point reads or bounded page/range reads"
+    );
 
     let tests = read_workspace_file("anvil-core/src/metadata_journal/tests.rs");
     assert_source_contains_all(
@@ -1055,9 +1066,10 @@ async fn rfc_0006_root_catalog_is_signed_generationed_and_recoverable() {
     );
     assert_eq!(
         store
-            .list_root_catalog_history("mesh-rfc0006")
+            .list_root_catalog_history_page("mesh-rfc0006", 0, 10)
             .await
             .unwrap()
+            .records
             .len(),
         1
     );
@@ -1124,9 +1136,10 @@ async fn rfc_0006_quorum_profile_requires_intersection_and_monotonic_epochs() {
         .await
         .expect("next quorum profile epoch commits");
     let history = store
-        .list_quorum_profile_history("pg-rfc0006")
+        .list_quorum_profile_history_page("pg-rfc0006", 0, 10)
         .await
-        .unwrap();
+        .unwrap()
+        .records;
     assert_eq!(history.len(), 2);
     assert_eq!(history[0].epoch, 1);
     assert_eq!(history[1].epoch, 2);
@@ -1219,7 +1232,10 @@ async fn rfc_0006_corestore_transactions_gate_coremeta_stream_and_watch_visibili
         1
     );
     assert_eq!(
-        store.list_stream_ids("object_metadata:").await.unwrap(),
+        store
+            .list_stream_ids_page("object_metadata:", None, 10)
+            .await
+            .unwrap(),
         vec!["object_metadata:t:b".to_string()],
         "CoreStore stream ids must be listed from RocksDB-backed stream metadata"
     );
@@ -1232,6 +1248,7 @@ async fn rfc_0006_corestore_transactions_gate_coremeta_stream_and_watch_visibili
             })
             .await
             .unwrap()
+            .events
             .len(),
         1
     );
@@ -1523,13 +1540,13 @@ async fn rfc_0006_corestore_streams_are_chained_and_idempotent() {
         })
         .await
         .unwrap();
-    assert_eq!(watched.len(), 1);
-    assert_eq!(watched[0].cursor, second.cursor);
-    assert_eq!(watched[0].previous_event_hash, records[0].event_hash);
-    assert_eq!(watched[0].event_hash, records[1].event_hash);
-    assert_eq!(watched[0].event_type, "audit.updated");
-    assert_eq!(watched[0].transaction_id, None);
-    assert_eq!(watched[0].payload_hash, records[1].payload_hash);
+    assert_eq!(watched.events.len(), 1);
+    assert_eq!(watched.events[0].cursor, second.cursor);
+    assert_eq!(watched.events[0].previous_event_hash, records[0].event_hash);
+    assert_eq!(watched.events[0].event_hash, records[1].event_hash);
+    assert_eq!(watched.events[0].event_type, "audit.updated");
+    assert_eq!(watched.events[0].transaction_id, None);
+    assert_eq!(watched.events[0].payload_hash, records[1].payload_hash);
 }
 
 #[tokio::test]

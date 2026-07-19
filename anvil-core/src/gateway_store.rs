@@ -232,6 +232,13 @@ pub struct GatewayAuditStreamRecord {
     pub stream: StreamRecord,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayAuditPage {
+    pub records: Vec<GatewayAuditStreamRecord>,
+    pub next_sequence: u64,
+    pub has_more: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GatewayAccessTokenClaims {
     pub token_kind: String,
@@ -1418,18 +1425,10 @@ pub async fn append_gateway_audit_record(
     )?;
     let store = CoreStore::new(storage.clone()).await?;
     if let Some(idempotency_key) = idempotency_key {
-        let idempotency_key_hash = format!("sha256:{}", sha256_hex(idempotency_key.as_bytes()));
-        for stream in store
-            .read_stream(ReadStream {
-                stream_id: stream_id.clone(),
-                after_sequence: 0,
-                limit: 0,
-            })
+        if let Some(stream) = store
+            .read_stream_record_by_idempotency_key(&stream_id, idempotency_key)
             .await?
         {
-            if stream.idempotency_key_hash.as_deref() != Some(idempotency_key_hash.as_str()) {
-                continue;
-            }
             let existing: GatewayAuditRecord = decode_gateway_record(&stream.payload)?;
             validate_gateway_audit_record(&existing)?;
             if record.created_at.is_empty() {
@@ -1474,27 +1473,27 @@ pub async fn append_gateway_audit_record(
     Ok(GatewayAuditAppendReceipt { record, stream })
 }
 
-pub async fn read_gateway_audit_records(
+pub async fn read_gateway_audit_page(
     storage: &Storage,
     tenant_id: i64,
     gateway: &str,
     registry_instance_id: &str,
     after_sequence: u64,
     limit: usize,
-) -> Result<Vec<GatewayAuditStreamRecord>> {
+) -> Result<GatewayAuditPage> {
     validate_tenant(tenant_id)?;
     let gateway = normalize_gateway_identifier(gateway, "gateway")?;
     let registry_instance_id = normalize_gateway_identifier(registry_instance_id, "registry")?;
-    let records = CoreStore::new(storage.clone())
+    let page = CoreStore::new(storage.clone())
         .await?
-        .read_stream(ReadStream {
+        .read_stream_page(ReadStream {
             stream_id: gateway_audit_stream_id(tenant_id, &gateway, &registry_instance_id)?,
             after_sequence,
             limit,
         })
         .await?;
-    let mut audited = Vec::with_capacity(records.len());
-    for stream in records {
+    let mut audited = Vec::with_capacity(page.records.len());
+    for stream in page.records {
         if stream.record_kind != GATEWAY_AUDIT_SCHEMA {
             bail!("gateway audit stream contains unexpected record kind");
         }
@@ -1508,17 +1507,39 @@ pub async fn read_gateway_audit_records(
         validate_gateway_audit_record(&audit)?;
         audited.push(GatewayAuditStreamRecord { audit, stream });
     }
-    Ok(audited)
+    Ok(GatewayAuditPage {
+        records: audited,
+        next_sequence: page.next_sequence,
+        has_more: page.has_more,
+    })
 }
 
 async fn list_gateway_mount_records(
     storage: &Storage,
 ) -> Result<Vec<(GatewayMountRecord, GatewayStoredHandle)>> {
+    const MAX_GATEWAY_MOUNT_CANDIDATES: usize = 16_384;
     let mut mounts = Vec::new();
-    for row in list_record_rows::<GatewayMountRecord>(storage, GATEWAY_ROW_MOUNT).await? {
-        validate_mount_record_shape(&row.record)?;
-        let stored_handle = row.stored_handle();
-        mounts.push((row.record, stored_handle));
+    let mut after_tuple_key = None;
+    loop {
+        let page = list_record_rows::<GatewayMountRecord>(
+            storage,
+            GATEWAY_ROW_MOUNT,
+            after_tuple_key.as_deref(),
+            1_000,
+        )
+        .await?;
+        if mounts.len().saturating_add(page.records.len()) > MAX_GATEWAY_MOUNT_CANDIDATES {
+            bail!("gateway mount candidate limit exceeded");
+        }
+        for row in page.records {
+            validate_mount_record_shape(&row.record)?;
+            let stored_handle = row.stored_handle();
+            mounts.push((row.record, stored_handle));
+        }
+        let Some(next_tuple_key) = page.next_tuple_key else {
+            break;
+        };
+        after_tuple_key = Some(next_tuple_key);
     }
     Ok(mounts)
 }

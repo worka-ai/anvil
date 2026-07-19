@@ -399,9 +399,10 @@ async fn gateway_audit_records_are_corestore_append_stream_records() {
     assert_eq!(replay.stream.sequence, first.stream.sequence);
     assert!(replay.stream.idempotent_replay);
 
-    let read = read_gateway_audit_records(&storage, 1, "docker", "registry-a", 0, 100)
+    let read = read_gateway_audit_page(&storage, 1, "docker", "registry-a", 0, 100)
         .await
-        .unwrap();
+        .unwrap()
+        .records;
     assert_eq!(read.len(), 1);
     assert_eq!(read[0].audit, first.record);
     assert_eq!(read[0].stream.record_kind, GATEWAY_AUDIT_SCHEMA);

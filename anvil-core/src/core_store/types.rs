@@ -686,6 +686,27 @@ pub struct WatchEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WatchPage {
+    pub events: Vec<WatchEvent>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadStreamPage {
+    pub records: Vec<StreamRecord>,
+    pub next_sequence: u64,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreHistoryPage<T> {
+    pub records: Vec<T>,
+    pub next_sequence: u64,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AcquireFence {
     pub fence_name: String,
     pub authenticated_principal: String,
