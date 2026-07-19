@@ -1,7 +1,7 @@
 use crate::core_store::{
     CF_MESH, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-    CoreStore, TABLE_CONTROL_CURRENT_ROW, core_meta_committed_row_common, core_meta_root_key_hash,
-    core_meta_tuple_key,
+    CoreStore, TABLE_CONTROL_CURRENT_ROW, core_meta_committed_row_common,
+    core_meta_record_tuple_key, core_meta_root_key_hash, core_meta_tuple_key,
 };
 use crate::formats::{Hash32, hash32};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
@@ -43,6 +43,9 @@ enum ControlEventBody {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ControlCurrentRecord {
+    Revision {
+        revision: u64,
+    },
     IdAllocator {
         max_allocated_id: i64,
     },
@@ -80,6 +83,12 @@ struct StoredControlApp {
     name: String,
     client_id: String,
     client_secret_encrypted: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CurrentAppPage {
+    pub apps: Vec<App>,
+    pub next_tuple_key: Option<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -120,7 +129,7 @@ struct ControlCurrentProto {
     common: Option<crate::core_store::CoreMetaRowCommonProto>,
     #[prost(string, tag = "2")]
     schema: String,
-    #[prost(oneof = "control_current_proto::Record", tags = "10, 11, 12, 13")]
+    #[prost(oneof = "control_current_proto::Record", tags = "10, 11, 12, 13, 14")]
     record: Option<control_current_proto::Record>,
 }
 
@@ -137,7 +146,15 @@ mod control_current_proto {
         Tenant(super::TenantCurrentProto),
         #[prost(message, tag = "13")]
         App(super::AppCurrentProto),
+        #[prost(message, tag = "14")]
+        Revision(super::RevisionCurrentProto),
     }
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct RevisionCurrentProto {
+    #[prost(uint64, tag = "1")]
+    revision: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -278,6 +295,187 @@ pub async fn read_control_state(storage: &Storage) -> Result<ControlState> {
     read_control_state_from_coremeta_rows(&core_store)
 }
 
+pub async fn read_tenant_by_name(storage: &Storage, name: &str) -> Result<Option<Tenant>> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let Some(payload) = core_store.read_coremeta_row(
+        CF_MESH,
+        TABLE_CONTROL_CURRENT_ROW,
+        &tenant_name_tuple_key(name)?,
+    )?
+    else {
+        return Ok(None);
+    };
+    match decode_control_current_row(&payload)? {
+        ControlCurrentRecord::Tenant {
+            id,
+            name: stored_name,
+            active,
+        } if stored_name == name => Ok(active.then_some(Tenant {
+            id,
+            name: stored_name,
+        })),
+        ControlCurrentRecord::Tenant { .. } => {
+            bail!("control tenant-name row does not match its key")
+        }
+        _ => bail!("control tenant-name row contains a different record type"),
+    }
+}
+
+pub async fn read_app_by_id(storage: &Storage, app_id: i64) -> Result<Option<App>> {
+    let Some(app) = read_stored_app(storage, &app_id_tuple_key(app_id)?).await? else {
+        return Ok(None);
+    };
+    if app.id != app_id {
+        bail!("control app-id row does not match its key");
+    }
+    Ok(Some(app_record(&app)))
+}
+
+pub async fn read_app_by_tenant_name(
+    storage: &Storage,
+    tenant_id: i64,
+    name: &str,
+) -> Result<Option<App>> {
+    let Some(app) = read_stored_app(storage, &app_tenant_name_tuple_key(tenant_id, name)?).await?
+    else {
+        return Ok(None);
+    };
+    if app.tenant_id != tenant_id || app.name != name {
+        bail!("control tenant-app row does not match its key");
+    }
+    Ok(Some(app_record(&app)))
+}
+
+pub async fn read_app_details_by_client_id(
+    storage: &Storage,
+    client_id: &str,
+) -> Result<Option<AppDetails>> {
+    let Some(app) = read_stored_app(storage, &app_client_id_tuple_key(client_id)?).await? else {
+        return Ok(None);
+    };
+    if app.client_id != client_id {
+        bail!("control app-client row does not match its key");
+    }
+    Ok(Some(AppDetails {
+        id: app.id,
+        tenant_id: app.tenant_id,
+        client_secret_encrypted: app.client_secret_encrypted,
+    }))
+}
+
+pub async fn current_control_collection_revision(storage: &Storage) -> Result<String> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let Some(payload) = core_store.read_coremeta_row(
+        CF_MESH,
+        TABLE_CONTROL_CURRENT_ROW,
+        &control_revision_tuple_key()?,
+    )?
+    else {
+        return Ok("0".to_string());
+    };
+    match decode_control_current_row(&payload)? {
+        ControlCurrentRecord::Revision { revision } => Ok(revision.to_string()),
+        _ => bail!("control revision key contains a different record type"),
+    }
+}
+
+pub async fn page_apps_for_tenant(
+    storage: &Storage,
+    tenant_id: i64,
+    expected_revision: &str,
+    after_tuple_key: Option<&[u8]>,
+    page_size: usize,
+) -> Result<CurrentAppPage> {
+    if !(1..=1000).contains(&page_size) {
+        bail!("application page size must be between 1 and 1000");
+    }
+    if current_control_collection_revision(storage).await? != expected_revision {
+        bail!("application collection revision changed");
+    }
+
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let prefix = app_tenant_name_tuple_prefix(tenant_id)?;
+    let mut rows = core_store.scan_coremeta_prefix_page(
+        CF_MESH,
+        TABLE_CONTROL_CURRENT_ROW,
+        &prefix,
+        after_tuple_key,
+        page_size + 1,
+    )?;
+    let has_more = rows.len() > page_size;
+    if has_more {
+        rows.truncate(page_size);
+    }
+    let next_tuple_key = if has_more {
+        Some(
+            core_meta_record_tuple_key(
+                &rows
+                    .last()
+                    .ok_or_else(|| anyhow!("application page continuation has no last row"))?
+                    .key,
+            )?
+            .to_vec(),
+        )
+    } else {
+        None
+    };
+    let mut apps = Vec::with_capacity(rows.len());
+    for row in rows {
+        match decode_control_current_row(&row.payload)? {
+            ControlCurrentRecord::App {
+                id,
+                tenant_id: row_tenant_id,
+                name,
+                client_id,
+                active: true,
+                ..
+            } if row_tenant_id == tenant_id => apps.push(App {
+                id,
+                name,
+                client_id,
+            }),
+            ControlCurrentRecord::App { .. } => {
+                bail!("tenant application collection contains an invalid row")
+            }
+            _ => bail!("tenant application collection contains a different record type"),
+        }
+    }
+    if current_control_collection_revision(storage).await? != expected_revision {
+        bail!("application collection changed during page read");
+    }
+    Ok(CurrentAppPage {
+        apps,
+        next_tuple_key,
+    })
+}
+
+async fn read_stored_app(storage: &Storage, tuple_key: &[u8]) -> Result<Option<StoredControlApp>> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let Some(payload) =
+        core_store.read_coremeta_row(CF_MESH, TABLE_CONTROL_CURRENT_ROW, tuple_key)?
+    else {
+        return Ok(None);
+    };
+    match decode_control_current_row(&payload)? {
+        ControlCurrentRecord::App {
+            id,
+            tenant_id,
+            name,
+            client_id,
+            client_secret_encrypted,
+            active: true,
+        } => Ok(Some(StoredControlApp {
+            id,
+            tenant_id,
+            name,
+            client_id,
+            client_secret_encrypted,
+        })),
+        ControlCurrentRecord::App { active: false, .. } => Ok(None),
+        _ => bail!("control application row contains a different record type"),
+    }
+}
+
 fn read_control_state_from_coremeta_rows(core_store: &CoreStore) -> Result<ControlState> {
     let mut state = ControlState::default();
 
@@ -312,7 +510,7 @@ fn read_control_state_from_coremeta_rows(core_store: &CoreStore) -> Result<Contr
     for row in core_store.scan_coremeta_prefix(
         CF_MESH,
         TABLE_CONTROL_CURRENT_ROW,
-        &tenant_tuple_prefix()?,
+        &tenant_id_tuple_prefix()?,
     )? {
         match decode_control_current_row(&row.payload)? {
             ControlCurrentRecord::Tenant { id, name, active } => {
@@ -325,9 +523,11 @@ fn read_control_state_from_coremeta_rows(core_store: &CoreStore) -> Result<Contr
         }
     }
 
-    for row in
-        core_store.scan_coremeta_prefix(CF_MESH, TABLE_CONTROL_CURRENT_ROW, &app_tuple_prefix()?)?
-    {
+    for row in core_store.scan_coremeta_prefix(
+        CF_MESH,
+        TABLE_CONTROL_CURRENT_ROW,
+        &app_id_tuple_prefix()?,
+    )? {
         match decode_control_current_row(&row.payload)? {
             ControlCurrentRecord::App {
                 id,
@@ -643,18 +843,19 @@ async fn delete_app_inner(
     partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
     let state = read_control_state(storage).await?;
-    if !state.apps.contains_key(&app_id) {
-        return Err(anyhow!("app not found"));
-    }
+    let existing = state
+        .apps
+        .get(&app_id)
+        .ok_or_else(|| anyhow!("app not found"))?;
     append_control_event(
         storage,
         ControlEventBody::AppDelete { app_id },
         vec![ControlCurrentRecord::App {
             id: app_id,
-            tenant_id: 0,
-            name: String::new(),
-            client_id: String::new(),
-            client_secret_encrypted: Vec::new(),
+            tenant_id: existing.tenant_id,
+            name: existing.name.clone(),
+            client_id: existing.client_id.clone(),
+            client_secret_encrypted: existing.client_secret_encrypted.clone(),
             active: false,
         }],
         fence_token,
@@ -675,10 +876,21 @@ async fn append_control_event(
     let row_generation = current_unix_nanos();
     let payload = encode_control_event_body(&event, fence_token, mutation_id)?;
     let partition_id = hex::encode(control_partition_id());
-    let mut operations = current_updates
-        .into_iter()
-        .map(|record| control_current_update(record, &mutation_id.to_string(), row_generation))
-        .collect::<Result<Vec<_>>>()?;
+    let mut operations = Vec::new();
+    for record in current_updates {
+        operations.extend(control_current_updates(
+            record,
+            &mutation_id.to_string(),
+            row_generation,
+        )?);
+    }
+    operations.extend(control_current_updates(
+        ControlCurrentRecord::Revision {
+            revision: row_generation,
+        },
+        &mutation_id.to_string(),
+        row_generation,
+    )?);
     operations.push(CoreMutationOperation::StreamAppend {
         partition_id: partition_id.clone(),
         stream_id: control_plane_stream_id(),
@@ -734,26 +946,79 @@ fn app_record(app: &StoredControlApp) -> App {
     }
 }
 
-fn control_current_update(
+fn control_current_updates(
     record: ControlCurrentRecord,
     mutation_id: &str,
     row_generation: u64,
-) -> Result<CoreMutationOperation> {
-    Ok(CoreMutationOperation::CoreMetaPut {
+) -> Result<Vec<CoreMutationOperation>> {
+    let payload = encode_control_current_row(&record, mutation_id, row_generation)?;
+    let mut operations = Vec::new();
+    match &record {
+        ControlCurrentRecord::Revision { .. } => {
+            operations.push(control_current_put(control_revision_tuple_key()?, payload));
+        }
+        ControlCurrentRecord::IdAllocator { .. } => {
+            operations.push(control_current_put(id_allocator_tuple_key()?, payload));
+        }
+        ControlCurrentRecord::Region { name, .. } => {
+            operations.push(control_current_put(region_tuple_key(name)?, payload));
+        }
+        ControlCurrentRecord::Tenant { id, name, active } => {
+            operations.push(control_current_put(
+                tenant_id_tuple_key(*id)?,
+                payload.clone(),
+            ));
+            if *active {
+                operations.push(control_current_put(tenant_name_tuple_key(name)?, payload));
+            } else {
+                operations.push(control_current_delete(tenant_name_tuple_key(name)?));
+            }
+        }
+        ControlCurrentRecord::App {
+            id,
+            tenant_id,
+            name,
+            client_id,
+            active,
+            ..
+        } => {
+            operations.push(control_current_put(app_id_tuple_key(*id)?, payload.clone()));
+            if *active {
+                operations.push(control_current_put(
+                    app_tenant_name_tuple_key(*tenant_id, name)?,
+                    payload.clone(),
+                ));
+                operations.push(control_current_put(
+                    app_client_id_tuple_key(client_id)?,
+                    payload,
+                ));
+            } else {
+                operations.push(control_current_delete(app_tenant_name_tuple_key(
+                    *tenant_id, name,
+                )?));
+                operations.push(control_current_delete(app_client_id_tuple_key(client_id)?));
+            }
+        }
+    }
+    Ok(operations)
+}
+
+fn control_current_put(tuple_key: Vec<u8>, payload: Vec<u8>) -> CoreMutationOperation {
+    CoreMutationOperation::CoreMetaPut {
         partition_id: hex::encode(control_partition_id()),
         cf: CF_MESH.to_string(),
         table_id: TABLE_CONTROL_CURRENT_ROW,
-        tuple_key: control_current_tuple_key(&record)?,
-        payload: encode_control_current_row(&record, mutation_id, row_generation)?,
-    })
+        tuple_key,
+        payload,
+    }
 }
 
-fn control_current_tuple_key(record: &ControlCurrentRecord) -> Result<Vec<u8>> {
-    match record {
-        ControlCurrentRecord::IdAllocator { .. } => id_allocator_tuple_key(),
-        ControlCurrentRecord::Region { name, .. } => region_tuple_key(name),
-        ControlCurrentRecord::Tenant { id, .. } => tenant_tuple_key(*id),
-        ControlCurrentRecord::App { id, .. } => app_tuple_key(*id),
+fn control_current_delete(tuple_key: Vec<u8>) -> CoreMutationOperation {
+    CoreMutationOperation::CoreMetaDelete {
+        partition_id: hex::encode(control_partition_id()),
+        cf: CF_MESH.to_string(),
+        table_id: TABLE_CONTROL_CURRENT_ROW,
+        tuple_key,
     }
 }
 
@@ -895,6 +1160,11 @@ fn encode_control_current_row(
         )),
         schema: CONTROL_CURRENT_SCHEMA.to_string(),
         record: Some(match record {
+            ControlCurrentRecord::Revision { revision } => {
+                control_current_proto::Record::Revision(RevisionCurrentProto {
+                    revision: *revision,
+                })
+            }
             ControlCurrentRecord::IdAllocator { max_allocated_id } => {
                 control_current_proto::Record::IdAllocator(IdAllocatorCurrentProto {
                     max_allocated_id: *max_allocated_id,
@@ -967,6 +1237,9 @@ fn decode_control_current_row(bytes: &[u8]) -> Result<ControlCurrentRecord> {
         .record
         .ok_or_else(|| anyhow!("control current protobuf is missing record"))?
     {
+        control_current_proto::Record::Revision(value) => Ok(ControlCurrentRecord::Revision {
+            revision: value.revision,
+        }),
         control_current_proto::Record::IdAllocator(value) => {
             Ok(ControlCurrentRecord::IdAllocator {
                 max_allocated_id: value.max_allocated_id,
@@ -992,68 +1265,81 @@ fn decode_control_current_row(bytes: &[u8]) -> Result<ControlCurrentRecord> {
     }
 }
 
-fn stable_suffix(bytes: &[u8]) -> String {
-    hex::encode(hash32(bytes))
+fn control_revision_tuple_key() -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("revision")])
 }
 
 fn id_allocator_tuple_key() -> Result<Vec<u8>> {
-    core_meta_tuple_key(&[
-        CoreMetaTuplePart::Utf8("control-current"),
-        CoreMetaTuplePart::Utf8("id-allocator"),
-    ])
+    core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("id-allocator")])
 }
 
 fn region_tuple_key(name: &str) -> Result<Vec<u8>> {
     core_meta_tuple_key(&[
-        CoreMetaTuplePart::Utf8("control-current"),
         CoreMetaTuplePart::Utf8("region"),
-        CoreMetaTuplePart::Hash(&stable_suffix(name.as_bytes())),
         CoreMetaTuplePart::Utf8(name),
     ])
 }
 
 fn region_tuple_prefix() -> Result<Vec<u8>> {
-    core_meta_tuple_key(&[
-        CoreMetaTuplePart::Utf8("control-current"),
-        CoreMetaTuplePart::Utf8("region"),
-    ])
+    core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("region")])
 }
 
-fn tenant_tuple_key(id: i64) -> Result<Vec<u8>> {
+fn tenant_id_tuple_key(id: i64) -> Result<Vec<u8>> {
     core_meta_tuple_key(&[
-        CoreMetaTuplePart::Utf8("control-current"),
-        CoreMetaTuplePart::Utf8("tenant"),
+        CoreMetaTuplePart::Utf8("tenant-id"),
         CoreMetaTuplePart::I64(id),
     ])
 }
 
-fn tenant_tuple_prefix() -> Result<Vec<u8>> {
+fn tenant_id_tuple_prefix() -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("tenant-id")])
+}
+
+fn tenant_name_tuple_key(name: &str) -> Result<Vec<u8>> {
     core_meta_tuple_key(&[
-        CoreMetaTuplePart::Utf8("control-current"),
-        CoreMetaTuplePart::Utf8("tenant"),
+        CoreMetaTuplePart::Utf8("tenant-name"),
+        CoreMetaTuplePart::Utf8(name),
     ])
 }
 
-fn app_tuple_key(id: i64) -> Result<Vec<u8>> {
+fn app_id_tuple_key(id: i64) -> Result<Vec<u8>> {
     core_meta_tuple_key(&[
-        CoreMetaTuplePart::Utf8("control-current"),
-        CoreMetaTuplePart::Utf8("app"),
+        CoreMetaTuplePart::Utf8("app-id"),
         CoreMetaTuplePart::I64(id),
     ])
 }
 
-fn app_tuple_prefix() -> Result<Vec<u8>> {
+fn app_id_tuple_prefix() -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("app-id")])
+}
+
+fn app_tenant_name_tuple_key(tenant_id: i64, name: &str) -> Result<Vec<u8>> {
     core_meta_tuple_key(&[
-        CoreMetaTuplePart::Utf8("control-current"),
-        CoreMetaTuplePart::Utf8("app"),
+        CoreMetaTuplePart::Utf8("app-tenant"),
+        CoreMetaTuplePart::I64(tenant_id),
+        CoreMetaTuplePart::Utf8(name),
+    ])
+}
+
+fn app_tenant_name_tuple_prefix(tenant_id: i64) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("app-tenant"),
+        CoreMetaTuplePart::I64(tenant_id),
+    ])
+}
+
+fn app_client_id_tuple_key(client_id: &str) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("app-client"),
+        CoreMetaTuplePart::Utf8(client_id),
     ])
 }
 
 fn control_current_realm_id(record: &ControlCurrentRecord) -> String {
     match record {
-        ControlCurrentRecord::IdAllocator { .. } | ControlCurrentRecord::Region { .. } => {
-            "system".to_string()
-        }
+        ControlCurrentRecord::Revision { .. }
+        | ControlCurrentRecord::IdAllocator { .. }
+        | ControlCurrentRecord::Region { .. } => "system".to_string(),
         ControlCurrentRecord::Tenant { id, .. } => format!("tenant/{id}"),
         ControlCurrentRecord::App { tenant_id, .. } => format!("tenant/{tenant_id}"),
     }
@@ -1061,6 +1347,9 @@ fn control_current_realm_id(record: &ControlCurrentRecord) -> String {
 
 fn control_current_root_key_hash(record: &ControlCurrentRecord) -> String {
     match record {
+        ControlCurrentRecord::Revision { .. } => {
+            core_meta_root_key_hash("control/current-revision")
+        }
         ControlCurrentRecord::IdAllocator { .. } => core_meta_root_key_hash("control/id-allocator"),
         ControlCurrentRecord::Region { .. } => core_meta_root_key_hash("control/regions"),
         ControlCurrentRecord::Tenant { id, .. } => {
@@ -1180,6 +1469,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_point_indexes_and_tenant_app_pages_track_current_state() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let tenant = create_tenant(&storage, "default").await.unwrap();
+        let zeta = create_app(&storage, tenant.id, "zeta", "client-z", b"secret-z")
+            .await
+            .unwrap();
+        let alpha = create_app(&storage, tenant.id, "alpha", "client-a", b"secret-a")
+            .await
+            .unwrap();
+        let middle = create_app(&storage, tenant.id, "middle", "client-m", b"secret-m")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_tenant_by_name(&storage, "default")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            tenant.id
+        );
+        assert_eq!(
+            read_app_by_tenant_name(&storage, tenant.id, "alpha")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            alpha.id
+        );
+        assert_eq!(
+            read_app_by_id(&storage, zeta.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .client_id,
+            "client-z"
+        );
+        assert_eq!(
+            read_app_details_by_client_id(&storage, "client-m")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            middle.id
+        );
+
+        let revision = current_control_collection_revision(&storage).await.unwrap();
+        let first = page_apps_for_tenant(&storage, tenant.id, &revision, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .apps
+                .iter()
+                .map(|app| app.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "middle"]
+        );
+        let second = page_apps_for_tenant(
+            &storage,
+            tenant.id,
+            &revision,
+            first.next_tuple_key.as_deref(),
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            second
+                .apps
+                .iter()
+                .map(|app| app.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["zeta"]
+        );
+        assert!(second.next_tuple_key.is_none());
+
+        delete_app_inner(&storage, alpha.id, 0, None).await.unwrap();
+        assert!(
+            read_app_by_tenant_name(&storage, tenant.id, "alpha")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            read_app_details_by_client_id(&storage, "client-a")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(read_app_by_id(&storage, alpha.id).await.unwrap().is_none());
+        assert!(
+            page_apps_for_tenant(&storage, tenant.id, &revision, None, 2)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("revision changed")
+        );
+    }
+
+    #[tokio::test]
     async fn control_current_state_does_not_replay_control_history_stream() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
@@ -1261,11 +1652,11 @@ mod tests {
                     },
                 ]
                 .into_iter()
-                .map(|record| {
-                    control_current_update(record, "current-row-seed", current_unix_nanos())
+                .flat_map(|record| {
+                    control_current_updates(record, "current-row-seed", current_unix_nanos())
+                        .unwrap()
                 })
-                .collect::<Result<Vec<_>>>()
-                .unwrap(),
+                .collect(),
             })
             .await
             .unwrap();

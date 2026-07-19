@@ -27,9 +27,7 @@ struct ActiveIndexPolicyDefinitionProto {
 
 impl Persistence {
     pub async fn get_tenant_by_name(&self, name: &str) -> Result<Option<Tenant>> {
-        Ok(control_journal::read_control_state(&self.storage)
-            .await?
-            .tenant_by_name(name))
+        control_journal::read_tenant_by_name(&self.storage, name).await
     }
 
     pub async fn list_tenants(&self) -> Result<Vec<Tenant>> {
@@ -39,9 +37,7 @@ impl Persistence {
     }
 
     pub async fn get_app_by_client_id(&self, client_id: &str) -> Result<Option<AppDetails>> {
-        Ok(control_journal::read_control_state(&self.storage)
-            .await?
-            .app_details_by_client_id(client_id))
+        control_journal::read_app_details_by_client_id(&self.storage, client_id).await
     }
 
     pub async fn create_tenant(&self, name: &str, idempotency_key: &str) -> Result<Tenant> {
@@ -81,21 +77,34 @@ impl Persistence {
     }
 
     pub async fn get_app_by_id(&self, id: i64) -> Result<Option<App>> {
-        Ok(control_journal::read_control_state(&self.storage)
-            .await?
-            .app_by_id(id))
+        control_journal::read_app_by_id(&self.storage, id).await
     }
 
-    pub async fn get_app_by_name(&self, name: &str) -> Result<Option<App>> {
-        Ok(control_journal::read_control_state(&self.storage)
-            .await?
-            .app_by_name(name))
+    pub async fn get_app_by_tenant_name(&self, tenant_id: i64, name: &str) -> Result<Option<App>> {
+        control_journal::read_app_by_tenant_name(&self.storage, tenant_id, name).await
     }
 
     pub async fn list_apps_for_tenant(&self, tenant_id: i64) -> Result<Vec<App>> {
         Ok(control_journal::read_control_state(&self.storage)
             .await?
             .apps_for_tenant(tenant_id))
+    }
+
+    pub async fn page_apps_for_tenant(
+        &self,
+        tenant_id: i64,
+        expected_revision: &str,
+        after_tuple_key: Option<&[u8]>,
+        page_size: usize,
+    ) -> Result<control_journal::CurrentAppPage> {
+        control_journal::page_apps_for_tenant(
+            &self.storage,
+            tenant_id,
+            expected_revision,
+            after_tuple_key,
+            page_size,
+        )
+        .await
     }
 
     pub async fn update_app_secret(&self, app_id: i64, new_encrypted_secret: &[u8]) -> Result<()> {

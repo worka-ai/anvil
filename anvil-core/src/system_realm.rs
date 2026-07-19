@@ -405,10 +405,8 @@ async fn resolve_bootstrap_subject(
     let tenant_id = SYSTEM_STORAGE_TENANT_ID;
 
     let existing = persistence
-        .list_apps_for_tenant(tenant_id)
-        .await?
-        .into_iter()
-        .find(|app| app.name == app_name);
+        .get_app_by_tenant_name(tenant_id, app_name)
+        .await?;
     let app = match existing {
         Some(app) => app,
         None => {

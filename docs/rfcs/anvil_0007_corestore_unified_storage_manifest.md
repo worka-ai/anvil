@@ -610,6 +610,7 @@ Initial CoreMeta table registry:
 | `0x8803` | `cf_mesh` | `scope_kind / scope_id / scope_revision` | `RepairFindingRow` | immutable finding at the committed repair-scope generation |
 | `0x8804` | `cf_mesh` | `tenant_id / bucket_name` | `BucketCurrentRow` | active tenant bucket rows only; removed on delete |
 | `0x8805` | `cf_mesh` | `bucket_id` | `BucketCurrentRow` | retained global bucket identity row, including deletion state |
+| `0x8806` | `cf_mesh` | one of the control-plane tuple forms below | `ControlCurrentRow` | committed control-plane generation only |
 | `0x880a` | `cf_mesh` | `scope_kind / scope_id` | `RepairFindingHeadRow` | current repair-scope revision point lookup |
 | `0x880b` | `cf_mesh` | `scope_kind / scope_id / finding_id` | `RepairFindingIdRow` | immutable finding-id-to-revision point lookup |
 | `0x8d01` | `cf_mesh` | `principal_or_node_id / key_id` | `NodeSigningKeyRow` | committed mesh root generation only |
@@ -989,6 +990,40 @@ the next opaque token in the S3 `ContinuationToken` response field only when
 more rows exist. A malformed, cross-principal, cross-page-size, expired, or
 stale-revision token MUST be rejected; neither protocol has an unbounded
 compatibility mode.
+
+`ControlCurrentRow` uses a closed set of tuple forms. The leading UTF-8 value is
+a table-local discriminator; the remaining parts are the direct lookup or sort
+key and MUST NOT include redundant hashes:
+
+```text
+("revision")
+("id-allocator")
+("region", region_name)
+("tenant-id", tenant_id)
+("tenant-name", tenant_name)
+("app-id", app_id)
+("app-tenant", tenant_id, app_name)
+("app-client", client_id)
+```
+
+Tenant creation writes both tenant rows and the allocator row in the same
+control-root mutation. Application creation and secret rotation write the
+`app-id`, `app-tenant`, and `app-client` rows in the same mutation. Application
+deletion retains an inactive `app-id` identity row but physically deletes the
+tenant/name and client-id rows. The public application lookup paths are point
+reads over these rows. `ListApplications` seeks the `("app-tenant", tenant_id)`
+prefix and reads at most `page_size + 1` rows; it MUST NOT reconstruct all
+control state or paginate an in-memory collection.
+
+The `("revision")` row is the current control collection head. Every control
+mutation MUST update it atomically with the current projection rows affected by
+that mutation. It is the revision bound into application-list continuation
+tokens. A mutation may therefore invalidate a page for an unrelated control
+collection, but obtaining or validating the revision remains an `O(1)` point
+read and cannot race the later publication of the history stream record.
+Reconstructing a collection revision from rows or history is forbidden. A
+narrower per-collection head may replace the global head only when it is updated
+atomically with every row in that collection.
 
 message RepairFindingRow {
   CoreMetaRowCommon common = 1;

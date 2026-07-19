@@ -8,7 +8,7 @@ use crate::{
         encode_optional_realm_namespace, encode_realm_namespace, encode_userset_subject_realm,
         parse_userset_subject,
     },
-    bucket_journal,
+    bucket_journal, control_journal,
     formats::hash32,
     permissions::AnvilAction,
     services::watch_envelope::{self, WatchEnvelopeParts},
@@ -363,11 +363,52 @@ impl AuthService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
         require_app_management_permission(self, &claims, AnvilAction::AppRead).await?;
-        let applications = self
-            .persistence
-            .list_apps_for_tenant(claims.tenant_id)
+        let page_size = crate::services::collection_cursor::page_size(req.page.as_ref())?;
+        let revision = control_journal::current_control_collection_revision(&self.storage)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
+        let binding = crate::services::collection_cursor::CollectionCursorBinding {
+            service_method: "anvil.AuthService/ListApplications",
+            filters: &[],
+            principal_scope: &principal_scope,
+            page_size,
+            revision: &revision,
+            sort: "app_name.asc",
+        };
+        let position = crate::services::collection_cursor::decode_page_token(
+            req.page.as_ref(),
+            &binding,
+            self.config.jwt_secret.as_bytes(),
+        )?;
+        let after_tuple_key =
+            crate::services::collection_cursor::decode_binary_position(position.as_deref())?;
+        let app_page = self
+            .persistence
+            .page_apps_for_tenant(
+                claims.tenant_id,
+                &revision,
+                after_tuple_key.as_deref(),
+                page_size,
+            )
+            .await
+            .map_err(|error| Status::aborted(error.to_string()))?;
+        let next_page_token = app_page
+            .next_tuple_key
+            .as_deref()
+            .map(crate::services::collection_cursor::encode_binary_position)
+            .transpose()?
+            .map(|position| {
+                crate::services::collection_cursor::encode_next_page_token(
+                    &position,
+                    &binding,
+                    self.config.jwt_secret.as_bytes(),
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let applications = app_page
+            .apps
             .into_iter()
             .map(|app| ApplicationDescriptor {
                 tenant_id: claims.tenant_id.to_string(),
@@ -375,27 +416,10 @@ impl AuthService for AppState {
                 app_name: app.name,
                 client_id: app.client_id,
             })
-            .collect::<Vec<_>>();
-        let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
-        let (applications, page) = crate::services::collection_cursor::paginate(
-            applications,
-            req.page.as_ref(),
-            "anvil.AuthService/ListApplications",
-            &[],
-            &principal_scope,
-            "app_name.asc",
-            self.config.jwt_secret.as_bytes(),
-            |app| app.app_name.as_str(),
-            |app| {
-                crate::services::collection_cursor::content_generation(&[
-                    app.app_id.as_bytes(),
-                    app.client_id.as_bytes(),
-                ])
-            },
-        )?;
+            .collect();
         Ok(Response::new(ListApplicationsResponse {
             applications,
-            page: Some(page),
+            page: Some(PageResponse { next_page_token }),
         }))
     }
 

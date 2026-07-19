@@ -907,11 +907,9 @@ pub(super) async fn app_in_claims_tenant(
 ) -> Result<crate::persistence::App, Status> {
     state
         .persistence
-        .list_apps_for_tenant(tenant_id)
+        .get_app_by_tenant_name(tenant_id, app_name)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .into_iter()
-        .find(|app| app.name == app_name)
         .ok_or_else(|| Status::not_found("Grantee app not found"))
 }
 

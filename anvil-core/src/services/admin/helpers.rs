@@ -1381,11 +1381,9 @@ pub(super) async fn resolve_tenant_app(
     }
     state
         .persistence
-        .list_apps_for_tenant(tenant_id)
+        .get_app_by_tenant_name(tenant_id, app_name)
         .await
         .map_err(|err| Status::internal(err.to_string()))?
-        .into_iter()
-        .find(|app| app.name == app_name)
         .ok_or_else(|| Status::not_found("Application not found"))
 }
 

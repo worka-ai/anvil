@@ -131,11 +131,9 @@ impl AdminService for AppState {
         let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
         let app = self
             .persistence
-            .list_apps_for_tenant(tenant_id)
+            .get_app_by_tenant_name(tenant_id, &req.app_name)
             .await
             .map_err(|err| Status::internal(err.to_string()))?
-            .into_iter()
-            .find(|app| app.name == req.app_name)
             .ok_or_else(|| Status::not_found("Application not found"))?;
         let client_secret = generated_client_secret();
         let encrypted_secret = encrypt_admin_client_secret(self, &client_secret)?;
