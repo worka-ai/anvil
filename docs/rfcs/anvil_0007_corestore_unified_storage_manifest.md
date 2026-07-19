@@ -608,6 +608,8 @@ Initial CoreMeta table registry:
 | `0x8801` | `cf_mesh` | `region / cell / node_id` | `MeshNodeRow` | committed mesh root generation only |
 | `0x8802` | `cf_mesh` | `partition_id / epoch` | `MeshPartitionRow` | committed mesh root generation only |
 | `0x8803` | `cf_mesh` | `scope_kind / scope_id / scope_revision` | `RepairFindingRow` | immutable finding at the committed repair-scope generation |
+| `0x8804` | `cf_mesh` | `tenant_id / bucket_name` | `BucketCurrentRow` | active tenant bucket rows only; removed on delete |
+| `0x8805` | `cf_mesh` | `bucket_id` | `BucketCurrentRow` | retained global bucket identity row, including deletion state |
 | `0x880a` | `cf_mesh` | `scope_kind / scope_id` | `RepairFindingHeadRow` | current repair-scope revision point lookup |
 | `0x880b` | `cf_mesh` | `scope_kind / scope_id / finding_id` | `RepairFindingIdRow` | immutable finding-id-to-revision point lookup |
 | `0x8d01` | `cf_mesh` | `principal_or_node_id / key_id` | `NodeSigningKeyRow` | committed mesh root generation only |
@@ -951,6 +953,42 @@ message MeshPartitionRow {
   repeated string root_key_ranges = 6;
   uint64 fence_token = 7;
 }
+
+message BucketCurrentRow {
+  CoreMetaRowCommon common = 1;
+  string schema = 2; // "anvil.core.bucket_current.v1"
+  bool deleted = 3;
+  int64 bucket_id = 4;
+  int64 tenant_id = 5;
+  string bucket_name = 6;
+  string region = 7;
+  string created_at = 8;
+  bool is_public_read = 9;
+}
+
+The tenant-name table is the ordered current collection used by
+`ListBuckets`. Its physical key is exactly `(tenant_id, bucket_name)`, so a page
+seek starts after the prior encoded tuple and visits at most `page_size + 1`
+rows. A delete removes this row in the same tenant-root mutation that appends
+the delete event. Deleted tenant rows MUST NOT remain as tombstones in the
+current collection. The global id table retains the last row for every allocated
+bucket id, including `deleted=true`, so an id is never recycled and a point read
+can distinguish a deleted identity from one that never existed.
+
+The tenant bucket metadata stream head is the collection revision. The stream
+append and current-row put/delete MUST be committed in one root mutation. Page
+tokens bind to the point-read stream head sequence and event hash; a head change
+before or during a page read invalidates the page. Implementations MUST NOT hash,
+sort, or materialize all bucket rows to construct a page token.
+
+Both native `BucketService.ListBuckets` and S3 `ListBuckets` MUST use this
+ordered current collection. Native callers use `PageRequest` with the global
+collection bounds in this RFC. S3 callers use `max-buckets` with a default and
+maximum of 1,000 and an opaque authenticated `continuation-token`. Anvil returns
+the next opaque token in the S3 `ContinuationToken` response field only when
+more rows exist. A malformed, cross-principal, cross-page-size, expired, or
+stale-revision token MUST be rejected; neither protocol has an unbounded
+compatibility mode.
 
 message RepairFindingRow {
   CoreMetaRowCommon common = 1;

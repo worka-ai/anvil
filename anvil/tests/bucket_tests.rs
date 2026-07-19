@@ -5,7 +5,7 @@ use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::{
     AbortMultipartRequest, CreateBucketRequest, DeleteBucketRequest, GetBucketPolicyRequest,
     InitiateMultipartRequest, ListBucketsRequest, NativeMutationContext, ObjectMetadata,
-    PutBucketPolicyRequest, PutObjectRequest, WatchBucketMetadataRequest,
+    PageRequest, PutBucketPolicyRequest, PutObjectRequest, WatchBucketMetadataRequest,
 };
 use anvil::tasks::TaskStatus;
 use futures_util::StreamExt;
@@ -401,6 +401,49 @@ async fn test_list_buckets() {
 
     assert!(list_res.buckets.iter().any(|b| b.name == bucket_name1));
     assert!(list_res.buckets.iter().any(|b| b.name == bucket_name2));
+
+    let first_page = bucket_client
+        .list_buckets(authenticated(
+            Request::new(ListBucketsRequest {
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: String::new(),
+                }),
+            }),
+            &actor.token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first_page.buckets.len(), 1);
+    let next_page_token = first_page
+        .page
+        .expect("first page metadata")
+        .next_page_token;
+    assert!(!next_page_token.is_empty());
+
+    let second_page = bucket_client
+        .list_buckets(authenticated(
+            Request::new(ListBucketsRequest {
+                page: Some(PageRequest {
+                    page_size: 1,
+                    page_token: next_page_token,
+                }),
+            }),
+            &actor.token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second_page.buckets.len(), 1);
+    assert_ne!(first_page.buckets[0].name, second_page.buckets[0].name);
+    assert!(
+        second_page
+            .page
+            .expect("second page metadata")
+            .next_page_token
+            .is_empty()
+    );
 }
 
 #[tokio::test]

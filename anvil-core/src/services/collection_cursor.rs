@@ -10,11 +10,14 @@ type HmacSha256 = Hmac<Sha256>;
 const TOKEN_VERSION: u8 = 1;
 const TOKEN_DOMAIN: &[u8] = b"anvil.collection.page-token.v1";
 const TOKEN_TTL_SECONDS: u64 = 15 * 60;
+const MAX_ENCODED_TOKEN_BYTES: usize = 32 * 1024;
+const MAX_POSITION_TEXT_BYTES: usize = 16 * 1024;
+const MAX_BINARY_POSITION_BYTES: usize = 8 * 1024;
 pub(crate) const DEFAULT_PAGE_SIZE: usize = 100;
 pub(crate) const MAX_PAGE_SIZE: usize = 1000;
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct CollectionCursorBinding<'a> {
+pub struct CollectionCursorBinding<'a> {
     pub service_method: &'static str,
     pub filters: &'a [(&'a str, &'a str)],
     pub principal_scope: &'a str,
@@ -60,7 +63,7 @@ struct CollectionCursorTokenProto {
     signature: String,
 }
 
-pub(crate) fn page_size(page: Option<&PageRequest>) -> Result<usize, Status> {
+pub fn page_size(page: Option<&PageRequest>) -> Result<usize, Status> {
     let requested = page.map(|page| page.page_size).unwrap_or_default();
     if requested == 0 {
         return Ok(DEFAULT_PAGE_SIZE);
@@ -75,7 +78,7 @@ pub(crate) fn page_size(page: Option<&PageRequest>) -> Result<usize, Status> {
     Ok(requested)
 }
 
-pub(crate) fn decode_page_token(
+pub fn decode_page_token(
     page: Option<&PageRequest>,
     binding: &CollectionCursorBinding<'_>,
     signing_key: &[u8],
@@ -86,6 +89,9 @@ pub(crate) fn decode_page_token(
     else {
         return Ok(None);
     };
+    if encoded.len() > MAX_ENCODED_TOKEN_BYTES {
+        return Err(invalid_token());
+    }
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded)
         .map_err(|_| invalid_token())?;
@@ -98,13 +104,15 @@ pub(crate) fn decode_page_token(
     Ok(Some(proto.position))
 }
 
-pub(crate) fn encode_next_page_token(
+pub fn encode_next_page_token(
     position: &str,
     binding: &CollectionCursorBinding<'_>,
     signing_key: &[u8],
 ) -> Result<String, Status> {
-    if position.is_empty() {
-        return Err(Status::internal("collection page position is empty"));
+    if position.is_empty() || position.len() > MAX_POSITION_TEXT_BYTES {
+        return Err(Status::internal(
+            "collection page position is outside supported bounds",
+        ));
     }
     let token = CollectionCursorToken {
         position: position.to_string(),
@@ -116,6 +124,32 @@ pub(crate) fn encode_next_page_token(
     proto.signature = sign(&proto, signing_key)?;
     let bytes = crate::core_store::encode_deterministic_proto(&proto);
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+pub fn encode_binary_position(position: &[u8]) -> Result<String, Status> {
+    if position.is_empty() || position.len() > MAX_BINARY_POSITION_BYTES {
+        return Err(Status::internal(
+            "collection binary page position is outside supported bounds",
+        ));
+    }
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(position))
+}
+
+pub fn decode_binary_position(position: Option<&str>) -> Result<Option<Vec<u8>>, Status> {
+    position
+        .map(|position| {
+            if position.is_empty() || position.len() > MAX_POSITION_TEXT_BYTES {
+                return Err(invalid_token());
+            }
+            let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(position)
+                .map_err(|_| invalid_token())?;
+            if decoded.is_empty() || decoded.len() > MAX_BINARY_POSITION_BYTES {
+                return Err(invalid_token());
+            }
+            Ok(decoded)
+        })
+        .transpose()
 }
 
 pub(crate) fn collection_revision<'a>(records: impl IntoIterator<Item = (&'a str, u64)>) -> String {
@@ -222,6 +256,8 @@ fn validate_proto(
         || proto.revision != binding.revision
         || proto.sort != binding.sort
         || proto.expires_at_unix_seconds < now_unix_seconds()?
+        || proto.position.is_empty()
+        || proto.position.len() > MAX_POSITION_TEXT_BYTES
     {
         return Err(invalid_token());
     }
@@ -394,5 +430,16 @@ mod tests {
         let page = ordered_page(vec!["c", "a", "b"], Some("a"), 1, |item| *item).unwrap();
         assert_eq!(page.items, vec!["b"]);
         assert_eq!(page.next_position.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn binary_positions_round_trip_and_reject_oversized_values() {
+        let position = vec![0, 1, 2, 0xff];
+        let encoded = encode_binary_position(&position).unwrap();
+        assert_eq!(
+            decode_binary_position(Some(&encoded)).unwrap(),
+            Some(position)
+        );
+        assert!(encode_binary_position(&vec![0; MAX_BINARY_POSITION_BYTES + 1]).is_err());
     }
 }

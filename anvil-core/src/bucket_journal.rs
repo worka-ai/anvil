@@ -2,8 +2,8 @@ use crate::core_store::{
     CF_MESH, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
     CoreStore, CoreTransaction, CoreTransactionState, CoreTransactionUpdate, ReadStream,
     TABLE_BUCKET_CURRENT_BY_ID_ROW, TABLE_BUCKET_CURRENT_BY_NAME_ROW,
-    core_meta_committed_row_common, core_meta_payload_digest, core_meta_root_key_hash,
-    core_meta_tuple_key,
+    core_meta_committed_row_common, core_meta_payload_digest, core_meta_record_tuple_key,
+    core_meta_root_key_hash, core_meta_tuple_key,
 };
 use crate::formats::{Hash32, hash32};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
@@ -506,6 +506,12 @@ struct BucketCurrentRow {
     bucket: Bucket,
 }
 
+#[derive(Debug, Clone)]
+pub struct CurrentBucketPage {
+    pub buckets: Vec<Bucket>,
+    pub next_tuple_key: Option<Vec<u8>>,
+}
+
 impl BucketCurrentRow {
     fn into_active_bucket(self) -> Option<Bucket> {
         if self.deleted {
@@ -546,28 +552,42 @@ fn bucket_current_coremeta_operations_with_root(
     common_realm_id: String,
     common_root_key_hash: String,
 ) -> Result<Vec<CoreMutationOperation>> {
-    let payload = encode_bucket_current_row_with_root(
-        bucket,
-        mutation == BucketJournalMutation::Delete,
-        mutation_id,
-        row_generation,
-        common_realm_id,
-        common_root_key_hash,
-    )?;
     let operations = match scope {
+        BucketJournalScope::Tenant(tenant_id) if mutation == BucketJournalMutation::Delete => {
+            vec![CoreMutationOperation::CoreMetaDelete {
+                partition_id: operation_partition_id.to_string(),
+                cf: CF_MESH.to_string(),
+                table_id: TABLE_BUCKET_CURRENT_BY_NAME_ROW,
+                tuple_key: tenant_bucket_name_current_tuple_key(tenant_id, &bucket.name)?,
+            }]
+        }
         BucketJournalScope::Tenant(tenant_id) => vec![CoreMutationOperation::CoreMetaPut {
             partition_id: operation_partition_id.to_string(),
             cf: CF_MESH.to_string(),
             table_id: TABLE_BUCKET_CURRENT_BY_NAME_ROW,
             tuple_key: tenant_bucket_name_current_tuple_key(tenant_id, &bucket.name)?,
-            payload,
+            payload: encode_bucket_current_row_with_root(
+                bucket,
+                false,
+                mutation_id,
+                row_generation,
+                common_realm_id,
+                common_root_key_hash,
+            )?,
         }],
         BucketJournalScope::Global => vec![CoreMutationOperation::CoreMetaPut {
             partition_id: operation_partition_id.to_string(),
             cf: CF_MESH.to_string(),
             table_id: TABLE_BUCKET_CURRENT_BY_ID_ROW,
             tuple_key: global_bucket_id_current_tuple_key(bucket.id)?,
-            payload,
+            payload: encode_bucket_current_row_with_root(
+                bucket,
+                mutation == BucketJournalMutation::Delete,
+                mutation_id,
+                row_generation,
+                common_realm_id,
+                common_root_key_hash,
+            )?,
         }],
     };
     Ok(operations)
@@ -668,21 +688,70 @@ async fn overlay_current_bucket_rows(
     Ok(())
 }
 
-fn encode_bucket_current_row(
-    scope: BucketJournalScope,
-    bucket: &Bucket,
-    deleted: bool,
-    mutation_id: &str,
-    row_generation: u64,
-) -> Result<Vec<u8>> {
-    encode_bucket_current_row_with_root(
-        bucket,
-        deleted,
-        mutation_id,
-        row_generation,
-        scope.realm_id(),
-        scope.root_key_hash(),
-    )
+pub async fn current_bucket_collection_revision(
+    storage: &Storage,
+    tenant_id: i64,
+) -> Result<String> {
+    let scope = BucketJournalScope::Tenant(tenant_id);
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let (sequence, event_hash) = core_store.raw_stream_head(&scope.stream_id()).await?;
+    Ok(format!("{sequence}:{event_hash}"))
+}
+
+pub async fn page_current_buckets(
+    storage: &Storage,
+    tenant_id: i64,
+    expected_revision: &str,
+    after_tuple_key: Option<&[u8]>,
+    page_size: usize,
+) -> Result<CurrentBucketPage> {
+    if !(1..=1000).contains(&page_size) {
+        return Err(anyhow!("bucket page size must be between 1 and 1000"));
+    }
+    if current_bucket_collection_revision(storage, tenant_id).await? != expected_revision {
+        return Err(anyhow!("bucket collection revision changed"));
+    }
+
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let prefix = tenant_bucket_name_current_tuple_prefix(tenant_id)?;
+    let mut rows = core_store.scan_coremeta_prefix_page(
+        CF_MESH,
+        TABLE_BUCKET_CURRENT_BY_NAME_ROW,
+        &prefix,
+        after_tuple_key,
+        page_size + 1,
+    )?;
+    let has_more = rows.len() > page_size;
+    if has_more {
+        rows.truncate(page_size);
+    }
+    let next_tuple_key = if has_more {
+        let last = rows
+            .last()
+            .ok_or_else(|| anyhow!("bucket page continuation has no last row"))?;
+        Some(core_meta_record_tuple_key(&last.key)?.to_vec())
+    } else {
+        None
+    };
+    let mut buckets = Vec::with_capacity(rows.len());
+    for row in rows {
+        let current = decode_bucket_current_row(&row.payload)
+            .with_context(|| "decode bucket list CoreMeta row")?;
+        ensure_bucket_scope_matches(BucketJournalScope::Tenant(tenant_id), &current.bucket)?;
+        if current.deleted {
+            return Err(anyhow!(
+                "tenant bucket current table contains a deleted row"
+            ));
+        }
+        buckets.push(current.bucket);
+    }
+    if current_bucket_collection_revision(storage, tenant_id).await? != expected_revision {
+        return Err(anyhow!("bucket collection changed during page read"));
+    }
+    Ok(CurrentBucketPage {
+        buckets,
+        next_tuple_key,
+    })
 }
 
 fn encode_bucket_current_row_with_root(
@@ -911,35 +980,23 @@ fn require_bucket_scope_permit(
     Ok(())
 }
 
-fn bucket_key_hash(tenant_id: i64, bucket_name: &str) -> Hash32 {
-    hash32(format!("tenant/{tenant_id}/bucket/{bucket_name}").as_bytes())
-}
-
 fn tenant_bucket_name_current_tuple_key(tenant_id: i64, bucket_name: &str) -> Result<Vec<u8>> {
     core_meta_tuple_key(&[
-        CoreMetaTuplePart::Utf8("bucket-current-by-name"),
         CoreMetaTuplePart::I64(tenant_id),
-        CoreMetaTuplePart::Hash(&hex::encode(bucket_key_hash(tenant_id, bucket_name))),
         CoreMetaTuplePart::Utf8(bucket_name),
     ])
 }
 
 fn tenant_bucket_name_current_tuple_prefix(tenant_id: i64) -> Result<Vec<u8>> {
-    core_meta_tuple_key(&[
-        CoreMetaTuplePart::Utf8("bucket-current-by-name"),
-        CoreMetaTuplePart::I64(tenant_id),
-    ])
+    core_meta_tuple_key(&[CoreMetaTuplePart::I64(tenant_id)])
 }
 
 fn global_bucket_id_current_tuple_key(bucket_id: i64) -> Result<Vec<u8>> {
-    core_meta_tuple_key(&[
-        CoreMetaTuplePart::Utf8("bucket-current-by-id"),
-        CoreMetaTuplePart::I64(bucket_id),
-    ])
+    core_meta_tuple_key(&[CoreMetaTuplePart::I64(bucket_id)])
 }
 
 fn global_bucket_id_current_tuple_prefix() -> Result<Vec<u8>> {
-    core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("bucket-current-by-id")])
+    Ok(Vec::new())
 }
 
 fn current_unix_nanos() -> u64 {
@@ -1182,6 +1239,64 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .is_public_read
+        );
+    }
+
+    #[tokio::test]
+    async fn bucket_current_rows_page_in_name_order_at_a_stable_revision() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        for (id, name) in [(3, "zeta"), (1, "alpha"), (2, "middle")] {
+            append_bucket_mutation(
+                &storage,
+                &bucket(id, name, false),
+                BucketJournalMutation::Create,
+            )
+            .await
+            .unwrap();
+        }
+
+        let revision = current_bucket_collection_revision(&storage, 42)
+            .await
+            .unwrap();
+        let first = page_current_buckets(&storage, 42, &revision, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .buckets
+                .iter()
+                .map(|bucket| bucket.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "middle"]
+        );
+        let second =
+            page_current_buckets(&storage, 42, &revision, first.next_tuple_key.as_deref(), 2)
+                .await
+                .unwrap();
+        assert_eq!(
+            second
+                .buckets
+                .iter()
+                .map(|bucket| bucket.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["zeta"]
+        );
+        assert!(second.next_tuple_key.is_none());
+
+        append_bucket_mutation(
+            &storage,
+            &bucket(4, "new", false),
+            BucketJournalMutation::Create,
+        )
+        .await
+        .unwrap();
+        assert!(
+            page_current_buckets(&storage, 42, &revision, None, 2)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("revision changed")
         );
     }
 

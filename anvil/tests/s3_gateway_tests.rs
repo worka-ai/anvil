@@ -177,6 +177,8 @@ fn s3_client(http_base: &str, client_id: &str, client_secret: &str) -> Client {
     Client::from_conf(config)
 }
 
+#[path = "s3_gateway_tests/bucket_listing.rs"]
+mod bucket_listing;
 #[path = "s3_gateway_tests/public_private_large_object.rs"]
 mod public_private_large_object;
 #[path = "s3_gateway_tests/routing_public_alias.rs"]

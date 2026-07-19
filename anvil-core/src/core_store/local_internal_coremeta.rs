@@ -93,6 +93,27 @@ impl CoreStore {
             .collect()
     }
 
+    pub(crate) fn scan_coremeta_prefix_page(
+        &self,
+        cf: &'static str,
+        table_id: u16,
+        tuple_prefix: &[u8],
+        after_tuple_key: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<CoreMetaRecord>> {
+        self.meta
+            .scan_prefix_page(cf, table_id, tuple_prefix, after_tuple_key, limit)?
+            .into_iter()
+            .filter_map(|record| {
+                match self.coremeta_payload_is_committed_visible(cf, table_id, &record.payload) {
+                    Ok(true) => Some(Ok(record)),
+                    Ok(false) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect()
+    }
+
     pub fn write_coremeta_encoded_rows(&self, rows: &[CoreMetaEncodedRow<'_>]) -> Result<()> {
         self.meta.write_encoded_rows(rows)
     }

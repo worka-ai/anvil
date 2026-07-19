@@ -90,39 +90,63 @@ impl BucketService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
 
-        let buckets = self.bucket_manager.list_buckets(&claims).await?;
-
-        let response_buckets: Vec<crate::anvil_api::Bucket> = buckets
-            .into_iter()
-            .map(|b| crate::anvil_api::Bucket {
-                name: b.name,
-                creation_date: b.created_at.to_string(),
-                region: b.region,
-                is_public_read: b.is_public_read,
-                deleted: false,
-                bucket_id: b.id,
-            })
-            .collect();
-
+        self.bucket_manager.authorize_bucket_list(&claims).await?;
+        let page_size = crate::services::collection_cursor::page_size(req.page.as_ref())?;
+        let revision =
+            bucket_journal::current_bucket_collection_revision(&self.storage, claims.tenant_id)
+                .await
+                .map_err(|error| Status::internal(error.to_string()))?;
         let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
-        let (response_buckets, page) = crate::services::collection_cursor::paginate(
-            response_buckets,
+        let binding = crate::services::collection_cursor::CollectionCursorBinding {
+            service_method: "anvil.BucketService/ListBuckets",
+            filters: &[],
+            principal_scope: &principal_scope,
+            page_size,
+            revision: &revision,
+            sort: "bucket_name.asc",
+        };
+        let position = crate::services::collection_cursor::decode_page_token(
             req.page.as_ref(),
-            "anvil.BucketService/ListBuckets",
-            &[],
-            &principal_scope,
-            "bucket_name.asc",
+            &binding,
             self.config.jwt_secret.as_bytes(),
-            |bucket| bucket.name.as_str(),
-            |bucket| {
-                crate::services::collection_cursor::content_generation(&[
-                    bucket.creation_date.as_bytes(),
-                    bucket.region.as_bytes(),
-                    &[u8::from(bucket.is_public_read)],
-                    &bucket.bucket_id.to_le_bytes(),
-                ])
-            },
         )?;
+        let after_tuple_key =
+            crate::services::collection_cursor::decode_binary_position(position.as_deref())?;
+        let bucket_page = bucket_journal::page_current_buckets(
+            &self.storage,
+            claims.tenant_id,
+            &revision,
+            after_tuple_key.as_deref(),
+            page_size,
+        )
+        .await
+        .map_err(|error| Status::aborted(error.to_string()))?;
+        let next_page_token = bucket_page
+            .next_tuple_key
+            .as_deref()
+            .map(crate::services::collection_cursor::encode_binary_position)
+            .transpose()?
+            .map(|position| {
+                crate::services::collection_cursor::encode_next_page_token(
+                    &position,
+                    &binding,
+                    self.config.jwt_secret.as_bytes(),
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let response_buckets = bucket_page
+            .buckets
+            .into_iter()
+            .map(|bucket| crate::anvil_api::Bucket {
+                name: bucket.name,
+                creation_date: bucket.created_at.to_string(),
+                region: bucket.region,
+                is_public_read: bucket.is_public_read,
+                deleted: false,
+                bucket_id: bucket.id,
+            })
+            .collect::<Vec<_>>();
 
         tracing::debug!(
             "[service] EXITING list_buckets, found {} buckets",
@@ -130,7 +154,7 @@ impl BucketService for AppState {
         );
         Ok(Response::new(ListBucketsResponse {
             buckets: response_buckets,
-            page: Some(page),
+            page: Some(PageResponse { next_page_token }),
         }))
     }
 
