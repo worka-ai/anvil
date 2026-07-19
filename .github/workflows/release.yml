@@ -220,9 +220,64 @@ jobs:
       - name: Run Rust unit release gates
         run: ./scripts/release-gates.sh rust
 
+  coremeta-performance:
+    name: CoreMeta ordered-access release performance gate
+    needs: rust-unit
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: "1"
+      ANVIL_MACHINE_CLASS: "worka-builder-2-linux-x64"
+      ANVIL_GATE_STEP_TIMEOUT_SECONDS: "9900"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            pkg-config \
+            libssl-dev \
+            protobuf-compiler
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-release-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-cargo-v2-
+            ${{ runner.os }}-cargo-v2-
+
+      - name: Run release CoreMeta performance gate
+        run: ./scripts/release-gates.sh perf-release
+
+      - name: Upload CoreMeta release performance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coremeta-performance-release
+          path: target/anvil/perf/coremeta/release/
+          if-no-files-found: error
+          retention-days: 90
+
   server-core:
     name: Server core integration tests
-    needs: rust-unit
+    needs: coremeta-performance
     runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 60
     env:
@@ -289,7 +344,7 @@ jobs:
 
   publish:
     name: Publish release artifacts
-    needs: [build-image, static-and-docs, rust-unit, server-core, docker-integration]
+    needs: [build-image, static-and-docs, rust-unit, coremeta-performance, server-core, docker-integration]
     runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 45
     environment:

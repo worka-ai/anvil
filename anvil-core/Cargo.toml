@@ -19,6 +19,11 @@ publish = false
 name = "anvil_core"
 path = "src/lib.rs"
 
+[[bench]]
+name = "coremeta_release_gate"
+path = "benches/coremeta_release_gate/main.rs"
+harness = false
+
 [features]
 #Declare an enterprise feature, doesn't activate any depdendencies so leave it with an empty array
 enterprise = []

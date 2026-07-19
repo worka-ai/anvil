@@ -78,6 +78,7 @@ static_gates() {
   run_step "no external database gate" ./scripts/check-no-external-db.sh
   run_step "no public unfenced journal writes gate" ./scripts/check-no-public-unfenced-journal-writes.sh
   run_step "documentation hardening gate" ./scripts/check-docs-hardening.sh
+  run_step "CoreMeta performance evidence checker tests" python3 ./scripts/test-coremeta-perf-report.py
   run_step "release notes gate" ./scripts/test-release-notes.sh
   run_step "fission docs check" fission site check --project-dir documentation --release
   run_step "fission docs build" fission site build --project-dir documentation --release
@@ -316,11 +317,22 @@ docker_mesh_gates() {
   done
 }
 
+performance_quick_gates() {
+  run_step "CoreMeta ordered-access performance gate (quick)" \
+    ./scripts/run-coremeta-perf-gate.sh quick
+}
+
+performance_release_gates() {
+  run_step "CoreMeta ordered-access performance gate (release)" \
+    ./scripts/run-coremeta-perf-gate.sh release
+}
+
 case "$group" in
   all)
     static_gates
     rust_unit_gates
     server_core_integration_gates
+    performance_quick_gates
     docker_auth_gates
     docker_storage_gates
     docker_index_gates
@@ -334,6 +346,12 @@ case "$group" in
     ;;
   server-core)
     server_core_integration_gates
+    ;;
+  perf|perf-quick)
+    performance_quick_gates
+    ;;
+  perf-release)
+    performance_release_gates
     ;;
   docker-auth)
     docker_auth_gates
@@ -349,7 +367,7 @@ case "$group" in
     ;;
   *)
     cat >&2 <<USAGE
-usage: $0 [all|static|rust|server-core|docker-auth|docker-storage|docker-index|docker-mesh]
+usage: $0 [all|static|rust|server-core|perf|perf-quick|perf-release|docker-auth|docker-storage|docker-index|docker-mesh]
 USAGE
     exit 2
     ;;

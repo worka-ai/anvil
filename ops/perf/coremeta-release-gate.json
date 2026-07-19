@@ -1,0 +1,61 @@
+{
+  "schema": "anvil.perf.coremeta_gate_manifest.v1",
+  "dataset_id": "anvil-coremeta-ordered-access-v1",
+  "seed": "anvil-coremeta-ordered-access-v1-seed-42",
+  "profiles": {
+    "quick": {
+      "small_rows": 4096,
+      "large_rows": 65536,
+      "unrelated_rows": 4096,
+      "batch_rows": 4096,
+      "payload_bytes": 64,
+      "page_size": 64,
+      "scaling_page_size": 256,
+      "warmup_operations": 64,
+      "point_samples": 1000,
+      "page_samples": 250,
+      "mutation_samples": 24,
+      "thresholds": {
+        "point_get_p95_ms": 10.0,
+        "page_p95_floor_ms": 25.0,
+        "page_p95_point_multiplier": 100.0,
+        "durable_single_p95_ms": 250.0,
+        "transactional_head_p95_floor_ms": 350.0,
+        "transactional_head_single_multiplier": 4.0,
+        "point_work_growth_ratio": 4.0,
+        "deep_page_work_growth_ratio": 3.0,
+        "deep_to_early_work_ratio": 3.0,
+        "page_size_work_ratio_multiplier": 2.0,
+        "page_work_per_item": 16.0,
+        "page_fixed_work": 512.0
+      }
+    },
+    "release": {
+      "small_rows": 65536,
+      "large_rows": 1048576,
+      "unrelated_rows": 65536,
+      "batch_rows": 4096,
+      "payload_bytes": 64,
+      "page_size": 128,
+      "scaling_page_size": 1024,
+      "warmup_operations": 512,
+      "point_samples": 10000,
+      "page_samples": 2000,
+      "mutation_samples": 100,
+      "thresholds": {
+        "point_get_p95_ms": 10.0,
+        "page_p95_floor_ms": 25.0,
+        "page_p95_point_multiplier": 100.0,
+        "durable_single_p95_ms": 250.0,
+        "transactional_head_p95_floor_ms": 350.0,
+        "transactional_head_single_multiplier": 4.0,
+        "point_work_growth_ratio": 4.0,
+        "deep_page_work_growth_ratio": 3.0,
+        "deep_to_early_work_ratio": 3.0,
+        "page_size_work_ratio_multiplier": 2.0,
+        "page_work_per_item": 16.0,
+        "page_fixed_work": 512.0
+      }
+    }
+  }
+}
