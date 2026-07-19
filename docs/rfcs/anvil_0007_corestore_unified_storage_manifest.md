@@ -981,26 +981,36 @@ message MaterialisationCursorRow {
 
 message WriterSegmentRow {
   CoreMetaRowCommon common = 1;
-  string writer_family = 2;
-  string scope_hash = 3;
-  uint64 generation = 4;
-  uint64 source_cursor = 5;
-  CoreMetaLocator segment_locator = 6;
+  string schema = 2; // "anvil.coremeta.writer_segment_locator.v1"
+  string writer_family = 3;
+  string scope = 4;
+  string segment_ref = 5;
+  string core_object_ref_target = 6;
   string segment_hash = 7;
-  uint64 record_count = 8;
-  uint64 created_at_unix_nanos = 9;
+  uint64 segment_length = 8;
+  uint64 generation = 9;
+  uint64 source_cursor = 10;
+  uint64 created_at_unix_nanos = 11;
+  uint64 publication_generation = 12;
 }
 
 message WriterHeadRow {
   CoreMetaRowCommon common = 1;
-  string writer_family = 2;
-  string scope_hash = 3;
-  uint64 current_generation = 4;
-  uint64 source_cursor = 5;
-  CoreMetaLocator segment_locator = 6;
-  string segment_hash = 7;
-  uint64 compacted_through_cursor = 8;
-  uint64 updated_at_unix_nanos = 9;
+  string schema = 2; // "anvil.coremeta.writer_head.v1"
+  string writer_family = 3;
+  string scope = 4;
+  string scope_hash = 5;
+  uint64 current_generation = 6;
+  uint64 source_cursor = 7;
+  string segment_ref = 8;
+  string core_object_ref_target = 9;
+  string segment_hash = 10;
+  uint64 segment_length = 11;
+  uint64 compacted_through_cursor = 12;
+  uint64 segment_created_at_unix_nanos = 13;
+  uint64 publication_generation = 14;
+  uint64 published_at_unix_nanos = 15;
+  string publication_transaction_id = 16;
 }
 
 message WatchCheckpointRow {
@@ -1019,6 +1029,20 @@ single point read of `WriterHeadRow`; listing all historical segments to compute
 the maximum generation is forbidden. Historical segment scans are permitted
 only for explicit history, repair, or diagnostics APIs and must themselves be
 bounded and paginated.
+
+`generation` is the writer family's logical generation and MAY begin above one
+when a writer adopts an existing source cursor. `publication_generation` is the
+contiguous CoreMeta root generation for the `(writer_family, scope_hash)` root.
+Each successful publication increments `publication_generation` by exactly one;
+the immutable segment row and replacement head carry that same value in both
+their payload and `CoreMetaRowCommon.root_generation`. Forward logical
+generations need not be contiguous. A writer MAY publish a previously missing
+historical generation for an explicit historical read or repair. Such a
+publication still advances `publication_generation` atomically but republishes
+the existing logical head unchanged; it never moves `current_generation`
+backwards. An existing logical generation is immutable: an exact retry succeeds
+idempotently and different content fails. This separation prevents source or
+historical-generation order from being misinterpreted as CoreMeta commit order.
 
 message LandedByteRefRow {
   CoreMetaRowCommon common = 1;

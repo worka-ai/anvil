@@ -178,6 +178,7 @@ pub async fn read_registry_segment(
             &parsed.repository,
             &parsed.record_kind,
         )?,
+        parsed.generation,
         segment_ref,
     )?
     .ok_or_else(|| anyhow!("registry segment catalog row is missing"))?;
@@ -268,6 +269,7 @@ struct ParsedRegistrySegmentRef {
     namespace: String,
     repository: String,
     record_kind: String,
+    generation: u64,
 }
 
 fn parse_registry_segment_ref(segment_ref: &str) -> Result<ParsedRegistrySegmentRef> {
@@ -287,7 +289,7 @@ fn parse_registry_segment_ref(segment_ref: &str) -> Result<ParsedRegistrySegment
     validate_segment_component(parts[4], "registry namespace")?;
     validate_segment_component(parts[6], "registry repository")?;
     validate_segment_component(parts[8], "registry record kind")?;
-    parts[10]
+    let generation = parts[10]
         .parse::<u64>()
         .map_err(|_| anyhow!("registry segment ref generation is invalid"))?;
     if parts[12].is_empty() {
@@ -298,6 +300,7 @@ fn parse_registry_segment_ref(segment_ref: &str) -> Result<ParsedRegistrySegment
         namespace: parts[4].to_string(),
         repository: parts[6].to_string(),
         record_kind: parts[8].to_string(),
+        generation,
     })
 }
 

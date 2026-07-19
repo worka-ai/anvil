@@ -246,8 +246,13 @@ pub(super) async fn read_authz_tuple_segment_at_revision(
         .into_iter()
         .filter(|record| record.generation <= revision)
     {
-        let Some(segment) =
-            read_authz_tuple_segment_ref(storage, tenant_id, &record.segment_ref).await?
+        let Some(segment) = read_authz_tuple_segment_ref(
+            storage,
+            tenant_id,
+            record.generation,
+            &record.segment_ref,
+        )
+        .await?
         else {
             bail!("AuthzCandidateSetStale");
         };

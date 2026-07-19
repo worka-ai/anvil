@@ -153,6 +153,7 @@ pub async fn read_git_source_index_bytes(storage: &Storage, index_ref: &str) -> 
         storage,
         GIT_SOURCE_INDEX_CATALOG_FAMILY,
         &git_source_index_scope(parsed.tenant_id, &parsed.repository_id)?,
+        parsed.generation,
         index_ref,
     )?
     .ok_or_else(|| anyhow!("git source index catalog row is missing"))?;
@@ -354,6 +355,7 @@ fn git_source_index_ref_prefix(tenant_id: i64, repository_id: &str) -> Result<St
 struct ParsedGitSourceIndexRef {
     tenant_id: i64,
     repository_id: String,
+    generation: u64,
 }
 
 fn parse_git_source_index_ref(index_ref: &str) -> Result<ParsedGitSourceIndexRef> {
@@ -384,6 +386,7 @@ fn parse_git_source_index_ref(index_ref: &str) -> Result<ParsedGitSourceIndexRef
     Ok(ParsedGitSourceIndexRef {
         tenant_id,
         repository_id: parts[4].to_string(),
+        generation,
     })
 }
 

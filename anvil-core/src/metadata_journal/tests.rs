@@ -1,8 +1,6 @@
 use super::*;
 use crate::core_store::{CoreStore, PutBlob};
-use crate::writer_segment_catalog::{
-    read_writer_segment_catalog_record, write_writer_segment_catalog_record,
-};
+use crate::writer_segment_catalog::read_writer_segment_catalog_record;
 use chrono::Utc;
 use tempfile::tempdir;
 
@@ -693,14 +691,14 @@ async fn seal_object_journal_segments_writes_metadata_and_directory_segments() {
     let mut catalog = read_writer_segment_catalog_record(
         &storage,
         OBJECT_METADATA_SEGMENT_CATALOG_FAMILY,
-        &object_metadata_segment_scope(ref_name),
+        &object_metadata_segment_scope(ref_name).unwrap(),
+        object_metadata_segment_generation(ref_name).unwrap(),
         ref_name,
     )
     .unwrap()
     .expect("metadata segment catalog row exists");
     catalog.core_object_ref_target = encode_core_object_ref_target(&object_ref).unwrap();
-    write_writer_segment_catalog_record(&storage, &catalog)
-        .await
+    crate::writer_segment_catalog::test_overwrite_writer_segment_catalog_record(&storage, &catalog)
         .unwrap();
     assert!(
         recover_object_metadata_partition(&storage, &bucket, signing_key)

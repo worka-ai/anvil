@@ -83,7 +83,7 @@ pub(super) async fn write_segment_file(
         storage,
         &WriterSegmentCatalogRecord {
             family: OBJECT_METADATA_SEGMENT_CATALOG_FAMILY.to_string(),
-            scope: object_metadata_segment_scope(&ref_name),
+            scope: object_metadata_segment_scope(&ref_name)?,
             segment_ref: ref_name.clone(),
             core_object_ref_target: encode_core_object_ref_target(&object_ref)?,
             segment_hash: file_hash.clone(),
@@ -337,7 +337,8 @@ pub(super) async fn read_manifest_segment(
     let record = read_writer_segment_catalog_record(
         storage,
         OBJECT_METADATA_SEGMENT_CATALOG_FAMILY,
-        &object_metadata_segment_scope(ref_name),
+        &object_metadata_segment_scope(ref_name)?,
+        object_metadata_segment_generation(ref_name)?,
         ref_name,
     )?
     .ok_or_else(|| anyhow!("partition segment catalog row is missing"))?;
@@ -357,7 +358,8 @@ pub(super) async fn read_core_ref_uri_payload(storage: &Storage, ref_uri: &str) 
     let record = read_writer_segment_catalog_record(
         storage,
         OBJECT_METADATA_SEGMENT_CATALOG_FAMILY,
-        &object_metadata_segment_scope(ref_name),
+        &object_metadata_segment_scope(ref_name)?,
+        object_metadata_segment_generation(ref_name)?,
         ref_name,
     )?
     .ok_or_else(|| anyhow!("CoreStore writer segment catalog row is missing"))?;
@@ -764,8 +766,57 @@ pub(super) fn object_metadata_manifest_scope(bucket: &Bucket) -> String {
     format!("tenant/{}/bucket/{}", bucket.tenant_id, bucket.id)
 }
 
-pub(super) fn object_metadata_segment_scope(segment_ref: &str) -> String {
-    format!("segment/{segment_ref}")
+pub(super) fn object_metadata_segment_scope(segment_ref: &str) -> Result<String> {
+    let parsed = parse_object_metadata_segment_ref(segment_ref)?;
+    Ok(format!(
+        "tenant/{}/bucket/{}/family/{}",
+        parsed.tenant_id, parsed.bucket_id, parsed.family
+    ))
+}
+
+pub(super) fn object_metadata_segment_generation(segment_ref: &str) -> Result<u64> {
+    Ok(parse_object_metadata_segment_ref(segment_ref)?.generation)
+}
+
+struct ParsedObjectMetadataSegmentRef<'a> {
+    family: &'a str,
+    tenant_id: i64,
+    bucket_id: i64,
+    generation: u64,
+}
+
+fn parse_object_metadata_segment_ref(
+    segment_ref: &str,
+) -> Result<ParsedObjectMetadataSegmentRef<'_>> {
+    let parts = segment_ref.split(':').collect::<Vec<_>>();
+    if parts.len() != 9
+        || !matches!(parts[0], "metadata_segment" | "directory_segment")
+        || parts[1] != "tenant"
+        || parts[3] != "bucket"
+        || parts[5] != "generation"
+        || parts[7] != "hash"
+    {
+        return Err(anyhow!("object metadata segment ref is malformed"));
+    }
+    let tenant_id = parts[2]
+        .parse::<i64>()
+        .map_err(|_| anyhow!("object metadata segment tenant id is invalid"))?;
+    let bucket_id = parts[4]
+        .parse::<i64>()
+        .map_err(|_| anyhow!("object metadata segment bucket id is invalid"))?;
+    let generation = parts[6]
+        .parse::<u64>()
+        .map_err(|_| anyhow!("object metadata segment generation is invalid"))?;
+    if tenant_id < 0 || bucket_id < 0 || generation == 0 {
+        return Err(anyhow!("object metadata segment scope is invalid"));
+    }
+    validate_hex32(parts[8], "object metadata segment hash")?;
+    Ok(ParsedObjectMetadataSegmentRef {
+        family: parts[0],
+        tenant_id,
+        bucket_id,
+        generation,
+    })
 }
 
 pub(super) fn object_metadata_partition_manifest_row_key(bucket: &Bucket) -> Result<Vec<u8>> {

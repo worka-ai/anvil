@@ -100,6 +100,7 @@ pub const TABLE_CORE_FENCE_ROW: u16 = 0x8905;
 pub const TABLE_MATERIALISATION_CURSOR_ROW: u16 = 0x8a01;
 pub const TABLE_WRITER_SEGMENT_ROW: u16 = 0x8a02;
 pub const TABLE_WATCH_CHECKPOINT_ROW: u16 = 0x8a03;
+pub const TABLE_WRITER_HEAD_ROW: u16 = 0x8a04;
 pub const TABLE_LANDED_BYTE_REF_ROW: u16 = 0x8b02;
 pub const TABLE_REFCOUNT_ROW: u16 = 0x8b01;
 pub const TABLE_OBSERVABILITY_CURSOR_ROW: u16 = 0x8c01;
@@ -1331,6 +1332,7 @@ fn table_spec(table_id: u16) -> Result<CoreMetaTableSpec> {
         TABLE_MATERIALISATION_CURSOR_ROW
         | TABLE_WRITER_SEGMENT_ROW
         | TABLE_WATCH_CHECKPOINT_ROW
+        | TABLE_WRITER_HEAD_ROW
         | TABLE_LANDED_BYTE_REF_ROW => CoreMetaTableSpec {
             cf: CF_MATERIALISATION,
             max_payload_bytes: CORE_META_MAX_VALUE_BYTES,
@@ -1622,6 +1624,7 @@ fn expected_schema_markers(table_id: u16) -> Option<&'static [&'static str]> {
         TABLE_LANDED_BYTE_REF_ROW => Some(&["anvil.core.landed_byte_ref.v1"]),
         TABLE_REFCOUNT_ROW => Some(&["anvil.core.payload_reference.v1"]),
         TABLE_WRITER_SEGMENT_ROW => Some(&["anvil.coremeta.writer_segment_locator.v1"]),
+        TABLE_WRITER_HEAD_ROW => Some(&["anvil.coremeta.writer_head.v1"]),
         TABLE_WATCH_CHECKPOINT_ROW => Some(&[
             "anvil.coremeta.watch_checkpoint.v1",
             "anvil.coremeta.watch_checkpoint_lag.v1",

@@ -492,9 +492,11 @@ pub async fn read_latest_authz_tuple_segment(
 async fn read_authz_tuple_segment_ref(
     storage: &Storage,
     tenant_id: i64,
+    generation: u64,
     segment_ref: &str,
 ) -> Result<Option<DecodedAuthzSegment>> {
-    let Some(record) = read_authz_tuple_segment_catalog_record(storage, tenant_id, segment_ref)?
+    let Some(record) =
+        read_authz_tuple_segment_catalog_record(storage, tenant_id, generation, segment_ref)?
     else {
         return Ok(None);
     };
@@ -544,7 +546,9 @@ pub async fn ensure_authz_tuple_segment_at_revision(
     let source_fence_token =
         authz_journal::latest_authz_journal_fence_token(storage, tenant_id).await?;
     let segment_ref = authz_tuple_segment_ref_name(tenant_id, target_revision)?;
-    if read_authz_tuple_segment_catalog_record(storage, tenant_id, &segment_ref)?.is_none() {
+    if read_authz_tuple_segment_catalog_record(storage, tenant_id, target_revision, &segment_ref)?
+        .is_none()
+    {
         // Historical stores may predate synchronous segment materialisation. Build the
         // requested revision as a checkpoint instead of replaying every missing revision.
         authz_journal::materialize_authz_tuple_segment_at_revision(
@@ -733,12 +737,14 @@ fn authz_tuple_segment_scope(tenant_id: i64) -> Result<String> {
 fn read_authz_tuple_segment_catalog_record(
     storage: &Storage,
     tenant_id: i64,
+    generation: u64,
     segment_ref: &str,
 ) -> Result<Option<WriterSegmentCatalogRecord>> {
     read_writer_segment_catalog_record(
         storage,
         AUTHZ_TUPLE_SEGMENT_CATALOG_FAMILY,
         &authz_tuple_segment_scope(tenant_id)?,
+        generation,
         segment_ref,
     )
 }
@@ -750,7 +756,7 @@ pub(crate) fn existing_authz_tuple_segment_ref(
 ) -> Result<Option<String>> {
     let segment_ref = authz_tuple_segment_ref_name(tenant_id, revision)?;
     Ok(
-        read_authz_tuple_segment_catalog_record(storage, tenant_id, &segment_ref)?
+        read_authz_tuple_segment_catalog_record(storage, tenant_id, revision, &segment_ref)?
             .map(|record| record.segment_ref),
     )
 }

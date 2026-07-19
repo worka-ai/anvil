@@ -457,6 +457,10 @@ fn is_runtime_local_bootstrap_row(row: &CoreMetaEncodedOwnedRow) -> bool {
                     CF_MATERIALISATION,
                     Some(crate::core_store::TABLE_WRITER_SEGMENT_ROW)
                 )
+                | (
+                    CF_MATERIALISATION,
+                    Some(crate::core_store::TABLE_WRITER_HEAD_ROW)
+                )
         )
 }
 

@@ -183,10 +183,11 @@ async fn authz_candidate_reader_merges_revisioned_tuple_segments() {
     .unwrap();
     assert_eq!(catalog.len(), 3);
     for (index, record) in catalog.into_iter().enumerate() {
-        let segment = read_authz_tuple_segment_ref(&storage, 7, &record.segment_ref)
-            .await
-            .unwrap()
-            .unwrap();
+        let segment =
+            read_authz_tuple_segment_ref(&storage, 7, record.generation, &record.segment_ref)
+                .await
+                .unwrap()
+                .unwrap();
         if index == 0 {
             assert_eq!(segment.header.segment_kind, "checkpoint");
             assert_eq!(segment.header.base_revision, 0);
