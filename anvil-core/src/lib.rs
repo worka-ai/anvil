@@ -31,6 +31,7 @@ pub mod anvil_personaldb_sqlite_changeset;
 pub mod auth;
 pub(crate) mod authz_coremeta_payload;
 pub mod authz_derived_lag_watch;
+mod authz_head;
 pub mod authz_journal;
 pub mod authz_namespace_watch;
 pub mod authz_realm_schema;

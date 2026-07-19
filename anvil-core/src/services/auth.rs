@@ -1029,22 +1029,17 @@ impl AuthService for AppState {
             &format!("schema:{}", req.schema_id),
         )
         .await?;
-        let authz_revision = authz_journal::latest_authz_revision(&self.storage, claims.tenant_id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))
-            .and_then(revision_to_u64)?
-            .saturating_add(1);
         let record = authz_realm_schema::put_schema_revision(
             &self.storage,
             claims.tenant_id,
             &req.schema_id,
             req.namespaces,
-            authz_revision,
             &claims.sub,
             &req.reason,
         )
         .await
         .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let authz_revision = record.authz_revision;
         Ok(Response::new(PutAuthzSchemaResponse {
             schema_ref: Some(schema_ref_response(&record.schema_ref)),
             authz_revision,
@@ -1073,11 +1068,6 @@ impl AuthService for AppState {
         // would make first bind impossible without a non-Zanzibar bypass.
         access_control::require_storage_tenant_permission(&self.storage, &claims, "manage_tenant")
             .await?;
-        let authz_revision = authz_journal::latest_authz_revision(&self.storage, claims.tenant_id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))
-            .and_then(revision_to_u64)?
-            .saturating_add(1);
         access_control::grant_authz_realm_defaults(
             &self.persistence,
             claims.tenant_id,
@@ -1106,12 +1096,12 @@ impl AuthService for AppState {
                 schema_digest: schema_ref.schema_digest,
             },
             req.expected_binding_generation,
-            authz_revision,
             &claims.sub,
             &req.reason,
         )
         .await
         .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        let authz_revision = binding.authz_revision;
         Ok(Response::new(BindAuthzSchemaResponse {
             scope: Some(scope),
             schema_ref: Some(schema_ref_response(&binding.schema_ref)),

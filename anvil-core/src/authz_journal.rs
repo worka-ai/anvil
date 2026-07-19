@@ -1,4 +1,5 @@
 use crate::authz_coremeta_payload::{decode_authz_payload_row, encode_authz_payload_row};
+use crate::authz_head::{self, AuthzHeadMutation, AuthzHeadSnapshot};
 use crate::authz_realm_schema;
 use crate::authz_schema_contract::{
     AuthzSchemaContractError, AuthzTupleShape, validate_tuple_batch,
@@ -10,10 +11,9 @@ use crate::authz_userset_index::{
     list_derived_userset_objects_at_revision, lookup_derived_userset_index_at_revision,
 };
 use crate::core_store::{
-    CF_AUTHZ, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaStore, CoreMetaTuplePart,
-    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreStore, ReadStream,
-    TABLE_AUTHZ_TUPLE_PAGE_ROW, core_meta_committed_row_common, core_meta_root_key_hash,
-    core_meta_tuple_key,
+    CF_AUTHZ, CoreMetaStore, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation,
+    CoreMutationPrecondition, CoreStore, ReadStream, TABLE_AUTHZ_TUPLE_PAGE_ROW,
+    core_meta_committed_row_common, core_meta_root_key_hash, core_meta_tuple_key,
 };
 use crate::formats::{Hash32, hash32};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
@@ -21,10 +21,7 @@ use crate::persistence::AuthzTupleRecord;
 use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow};
 use prost::Message;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::{Arc, LazyLock},
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 mod idempotency;
 pub(crate) mod resolver;
@@ -35,20 +32,6 @@ const AUTHZ_TUPLE_CURRENT_ROW_SCHEMA: &str = "anvil.authz_tuple.current_row.v1";
 const AUTHZ_TUPLE_PAGE_PAYLOAD_KIND: &str = "authz_tuple_page";
 const AUTHZ_TUPLE_RECORD_KIND: &str = "authz_tuple";
 const AUTHZ_TUPLE_BATCH_RECORD_KIND: &str = "authz_tuple_batch";
-
-static AUTHZ_TUPLE_WRITE_LOCKS: LazyLock<
-    std::sync::Mutex<BTreeMap<i64, Arc<tokio::sync::Mutex<()>>>>,
-> = LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
-
-fn authz_tuple_write_lock(tenant_id: i64) -> Result<Arc<tokio::sync::Mutex<()>>> {
-    let mut locks = AUTHZ_TUPLE_WRITE_LOCKS
-        .lock()
-        .map_err(|_| anyhow!("authz tuple write lock is poisoned"))?;
-    Ok(locks
-        .entry(tenant_id)
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone())
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
 enum AuthzTupleOperationProto {
@@ -168,7 +151,7 @@ pub(crate) async fn write_authz_tuple_with_permit(
 ) -> Result<AuthzTupleRecord> {
     require_authz_permit(input.tenant_id, permit)?;
     validate_optional_caveat_hash(input.caveat_hash)?;
-    let write_lock = authz_tuple_write_lock(input.tenant_id)?;
+    let write_lock = authz_head::tenant_write_lock(input.tenant_id)?;
     let _guard = write_lock.lock().await;
     let schema_binding_precondition =
         validate_writes_against_bound_schema(storage, std::slice::from_ref(&input), None).await?;
@@ -201,7 +184,7 @@ pub(crate) async fn write_authz_tuple_batch_with_permit(
         }
         validate_optional_caveat_hash(input.caveat_hash)?;
     }
-    let write_lock = authz_tuple_write_lock(tenant_id)?;
+    let write_lock = authz_head::tenant_write_lock(tenant_id)?;
     let _guard = write_lock.lock().await;
     let schema_binding_precondition =
         validate_writes_against_bound_schema(storage, &inputs, None).await?;
@@ -246,7 +229,7 @@ pub(crate) async fn write_authz_tuple_batch_conditionally_with_permit(
     if let Some(operation_id) = options.operation_id.as_deref() {
         idempotency::validate_operation_id(operation_id)?;
     }
-    let write_lock = authz_tuple_write_lock(tenant_id)?;
+    let write_lock = authz_head::tenant_write_lock(tenant_id)?;
     let _guard = write_lock.lock().await;
     let partition_precondition =
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
@@ -329,8 +312,8 @@ async fn write_authz_tuple_inner(
     schema_binding_precondition: crate::persistence::AuthzSchemaBindingPrecondition,
 ) -> Result<AuthzTupleRecord> {
     validate_optional_caveat_hash(input.caveat_hash)?;
-    let revision = latest_authz_revision(storage, input.tenant_id)
-        .await?
+    let head_snapshot = authz_head::read(storage, input.tenant_id)?;
+    let revision = i64::try_from(head_snapshot.head.committed_revision)?
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("authz revision overflow"))?;
     let record = build_authz_tuple_record(input, revision, 0)?;
@@ -340,6 +323,7 @@ async fn write_authz_tuple_inner(
         fence_token,
         partition_precondition,
         Some(&schema_binding_precondition),
+        &head_snapshot,
     )
     .await;
     handle_schema_fenced_write_result(storage, &schema_binding_precondition, write_result)?;
@@ -357,8 +341,8 @@ async fn write_authz_tuple_batch_inner(
         .first()
         .ok_or_else(|| anyhow!("authz tuple batch must not be empty"))?
         .tenant_id;
-    let revision = latest_authz_revision(storage, tenant_id)
-        .await?
+    let head_snapshot = authz_head::read(storage, tenant_id)?;
+    let revision = i64::try_from(head_snapshot.head.committed_revision)?
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("authz revision overflow"))?;
     let mut records = Vec::with_capacity(inputs.len());
@@ -377,6 +361,7 @@ async fn write_authz_tuple_batch_inner(
         partition_precondition,
         None,
         Some(&schema_binding_precondition),
+        &head_snapshot,
     )
     .await;
     handle_schema_fenced_write_result(storage, &schema_binding_precondition, write_result)?;
@@ -403,7 +388,9 @@ async fn write_authz_tuple_batch_conditionally_inner(
         .first()
         .ok_or_else(|| anyhow!("authz tuple batch must not be empty"))?
         .tenant_id;
-    let current_revision = latest_authz_revision(storage, tenant_id).await?;
+    let head_snapshot = authz_head::read(storage, tenant_id)?;
+    let current_revision = i64::try_from(head_snapshot.head.committed_revision)
+        .context("authorization revision exceeds i64")?;
     if let Some(expected) = options.expected_revision
         && expected != current_revision
     {
@@ -434,6 +421,7 @@ async fn write_authz_tuple_batch_conditionally_inner(
         partition_precondition,
         receipt.as_ref(),
         Some(&schema_binding_precondition),
+        &head_snapshot,
     )
     .await;
     if let Err(error) = write_result {
@@ -498,7 +486,8 @@ pub(crate) async fn test_append_authz_tuple_record_unfenced(
     storage: &Storage,
     record: &AuthzTupleRecord,
 ) -> Result<()> {
-    append_authz_tuple_record_inner(storage, record, 0, None, None).await
+    let head_snapshot = authz_head::read(storage, record.tenant_id)?;
+    append_authz_tuple_record_inner(storage, record, 0, None, None, &head_snapshot).await
 }
 
 #[cfg(test)]
@@ -511,12 +500,14 @@ pub(crate) async fn append_authz_tuple_record_with_permit(
     require_authz_permit(record.tenant_id, permit)?;
     let partition_precondition =
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    let head_snapshot = authz_head::read(storage, record.tenant_id)?;
     append_authz_tuple_record_inner(
         storage,
         record,
         permit.fence_token,
         Some(partition_precondition),
         None,
+        &head_snapshot,
     )
     .await
 }
@@ -527,39 +518,65 @@ async fn append_authz_tuple_record_inner(
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
     schema_binding_precondition: Option<&crate::persistence::AuthzSchemaBindingPrecondition>,
+    head_snapshot: &AuthzHeadSnapshot,
 ) -> Result<()> {
     let core_store = CoreStore::new(storage.clone()).await?;
     let stream_id = authz_tuple_stream_id(record.tenant_id);
     let payload = encode_authz_tuple_journal_body(record, fence_token)?;
-
-    let partition_id = hex::encode(authz_partition_id(record.tenant_id));
+    let transaction_id = format!("authz-tuple:{}", record.mutation_id);
+    let partition_id = authz_head::transaction_partition(record.tenant_id);
+    let head = authz_head::advance(
+        head_snapshot,
+        &transaction_id,
+        AuthzHeadMutation::TupleBatch {
+            journal_payload: &payload,
+        },
+    )?;
+    if i64::try_from(head.committed_revision)? != record.revision {
+        return Err(anyhow!(
+            "authorization tuple revision does not advance the authorization head"
+        ));
+    }
+    let mut preconditions = partition_precondition.into_iter().collect::<Vec<_>>();
+    if let Some(schema_binding_precondition) = schema_binding_precondition {
+        preconditions.push(idempotency::schema_binding_precondition(
+            schema_binding_precondition,
+        ));
+    }
+    preconditions.push(authz_head::precondition(head_snapshot)?);
+    let mut operations = vec![CoreMutationOperation::StreamAppend {
+        partition_id: partition_id.clone(),
+        stream_id,
+        record_kind: AUTHZ_TUPLE_RECORD_KIND.to_string(),
+        payload,
+        idempotency_key: Some(transaction_id.clone()),
+    }];
+    operations.extend(
+        authz_tuple_current_operations(
+            storage,
+            std::slice::from_ref(record),
+            &partition_id,
+            &transaction_id,
+        )
+        .await?,
+    );
+    operations.push(authz_head::put_operation(
+        &partition_id,
+        &transaction_id,
+        &head,
+    )?);
     let step_started_at = std::time::Instant::now();
     core_store
         .commit_mutation_batch(CoreMutationBatch {
-            transaction_id: format!("authz-tuple:{}", record.mutation_id),
+            transaction_id,
             scope_partition: partition_id.clone(),
-            committed_by_principal: authz_partition_principal(record.tenant_id),
-            preconditions: partition_precondition
-                .into_iter()
-                .chain(schema_binding_precondition.map(idempotency::schema_binding_precondition))
-                .collect(),
-            operations: vec![CoreMutationOperation::StreamAppend {
-                partition_id,
-                stream_id,
-                record_kind: AUTHZ_TUPLE_RECORD_KIND.to_string(),
-                payload,
-                idempotency_key: Some(format!("authz-tuple:{}", record.mutation_id)),
-            }],
+            committed_by_principal: authz_head::transaction_principal(record.tenant_id),
+            preconditions,
+            operations,
         })
         .await?;
     crate::emit_test_timing(
         "authz_journal.append_record commit_mutation_batch",
-        step_started_at.elapsed(),
-    );
-    let step_started_at = std::time::Instant::now();
-    write_authz_tuple_records_to_current_rows(storage, std::slice::from_ref(record)).await?;
-    crate::emit_test_timing(
-        "authz_journal.append_record write_current_rows",
         step_started_at.elapsed(),
     );
     record_authz_materialization_deferred(
@@ -578,6 +595,7 @@ async fn append_authz_tuple_batch_inner(
     partition_precondition: Option<CoreMutationPrecondition>,
     idempotency_receipt: Option<&idempotency::PreparedAuthzIdempotencyReceipt>,
     schema_binding_precondition: Option<&crate::persistence::AuthzSchemaBindingPrecondition>,
+    head_snapshot: &AuthzHeadSnapshot,
 ) -> Result<()> {
     if records.is_empty() {
         return Err(anyhow!("authz tuple batch must not be empty"));
@@ -595,11 +613,23 @@ async fn append_authz_tuple_batch_inner(
     let stream_id = authz_tuple_stream_id(tenant_id);
     let payload = encode_authz_tuple_batch_journal_body(tenant_id, revision, records, fence_token)?;
 
-    let partition_id = hex::encode(authz_partition_id(tenant_id));
+    let partition_id = authz_head::transaction_partition(tenant_id);
     let step_started_at = std::time::Instant::now();
     let transaction_id = idempotency_receipt
         .map(|receipt| receipt.transaction_id.clone())
         .unwrap_or_else(|| format!("authz-tuple-batch:{tenant_id}:{revision}"));
+    let head = authz_head::advance(
+        head_snapshot,
+        &transaction_id,
+        AuthzHeadMutation::TupleBatch {
+            journal_payload: &payload,
+        },
+    )?;
+    if i64::try_from(head.committed_revision)? != revision {
+        return Err(anyhow!(
+            "authorization tuple batch revision does not advance the authorization head"
+        ));
+    }
     let mut preconditions = partition_precondition.into_iter().collect::<Vec<_>>();
     if let Some(schema_binding_precondition) = schema_binding_precondition {
         preconditions.push(idempotency::schema_binding_precondition(
@@ -609,6 +639,7 @@ async fn append_authz_tuple_batch_inner(
     if let Some(receipt) = idempotency_receipt {
         preconditions.push(idempotency::receipt_precondition(receipt));
     }
+    preconditions.push(authz_head::precondition(head_snapshot)?);
     let mut operations = vec![CoreMutationOperation::StreamAppend {
         partition_id: partition_id.clone(),
         stream_id,
@@ -619,23 +650,25 @@ async fn append_authz_tuple_batch_inner(
     if let Some(receipt) = idempotency_receipt {
         operations.push(idempotency::receipt_operation(&partition_id, receipt));
     }
+    operations.extend(
+        authz_tuple_current_operations(storage, records, &partition_id, &transaction_id).await?,
+    );
+    operations.push(authz_head::put_operation(
+        &partition_id,
+        &transaction_id,
+        &head,
+    )?);
     core_store
         .commit_mutation_batch(CoreMutationBatch {
             transaction_id,
             scope_partition: partition_id,
-            committed_by_principal: authz_partition_principal(tenant_id),
+            committed_by_principal: authz_head::transaction_principal(tenant_id),
             preconditions,
             operations,
         })
         .await?;
     crate::emit_test_timing(
         "authz_journal.append_batch commit_mutation_batch",
-        step_started_at.elapsed(),
-    );
-    let step_started_at = std::time::Instant::now();
-    write_authz_tuple_records_to_current_rows(storage, records).await?;
-    crate::emit_test_timing(
-        "authz_journal.append_batch write_current_rows",
         step_started_at.elapsed(),
     );
     record_authz_materialization_deferred(tenant_id, revision, records.len());
@@ -876,49 +909,17 @@ async fn advance_authz_materialization(
 }
 
 pub async fn latest_authz_revision(storage: &Storage, tenant_id: i64) -> Result<i64> {
-    let tuple_revision = latest_authz_tuple_revision(storage, tenant_id).await?;
-    let schema_revision = crate::authz_realm_schema::list_schema_revisions(storage, tenant_id)
-        .await?
-        .into_iter()
-        .map(|record| record.authz_revision)
-        .chain(
-            crate::authz_realm_schema::list_schema_bindings(storage, tenant_id)
-                .await?
-                .into_iter()
-                .map(|record| record.authz_revision),
-        )
-        .max()
-        .unwrap_or(0);
-    Ok(tuple_revision.max(i64::try_from(schema_revision)?))
+    i64::try_from(
+        authz_head::read(storage, tenant_id)?
+            .head
+            .committed_revision,
+    )
+    .context("authorization revision exceeds i64")
 }
 
 pub(crate) async fn latest_authz_tuple_revision(storage: &Storage, tenant_id: i64) -> Result<i64> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let stream_id = authz_tuple_stream_id(tenant_id);
-    let (sequence, _) = store.raw_stream_head(&stream_id).await?;
-    if sequence == 0 {
-        return Ok(0);
-    }
-    let record = store
-        .read_stream(ReadStream {
-            stream_id,
-            after_sequence: sequence.saturating_sub(1),
-            limit: 1,
-        })
-        .await?
-        .pop()
-        .ok_or_else(|| anyhow!("authorization journal head record is missing"))?;
-    match record.record_kind.as_str() {
-        AUTHZ_TUPLE_RECORD_KIND => Ok(decode_authz_tuple_journal_body(&record.payload)?.revision),
-        AUTHZ_TUPLE_BATCH_RECORD_KIND => decode_authz_tuple_batch_journal_body(&record.payload)?
-            .into_iter()
-            .map(|record| record.revision)
-            .max()
-            .ok_or_else(|| anyhow!("authorization journal head batch is empty")),
-        other => Err(anyhow!(
-            "authorization journal head has unsupported record kind {other}"
-        )),
-    }
+    i64::try_from(authz_head::read(storage, tenant_id)?.head.tuple_revision)
+        .context("authorization tuple revision exceeds i64")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1439,63 +1440,48 @@ fn decode_authz_tuple_batch_journal_body_fence(bytes: &[u8]) -> Result<u64> {
     Ok(body.fence_token)
 }
 
-async fn write_authz_tuple_records_to_current_rows(
+async fn authz_tuple_current_operations(
     storage: &Storage,
     records: &[AuthzTupleRecord],
-) -> Result<()> {
+    partition_id: &str,
+    transaction_id: &str,
+) -> Result<Vec<CoreMutationOperation>> {
     if records.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let mut keys = Vec::with_capacity(records.len());
-    let mut payloads = Vec::with_capacity(records.len());
+    let mut current_records = BTreeMap::new();
     for record in records {
-        keys.push(authz_tuple_current_row_key(record)?);
-        let record_payload = encode_authz_tuple_current_row(record)?;
-        payloads.push(
-            encode_authz_payload_row(
-                storage,
-                authz_tuple_current_common(record),
-                AUTHZ_TUPLE_PAGE_PAYLOAD_KIND,
-                &format!(
-                    "tenant/{}/tuple/{}/{}/{}/{}",
-                    record.tenant_id,
-                    record.namespace,
-                    record.object_id,
-                    record.relation,
-                    record.revision
-                ),
-                record.revision.max(0) as u64,
-                &record.mutation_id.to_string(),
-                record_payload,
-            )
-            .await?,
-        );
+        current_records.insert(authz_tuple_current_row_key(record)?, record);
     }
-    let ops = keys
-        .iter()
-        .zip(payloads.iter())
-        .map(|(key, payload)| CoreMetaBatchOp {
-            cf: CF_AUTHZ,
-            table_id: TABLE_AUTHZ_TUPLE_PAGE_ROW,
-            tuple_key: key,
-            common: None,
-            kind: CoreMetaBatchOpKind::Put(payload),
-        })
-        .collect::<Vec<_>>();
-    let tenant_id = records[0].tenant_id;
-    let revision = records
-        .iter()
-        .map(|record| record.revision)
-        .max()
-        .unwrap_or(0);
-    core_store
-        .commit_coremeta_batch_by_embedded_roots(
-            &format!("authz-current:{tenant_id}:{revision}"),
-            &ops,
+    let mut operations = Vec::with_capacity(current_records.len());
+    for (tuple_key, record) in current_records {
+        let record_payload = encode_authz_tuple_current_row(record, transaction_id)?;
+        let payload = encode_authz_payload_row(
+            storage,
+            authz_tuple_current_common(record, transaction_id),
+            AUTHZ_TUPLE_PAGE_PAYLOAD_KIND,
+            &format!(
+                "tenant/{}/tuple/{}/{}/{}/{}",
+                record.tenant_id,
+                record.namespace,
+                record.object_id,
+                record.relation,
+                record.revision
+            ),
+            record.revision.max(0) as u64,
+            transaction_id,
+            record_payload,
         )
         .await?;
-    Ok(())
+        operations.push(CoreMutationOperation::CoreMetaPut {
+            partition_id: partition_id.to_string(),
+            cf: CF_AUTHZ.to_string(),
+            table_id: TABLE_AUTHZ_TUPLE_PAGE_ROW,
+            tuple_key,
+            payload,
+        });
+    }
+    Ok(operations)
 }
 
 async fn read_authz_tuple_records_from_current_rows(
@@ -1526,9 +1512,12 @@ async fn read_authz_tuple_records_from_current_rows(
     Ok(records)
 }
 
-fn encode_authz_tuple_current_row(record: &AuthzTupleRecord) -> Result<Vec<u8>> {
+fn encode_authz_tuple_current_row(
+    record: &AuthzTupleRecord,
+    transaction_id: &str,
+) -> Result<Vec<u8>> {
     encode_deterministic_proto(&AuthzTupleCurrentRowProto {
-        common: Some(authz_tuple_current_common(record)),
+        common: Some(authz_tuple_current_common(record, transaction_id)),
         schema: AUTHZ_TUPLE_CURRENT_ROW_SCHEMA.to_string(),
         record: Some(authz_record_to_proto(record)?),
     })
@@ -1536,12 +1525,13 @@ fn encode_authz_tuple_current_row(record: &AuthzTupleRecord) -> Result<Vec<u8>> 
 
 fn authz_tuple_current_common(
     record: &AuthzTupleRecord,
+    transaction_id: &str,
 ) -> crate::core_store::CoreMetaRowCommonProto {
     core_meta_committed_row_common(
         format!("tenant/{}", record.tenant_id),
         core_meta_root_key_hash(&format!("authz/{}", record.tenant_id)),
         record.revision.max(0) as u64,
-        record.mutation_id.to_string(),
+        transaction_id,
         record
             .written_at
             .timestamp_nanos_opt()
@@ -1736,10 +1726,6 @@ pub fn authz_partition_id(tenant_id: i64) -> Hash32 {
 
 fn authz_tuple_stream_id(tenant_id: i64) -> String {
     format!("authz_tuple:tenant:{tenant_id}")
-}
-
-fn authz_partition_principal(tenant_id: i64) -> String {
-    format!("partition-owner:authz_tuple:{tenant_id}")
 }
 
 pub(crate) async fn latest_authz_journal_fence_token(

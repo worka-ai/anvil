@@ -1152,7 +1152,6 @@ mod tests {
                 test_namespace("document", &["viewer"]),
                 test_namespace("group", &["member"]),
             ],
-            0,
             "tester",
             "bind userset index test schema",
         )
@@ -1164,7 +1163,6 @@ mod tests {
             crate::authz_scope::DEFAULT_AUTHZ_REALM_ID,
             schema.schema_ref,
             None,
-            0,
             "tester",
             "bind userset index test schema",
         )
@@ -1301,7 +1299,7 @@ mod tests {
             "add",
         )
         .await;
-        write_tuple(
+        let document_userset = write_tuple(
             &storage,
             &permit,
             "document",
@@ -1316,7 +1314,8 @@ mod tests {
         let index = rebuild_derived_userset_index(&storage, 42, DEFAULT_DERIVED_USERSET_INDEX_ID)
             .await
             .unwrap();
-        assert_eq!(index.processed_revision, 2);
+        let processed_revision = document_userset.revision as u64;
+        assert_eq!(index.processed_revision, processed_revision);
 
         assert_eq!(
             lookup_derived_userset_index_at_revision(
@@ -1329,7 +1328,7 @@ mod tests {
                 "user",
                 "alice",
                 "",
-                2,
+                processed_revision,
             )
             .await
             .unwrap(),
@@ -1345,7 +1344,7 @@ mod tests {
                 "user",
                 "alice",
                 "",
-                2,
+                processed_revision,
             )
             .await
             .unwrap(),
@@ -1362,7 +1361,7 @@ mod tests {
                 "user",
                 "alice",
                 "",
-                1,
+                processed_revision - 1,
             )
             .await
             .unwrap(),
@@ -1396,7 +1395,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(first.processed_revision, 1);
+        assert_eq!(first.processed_revision, group_member.revision as u64);
         assert!(first.entries.iter().any(|entry| {
             entry.namespace == "group"
                 && entry.object_id == "engineering"
@@ -1423,7 +1422,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(second.processed_revision, 2);
+        assert_eq!(second.processed_revision, document_userset.revision as u64);
         assert!(second.entries.iter().any(|entry| {
             entry.namespace == "document"
                 && entry.object_id == "alpha"
@@ -1463,7 +1462,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(advanced.processed_revision, 4);
+        assert_eq!(advanced.processed_revision, remove_member.revision as u64);
         assert!(!advanced.entries.iter().any(|entry| {
             entry.namespace == "document"
                 && entry.object_id == "alpha"

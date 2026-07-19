@@ -125,7 +125,7 @@ async fn ready_authz_permit(
     .unwrap()
 }
 
-async fn bind_default_document_schema(storage: &Storage, tenant_id: i64) {
+async fn bind_default_document_schema(storage: &Storage, tenant_id: i64) -> i64 {
     let schema = crate::authz_realm_schema::put_schema_revision(
         storage,
         tenant_id,
@@ -142,7 +142,6 @@ async fn bind_default_document_schema(storage: &Storage, tenant_id: i64) {
             authz_revision: 0,
             applied_at: String::new(),
         }],
-        0,
         "tester",
         "test schema",
     )
@@ -154,36 +153,21 @@ async fn bind_default_document_schema(storage: &Storage, tenant_id: i64) {
         DEFAULT_AUTHZ_REALM_ID,
         schema.schema_ref,
         None,
-        0,
         "tester",
         "bind test schema",
     )
     .await
-    .unwrap();
+    .unwrap()
+    .authz_revision
+    .try_into()
+    .unwrap()
 }
 
 async fn append_authz_record_without_segment(
     storage: &Storage,
     record: &AuthzTupleRecord,
 ) -> Result<()> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let partition_id = hex::encode(authz_partition_id(record.tenant_id));
-    core_store
-        .commit_mutation_batch(CoreMutationBatch {
-            transaction_id: format!("authz-tuple-unmaterialized:{}", record.mutation_id),
-            scope_partition: partition_id.clone(),
-            committed_by_principal: authz_partition_principal(record.tenant_id),
-            preconditions: Vec::new(),
-            operations: vec![CoreMutationOperation::StreamAppend {
-                partition_id,
-                stream_id: authz_tuple_stream_id(record.tenant_id),
-                record_kind: AUTHZ_TUPLE_RECORD_KIND.to_string(),
-                payload: encode_authz_tuple_journal_body(record, 0)?,
-                idempotency_key: Some(format!("authz-tuple-unmaterialized:{}", record.mutation_id)),
-            }],
-        })
-        .await?;
-    write_authz_tuple_records_to_current_rows(storage, std::slice::from_ref(record)).await
+    test_append_authz_tuple_record_unfenced(storage, record).await
 }
 
 #[tokio::test]
@@ -558,28 +542,27 @@ async fn authz_bound_schema_inherit_computed_and_tuple_to_userset_rules_are_enfo
                 applied_at: String::new(),
             },
         ],
-        1,
         "tester",
         "test schema",
     )
     .await
     .unwrap();
-    crate::authz_realm_schema::bind_schema(
+    let binding = crate::authz_realm_schema::bind_schema(
         &storage,
         42,
         realm_id,
         schema.schema_ref,
         None,
-        2,
         "tester",
         "bind schema",
     )
     .await
     .unwrap();
+    let tuple_base_revision = i64::try_from(binding.authz_revision).unwrap();
 
     for record in [
         tuple(
-            1,
+            tuple_base_revision + 1,
             &document_ns,
             "alpha",
             "editor",
@@ -588,7 +571,7 @@ async fn authz_bound_schema_inherit_computed_and_tuple_to_userset_rules_are_enfo
             "add",
         ),
         tuple(
-            2,
+            tuple_base_revision + 2,
             &tenant_ns,
             "acme",
             "member",
@@ -597,7 +580,7 @@ async fn authz_bound_schema_inherit_computed_and_tuple_to_userset_rules_are_enfo
             "add",
         ),
         tuple(
-            3,
+            tuple_base_revision + 3,
             &folder_ns,
             "platform",
             "parent_tenant",
@@ -606,7 +589,7 @@ async fn authz_bound_schema_inherit_computed_and_tuple_to_userset_rules_are_enfo
             "add",
         ),
         tuple(
-            4,
+            tuple_base_revision + 4,
             &document_ns,
             "alpha",
             "parent_folder",
@@ -615,7 +598,7 @@ async fn authz_bound_schema_inherit_computed_and_tuple_to_userset_rules_are_enfo
             "add",
         ),
         tuple(
-            5,
+            tuple_base_revision + 5,
             &group_ns,
             "engineering",
             "member",
@@ -624,7 +607,7 @@ async fn authz_bound_schema_inherit_computed_and_tuple_to_userset_rules_are_enfo
             "add",
         ),
         tuple(
-            6,
+            tuple_base_revision + 6,
             &document_ns,
             "alpha",
             "shared_group",
@@ -649,7 +632,7 @@ async fn authz_bound_schema_inherit_computed_and_tuple_to_userset_rules_are_enfo
                 "user",
                 subject,
                 "",
-                6,
+                tuple_base_revision + 6,
             )
             .await
             .unwrap(),
@@ -665,7 +648,7 @@ async fn authz_bound_schema_inherit_computed_and_tuple_to_userset_rules_are_enfo
             "user",
             "tenant-member",
             "",
-            6,
+            tuple_base_revision + 6,
         )
         .await
         .unwrap(),
@@ -679,7 +662,7 @@ async fn authz_bound_schema_inherit_computed_and_tuple_to_userset_rules_are_enfo
             "alpha",
             "viewer",
             Some("user"),
-            6,
+            tuple_base_revision + 6,
         )
         .await
         .unwrap(),
@@ -734,7 +717,6 @@ async fn authz_schema_writes_materialize_segment_schema_tables() {
             authz_revision: 0,
             applied_at: String::new(),
         }],
-        10,
         "tester",
         "put schema",
     )
@@ -745,7 +727,7 @@ async fn authz_schema_writes_materialize_segment_schema_tables() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(segment.header.generation, 10);
+    assert_eq!(segment.header.generation, schema.authz_revision);
     assert!(segment.records.is_empty());
     assert!(segment.schema_descriptors.iter().any(|row| {
         row.realm_id.is_empty()
@@ -761,13 +743,12 @@ async fn authz_schema_writes_materialize_segment_schema_tables() {
             && row.inherited_relation == "editor"
     }));
 
-    crate::authz_realm_schema::bind_schema(
+    let binding = crate::authz_realm_schema::bind_schema(
         &storage,
         42,
         "workspace-a",
         schema.schema_ref,
         None,
-        11,
         "tester",
         "bind schema",
     )
@@ -778,7 +759,10 @@ async fn authz_schema_writes_materialize_segment_schema_tables() {
         .unwrap()
         .unwrap();
     let bound_namespace = encode_realm_namespace("workspace-a", "document");
-    assert_eq!(bound_segment.header.generation, 11);
+    assert_eq!(
+        bound_segment.header.generation,
+        binding.authz_revision as u64
+    );
     assert!(bound_segment.schema_descriptors.iter().any(|row| {
         row.realm_id == "workspace-a"
             && row.namespace == bound_namespace
@@ -796,7 +780,7 @@ async fn authz_schema_writes_materialize_segment_schema_tables() {
         bound_segment
             .revision_checkpoints
             .iter()
-            .any(|row| row.revision == 11)
+            .any(|row| row.revision == binding.authz_revision as u64)
     );
 }
 
@@ -961,12 +945,16 @@ async fn authz_tuple_writes_materialize_userset_and_reverse_lookup_segments() {
 async fn authz_journal_permit_sets_payload_and_segment_fence() {
     let temp = tempdir().unwrap();
     let storage = Storage::new_at(temp.path()).await.unwrap();
-    bind_default_document_schema(&storage, 42).await;
+    let base_revision = bind_default_document_schema(&storage, 42).await;
+    let initial_head = crate::authz_head::read(&storage, 42).unwrap().head;
+    assert_eq!(initial_head.committed_revision, base_revision as u64);
+    assert_eq!(initial_head.schema_revision, base_revision as u64);
+    assert_eq!(initial_head.tuple_revision, 0);
     let permit = ready_authz_permit(&storage, 42, "node-a").await;
 
     append_authz_tuple_record_with_permit(
         &storage,
-        &record(1, "add"),
+        &record(base_revision + 1, "add"),
         &permit,
         PARTITION_OWNER_KEY,
     )
@@ -978,21 +966,26 @@ async fn authz_journal_permit_sets_payload_and_segment_fence() {
         .unwrap();
     assert_eq!(fences, vec![permit.fence_token]);
 
-    authz_segment::ensure_authz_tuple_segment_at_revision(&storage, 42, 1)
-        .await
-        .unwrap()
-        .unwrap();
+    authz_segment::ensure_authz_tuple_segment_at_revision(
+        &storage,
+        42,
+        u64::try_from(base_revision + 1).unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
 
     let segment = authz_segment::read_latest_authz_tuple_segment(&storage, 42)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(segment.header.source_fence_token, permit.fence_token);
-    assert_eq!(segment.revision_checkpoints.len(), 1);
-    assert_eq!(
-        segment.revision_checkpoints[0].source_fence_token,
-        permit.fence_token
-    );
+    let tuple_checkpoint = segment
+        .revision_checkpoints
+        .last()
+        .expect("tuple revision checkpoint");
+    assert_eq!(tuple_checkpoint.revision, (base_revision + 1) as u64);
+    assert_eq!(tuple_checkpoint.source_fence_token, permit.fence_token);
 }
 
 #[tokio::test]
@@ -1050,6 +1043,7 @@ async fn authz_journal_batch_rejects_stale_partition_precondition() {
     .unwrap();
     let fresh = ready_authz_permit(&storage, 42, "node-b").await;
     assert!(fresh.fence_token > stale.fence_token);
+    let head_snapshot = crate::authz_head::read(&storage, 42).unwrap();
 
     let rejected = append_authz_tuple_record_inner(
         &storage,
@@ -1057,6 +1051,7 @@ async fn authz_journal_batch_rejects_stale_partition_precondition() {
         stale.fence_token,
         Some(stale_precondition),
         None,
+        &head_snapshot,
     )
     .await
     .unwrap_err();
@@ -1125,7 +1120,7 @@ async fn authz_journal_rejects_wrong_partition_scope_before_write() {
 pub(crate) async fn authz_write_with_permit_allocates_revision_under_fence() {
     let temp = tempdir().unwrap();
     let storage = Storage::new_at(temp.path()).await.unwrap();
-    bind_default_document_schema(&storage, 42).await;
+    let base_revision = bind_default_document_schema(&storage, 42).await;
     let permit = ready_authz_permit(&storage, 42, "node-a").await;
 
     let written = write_authz_tuple_with_permit(
@@ -1147,7 +1142,7 @@ pub(crate) async fn authz_write_with_permit_allocates_revision_under_fence() {
     )
     .await
     .unwrap();
-    assert_eq!(written.revision, 1);
+    assert_eq!(written.revision, base_revision + 1);
     let fences = read_authz_journal_payload_fences(&storage, 42)
         .await
         .unwrap();
@@ -1158,7 +1153,7 @@ pub(crate) async fn authz_write_with_permit_allocates_revision_under_fence() {
 async fn conditional_authz_batch_receipt_replays_and_conflicts() {
     let temp = tempdir().unwrap();
     let storage = Storage::new_at(temp.path()).await.unwrap();
-    bind_default_document_schema(&storage, 42).await;
+    let base_revision = bind_default_document_schema(&storage, 42).await;
     let permit = ready_authz_permit(&storage, 42, "node-a").await;
     let schema_binding_key = core_meta_tuple_key(&[
         CoreMetaTuplePart::Utf8("schema_binding"),
@@ -1169,7 +1164,7 @@ async fn conditional_authz_batch_receipt_replays_and_conflicts() {
     let options = crate::persistence::AuthzTupleBatchWriteOptions {
         authz_realm_id: "default".to_string(),
         operation_id: Some("provision-access-1".to_string()),
-        expected_revision: Some(0),
+        expected_revision: Some(base_revision),
         schema_binding_precondition: Some(crate::persistence::AuthzSchemaBindingPrecondition {
             tuple_key: schema_binding_key.clone(),
             expected_payload_hash: None,
@@ -1215,7 +1210,12 @@ async fn conditional_authz_batch_receipt_replays_and_conflicts() {
     .unwrap();
     assert!(!first.replayed);
     assert_eq!(first.records.len(), 2);
-    assert!(first.records.iter().all(|record| record.revision == 1));
+    assert!(
+        first
+            .records
+            .iter()
+            .all(|record| record.revision == base_revision + 1)
+    );
     assert_eq!(
         CoreMetaStore::open(storage.core_store_meta_path())
             .unwrap()
@@ -1228,7 +1228,7 @@ async fn conditional_authz_batch_receipt_replays_and_conflicts() {
 
     let second_options = crate::persistence::AuthzTupleBatchWriteOptions {
         operation_id: Some("provision-access-2".to_string()),
-        expected_revision: Some(1),
+        expected_revision: Some(base_revision + 1),
         ..options.clone()
     };
     let second = write_authz_tuple_batch_conditionally_with_permit(
@@ -1251,7 +1251,11 @@ async fn conditional_authz_batch_receipt_replays_and_conflicts() {
     )
     .await
     .unwrap();
-    assert_eq!(second.records[0].revision, 2);
+    assert_eq!(second.records[0].revision, base_revision + 2);
+    let current_head = crate::authz_head::read(&storage, 42).unwrap().head;
+    assert_eq!(current_head.committed_revision, (base_revision + 2) as u64);
+    assert_eq!(current_head.schema_revision, base_revision as u64);
+    assert_eq!(current_head.tuple_revision, (base_revision + 2) as u64);
 
     let replay = write_authz_tuple_batch_conditionally_with_permit(
         &storage,
@@ -1276,8 +1280,16 @@ async fn conditional_authz_batch_receipt_replays_and_conflicts() {
             .map(|record| record.record_hash.as_str())
             .collect::<Vec<_>>()
     );
-    assert!(replay.records.iter().all(|record| record.revision == 1));
-    assert_eq!(latest_authz_revision(&storage, 42).await.unwrap(), 2);
+    assert!(
+        replay
+            .records
+            .iter()
+            .all(|record| record.revision == base_revision + 1)
+    );
+    assert_eq!(
+        latest_authz_revision(&storage, 42).await.unwrap(),
+        base_revision + 2
+    );
 
     let changed = write_authz_tuple_batch_conditionally_with_permit(
         &storage,
@@ -1300,7 +1312,7 @@ async fn conditional_authz_batch_receipt_replays_and_conflicts() {
 
     let stale_options = crate::persistence::AuthzTupleBatchWriteOptions {
         operation_id: Some("stale-operation".to_string()),
-        expected_revision: Some(1),
+        expected_revision: Some(base_revision + 1),
         ..options
     };
     let stale = write_authz_tuple_batch_conditionally_with_permit(
@@ -1317,10 +1329,10 @@ async fn conditional_authz_batch_receipt_replays_and_conflicts() {
             cause.downcast_ref::<crate::persistence::AuthzTupleBatchWriteError>(),
             Some(
                 crate::persistence::AuthzTupleBatchWriteError::RevisionConflict {
-                    expected: 1,
-                    actual: 2,
+                    expected,
+                    actual,
                 }
-            )
+            ) if *expected == base_revision + 1 && *actual == base_revision + 2
         )
     }));
 }

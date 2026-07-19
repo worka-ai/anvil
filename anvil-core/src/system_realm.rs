@@ -504,7 +504,6 @@ async fn install_system_schema(storage: &Storage, persistence: &Persistence) -> 
         SYSTEM_STORAGE_TENANT_ID,
         SYSTEM_SCHEMA_ID,
         namespaces.clone(),
-        u64::try_from(latest_revision.max(0)).unwrap_or(0),
         "system-realm-bootstrap",
         "install built-in system realm schema",
     )
@@ -524,7 +523,6 @@ async fn install_system_schema(storage: &Storage, persistence: &Persistence) -> 
                 SYSTEM_REALM_ID,
                 revision.schema_ref,
                 Some(binding.binding_generation),
-                u64::try_from(latest_revision.max(0)).unwrap_or(0),
                 "system-realm-bootstrap",
                 "bind built-in system realm schema",
             )
@@ -537,7 +535,6 @@ async fn install_system_schema(storage: &Storage, persistence: &Persistence) -> 
                 SYSTEM_REALM_ID,
                 revision.schema_ref.clone(),
                 None,
-                u64::try_from(latest_revision.max(0)).unwrap_or(0),
                 "system-realm-bootstrap",
                 "bind built-in system realm schema",
             )

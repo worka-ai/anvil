@@ -70,7 +70,6 @@ async fn bind_persistence_test_authz_schema(persistence: &Persistence, tenant_id
                 applied_at: String::new(),
             },
         ],
-        0,
         "test",
         "bind persistence test schema",
     )
@@ -82,7 +81,6 @@ async fn bind_persistence_test_authz_schema(persistence: &Persistence, tenant_id
         crate::authz_scope::DEFAULT_AUTHZ_REALM_ID,
         schema.schema_ref,
         None,
-        0,
         "test",
         "bind persistence test schema",
     )

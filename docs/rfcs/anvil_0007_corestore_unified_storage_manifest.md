@@ -597,7 +597,7 @@ Initial CoreMeta table registry:
 | `0x8302` | `cf_index_rows` | `realm / bucket / index_id / encoded_sort_key / object_ref` | `IndexRow` | committed root generation only |
 | `0x8401` | `cf_boundary` | `realm / bucket / generation` | `BoundarySchemaRow` | committed root generation only |
 | `0x8402` | `cf_boundary` | `realm / bucket / dimension_id / encoded_value / object_ref` | `BoundaryValueRow` | committed root generation only |
-| `0x8501` | `cf_authz` | `realm / schema_generation` | `AuthzSchemaRow` | committed authz root generation only |
+| `0x8501` | `cf_authz` | `schema_revision / tenant / schema_id / revision`; `schema_latest / tenant / schema_id`; `schema_digest / tenant / schema_id / digest`; or `schema_binding / tenant / realm` | `AuthzSchemaRow` | committed authz root generation only |
 | `0x8502` | `cf_authz` | `realm / revision / tuple_hash` | `AuthzTuplePageRow` | committed authz root generation only |
 | `0x8503` | `cf_authz` | `tenant / principal / operation_hash` | `AuthzIdempotencyReceiptRow` | committed atomically with the tuple batch revision |
 | `0x8504` | `cf_authz` | `tenant` | `AuthzHeadRow` | committed atomically with every schema, binding, or tuple mutation |
@@ -860,14 +860,15 @@ message AuthzTuplePageRow {
 
 message AuthzHeadRow {
   CoreMetaRowCommon common = 1;
-  int64 tenant_id = 2;
-  uint64 committed_revision = 3;
-  uint64 tuple_revision = 4;
-  uint64 schema_revision = 5;
-  uint64 derived_through_revision = 6;
-  string tuple_stream_head_hash = 7;
-  string active_schema_bindings_hash = 8;
-  uint64 updated_at_unix_nanos = 9;
+  string schema = 2; // "anvil.authz.head.v1"
+  int64 tenant_id = 3;
+  uint64 committed_revision = 4;
+  uint64 tuple_revision = 5;
+  uint64 schema_revision = 6;
+  uint64 derived_through_revision = 7;
+  string tuple_stream_head_hash = 8;
+  string active_schema_bindings_hash = 9;
+  uint64 updated_at_unix_nanos = 10;
 }
 
 `AuthzHeadRow` is the sole allocator and current-revision source for one storage
@@ -880,6 +881,12 @@ to infer the current revision is forbidden. `derived_through_revision` may lag,
 but permission evaluation at a newer committed revision MUST apply the complete
 delta from that watermark through `committed_revision` or wait for catch-up; it
 must never answer from stale derived state.
+
+`tuple_stream_head_hash` is the SHA-256 commitment to the latest logical tuple
+journal payload, independent of the internal CoreStore stream envelope hash.
+`active_schema_bindings_hash` is a rolling SHA-256 commitment over binding
+mutations serialized by `committed_revision`; updating it MUST NOT scan the
+binding history or current binding rows.
 
 message PersonalDbGroupRow {
   CoreMetaRowCommon common = 1;

@@ -201,12 +201,7 @@ pub(super) fn prepare_receipt(
     Ok(Some(PreparedAuthzIdempotencyReceipt {
         tuple_key: receipt_tuple_key(tenant_id, &operation_key_hash)?,
         payload: encode_receipt(&receipt)?,
-        transaction_id: format!(
-            "authz-tuple-batch-idempotent:{}",
-            operation_key_hash
-                .strip_prefix("blake3:")
-                .unwrap_or(&operation_key_hash)
-        ),
+        transaction_id: receipt_transaction_id(&operation_key_hash),
     }))
 }
 
@@ -395,12 +390,23 @@ fn receipt_to_proto(receipt: &AuthzIdempotencyReceipt) -> AuthzIdempotencyReceip
 }
 
 fn receipt_common(receipt: &AuthzIdempotencyReceipt) -> CoreMetaRowCommonProto {
+    let operation_key_hash =
+        operation_key_hash(receipt.tenant_id, &receipt.principal, &receipt.operation_id);
     core_meta_committed_row_common(
         format!("tenant/{}/authz", receipt.tenant_id),
         core_meta_root_key_hash(&format!("authz/{}", receipt.tenant_id)),
         receipt.revision.max(0) as u64,
-        operation_key_hash(receipt.tenant_id, &receipt.principal, &receipt.operation_id),
+        receipt_transaction_id(&operation_key_hash),
         receipt.committed_at_unix_nanos.max(0) as u64,
+    )
+}
+
+fn receipt_transaction_id(operation_key_hash: &str) -> String {
+    format!(
+        "authz-tuple-batch-idempotent:{}",
+        operation_key_hash
+            .strip_prefix("blake3:")
+            .unwrap_or(operation_key_hash)
     )
 }
 
