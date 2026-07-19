@@ -346,6 +346,52 @@ async fn partition_owner_pages_are_bounded_and_continue_without_duplicates() {
 }
 
 #[tokio::test]
+async fn partition_owner_node_pages_use_the_node_projection() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    for seed in 1..=32 {
+        acquire_partition_recovery(
+            &storage,
+            acquire_for_partition(&format!("noise-{seed}"), seed, 100),
+            KEY,
+        )
+        .await
+        .unwrap();
+    }
+    for seed in 40..=42 {
+        acquire_partition_recovery(
+            &storage,
+            acquire_for_partition("node-target", seed, 100),
+            KEY,
+        )
+        .await
+        .unwrap();
+    }
+
+    let first = list_partition_owners_for_node_page(&storage, "node-target", None, 2, KEY)
+        .await
+        .unwrap();
+    assert_eq!(first.owners.len(), 2);
+    assert!(
+        first
+            .owners
+            .iter()
+            .all(|owner| owner.owner_node_id == "node-target")
+    );
+    let second = list_partition_owners_for_node_page(
+        &storage,
+        "node-target",
+        first.next_cursor.as_ref(),
+        2,
+        KEY,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.owners.len(), 1);
+    assert!(second.next_cursor.is_none());
+}
+
+#[tokio::test]
 async fn point_cas_reads_are_independent_of_unrelated_owner_cardinality() {
     let temp = tempdir().unwrap();
     let storage = Storage::new_at(temp.path()).await.unwrap();
@@ -632,6 +678,50 @@ async fn ownership_fence_pages_continue_in_bounded_coremeta_order() {
     }
     assert_eq!(page_sizes, vec![2, 2, 1]);
     assert_eq!(listed, expected);
+}
+
+#[tokio::test]
+async fn ownership_fence_node_pages_use_the_node_projection() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    for index in 0..24 {
+        let mut request = ownership_acquire(
+            OwnershipPrincipal::node(format!("noise-{index}")),
+            100,
+            500,
+            format!("noise-{index}"),
+        );
+        request.resource.resource_id = format!("noise-resource-{index}");
+        acquire_ownership(&storage, request, KEY).await.unwrap();
+    }
+    for index in 0..3 {
+        let mut request = ownership_acquire(
+            OwnershipPrincipal::node("node-target"),
+            100,
+            500,
+            format!("target-{index}"),
+        );
+        request.resource.resource_id = format!("target-resource-{index}");
+        acquire_ownership(&storage, request, KEY).await.unwrap();
+    }
+
+    let first =
+        list_active_ownership_fences_for_node_page(&storage, "node-target", 200, None, 2, KEY)
+            .await
+            .unwrap();
+    assert_eq!(first.fences.len(), 2);
+    let second = list_active_ownership_fences_for_node_page(
+        &storage,
+        "node-target",
+        200,
+        first.next_cursor.as_ref(),
+        2,
+        KEY,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.fences.len(), 1);
+    assert!(second.next_cursor.is_none());
 }
 
 #[tokio::test]

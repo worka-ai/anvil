@@ -17,7 +17,9 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 const PARTITION_OWNER_ROW_PREFIX: &str = "partition_owner";
+const PARTITION_OWNER_BY_NODE_PREFIX: &str = "partition_owner_by_node";
 const OWNERSHIP_FENCE_ROW_PREFIX: &str = "ownership_fence";
+const OWNERSHIP_FENCE_BY_NODE_PREFIX: &str = "ownership_fence_by_node";
 
 /// Maximum number of ordered CoreMeta rows inspected by one fence page request.
 pub const MAX_PARTITION_FENCE_PAGE_SIZE: usize = 256;
@@ -65,13 +67,17 @@ pub async fn list_partition_owners_page(
     limit: usize,
     signing_key: &[u8],
 ) -> Result<PartitionOwnerPage> {
-    partition_owner_page(storage, cursor, limit, signing_key, |_| true)
+    partition_owner_page(
+        storage,
+        partition_owner_row_prefix()?,
+        cursor,
+        limit,
+        signing_key,
+        |owner| partition_owner_row_key(&owner.partition_family, &owner.partition_id),
+    )
 }
 
-/// Lists one bounded source page, retaining owners assigned to `owner_node_id`.
-///
-/// The limit bounds inspected CoreMeta rows, so a filtered page can contain fewer
-/// owners than `limit` while still returning a continuation cursor.
+/// Lists one bounded page from the node-owned partition projection.
 pub async fn list_partition_owners_for_node_page(
     storage: &Storage,
     owner_node_id: &str,
@@ -80,9 +86,14 @@ pub async fn list_partition_owners_for_node_page(
     signing_key: &[u8],
 ) -> Result<PartitionOwnerPage> {
     require_nonempty(owner_node_id, "owner node id")?;
-    partition_owner_page(storage, cursor, limit, signing_key, |owner| {
-        owner.owner_node_id == owner_node_id
-    })
+    partition_owner_page(
+        storage,
+        partition_owner_by_node_prefix(owner_node_id)?,
+        cursor,
+        limit,
+        signing_key,
+        partition_owner_by_node_key,
+    )
 }
 
 /// Lists at most `limit` ownership-fence rows after `cursor`.
@@ -92,13 +103,18 @@ pub async fn list_ownership_fences_page(
     limit: usize,
     signing_key: &[u8],
 ) -> Result<OwnershipFencePage> {
-    ownership_fence_page(storage, cursor, limit, signing_key, |_| true)
+    ownership_fence_page(
+        storage,
+        ownership_fence_row_prefix()?,
+        cursor,
+        limit,
+        signing_key,
+        |record| ownership_fence_row_key(record.owner.tenant_id, &record.resource),
+        |_| true,
+    )
 }
 
-/// Lists one bounded source page, retaining active node-owned fences.
-///
-/// The limit bounds inspected CoreMeta rows, so a filtered page can contain fewer
-/// fences than `limit` while still returning a continuation cursor.
+/// Lists one bounded source page from the node-owned fence projection.
 pub async fn list_active_ownership_fences_for_node_page(
     storage: &Storage,
     owner_node_id: &str,
@@ -111,11 +127,15 @@ pub async fn list_active_ownership_fences_for_node_page(
     if now_nanos < 0 {
         return Err(anyhow!("ownership fence timestamp must be nonnegative"));
     }
-    ownership_fence_page(storage, cursor, limit, signing_key, |record| {
-        record.owner.principal_kind == "node"
-            && record.owner.actor_instance_id == owner_node_id
-            && record.is_active_unexpired(now_nanos)
-    })
+    ownership_fence_page(
+        storage,
+        ownership_fence_by_node_prefix(owner_node_id)?,
+        cursor,
+        limit,
+        signing_key,
+        ownership_fence_by_node_key,
+        |record| record.is_active_unexpired(now_nanos),
+    )
 }
 
 pub(super) async fn read_ownership_fence_state(
@@ -145,13 +165,24 @@ pub(super) async fn write_ownership_fence_state(
 ) -> Result<()> {
     let row_key = ownership_fence_row_key(record.owner.tenant_id, &record.resource)?;
     let payload = encode_ownership_fence_record(record)?;
+    let old_projection_key = expected_ref
+        .map(|payload| decode_ownership_fence_record(payload))
+        .transpose()?
+        .filter(|record| record.owner.principal_kind == "node")
+        .map(|record| ownership_fence_by_node_key(&record))
+        .transpose()?;
+    let new_projection_key = (record.owner.principal_kind == "node")
+        .then(|| ownership_fence_by_node_key(record))
+        .transpose()?;
     let scope_partition = ownership_resource_hash(record.owner.tenant_id, &record.resource)?;
-    commit_point_put(
+    commit_projected_point_put(
         storage,
         TABLE_OWNERSHIP_FENCE_ROW,
         row_key,
         expected_ref.map(Vec::as_slice),
         payload,
+        old_projection_key,
+        new_projection_key,
         scope_partition,
         "ownership-fence-cas",
     )
@@ -185,12 +216,19 @@ pub(super) async fn write_partition_owner_state(
 ) -> Result<()> {
     let row_key = partition_owner_row_key(&owner.partition_family, &owner.partition_id)?;
     let payload = encode_partition_owner_record(owner)?;
-    commit_point_put(
+    let old_projection_key = expected_ref
+        .map(|payload| decode_partition_owner_record(payload))
+        .transpose()?
+        .map(|owner| partition_owner_by_node_key(&owner))
+        .transpose()?;
+    commit_projected_point_put(
         storage,
         TABLE_PARTITION_OWNER_ROW,
         row_key,
         expected_ref.map(Vec::as_slice),
         payload,
+        old_projection_key,
+        Some(partition_owner_by_node_key(owner)?),
         owner.partition_id.clone(),
         "partition-owner-cas",
     )
@@ -240,38 +278,84 @@ pub(super) fn partition_owner_row_key(
     ])
 }
 
-async fn commit_point_put(
+async fn commit_projected_point_put(
     storage: &Storage,
     table_id: u16,
     tuple_key: Vec<u8>,
     expected_payload: Option<&[u8]>,
     payload: Vec<u8>,
+    old_projection_key: Option<Vec<u8>>,
+    new_projection_key: Option<Vec<u8>>,
     scope_partition: String,
     transaction_prefix: &str,
 ) -> Result<()> {
     let store = CoreStore::new(storage.clone()).await?;
     wait_at_point_cas_barrier().await;
+    let projection_changed = old_projection_key != new_projection_key;
+    let mut preconditions = vec![CoreMutationPrecondition::CoreMetaRow {
+        cf: CF_LEASES_FENCES.to_string(),
+        table_id,
+        tuple_key: tuple_key.clone(),
+        expected_payload_hash: expected_payload
+            .map(|payload| core_meta_payload_digest(table_id, payload)),
+        require_absent: expected_payload.is_none(),
+        require_present: expected_payload.is_some(),
+    }];
+    if projection_changed {
+        if let Some(old_key) = old_projection_key.as_ref() {
+            preconditions.push(CoreMutationPrecondition::CoreMetaRow {
+                cf: CF_LEASES_FENCES.to_string(),
+                table_id,
+                tuple_key: old_key.clone(),
+                expected_payload_hash: expected_payload
+                    .map(|payload| core_meta_payload_digest(table_id, payload)),
+                require_absent: false,
+                require_present: true,
+            });
+        }
+        if let Some(new_key) = new_projection_key.as_ref() {
+            preconditions.push(CoreMutationPrecondition::CoreMetaRow {
+                cf: CF_LEASES_FENCES.to_string(),
+                table_id,
+                tuple_key: new_key.clone(),
+                expected_payload_hash: None,
+                require_absent: true,
+                require_present: false,
+            });
+        }
+    }
+    let mut operations = Vec::with_capacity(3);
+    if projection_changed && let Some(old_key) = old_projection_key {
+        operations.push(CoreMutationOperation::CoreMetaDelete {
+            partition_id: scope_partition.clone(),
+            cf: CF_LEASES_FENCES.to_string(),
+            table_id,
+            tuple_key: old_key,
+        });
+    }
+    operations.push(CoreMutationOperation::CoreMetaPut {
+        partition_id: scope_partition.clone(),
+        cf: CF_LEASES_FENCES.to_string(),
+        table_id,
+        tuple_key,
+        payload: payload.clone(),
+    });
+    if let Some(new_key) = new_projection_key {
+        operations.push(CoreMutationOperation::CoreMetaPut {
+            partition_id: scope_partition.clone(),
+            cf: CF_LEASES_FENCES.to_string(),
+            table_id,
+            tuple_key: new_key,
+            payload,
+        });
+    }
     store
         .commit_mutation_batch(CoreMutationBatch {
             transaction_id: format!("{transaction_prefix}:{}", uuid::Uuid::new_v4()),
             scope_partition: scope_partition.clone(),
             committed_by_principal: "partition-fence".to_string(),
-            preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
-                cf: CF_LEASES_FENCES.to_string(),
-                table_id,
-                tuple_key: tuple_key.clone(),
-                expected_payload_hash: expected_payload
-                    .map(|payload| core_meta_payload_digest(table_id, payload)),
-                require_absent: expected_payload.is_none(),
-                require_present: expected_payload.is_some(),
-            }],
-            operations: vec![CoreMutationOperation::CoreMetaPut {
-                partition_id: scope_partition,
-                cf: CF_LEASES_FENCES.to_string(),
-                table_id,
-                tuple_key,
-                payload,
-            }],
+            preconditions,
+            operations,
         })
         .await?;
     Ok(())
@@ -279,12 +363,12 @@ async fn commit_point_put(
 
 fn partition_owner_page(
     storage: &Storage,
+    prefix: Vec<u8>,
     cursor: Option<&PartitionOwnerPageCursor>,
     limit: usize,
     signing_key: &[u8],
-    include: impl Fn(&PartitionOwnerState) -> bool,
+    expected_key: impl Fn(&PartitionOwnerState) -> Result<Vec<u8>>,
 ) -> Result<PartitionOwnerPage> {
-    let prefix = partition_owner_row_prefix()?;
     let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
     let (rows, has_more) = scan_page(
         &meta,
@@ -303,13 +387,11 @@ fn partition_owner_page(
         let owner = decode_partition_owner_record(&row.payload)?;
         owner.verify(signing_key)?;
         let tuple_key = core_meta_record_tuple_key(&row.key)?;
-        let expected_key = partition_owner_row_key(&owner.partition_family, &owner.partition_id)?;
+        let expected_key = expected_key(&owner)?;
         if tuple_key != expected_key.as_slice() {
             bail!("partition owner page row key does not match its payload");
         }
-        if include(&owner) {
-            owners.push(owner);
-        }
+        owners.push(owner);
     }
     Ok(PartitionOwnerPage {
         owners,
@@ -319,12 +401,13 @@ fn partition_owner_page(
 
 fn ownership_fence_page(
     storage: &Storage,
+    prefix: Vec<u8>,
     cursor: Option<&OwnershipFencePageCursor>,
     limit: usize,
     signing_key: &[u8],
+    expected_key: impl Fn(&OwnershipFenceRecord) -> Result<Vec<u8>>,
     include: impl Fn(&OwnershipFenceRecord) -> bool,
 ) -> Result<OwnershipFencePage> {
-    let prefix = ownership_fence_row_prefix()?;
     let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
     let (rows, has_more) = scan_page(
         &meta,
@@ -343,7 +426,7 @@ fn ownership_fence_page(
         let record = decode_ownership_fence_record(&row.payload)?;
         record.verify(signing_key)?;
         let tuple_key = core_meta_record_tuple_key(&row.key)?;
-        let expected_key = ownership_fence_row_key(record.owner.tenant_id, &record.resource)?;
+        let expected_key = expected_key(&record)?;
         if tuple_key != expected_key.as_slice() {
             bail!("ownership fence page row key does not match its payload");
         }
@@ -411,8 +494,50 @@ fn partition_owner_row_prefix() -> Result<Vec<u8>> {
     core_meta_tuple_key(&[CoreMetaTuplePart::Utf8(PARTITION_OWNER_ROW_PREFIX)])
 }
 
+fn partition_owner_by_node_prefix(owner_node_id: &str) -> Result<Vec<u8>> {
+    require_nonempty(owner_node_id, "owner node id")?;
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(PARTITION_OWNER_BY_NODE_PREFIX),
+        CoreMetaTuplePart::Utf8(owner_node_id),
+    ])
+}
+
+fn partition_owner_by_node_key(owner: &PartitionOwnerState) -> Result<Vec<u8>> {
+    validate_hex32(&owner.partition_id, "partition id")?;
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(PARTITION_OWNER_BY_NODE_PREFIX),
+        CoreMetaTuplePart::Utf8(&owner.owner_node_id),
+        CoreMetaTuplePart::Utf8(&owner.partition_family),
+        CoreMetaTuplePart::Hash(&format!("blake3:{}", owner.partition_id)),
+    ])
+}
+
 fn ownership_fence_row_prefix() -> Result<Vec<u8>> {
     core_meta_tuple_key(&[CoreMetaTuplePart::Utf8(OWNERSHIP_FENCE_ROW_PREFIX)])
+}
+
+fn ownership_fence_by_node_prefix(owner_node_id: &str) -> Result<Vec<u8>> {
+    require_nonempty(owner_node_id, "owner node id")?;
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(OWNERSHIP_FENCE_BY_NODE_PREFIX),
+        CoreMetaTuplePart::Utf8(owner_node_id),
+    ])
+}
+
+fn ownership_fence_by_node_key(record: &OwnershipFenceRecord) -> Result<Vec<u8>> {
+    if record.owner.principal_kind != "node" {
+        bail!("ownership fence node projection requires a node principal");
+    }
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(OWNERSHIP_FENCE_BY_NODE_PREFIX),
+        CoreMetaTuplePart::Utf8(&record.owner.actor_instance_id),
+        CoreMetaTuplePart::I64(record.owner.tenant_id),
+        CoreMetaTuplePart::Utf8(record.resource.resource_kind.as_str()),
+        CoreMetaTuplePart::Hash(&format!(
+            "blake3:{}",
+            ownership_resource_hash(record.owner.tenant_id, &record.resource)?
+        )),
+    ])
 }
 
 #[cfg(test)]
