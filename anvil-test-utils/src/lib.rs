@@ -22,13 +22,19 @@ use tonic::transport::Channel;
 use tracing_subscriber::{self, EnvFilter};
 
 mod coremeta_bootstrap;
+mod docker_cluster_control;
 mod docker_image;
+mod docker_observation;
 mod docker_process;
+mod docker_response_fault;
 mod docker_topology;
 
 use coremeta_bootstrap::*;
+pub use docker_cluster_control::{DockerNetworkPartition, DockerPeer};
 use docker_image::require_docker_image;
+pub use docker_observation::DockerObjectObservation;
 use docker_process::*;
+pub use docker_response_fault::GrpcLostResponseProxy;
 use docker_topology::ensure_docker_topology;
 
 static INIT_LOGGER: Once = Once::new();

@@ -453,37 +453,14 @@ pub(super) fn docker_container_publishes_port(
 }
 
 pub(super) fn docker_container_command(project_name: &str, node: u8, operation: &str) {
-    let service = docker_node_service(node);
-    let output = command_with_docker_env("docker")
-        .args([
-            "ps",
-            "-aq",
-            "--filter",
-            &format!("label=com.docker.compose.project={project_name}"),
-            "--filter",
-            &format!("label=com.docker.compose.service={service}"),
-        ])
-        .output()
-        .expect("failed to locate Docker test node");
-    assert!(
-        output.status.success(),
-        "failed to locate Docker test node {node}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let ids = String::from_utf8(output.stdout).expect("Docker container id is utf-8");
-    let ids = ids.lines().filter(|id| !id.is_empty()).collect::<Vec<_>>();
-    assert_eq!(
-        ids.len(),
-        1,
-        "expected one container for Docker test node {node}"
-    );
-    if operation == "start" && docker_container_is_running(ids[0]) {
+    let container_id = docker_container_id(project_name, node);
+    if operation == "start" && docker_container_is_running(&container_id) {
         return;
     }
     let mut last_failure = String::new();
     for _ in 0..3 {
         let mut child = command_with_docker_env("docker")
-            .args([operation, ids[0]])
+            .args([operation, &container_id])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -511,11 +488,254 @@ pub(super) fn docker_container_command(project_name: &str, node: u8, operation: 
                 None => std::thread::sleep(Duration::from_millis(25)),
             }
         }
-        if operation == "start" && docker_container_is_running(ids[0]) {
+        if operation == "start" && docker_container_is_running(&container_id) {
             return;
         }
     }
     panic!("docker {operation} failed for node {node}: {last_failure}");
+}
+
+pub(super) fn docker_container_id(project_name: &str, node: u8) -> String {
+    let service = docker_node_service(node);
+    let output = command_with_docker_env("docker")
+        .args([
+            "ps",
+            "-aq",
+            "--filter",
+            &format!("label=com.docker.compose.project={project_name}"),
+            "--filter",
+            &format!("label=com.docker.compose.service={service}"),
+        ])
+        .output()
+        .expect("failed to locate Docker test node");
+    assert!(
+        output.status.success(),
+        "failed to locate Docker test node {node}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let ids = String::from_utf8(output.stdout).expect("Docker container id is utf-8");
+    let ids = ids
+        .lines()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids.len(),
+        1,
+        "expected one container for Docker test node {node}"
+    );
+    ids.into_iter().next().unwrap()
+}
+
+pub(super) fn docker_container_volume_name(
+    project_name: &str,
+    node: u8,
+    destination: &str,
+) -> String {
+    let container_id = docker_container_id(project_name, node);
+    let output = command_with_docker_env("docker")
+        .args([
+            "inspect",
+            "--format",
+            "{{range .Mounts}}{{println .Name \"|\" .Destination}}{{end}}",
+            &container_id,
+        ])
+        .output()
+        .expect("inspect Docker test node mounts");
+    assert!(
+        output.status.success(),
+        "inspect Docker test node {node} mounts: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_once('|'))
+        .find_map(|(name, mounted_at)| {
+            (mounted_at.trim() == destination).then(|| name.trim().to_string())
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| panic!("Docker test node {node} has no volume at {destination}"))
+}
+
+pub(super) fn docker_recreate_node_with_empty_volume(
+    compose_file: &std::path::Path,
+    project_name: &str,
+    compose_env: &[(String, String)],
+    node: u8,
+) {
+    let service = docker_node_service(node);
+    let volume = docker_container_volume_name(project_name, node, "/var/lib/anvil");
+    docker_compose_with_env(
+        compose_file,
+        project_name,
+        &["rm", "--force", "--stop", &service],
+        compose_env,
+    );
+    docker_command_expect_success(
+        &["volume", "rm", &volume],
+        &format!("remove Docker test node {node} volume"),
+    );
+    docker_compose_with_env(
+        compose_file,
+        project_name,
+        &["create", "--no-deps", &service],
+        compose_env,
+    );
+}
+
+pub(super) fn docker_clear_node_block_shards(
+    project_name: &str,
+    compose_env: &[(String, String)],
+    node: u8,
+) {
+    let volume = docker_container_volume_name(project_name, node, "/var/lib/anvil");
+    let image = compose_env
+        .iter()
+        .find_map(|(key, value)| (key == "ANVIL_IMAGE").then_some(value.as_str()))
+        .expect("Docker test compose env includes ANVIL_IMAGE");
+    docker_command_expect_success(
+        &[
+            "run",
+            "--rm",
+            "--entrypoint",
+            "sh",
+            "--volume",
+            &format!("{volume}:/var/lib/anvil"),
+            image,
+            "-c",
+            "rm -rf /var/lib/anvil/corestore/blocks/local-cache/*",
+        ],
+        &format!("clear Docker test node {node} block shards"),
+    );
+}
+
+pub(super) fn docker_compose_network_name(project_name: &str) -> String {
+    let output = command_with_docker_env("docker")
+        .args([
+            "network",
+            "ls",
+            "--quiet",
+            "--filter",
+            &format!("label=com.docker.compose.project={project_name}"),
+            "--filter",
+            "label=com.docker.compose.network=anvilnet",
+        ])
+        .output()
+        .expect("locate Docker Compose test network");
+    assert!(
+        output.status.success(),
+        "locate Docker Compose test network: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let network_ids = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        network_ids.len(),
+        1,
+        "expected one Docker Compose test network for {project_name}"
+    );
+    network_ids.into_iter().next().unwrap()
+}
+
+pub(super) fn docker_create_bridge_network(network_name: &str, project_name: &str) {
+    if docker_network_exists(network_name) {
+        return;
+    }
+    docker_command_expect_success(
+        &[
+            "network",
+            "create",
+            "--driver",
+            "bridge",
+            "--label",
+            &format!("anvil.test.project={project_name}"),
+            network_name,
+        ],
+        &format!("create Docker partition network {network_name}"),
+    );
+}
+
+pub(super) fn docker_connect_network(network: &str, container_id: &str, alias: &str) {
+    if docker_network_contains_container(network, container_id) {
+        return;
+    }
+    docker_command_expect_success(
+        &[
+            "network",
+            "connect",
+            "--alias",
+            alias,
+            network,
+            container_id,
+        ],
+        &format!("connect {container_id} to Docker network {network}"),
+    );
+}
+
+pub(super) fn docker_disconnect_network(network: &str, container_id: &str) {
+    if !docker_network_contains_container(network, container_id) {
+        return;
+    }
+    docker_command_expect_success(
+        &["network", "disconnect", "--force", network, container_id],
+        &format!("disconnect {container_id} from Docker network {network}"),
+    );
+}
+
+pub(super) fn docker_remove_network(network: &str) {
+    if !docker_network_exists(network) {
+        return;
+    }
+    docker_command_expect_success(
+        &["network", "rm", network],
+        &format!("remove Docker network {network}"),
+    );
+}
+
+fn docker_network_exists(network: &str) -> bool {
+    command_with_docker_env("docker")
+        .args(["network", "inspect", network])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn docker_network_contains_container(network: &str, container_id: &str) -> bool {
+    if !docker_network_exists(network) {
+        return false;
+    }
+    let output = command_with_docker_env("docker")
+        .args([
+            "network",
+            "inspect",
+            "--format",
+            "{{range $id, $_ := .Containers}}{{println $id}}{{end}}",
+            network,
+        ])
+        .output()
+        .expect("inspect Docker network containers");
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|member| member.starts_with(container_id) || container_id.starts_with(member))
+}
+
+fn docker_command_expect_success(args: &[&str], operation: &str) {
+    let output = command_with_docker_env("docker")
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("{operation}: {error}"));
+    assert!(
+        output.status.success(),
+        "{operation}\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 pub(super) fn docker_container_is_running(container_id: &str) -> bool {
