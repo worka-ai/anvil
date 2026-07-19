@@ -108,6 +108,8 @@ pub const TABLE_REFCOUNT_ROW: u16 = 0x8b01;
 pub const TABLE_OBSERVABILITY_CURSOR_ROW: u16 = 0x8c01;
 pub const TABLE_DIAGNOSTIC_ROW: u16 = 0x8c02;
 pub const TABLE_NODE_SIGNING_KEYPAIR_ROW: u16 = 0x8d01;
+pub const TABLE_PERSONALDB_SIGNING_KEY_ROW: u16 = 0x8d02;
+pub const TABLE_PERSONALDB_SIGNING_KEY_HEAD_ROW: u16 = 0x8d03;
 
 const CORE_META_VALUE_SCHEMA_VERSION: u32 = 1;
 pub(crate) const CORE_META_MAX_VALUE_BYTES: usize = 64 * 1024;
@@ -1398,7 +1400,9 @@ fn table_spec(table_id: u16) -> Result<CoreMetaTableSpec> {
         | TABLE_SYSTEM_BOOTSTRAP_MARKER_ROW
         | TABLE_ROOT_CATALOG_CURRENT_ROW
         | TABLE_QUORUM_PROFILE_CURRENT_ROW
-        | TABLE_NODE_SIGNING_KEYPAIR_ROW => CoreMetaTableSpec {
+        | TABLE_NODE_SIGNING_KEYPAIR_ROW
+        | TABLE_PERSONALDB_SIGNING_KEY_ROW
+        | TABLE_PERSONALDB_SIGNING_KEY_HEAD_ROW => CoreMetaTableSpec {
             cf: CF_MESH,
             max_payload_bytes: CORE_META_MAX_VALUE_BYTES,
         },

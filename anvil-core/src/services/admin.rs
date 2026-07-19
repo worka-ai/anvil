@@ -434,31 +434,56 @@ impl AdminService for AppState {
         )
         .await?;
         let req = request.into_inner();
-        let keys = self
+        let page_size = crate::services::collection_cursor::page_size(req.page.as_ref())?;
+        let revision = self
             .personaldb_signing_key_store
-            .list_public_records()
-            .map_err(|err| Status::internal(err.to_string()))?
-            .into_iter()
-            .map(personaldb_signing_key_to_proto)
-            .collect::<Vec<_>>();
+            .current_collection_revision()
+            .map_err(|err| Status::internal(err.to_string()))?;
         let principal_scope = format!(
             "admin:{}/tenant:{}",
             principal.principal_id, principal.tenant_id
         );
-        let (keys, page) = crate::services::collection_cursor::paginate(
-            keys,
+        let revision_string = revision.to_string();
+        let binding = crate::services::collection_cursor::CollectionCursorBinding {
+            service_method: "anvil.AdminService/ListPersonalDbSigningKeys",
+            filters: &[],
+            principal_scope: &principal_scope,
+            page_size,
+            revision: &revision_string,
+            sort: "key_id.asc",
+        };
+        let position = crate::services::collection_cursor::decode_page_token(
             req.page.as_ref(),
-            "anvil.AdminService/ListPersonalDbSigningKeys",
-            &[],
-            &principal_scope,
-            "key_id.asc",
+            &binding,
             self.config.jwt_secret.as_bytes(),
-            |key| key.key_id.as_str(),
-            |key| key.record_revision,
         )?;
+        let after_tuple_key =
+            crate::services::collection_cursor::decode_binary_position(position.as_deref())?;
+        let page = self
+            .personaldb_signing_key_store
+            .page_public_records(revision, after_tuple_key.as_deref(), page_size)
+            .map_err(|err| Status::aborted(err.to_string()))?;
+        let next_page_token = page
+            .next_tuple_key
+            .as_deref()
+            .map(crate::services::collection_cursor::encode_binary_position)
+            .transpose()?
+            .map(|position| {
+                crate::services::collection_cursor::encode_next_page_token(
+                    &position,
+                    &binding,
+                    self.config.jwt_secret.as_bytes(),
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
         Ok(Response::new(ListPersonalDbSigningKeysResponse {
-            keys,
-            page: Some(page),
+            keys: page
+                .records
+                .into_iter()
+                .map(personaldb_signing_key_to_proto)
+                .collect(),
+            page: Some(PageResponse { next_page_token }),
         }))
     }
 

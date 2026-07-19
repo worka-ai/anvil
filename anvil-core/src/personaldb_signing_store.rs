@@ -9,8 +9,9 @@
 use crate::{
     core_store::{
         CF_MESH, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaRowCommonProto, CoreMetaStore,
-        CoreMetaTuplePart, TABLE_NODE_SIGNING_KEYPAIR_ROW, commit_coremeta_batch_for_storage,
-        core_meta_committed_row_common, core_meta_root_key_hash, core_meta_tuple_key,
+        CoreMetaTuplePart, TABLE_PERSONALDB_SIGNING_KEY_HEAD_ROW, TABLE_PERSONALDB_SIGNING_KEY_ROW,
+        commit_coremeta_batch_for_storage, core_meta_committed_row_common,
+        core_meta_record_tuple_key, core_meta_root_key_hash, core_meta_tuple_key,
         decode_deterministic_proto, encode_deterministic_proto,
     },
     crypto::EncryptionKeyring,
@@ -38,12 +39,10 @@ use tokio::sync::Mutex;
 
 const SIGNING_KEY_RECORD_FORMAT_VERSION: u32 = 1;
 const SIGNING_KEY_RECORD_SCHEMA: &str = "anvil.system.personaldb_signing_key.v1";
+const SIGNING_KEY_HEAD_SCHEMA: &str = "anvil.system.personaldb_signing_key_head.v1";
 const SIGNING_KEY_NAMESPACE: &str = "personaldb-signing-key";
-
-// This existing table is the Anvil-owned CoreMeta home for node/control-plane
-// signing material. The tuple namespace keeps PersonalDB keys disjoint from the
-// node identity rows already stored in it.
-const SIGNING_KEY_TABLE_ID: u16 = TABLE_NODE_SIGNING_KEYPAIR_ROW;
+const SIGNING_KEY_PAGE_MAX: usize = 1_000;
+const SIGNING_KEY_COUNT_MAX: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersonalDbSigningKeyAuditMetadata {
@@ -84,6 +83,12 @@ pub struct PersonalDbSigningKeyPublicRecord {
     pub created_audit: PersonalDbSigningKeyAuditMetadata,
     pub updated_audit: PersonalDbSigningKeyAuditMetadata,
     pub record_revision: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PersonalDbSigningKeyPage {
+    pub records: Vec<PersonalDbSigningKeyPublicRecord>,
+    pub next_tuple_key: Option<Vec<u8>>,
 }
 
 pub struct PersonalDbSigningKeyImport<'a> {
@@ -171,7 +176,13 @@ impl PersonalDbSigningKeyStore {
                 trust_record.key_id
             );
         }
-        self.reject_conflicting_generation(&trust_record)?;
+        let existing_records = self.list_public_records()?;
+        if existing_records.len() >= SIGNING_KEY_COUNT_MAX {
+            bail!(
+                "PersonalDB signing key count has reached the configured maximum of {SIGNING_KEY_COUNT_MAX}"
+            );
+        }
+        self.reject_conflicting_generation(&trust_record, &existing_records)?;
 
         let now = current_unix_nanos()?;
         let row = StoredSigningKey {
@@ -197,20 +208,89 @@ impl PersonalDbSigningKeyStore {
     }
 
     pub fn list_public_records(&self) -> Result<Vec<PersonalDbSigningKeyPublicRecord>> {
+        let revision = self.current_collection_revision()?;
+        let mut records = Vec::new();
+        let mut after_tuple_key = None;
+        loop {
+            let page = self.page_public_records(
+                revision,
+                after_tuple_key.as_deref(),
+                SIGNING_KEY_PAGE_MAX,
+            )?;
+            records.extend(page.records);
+            if records.len() > SIGNING_KEY_COUNT_MAX {
+                bail!(
+                    "PersonalDB signing key count exceeds the configured maximum of {SIGNING_KEY_COUNT_MAX}"
+                );
+            }
+            let Some(next_tuple_key) = page.next_tuple_key else {
+                return Ok(records);
+            };
+            after_tuple_key = Some(next_tuple_key);
+        }
+    }
+
+    pub fn current_collection_revision(&self) -> Result<u64> {
         let meta = CoreMetaStore::open(self.storage.core_store_meta_path())?;
-        let prefix = signing_key_tuple_prefix()?;
-        let mut records = meta
-            .scan_prefix(CF_MESH, SIGNING_KEY_TABLE_ID, &prefix)?
+        let Some(payload) = meta.get(
+            CF_MESH,
+            TABLE_PERSONALDB_SIGNING_KEY_HEAD_ROW,
+            &signing_key_head_tuple_key()?,
+        )?
+        else {
+            return Ok(0);
+        };
+        decode_signing_key_head(&payload)
+    }
+
+    pub fn page_public_records(
+        &self,
+        expected_revision: u64,
+        after_tuple_key: Option<&[u8]>,
+        page_size: usize,
+    ) -> Result<PersonalDbSigningKeyPage> {
+        if !(1..=SIGNING_KEY_PAGE_MAX).contains(&page_size) {
+            bail!("PersonalDB signing key page size must be between 1 and {SIGNING_KEY_PAGE_MAX}");
+        }
+        if self.current_collection_revision()? != expected_revision {
+            bail!("PersonalDB signing key collection revision changed");
+        }
+        let meta = CoreMetaStore::open(self.storage.core_store_meta_path())?;
+        let mut rows = meta.scan_prefix_page(
+            CF_MESH,
+            TABLE_PERSONALDB_SIGNING_KEY_ROW,
+            &signing_key_tuple_prefix()?,
+            after_tuple_key,
+            page_size + 1,
+        )?;
+        let has_more = rows.len() > page_size;
+        if has_more {
+            rows.truncate(page_size);
+        }
+        let next_tuple_key = if has_more {
+            Some(
+                core_meta_record_tuple_key(
+                    &rows
+                        .last()
+                        .ok_or_else(|| anyhow!("signing key page continuation has no last row"))?
+                        .key,
+                )?
+                .to_vec(),
+            )
+        } else {
+            None
+        };
+        let records = rows
             .into_iter()
-            .map(|record| decode_stored_row(&record.payload))
+            .map(|record| decode_stored_row(&record.payload).map(|row| row.public))
             .collect::<Result<Vec<_>>>()?;
-        records.sort_by(|left, right| {
-            left.public
-                .trust_record
-                .key_id
-                .cmp(&right.public.trust_record.key_id)
-        });
-        Ok(records.into_iter().map(|record| record.public).collect())
+        if self.current_collection_revision()? != expected_revision {
+            bail!("PersonalDB signing key collection changed during page read");
+        }
+        Ok(PersonalDbSigningKeyPage {
+            records,
+            next_tuple_key,
+        })
     }
 
     pub fn load_trust_records(&self) -> Result<Vec<PublicKeyTrustRecord>> {
@@ -391,9 +471,13 @@ impl PersonalDbSigningKeyStore {
         })
     }
 
-    fn reject_conflicting_generation(&self, candidate: &PublicKeyTrustRecord) -> Result<()> {
-        for existing in self.list_public_records()? {
-            let existing = existing.trust_record;
+    fn reject_conflicting_generation(
+        &self,
+        candidate: &PublicKeyTrustRecord,
+        existing_records: &[PersonalDbSigningKeyPublicRecord],
+    ) -> Result<()> {
+        for existing in existing_records {
+            let existing = &existing.trust_record;
             if existing.purpose == candidate.purpose
                 && existing.key_generation == candidate.key_generation
                 && scopes_overlap(&existing.database_scopes, &candidate.database_scopes)
@@ -413,7 +497,7 @@ impl PersonalDbSigningKeyStore {
     fn load_stored_row(&self, key_id: &KeyId) -> Result<Option<StoredSigningKey>> {
         let meta = CoreMetaStore::open(self.storage.core_store_meta_path())?;
         let key = signing_key_tuple_key(key_id)?;
-        meta.get(CF_MESH, SIGNING_KEY_TABLE_ID, &key)?
+        meta.get(CF_MESH, TABLE_PERSONALDB_SIGNING_KEY_ROW, &key)?
             .map(|payload| decode_stored_row(&payload))
             .transpose()
     }
@@ -424,20 +508,30 @@ impl PersonalDbSigningKeyStore {
         let tuple_key = signing_key_tuple_key(key_id)?;
         let payload = encode_stored_row(row)?;
         let common = signing_key_common(row)?;
-        let op = CoreMetaBatchOp {
+        let collection_revision = self
+            .current_collection_revision()?
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("PersonalDB signing key collection revision overflow"))?;
+        let mutation_id = signing_key_mutation_id(key_id, row.public.record_revision);
+        let head_tuple_key = signing_key_head_tuple_key()?;
+        let head_payload = encode_signing_key_head(collection_revision, &mutation_id)?;
+        let key_op = CoreMetaBatchOp {
             cf: CF_MESH,
-            table_id: SIGNING_KEY_TABLE_ID,
+            table_id: TABLE_PERSONALDB_SIGNING_KEY_ROW,
             tuple_key: &tuple_key,
             common: Some(common),
             kind: CoreMetaBatchOpKind::Put(&payload),
         };
-        commit_coremeta_batch_for_storage(
-            &self.storage,
-            &signing_key_mutation_id(key_id, row.public.record_revision),
-            &[op],
-        )
-        .await
-        .with_context(|| format!("persist PersonalDB signing key {key_id}"))?;
+        let head_op = CoreMetaBatchOp {
+            cf: CF_MESH,
+            table_id: TABLE_PERSONALDB_SIGNING_KEY_HEAD_ROW,
+            tuple_key: &head_tuple_key,
+            common: None,
+            kind: CoreMetaBatchOpKind::Put(&head_payload),
+        };
+        commit_coremeta_batch_for_storage(&self.storage, &mutation_id, &[key_op, head_op])
+            .await
+            .with_context(|| format!("persist PersonalDB signing key {key_id}"))?;
         Ok(())
     }
 }
@@ -556,6 +650,54 @@ struct PersonalDbSigningKeyRowProto {
     updated_audit: Option<SigningKeyAuditProto>,
     #[prost(uint64, tag = "19")]
     record_revision: u64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct PersonalDbSigningKeyHeadProto {
+    #[prost(message, optional, tag = "1")]
+    common: Option<CoreMetaRowCommonProto>,
+    #[prost(string, tag = "2")]
+    schema: String,
+    #[prost(uint64, tag = "3")]
+    revision: u64,
+}
+
+fn encode_signing_key_head(revision: u64, mutation_id: &str) -> Result<Vec<u8>> {
+    if revision == 0 {
+        bail!("PersonalDB signing key collection revision must be non-zero");
+    }
+    Ok(encode_deterministic_proto(&PersonalDbSigningKeyHeadProto {
+        common: Some(core_meta_committed_row_common(
+            SYSTEM_REALM_ID,
+            signing_key_head_root_hash(),
+            revision,
+            mutation_id,
+            current_unix_nanos()?,
+        )),
+        schema: SIGNING_KEY_HEAD_SCHEMA.to_string(),
+        revision,
+    }))
+}
+
+fn decode_signing_key_head(bytes: &[u8]) -> Result<u64> {
+    let proto = decode_deterministic_proto::<PersonalDbSigningKeyHeadProto>(
+        bytes,
+        "PersonalDB signing key collection head",
+    )?;
+    if proto.schema != SIGNING_KEY_HEAD_SCHEMA || proto.revision == 0 {
+        bail!("PersonalDB signing key collection head is invalid");
+    }
+    let common = proto
+        .common
+        .ok_or_else(|| anyhow!("PersonalDB signing key collection head has no CoreMeta common"))?;
+    if common.realm_id != SYSTEM_REALM_ID
+        || common.root_key_hash != signing_key_head_root_hash()
+        || common.root_generation != proto.revision
+        || common.transaction_id.is_empty()
+    {
+        bail!("PersonalDB signing key collection head common fields are invalid");
+    }
+    Ok(proto.revision)
 }
 
 fn encode_stored_row(row: &StoredSigningKey) -> Result<Vec<u8>> {
@@ -706,8 +848,19 @@ fn signing_key_tuple_key(key_id: &KeyId) -> Result<Vec<u8>> {
     core_meta_tuple_key(&[
         CoreMetaTuplePart::Utf8(SYSTEM_REALM_ID),
         CoreMetaTuplePart::Utf8(SIGNING_KEY_NAMESPACE),
-        CoreMetaTuplePart::Hash(key_id.as_str()),
+        CoreMetaTuplePart::Utf8(key_id.as_str()),
     ])
+}
+
+fn signing_key_head_tuple_key() -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(SYSTEM_REALM_ID),
+        CoreMetaTuplePart::Utf8(SIGNING_KEY_NAMESPACE),
+    ])
+}
+
+fn signing_key_head_root_hash() -> String {
+    core_meta_root_key_hash(&format!("{SYSTEM_REALM_ID}/{SIGNING_KEY_NAMESPACE}/head"))
 }
 
 fn signing_key_root_id(key_id: &KeyId) -> String {
@@ -873,7 +1026,7 @@ mod tests {
             .unwrap()
             .get(
                 CF_MESH,
-                SIGNING_KEY_TABLE_ID,
+                TABLE_PERSONALDB_SIGNING_KEY_ROW,
                 &signing_key_tuple_key(&trust_record.key_id).unwrap(),
             )
             .unwrap()
@@ -907,6 +1060,64 @@ mod tests {
             .unwrap()
             .verify(&object, &envelope)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn signing_key_pages_seek_ordered_rows_and_reject_stale_revisions() {
+        let directory = tempdir().unwrap();
+        let store = test_store(Storage::new_at(directory.path()).await.unwrap());
+        let mut imported = Vec::new();
+        for (seed, generation) in [(0x31, 1), (0x32, 2), (0x33, 3)] {
+            let private_key = pkcs8(seed);
+            imported.push(
+                store
+                    .import_key(PersonalDbSigningKeyImport {
+                        trust_record: trust_record(
+                            &private_key,
+                            SignaturePurpose::Witness,
+                            generation,
+                            Vec::new(),
+                            Vec::new(),
+                        ),
+                        private_key_pkcs8_der: &private_key,
+                        audit: audit(&format!("import-{generation}")),
+                    })
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let revision = store.current_collection_revision().unwrap();
+        assert_eq!(revision, 3);
+        let first = store.page_public_records(revision, None, 2).unwrap();
+        assert_eq!(first.records.len(), 2);
+        let second = store
+            .page_public_records(revision, first.next_tuple_key.as_deref(), 2)
+            .unwrap();
+        assert_eq!(second.records.len(), 1);
+        assert!(second.next_tuple_key.is_none());
+        let mut paged = first.records;
+        paged.extend(second.records);
+        assert_eq!(paged, store.list_public_records().unwrap());
+
+        store
+            .set_status(PersonalDbSigningKeyStatusUpdate {
+                key_id: imported[0].trust_record.key_id.clone(),
+                expected_record_revision: 1,
+                status: PublicKeyStatus::Retiring,
+                valid_until_log_index: Some(10),
+                audit: audit("retire"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(store.current_collection_revision().unwrap(), 4);
+        assert!(
+            store
+                .page_public_records(revision, None, 2)
+                .unwrap_err()
+                .to_string()
+                .contains("revision changed")
+        );
     }
 
     #[tokio::test]

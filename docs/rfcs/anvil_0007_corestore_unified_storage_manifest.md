@@ -614,6 +614,8 @@ Initial CoreMeta table registry:
 | `0x880a` | `cf_mesh` | `scope_kind / scope_id` | `RepairFindingHeadRow` | current repair-scope revision point lookup |
 | `0x880b` | `cf_mesh` | `scope_kind / scope_id / finding_id` | `RepairFindingIdRow` | immutable finding-id-to-revision point lookup |
 | `0x8d01` | `cf_mesh` | `principal_or_node_id / key_id` | `NodeSigningKeyRow` | committed mesh root generation only |
+| `0x8d02` | `cf_mesh` | `system / personaldb-signing-key / key_id` | `PersonalDbSigningKeyRow` | current encrypted key record ordered by key id |
+| `0x8d03` | `cf_mesh` | `system / personaldb-signing-key` | `PersonalDbSigningKeyHeadRow` | current signing-key collection revision point lookup |
 | `0x8901` | `cf_leases_fences` | `realm / lease_id` | `LeaseFenceRow` | committed root generation only |
 | `0x8a01` | `cf_materialisation` | `node_id / materialisation_epoch` | `MaterialisationCursorRow` | local committed metadata |
 | `0x8a02` | `cf_materialisation` | `writer_family / scope_hash / generation` | `WriterSegmentRow` | immutable historical segment catalogue row |
@@ -1089,6 +1091,25 @@ the cursor token to that revision. Each page seeks directly to
 `page_size + 1` rows. If the scope head changes, an old token is rejected and
 the caller restarts. Point reads by `finding_id` use `RepairFindingIdRow`; they
 MUST NOT scan the finding history.
+
+PersonalDB protocol signing keys use a dedicated ordered table rather than the
+node-signing-key table. The final key-id tuple part is UTF-8, not a hash, so an
+admin listing can seek and resume directly in canonical key-id order. Every
+import or status mutation writes the key row and increments the collection head
+in the same CoreMeta commit group:
+
+```text
+PersonalDbSigningKeyRow  = ("system", "personaldb-signing-key", key_id)
+PersonalDbSigningKeyHead = ("system", "personaldb-signing-key")
+```
+
+`ListPersonalDbSigningKeys` MUST bind its signed continuation token to the head
+revision and read no more than `page_size + 1` key rows. Page sizes are in
+`1..=1000`; the persisted collection is capped at 4096 keys because loading the
+complete trust set is required to verify historical signatures. Imports beyond
+that cap MUST fail rather than allowing an unbounded runtime trust-store load.
+Hashing `key_id` in the physical key or materialising all rows before paging is
+forbidden.
 
 message NodeSigningKeyRow {
   CoreMetaRowCommon common = 1;
