@@ -141,7 +141,16 @@ async fn rfc_0007_large_compressible_payloads_do_not_inline_into_rocksdb() {
     );
 
     let meta = CoreMetaStore::open(meta_path).unwrap();
-    let rows = meta.scan_all_encoded_rows().unwrap();
+    let mut rows = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = meta.scan_encoded_rows_page(cursor.as_ref(), 256).unwrap();
+        rows.extend(page.rows);
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
     let oversized = rows
         .iter()
         .filter(|row| row.value_envelope.len() > 64 * 1024)
@@ -189,7 +198,7 @@ async fn rfc_0007_core_transaction_stream_is_root_anchor_backed() {
         .read_stream(ReadStream {
             stream_id: "core_transactions".to_string(),
             after_sequence: 0,
-            limit: 0,
+            limit: 100,
         })
         .await
         .unwrap();

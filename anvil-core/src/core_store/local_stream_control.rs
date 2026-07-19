@@ -23,6 +23,13 @@ struct CoreControlCurrentRowProto {
     payload_hash: String,
 }
 
+fn validate_stream_page_limit(limit: usize) -> Result<()> {
+    if !(1..=CORE_META_MAX_SCAN_PAGE_ROWS).contains(&limit) {
+        bail!("CoreStore stream page limit must be between 1 and {CORE_META_MAX_SCAN_PAGE_ROWS}");
+    }
+    Ok(())
+}
+
 impl CoreStore {
     pub async fn put_boundary_schema(
         &self,
@@ -333,11 +340,6 @@ impl CoreStore {
         }
     }
 
-    pub(crate) async fn read_raw_stream(&self, stream_id: &str) -> Result<Vec<StreamRecord>> {
-        validate_logical_id(stream_id, "stream id")?;
-        self.read_all_stream_records(stream_id).await
-    }
-
     pub(crate) async fn read_raw_stream_record(
         &self,
         stream_id: &str,
@@ -345,11 +347,11 @@ impl CoreStore {
         event_hash: &str,
     ) -> Result<Option<StreamRecord>> {
         validate_logical_id(stream_id, "stream id")?;
+        validate_hash(event_hash, "stream event hash")?;
         Ok(self
-            .read_all_stream_records(stream_id)
+            .read_stream_record_from_meta(stream_id, sequence)
             .await?
-            .into_iter()
-            .find(|record| record.sequence == sequence && record.event_hash == event_hash))
+            .filter(|record| record.event_hash == event_hash))
     }
 
     pub(crate) async fn raw_stream_head(&self, stream_id: &str) -> Result<(u64, String)> {
@@ -818,6 +820,7 @@ impl CoreStore {
         let _perf_guard =
             crate::perf::guard("anvil_core_store_op", &[("operation", "read_stream")]);
         validate_logical_id(&input.stream_id, "stream id")?;
+        validate_stream_page_limit(input.limit)?;
         let records = self
             .read_stream_records_after(&input.stream_id, input.after_sequence, input.limit)
             .await?;
@@ -852,20 +855,16 @@ impl CoreStore {
         let _perf_guard =
             crate::perf::guard("anvil_core_store_op", &[("operation", "read_stream_page")]);
         validate_logical_id(&input.stream_id, "stream id")?;
-        if !(1..=CORE_META_MAX_SCAN_PAGE_ROWS).contains(&input.limit) {
-            bail!(
-                "CoreStore stream page limit must be between 1 and {CORE_META_MAX_SCAN_PAGE_ROWS}"
-            );
-        }
+        validate_stream_page_limit(input.limit)?;
 
-        // Read one extra source row so has_more describes durable source state,
-        // rather than whether the visible result happened to fill the page.
-        let source_limit = input.limit.saturating_add(1);
-        let mut source_records = self
-            .read_stream_records_after(&input.stream_id, input.after_sequence, source_limit)
+        let snapshot_head = self.stream_head_sequence(&input.stream_id).await?;
+        let source_records = self
+            .read_stream_records_after(&input.stream_id, input.after_sequence, input.limit)
             .await?;
-        let source_has_more = source_records.len() > input.limit;
-        source_records.truncate(input.limit);
+        let source_has_more = source_records
+            .last()
+            .map(|record| record.sequence < snapshot_head)
+            .unwrap_or(snapshot_head > input.after_sequence);
 
         let mut records = Vec::with_capacity(source_records.len());
         let mut next_sequence = input.after_sequence;
@@ -903,6 +902,7 @@ impl CoreStore {
             &[("operation", "read_stream_at_generation")],
         );
         validate_logical_id(&input.stream_id, "stream id")?;
+        validate_stream_page_limit(input.limit)?;
         if root_generation <= input.after_sequence {
             return Ok(Vec::new());
         }

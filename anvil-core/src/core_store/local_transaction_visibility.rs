@@ -11,7 +11,54 @@ enum StreamPredecessorVisibility {
     TerminalInvisible,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StreamWatchVisibility {
+    Visible,
+    Pending,
+    TerminalInvisible,
+}
+
 impl CoreStore {
+    pub(super) async fn stream_record_watch_visibility(
+        &self,
+        record: &StreamRecord,
+    ) -> Result<StreamWatchVisibility> {
+        if record.stream_id == CORE_TRANSACTION_STREAM_ID || record.transaction_id.is_none() {
+            return Ok(StreamWatchVisibility::Visible);
+        }
+        let transaction_id = record
+            .transaction_id
+            .as_deref()
+            .expect("transaction id was checked above");
+        let Some(transaction) = self.read_transaction_unlocked(transaction_id).await? else {
+            // Mutation operations are durable before their transaction commit
+            // record. A watcher must retry this row rather than advancing past
+            // data which may become visible after recovery completes the commit.
+            return Ok(StreamWatchVisibility::Pending);
+        };
+        match transaction.state {
+            CoreTransactionState::Committed => {
+                if !transaction_lists_stream_record(&transaction, record)? {
+                    bail!(
+                        "CoreStore committed transaction {} does not publish stream record {}:{}",
+                        transaction_id,
+                        record.stream_id,
+                        record.sequence
+                    );
+                }
+                Ok(StreamWatchVisibility::Visible)
+            }
+            CoreTransactionState::Open | CoreTransactionState::Prepared => {
+                Ok(StreamWatchVisibility::Pending)
+            }
+            CoreTransactionState::FinalisationFailed
+            | CoreTransactionState::Aborted
+            | CoreTransactionState::RolledBack
+            | CoreTransactionState::Expired
+            | CoreTransactionState::Failed => Ok(StreamWatchVisibility::TerminalInvisible),
+        }
+    }
+
     pub(super) async fn transaction_makes_stream_record_visible(
         &self,
         record: &StreamRecord,
@@ -325,7 +372,7 @@ impl CoreStore {
                 stream_id,
                 first_staged_sequence.saturating_sub(1),
                 last_staged_sequence,
-                0,
+                updates.len(),
             )?;
             crate::emit_test_timing(
                 format!(
@@ -797,6 +844,7 @@ impl CoreStore {
                         current.as_deref(),
                         cf,
                         *table_id,
+                        tuple_key,
                         expected_payload_hash.as_deref(),
                         *require_absent,
                         *require_present,

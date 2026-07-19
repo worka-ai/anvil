@@ -380,7 +380,7 @@ async fn core_store_streams_are_gap_free_hash_chained_and_idempotent() {
     assert_eq!(records.len(), 2);
     assert_eq!(records[1].previous_event_hash, records[0].event_hash);
     let stream_ids = store
-        .list_stream_ids("object_metadata:")
+        .list_stream_ids_page("object_metadata:", None, 10)
         .await
         .expect("list stream ids");
     assert_eq!(stream_ids, vec!["object_metadata:tenant:b".to_string()]);
@@ -413,34 +413,45 @@ async fn core_store_read_stream_page_uses_corestore_stream_metadata() {
             .unwrap();
     }
 
-    let raw_records = store
-        .read_raw_stream("tenant:t/bucket:b/ranged-stream")
+    let raw_record = store
+        .read_raw_stream_record(
+            "tenant:t/bucket:b/ranged-stream",
+            3,
+            &store
+                .read_stream_record_from_meta("tenant:t/bucket:b/ranged-stream", 3)
+                .await
+                .unwrap()
+                .unwrap()
+                .event_hash,
+        )
         .await
         .unwrap();
-    assert_eq!(raw_records.len(), 3);
-    assert_eq!(raw_records[2].record_kind, "event.3");
+    assert_eq!(raw_record.unwrap().record_kind, "event.3");
 
     let page = store
-        .read_stream(ReadStream {
+        .read_stream_page(ReadStream {
             stream_id: "tenant:t/bucket:b/ranged-stream".to_string(),
             after_sequence: 0,
             limit: 2,
         })
         .await
         .unwrap();
-    assert_eq!(page.len(), 2);
-    assert_eq!(page[0].record_kind, "event.1");
-    assert_eq!(page[1].record_kind, "event.2");
+    assert_eq!(page.records.len(), 2);
+    assert_eq!(page.records[0].record_kind, "event.1");
+    assert_eq!(page.records[1].record_kind, "event.2");
+    assert!(page.has_more);
 
-    let full = store
-        .read_stream(ReadStream {
+    let tail = store
+        .read_stream_page(ReadStream {
             stream_id: "tenant:t/bucket:b/ranged-stream".to_string(),
-            after_sequence: 0,
-            limit: 0,
+            after_sequence: page.next_sequence,
+            limit: 2,
         })
         .await
         .unwrap();
-    assert_eq!(full.len(), 3);
+    assert_eq!(tail.records.len(), 1);
+    assert_eq!(tail.records[0].record_kind, "event.3");
+    assert!(!tail.has_more);
 }
 
 #[tokio::test]
@@ -667,10 +678,12 @@ async fn core_store_root_anchor_uses_coremeta_rows_not_shard_files() {
 
     let rows = store
         .meta
-        .scan_prefix(
+        .scan_prefix_page(
             CF_ROOT_CACHE,
             TABLE_ROOT_CACHE_ROW,
             &root_anchor_generation_prefix(&root_key_hash),
+            None,
+            2,
         )
         .unwrap();
     assert_eq!(rows.len(), 1);
