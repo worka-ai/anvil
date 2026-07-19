@@ -443,7 +443,6 @@ impl IndexService for AppState {
             result: Some(response),
             canonical_query_hash: plan.canonical_query_hash,
             plan_json: plan.plan_json,
-            diagnostics: plan.diagnostics,
         }))
     }
 

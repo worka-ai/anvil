@@ -1,5 +1,7 @@
 use super::*;
 
+const MAX_MUTATION_BATCH_OPERATIONS: usize = 256;
+
 pub(crate) async fn enforce_write_precondition(
     state: &AppState,
     claims: &auth::Claims,
@@ -83,6 +85,16 @@ pub(crate) async fn enforce_write_precondition(
 }
 
 pub(super) fn validate_mutation_batch_operations(req: &MutationBatchRequest) -> Result<(), Status> {
+    if req.operations.is_empty() {
+        return Err(Status::invalid_argument(
+            "MutationBatch requires at least one operation",
+        ));
+    }
+    if req.operations.len() > MAX_MUTATION_BATCH_OPERATIONS {
+        return Err(Status::invalid_argument(format!(
+            "MutationBatch supports at most {MAX_MUTATION_BATCH_OPERATIONS} operations"
+        )));
+    }
     for operation in &req.operations {
         let Some(op) = operation.op.as_ref() else {
             return Err(Status::invalid_argument(
@@ -417,5 +429,40 @@ mod tests {
             assert_eq!(err.code(), tonic::Code::PermissionDenied);
             assert_eq!(err.message(), "UnauthorizedReservedNamespace");
         }
+    }
+
+    #[test]
+    fn mutation_batch_rejects_empty_and_oversized_requests() {
+        let empty = MutationBatchRequest {
+            bucket_name: "docs".to_string(),
+            mutation_context: None,
+            precondition: None,
+            operations: Vec::new(),
+        };
+        assert_eq!(
+            validate_mutation_batch_operations(&empty)
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+
+        let operation = MutationBatchOperation {
+            op: Some(mutation_batch_operation::Op::DeleteObject(
+                MutationBatchDeleteObject {
+                    object_key: "document".to_string(),
+                    version_id: None,
+                },
+            )),
+        };
+        let oversized = MutationBatchRequest {
+            operations: vec![operation; MAX_MUTATION_BATCH_OPERATIONS + 1],
+            ..empty
+        };
+        assert_eq!(
+            validate_mutation_batch_operations(&oversized)
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
     }
 }

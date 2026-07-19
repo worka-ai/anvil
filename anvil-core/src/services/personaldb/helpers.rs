@@ -399,8 +399,37 @@ pub(super) fn configured_personaldb_snapshot_policy(
     }
 }
 
-pub(super) fn nonzero_limit(limit: u32) -> usize {
-    if limit == 0 { 100 } else { limit as usize }
+pub(super) fn nonzero_limit(limit: u32) -> Result<usize, Status> {
+    const DEFAULT_LIMIT: usize = 100;
+    const MAX_LIMIT: usize = 1000;
+
+    let limit = if limit == 0 {
+        DEFAULT_LIMIT
+    } else {
+        usize::try_from(limit)
+            .map_err(|_| Status::invalid_argument("max_entries exceeds supported range"))?
+    };
+    if limit > MAX_LIMIT {
+        return Err(Status::invalid_argument(format!(
+            "max_entries must not exceed {MAX_LIMIT}"
+        )));
+    }
+    Ok(limit)
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    #[test]
+    fn personaldb_catch_up_limit_is_bounded() {
+        assert_eq!(nonzero_limit(0).unwrap(), 100);
+        assert_eq!(nonzero_limit(1000).unwrap(), 1000);
+        assert_eq!(
+            nonzero_limit(1001).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+    }
 }
 
 pub(super) fn split_u128(value: u128) -> (u64, u64) {

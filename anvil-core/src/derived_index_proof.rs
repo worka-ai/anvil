@@ -15,6 +15,8 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
+const MAX_DERIVED_INDEX_SEGMENT_HASHES: usize = 1024;
+
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,6 +249,11 @@ fn validate_unsigned_proof(proof: &DerivedIndexProof) -> Result<()> {
     }
     if proof.segment_hashes.is_empty() {
         return Err(anyhow!("derived index proof must include segment hashes"));
+    }
+    if proof.segment_hashes.len() > MAX_DERIVED_INDEX_SEGMENT_HASHES {
+        return Err(anyhow!(
+            "derived index proof must contain no more than {MAX_DERIVED_INDEX_SEGMENT_HASHES} segment hashes"
+        ));
     }
     for segment_hash in &proof.segment_hashes {
         validate_hex32(segment_hash, "segment_hash")?;
@@ -564,6 +571,13 @@ mod tests {
         invalid.segment_hashes = Vec::new();
         assert!(
             write_derived_index_proof(&storage, invalid, KEY)
+                .await
+                .is_err()
+        );
+        let mut oversized = proof(8, 43, hex::encode([8; 32]));
+        oversized.segment_hashes = vec![hex::encode([3; 32]); MAX_DERIVED_INDEX_SEGMENT_HASHES + 1];
+        assert!(
+            write_derived_index_proof(&storage, oversized, KEY)
                 .await
                 .is_err()
         );

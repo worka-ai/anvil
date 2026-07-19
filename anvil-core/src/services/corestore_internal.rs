@@ -14,6 +14,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
+const MAX_COREMETA_READ_KEYS: usize = 4096;
+
 #[tonic::async_trait]
 impl BlockStoreInternal for AppState {
     type GetShardStream =
@@ -510,6 +512,7 @@ impl CoreMetaReplicationInternal for AppState {
     ) -> Result<Response<CoreMetaReadRowsResponse>, Status> {
         ensure_internal_node_request(self, &request).await?;
         let req = request.into_inner();
+        validate_coremeta_read_key_count(req.core_meta_keys.len())?;
         let rows = self
             .core_store
             .read_coremeta_encoded_rows(&req.column_family, &req.core_meta_keys)
@@ -1631,4 +1634,38 @@ fn ensure_local_proxy_target(local_region: &str, target_region: &str) -> Result<
 
 fn now_unix_nanos() -> i64 {
     chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX)
+}
+
+fn validate_coremeta_read_key_count(key_count: usize) -> Result<(), Status> {
+    if key_count == 0 {
+        return Err(Status::invalid_argument(
+            "CoreMeta ReadRows requires at least one key",
+        ));
+    }
+    if key_count > MAX_COREMETA_READ_KEYS {
+        return Err(Status::invalid_argument(format!(
+            "CoreMeta ReadRows supports at most {MAX_COREMETA_READ_KEYS} keys"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod read_rows_contract_tests {
+    use super::*;
+
+    #[test]
+    fn coremeta_read_rows_key_count_is_bounded() {
+        assert_eq!(
+            validate_coremeta_read_key_count(0).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+        validate_coremeta_read_key_count(MAX_COREMETA_READ_KEYS).unwrap();
+        assert_eq!(
+            validate_coremeta_read_key_count(MAX_COREMETA_READ_KEYS + 1)
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
 }

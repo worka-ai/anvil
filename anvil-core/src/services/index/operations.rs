@@ -100,7 +100,6 @@ impl AppState {
             authz_scope,
             canonical_query_hash: stable_json_hash(&spec.canonical_json()?),
             plan_json,
-            diagnostics: Vec::new(),
             query_text: shape.query_text.unwrap_or_default(),
             query_vector: shape.query_vector.unwrap_or_default(),
             phrase: shape.phrase,

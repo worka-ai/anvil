@@ -464,7 +464,7 @@ impl PersonalDbService for AppState {
                 replica_id: req.replica_id,
                 have_log_index: req.have_log_index,
                 have_log_hash: req.have_log_hash,
-                max_entries: nonzero_limit(req.max_entries),
+                max_entries: nonzero_limit(req.max_entries)?,
             },
             self.personaldb_protocol_keyring.trust_store(),
         )

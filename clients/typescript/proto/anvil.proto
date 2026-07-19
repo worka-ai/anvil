@@ -1189,7 +1189,6 @@ message QuerySpecResponse {
     QueryIndexResponse result = 1;
     string canonical_query_hash = 2;
     string plan_json = 3;
-    repeated string diagnostics = 4;
 }
 
 message WatchIndexDefinitionRequest {

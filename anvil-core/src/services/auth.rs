@@ -1229,11 +1229,6 @@ impl AuthService for AppState {
                 "namespaces must contain at least one schema",
             ));
         }
-        if req.namespaces.len() > 1000 {
-            return Err(Status::invalid_argument(
-                "namespaces must contain no more than 1000 schemas",
-            ));
-        }
         for namespace in &req.namespaces {
             validate_public_authz_namespace(&namespace.namespace)?;
         }

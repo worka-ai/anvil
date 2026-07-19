@@ -10,6 +10,11 @@ use crate::system_realm::SystemAdminRelation;
 use crate::{AppState, access_control, auth, bucket_journal, middleware};
 use tonic::{Request, Response, Status};
 
+const MAX_BOOTSTRAP_REGIONS: usize = 256;
+const MAX_BOOTSTRAP_CELLS: usize = 1024;
+const MAX_BOOTSTRAP_NODES: usize = 4096;
+const MAX_BOOTSTRAP_COREMETA_ROWS: usize = 4096;
+
 fn mesh_transaction_id(options: Option<&WriteOptions>) -> Result<Option<&str>, Status> {
     crate::services::saga_reserved::write_options_transaction_id(options)
 }
@@ -23,6 +28,7 @@ impl MeshControlService for AppState {
         require_mesh_admin(&request, self, SystemAdminRelation::ManageNodes).await?;
         let request_id = request_id(&request);
         let req = request.into_inner();
+        validate_bootstrap_topology_size(&req)?;
         if req.regions.is_empty() || req.cells.is_empty() || req.nodes.is_empty() {
             return Err(Status::invalid_argument(
                 "bootstrap topology requires regions, cells, and nodes",
@@ -101,11 +107,17 @@ impl MeshControlService for AppState {
                 },
             )
             .map_err(mesh_status)?;
-            encode_bootstrap_snapshot_rows(
+            let rows = encode_bootstrap_snapshot_rows(
                 self.core_store
                     .export_portable_coremeta_bootstrap_rows()
                     .map_err(mesh_status)?,
-            )
+            );
+            if rows.len() > MAX_BOOTSTRAP_COREMETA_ROWS {
+                return Err(Status::resource_exhausted(format!(
+                    "bootstrap snapshot exceeds {MAX_BOOTSTRAP_COREMETA_ROWS} CoreMeta rows"
+                )));
+            }
+            rows
         } else {
             let rows = decode_bootstrap_snapshot_rows(req.canonical_coremeta_rows)?;
             self.core_store
@@ -1117,12 +1129,51 @@ fn mesh_write_response(
     }
 }
 
+fn validate_bootstrap_topology_size(req: &BootstrapMeshTopologyRequest) -> Result<(), Status> {
+    for (actual, maximum, field) in [
+        (req.regions.len(), MAX_BOOTSTRAP_REGIONS, "regions"),
+        (req.cells.len(), MAX_BOOTSTRAP_CELLS, "cells"),
+        (req.nodes.len(), MAX_BOOTSTRAP_NODES, "nodes"),
+        (
+            req.canonical_coremeta_rows.len(),
+            MAX_BOOTSTRAP_COREMETA_ROWS,
+            "canonical_coremeta_rows",
+        ),
+    ] {
+        if actual > maximum {
+            return Err(Status::invalid_argument(format!(
+                "bootstrap topology {field} must not exceed {maximum} entries"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn request_id<T>(request: &Request<T>) -> String {
     request
         .extensions()
         .get::<middleware::AnvilRequestId>()
         .map(|request_id| request_id.0.clone())
         .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string())
+}
+
+#[cfg(test)]
+mod bootstrap_contract_tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_topology_collections_are_bounded() {
+        let request = BootstrapMeshTopologyRequest {
+            regions: vec![PutRegionRequest::default(); MAX_BOOTSTRAP_REGIONS + 1],
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_bootstrap_topology_size(&request)
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
 }
 
 fn mesh_status(error: impl std::fmt::Display) -> Status {

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 const INDEX_PARTITION_FAMILY: u16 = 7;
 const INDEX_PARTITION_RECORD_KIND: u16 = 1;
+const MAX_INDEX_PARTITION_SEGMENT_HASHES: usize = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexPartitionWatchPayload {
@@ -309,6 +310,11 @@ fn validate_payload(partition_id: &str, payload: &IndexPartitionWatchPayload) ->
     validate_hex32(&payload.proof_hash, "proof_hash")?;
     if payload.segment_hashes.is_empty() {
         return Err(anyhow!("index partition watch requires segment hashes"));
+    }
+    if payload.segment_hashes.len() > MAX_INDEX_PARTITION_SEGMENT_HASHES {
+        return Err(anyhow!(
+            "index partition watch must contain no more than {MAX_INDEX_PARTITION_SEGMENT_HASHES} segment hashes"
+        ));
     }
     for segment_hash in &payload.segment_hashes {
         validate_hex32(segment_hash, "segment_hash")?;
