@@ -175,12 +175,16 @@ async fn authz_candidate_reader_merges_revisioned_tuple_segments() {
     assert_eq!(latest.records.len(), 3);
     assert_eq!(latest.revision_checkpoints.len(), 3);
     assert_eq!(latest.schema_descriptors.len(), 1);
-    let catalog = crate::writer_segment_catalog::list_writer_segment_catalog_records(
+    let catalog = crate::writer_segment_catalog::page_writer_segment_catalog_records(
         &storage,
         AUTHZ_TUPLE_SEGMENT_CATALOG_FAMILY,
         &authz_tuple_segment_scope(7).unwrap(),
+        0,
+        u64::MAX,
+        10,
     )
-    .unwrap();
+    .unwrap()
+    .records;
     assert_eq!(catalog.len(), 3);
     for (index, record) in catalog.into_iter().enumerate() {
         let segment =

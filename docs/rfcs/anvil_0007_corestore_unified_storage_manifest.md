@@ -1044,6 +1044,21 @@ backwards. An existing logical generation is immutable: an exact retry succeeds
 idempotently and different content fails. This separation prevents source or
 historical-generation order from being misinterpreted as CoreMeta commit order.
 
+Writer history is exposed internally only as an ordered page:
+
+```text
+PageWriterSegments(writer_family, scope_hash, after_generation,
+                   through_generation, page_size)
+  -> records, next_generation?
+```
+
+`page_size` MUST be in `1..=1000`. The implementation seeks directly to
+`after_generation + 1`, applies the physical upper bound for
+`through_generation`, and reads at most `page_size + 1` rows. There is no
+unbounded writer-catalogue list operation. A caller that intentionally needs
+more history advances `after_generation` using `next_generation`; ordinary
+latest-state reads use `WriterHeadRow` and never call this page API.
+
 message LandedByteRefRow {
   CoreMetaRowCommon common = 1;
   string landing_id = 2;

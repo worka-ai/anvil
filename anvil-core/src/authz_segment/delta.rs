@@ -1,5 +1,7 @@
 use super::*;
-use crate::writer_segment_catalog::list_writer_segment_catalog_records;
+use crate::writer_segment_catalog::page_writer_segment_catalog_records;
+
+const AUTHZ_SEGMENT_READ_PAGE_SIZE: usize = 256;
 
 pub(crate) async fn write_authz_tuple_delta_segment(
     storage: &Storage,
@@ -230,8 +232,6 @@ pub(super) async fn read_authz_tuple_segment_at_revision(
     revision: u64,
 ) -> Result<Option<DecodedAuthzSegment>> {
     let scope = authz_tuple_segment_scope(tenant_id)?;
-    let records =
-        list_writer_segment_catalog_records(storage, AUTHZ_TUPLE_SEGMENT_CATALOG_FAMILY, &scope)?;
     let mut last_generation = 0_u64;
     let mut merged_records = Vec::new();
     let mut schema_descriptors = Vec::new();
@@ -242,53 +242,68 @@ pub(super) async fn read_authz_tuple_segment_at_revision(
     let mut revision_checkpoints = Vec::new();
     let mut final_header = None;
 
-    for record in records
-        .into_iter()
-        .filter(|record| record.generation <= revision)
-    {
-        let Some(segment) = read_authz_tuple_segment_ref(
+    let mut after_generation = 0_u64;
+    loop {
+        let page = page_writer_segment_catalog_records(
             storage,
-            tenant_id,
-            record.generation,
-            &record.segment_ref,
-        )
-        .await?
-        else {
-            bail!("AuthzCandidateSetStale");
-        };
-        match segment.header.segment_kind.as_str() {
-            "checkpoint" => {
-                merged_records.clear();
-                userset_edges.clear();
-                list_objects.clear();
-                list_subjects.clear();
-                revision_checkpoints.clear();
-                last_generation = segment.header.generation;
-                schema_descriptors = segment.schema_descriptors.clone();
-                relation_rules = segment.relation_rules.clone();
-            }
-            "delta" => {
-                if segment.header.base_revision != last_generation
-                    || segment.header.generation != last_generation.saturating_add(1)
-                {
-                    bail!("AuthzCandidateSetStale");
-                }
-                last_generation = segment.header.generation;
-                if segment.header.schema_replacement {
+            AUTHZ_TUPLE_SEGMENT_CATALOG_FAMILY,
+            &scope,
+            after_generation,
+            revision,
+            AUTHZ_SEGMENT_READ_PAGE_SIZE,
+        )?;
+        for record in page.records {
+            let Some(segment) = read_authz_tuple_segment_ref(
+                storage,
+                tenant_id,
+                record.generation,
+                &record.segment_ref,
+            )
+            .await?
+            else {
+                bail!("AuthzCandidateSetStale");
+            };
+            match segment.header.segment_kind.as_str() {
+                "checkpoint" => {
+                    merged_records.clear();
+                    userset_edges.clear();
+                    list_objects.clear();
+                    list_subjects.clear();
+                    revision_checkpoints.clear();
+                    last_generation = segment.header.generation;
                     schema_descriptors = segment.schema_descriptors.clone();
-                }
-                if segment.header.relation_rule_replacement {
                     relation_rules = segment.relation_rules.clone();
                 }
+                "delta" => {
+                    if segment.header.base_revision != last_generation
+                        || segment.header.generation != last_generation.saturating_add(1)
+                    {
+                        bail!("AuthzCandidateSetStale");
+                    }
+                    last_generation = segment.header.generation;
+                    if segment.header.schema_replacement {
+                        schema_descriptors = segment.schema_descriptors.clone();
+                    }
+                    if segment.header.relation_rule_replacement {
+                        relation_rules = segment.relation_rules.clone();
+                    }
+                }
+                _ => bail!("authz segment has unsupported segment kind"),
             }
-            _ => bail!("authz segment has unsupported segment kind"),
+            merged_records.extend(segment.records);
+            apply_userset_edge_deltas(&mut userset_edges, segment.userset_edges)?;
+            apply_list_object_deltas(&mut list_objects, segment.list_objects)?;
+            apply_list_subject_deltas(&mut list_subjects, segment.list_subjects)?;
+            revision_checkpoints.extend(segment.revision_checkpoints);
+            final_header = Some(segment.header);
         }
-        merged_records.extend(segment.records);
-        apply_userset_edge_deltas(&mut userset_edges, segment.userset_edges)?;
-        apply_list_object_deltas(&mut list_objects, segment.list_objects)?;
-        apply_list_subject_deltas(&mut list_subjects, segment.list_subjects)?;
-        revision_checkpoints.extend(segment.revision_checkpoints);
-        final_header = Some(segment.header);
+        let Some(next_generation) = page.next_generation else {
+            break;
+        };
+        if next_generation <= after_generation {
+            bail!("AuthzCandidateSetStale");
+        }
+        after_generation = next_generation;
     }
 
     if last_generation != revision {

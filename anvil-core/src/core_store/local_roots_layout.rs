@@ -407,18 +407,31 @@ impl CoreStore {
         if head.schema != "anvil.core.stream_head.v1" || head.stream_id != stream_id {
             bail!("CoreStore stream head metadata row has invalid scope");
         }
+        const PAGE_SIZE: usize = 1024;
         let mut records = Vec::new();
-        for item in self.meta.scan_range_inclusive(
-            CF_STREAM_RECORDS,
-            TABLE_STREAM_RECORD_INDEX_ROW,
-            &stream_record_key(stream_id, 1),
-            &stream_record_key(stream_id, u64::MAX),
-        )? {
-            let stored = decode_stream_record_index_row(&item.payload)?;
-            if stored.stream_id != stream_id {
-                bail!("CoreStore stream record metadata row has invalid scope");
+        let mut after_sequence = 0_u64;
+        while after_sequence < head.last_sequence {
+            let through_sequence = after_sequence
+                .saturating_add(PAGE_SIZE as u64)
+                .min(head.last_sequence);
+            let page = self.meta.scan_range_inclusive(
+                CF_STREAM_RECORDS,
+                TABLE_STREAM_RECORD_INDEX_ROW,
+                &stream_record_key(stream_id, after_sequence.saturating_add(1)),
+                &stream_record_key(stream_id, through_sequence),
+                PAGE_SIZE,
+            )?;
+            if page.is_empty() {
+                bail!("CoreStore stream record metadata range has missing records");
             }
-            records.push(self.stream_record_from_index_row(stored).await?);
+            for item in page {
+                let stored = decode_stream_record_index_row(&item.payload)?;
+                if stored.stream_id != stream_id {
+                    bail!("CoreStore stream record metadata row has invalid scope");
+                }
+                after_sequence = stored.sequence;
+                records.push(self.stream_record_from_index_row(stored).await?);
+            }
         }
         records.sort_by_key(|record| record.sequence);
         if records.len() as u64 != head.record_count {
@@ -497,6 +510,12 @@ impl CoreStore {
                 TABLE_STREAM_RECORD_INDEX_ROW,
                 &stream_record_key(stream_id, first_requested),
                 &stream_record_key(stream_id, last_requested),
+                usize::try_from(
+                    last_requested
+                        .saturating_sub(first_requested)
+                        .saturating_add(1),
+                )
+                .map_err(|_| anyhow!("CoreStore stream metadata range exceeds usize"))?,
             )?
             .into_iter()
             .map(|item| decode_stream_record_index_row(&item.payload))

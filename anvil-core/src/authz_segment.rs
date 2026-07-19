@@ -29,8 +29,7 @@ use crate::{
     storage::Storage,
     writer_segment_catalog::{
         WriterSegmentCatalogRecord, latest_writer_segment_catalog_record,
-        list_writer_segment_catalog_records, read_writer_segment_catalog_record,
-        write_writer_segment_catalog_record,
+        read_writer_segment_catalog_record, write_writer_segment_catalog_record,
     },
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -697,16 +696,14 @@ pub(crate) fn authz_tuple_segment_requires_checkpoint(
     tenant_id: i64,
     target_revision: u64,
 ) -> Result<bool> {
-    let previous = list_writer_segment_catalog_records(
+    let previous = latest_writer_segment_catalog_record(
         storage,
         AUTHZ_TUPLE_SEGMENT_CATALOG_FAMILY,
         &authz_tuple_segment_scope(tenant_id)?,
-    )?
-    .into_iter()
-    .filter(|record| record.generation < target_revision)
-    .max_by_key(|record| (record.generation, record.created_at_unix_nanos));
+    )?;
     Ok(previous.is_none_or(|record| {
-        record.generation.saturating_add(1) != target_revision
+        record.generation >= target_revision
+            || record.generation.saturating_add(1) != target_revision
             || target_revision % AUTHZ_DELTA_CHECKPOINT_INTERVAL == 0
     }))
 }

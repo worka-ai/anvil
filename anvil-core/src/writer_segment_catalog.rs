@@ -17,6 +17,7 @@ use std::{
 mod head;
 
 const WRITER_SEGMENT_ROW_SCHEMA: &str = "anvil.coremeta.writer_segment_locator.v1";
+pub const WRITER_SEGMENT_PAGE_MAX: usize = 1000;
 
 static WRITER_LOCKS: LazyLock<std::sync::Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
@@ -32,6 +33,12 @@ pub struct WriterSegmentCatalogRecord {
     pub generation: u64,
     pub source_cursor: u64,
     pub created_at_unix_nanos: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriterSegmentCatalogPage {
+    pub records: Vec<WriterSegmentCatalogRecord>,
+    pub next_generation: Option<u64>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -172,17 +179,34 @@ pub fn latest_writer_segment_catalog_record(
     Ok(head::read(storage, family, scope)?.map(|head| head.record))
 }
 
-pub fn list_writer_segment_catalog_records(
+pub fn page_writer_segment_catalog_records(
     storage: &Storage,
     family: &str,
     scope: &str,
-) -> Result<Vec<WriterSegmentCatalogRecord>> {
+    after_generation: u64,
+    through_generation: u64,
+    limit: usize,
+) -> Result<WriterSegmentCatalogPage> {
     validate_scope_components(family, scope)?;
-    CoreMetaStore::open(storage.core_store_meta_path())?
-        .scan_prefix(
+    if limit == 0 || limit > WRITER_SEGMENT_PAGE_MAX {
+        bail!("writer segment page limit must be between 1 and {WRITER_SEGMENT_PAGE_MAX}");
+    }
+    if through_generation <= after_generation {
+        return Ok(WriterSegmentCatalogPage {
+            records: Vec::new(),
+            next_generation: None,
+        });
+    }
+    let scan_limit = limit
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("writer segment page limit overflow"))?;
+    let mut records = CoreMetaStore::open(storage.core_store_meta_path())?
+        .scan_range_inclusive(
             CF_MATERIALISATION,
             TABLE_WRITER_SEGMENT_ROW,
-            &tuple_prefix(family, scope)?,
+            &tuple_key(family, scope, after_generation.saturating_add(1))?,
+            &tuple_key(family, scope, through_generation)?,
+            scan_limit,
         )?
         .into_iter()
         .map(|row| {
@@ -192,7 +216,18 @@ pub fn list_writer_segment_catalog_records(
             }
             Ok(record)
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    let has_more = records.len() > limit;
+    if has_more {
+        records.truncate(limit);
+    }
+    let next_generation = has_more
+        .then(|| records.last().map(|record| record.generation))
+        .flatten();
+    Ok(WriterSegmentCatalogPage {
+        records,
+        next_generation,
+    })
 }
 
 #[cfg(test)]
@@ -361,15 +396,6 @@ fn tuple_key(family: &str, scope: &str, generation: u64) -> Result<Vec<u8>> {
     ])
 }
 
-fn tuple_prefix(family: &str, scope: &str) -> Result<Vec<u8>> {
-    validate_scope_components(family, scope)?;
-    let scope_hash = writer_scope_hash(family, scope);
-    core_meta_tuple_key(&[
-        CoreMetaTuplePart::Utf8(family),
-        CoreMetaTuplePart::Hash(&scope_hash),
-    ])
-}
-
 fn writer_lock(family: &str, scope: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
     let key = writer_scope_hash(family, scope);
     let mut locks = WRITER_LOCKS
@@ -483,10 +509,28 @@ mod tests {
             .unwrap(),
             Some(first.clone())
         );
-        assert_eq!(
-            list_writer_segment_catalog_records(&storage, &first.family, &first.scope).unwrap(),
-            vec![first.clone(), second, third]
-        );
+        let first_page = page_writer_segment_catalog_records(
+            &storage,
+            &first.family,
+            &first.scope,
+            0,
+            u64::MAX,
+            2,
+        )
+        .unwrap();
+        assert_eq!(first_page.records, vec![first.clone(), second]);
+        assert_eq!(first_page.next_generation, Some(2));
+        let second_page = page_writer_segment_catalog_records(
+            &storage,
+            &first.family,
+            &first.scope,
+            first_page.next_generation.unwrap(),
+            u64::MAX,
+            2,
+        )
+        .unwrap();
+        assert_eq!(second_page.records, vec![third]);
+        assert_eq!(second_page.next_generation, None);
 
         let mut conflicting = first;
         conflicting.segment_ref = "segment:conflict".to_string();

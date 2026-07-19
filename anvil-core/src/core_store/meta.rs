@@ -545,7 +545,11 @@ impl CoreMetaStore {
         table_id: u16,
         start_tuple_key: &[u8],
         end_tuple_key: &[u8],
+        limit: usize,
     ) -> Result<Vec<CoreMetaRecord>> {
+        if limit == 0 {
+            bail!("CoreMeta range scan limit must be nonzero");
+        }
         validate_meta_payload(cf, table_id, 0)?;
         let start_key = core_meta_key(table_id, 0, start_tuple_key)?;
         let end_key = core_meta_key(table_id, 0, end_tuple_key)?;
@@ -579,6 +583,9 @@ impl CoreMetaStore {
                 key: key.to_vec(),
                 payload: decode_envelope(cf_name, table_id, &value)?,
             });
+            if records.len() >= limit {
+                break;
+            }
         }
         crate::perf::record_coremeta_duration(
             "scan_range",
