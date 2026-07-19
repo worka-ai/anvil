@@ -17,24 +17,22 @@ struct ActiveIndexPolicyDefinitionProto {
 }
 
 impl Persistence {
+    pub async fn current_control_collection_revision(&self) -> Result<String> {
+        control_journal::current_control_collection_revision(&self.storage).await
+    }
+
     pub async fn get_tenant_by_name(&self, name: &str) -> Result<Option<Tenant>> {
         control_journal::read_tenant_by_name(&self.storage, name).await
     }
 
-    pub async fn list_tenants(&self) -> Result<Vec<Tenant>> {
-        let revision = control_journal::current_control_collection_revision(&self.storage).await?;
-        let mut cursor = None;
-        let mut tenants = Vec::new();
-        loop {
-            let page =
-                control_journal::page_tenants(&self.storage, &revision, cursor.as_deref(), 512)
-                    .await?;
-            tenants.extend(page.tenants);
-            let Some(next) = page.next_tuple_key else {
-                return Ok(tenants);
-            };
-            cursor = Some(next);
-        }
+    pub async fn page_tenants(
+        &self,
+        expected_revision: &str,
+        after_tuple_key: Option<&[u8]>,
+        page_size: usize,
+    ) -> Result<control_journal::CurrentTenantPage> {
+        control_journal::page_tenants(&self.storage, expected_revision, after_tuple_key, page_size)
+            .await
     }
 
     pub async fn get_app_by_client_id(&self, client_id: &str) -> Result<Option<AppDetails>> {
@@ -81,27 +79,6 @@ impl Persistence {
 
     pub async fn get_app_by_tenant_name(&self, tenant_id: i64, name: &str) -> Result<Option<App>> {
         control_journal::read_app_by_tenant_name(&self.storage, tenant_id, name).await
-    }
-
-    pub async fn list_apps_for_tenant(&self, tenant_id: i64) -> Result<Vec<App>> {
-        let revision = control_journal::current_control_collection_revision(&self.storage).await?;
-        let mut cursor = None;
-        let mut apps = Vec::new();
-        loop {
-            let page = control_journal::page_apps_for_tenant(
-                &self.storage,
-                tenant_id,
-                &revision,
-                cursor.as_deref(),
-                512,
-            )
-            .await?;
-            apps.extend(page.apps);
-            let Some(next) = page.next_tuple_key else {
-                return Ok(apps);
-            };
-            cursor = Some(next);
-        }
     }
 
     pub async fn page_apps_for_tenant(

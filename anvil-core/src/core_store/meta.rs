@@ -59,6 +59,7 @@ pub const TABLE_MANIFEST_CAS_CURRENT_ROW: u16 = 0x8104;
 pub const TABLE_MULTIPART_UPLOAD_CURRENT_ROW: u16 = 0x8105;
 pub const TABLE_MULTIPART_PART_CURRENT_ROW: u16 = 0x8106;
 pub const TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW: u16 = 0x8107;
+pub const TABLE_OBJECT_WATCH_CURSOR_ROW: u16 = 0x8108;
 pub const TABLE_STREAM_HEAD_ROW: u16 = 0x8201;
 pub const TABLE_STREAM_RECORD_INDEX_ROW: u16 = 0x8202;
 pub const TABLE_STREAM_IDEMPOTENCY_ROW: u16 = 0x8203;
@@ -68,10 +69,13 @@ pub const TABLE_DERIVED_INDEX_PROOF_ROW: u16 = 0x8303;
 pub const TABLE_BOUNDARY_SCHEMA_ROW: u16 = 0x8401;
 pub const TABLE_BOUNDARY_VALUE_ROW: u16 = 0x8402;
 pub const TABLE_BOUNDARY_MIGRATION_ROW: u16 = 0x8403;
+pub const TABLE_BOUNDARY_SCHEMA_CURRENT_ROW: u16 = 0x8404;
 pub const TABLE_AUTHZ_SCHEMA_ROW: u16 = 0x8501;
 pub const TABLE_AUTHZ_TUPLE_PAGE_ROW: u16 = 0x8502;
 pub const TABLE_AUTHZ_IDEMPOTENCY_RECEIPT_ROW: u16 = 0x8503;
 pub const TABLE_AUTHZ_HEAD_ROW: u16 = 0x8504;
+pub const TABLE_AUTHZ_TUPLE_OBJECT_CURRENT_ROW: u16 = 0x8505;
+pub const TABLE_AUTHZ_TUPLE_SUBJECT_CURRENT_ROW: u16 = 0x8506;
 pub const TABLE_PERSONALDB_GROUP_ROW: u16 = 0x8601;
 pub const TABLE_PERSONALDB_DATA_LOCATOR_ROW: u16 = 0x8602;
 pub const TABLE_PERSONALDB_PROPOSAL_CLAIM_ROW: u16 = 0x8603;
@@ -83,6 +87,7 @@ pub const TABLE_REGISTRY_VERSION_ROW: u16 = 0x8701;
 pub const TABLE_REGISTRY_BLOB_LOCATOR_ROW: u16 = 0x8702;
 pub const TABLE_GATEWAY_METADATA_ROW: u16 = 0x8703;
 pub const TABLE_GIT_SOURCE_MANIFEST_ROW: u16 = 0x8704;
+pub const TABLE_GATEWAY_MOUNT_ROUTE_ROW: u16 = 0x8705;
 pub const TABLE_MESH_NODE_ROW: u16 = 0x8801;
 pub const TABLE_MESH_PARTITION_ROW: u16 = 0x8802;
 pub const TABLE_REPAIR_FINDING_ROW: u16 = 0x8803;
@@ -94,6 +99,8 @@ pub const TABLE_ROOT_CATALOG_CURRENT_ROW: u16 = 0x8808;
 pub const TABLE_QUORUM_PROFILE_CURRENT_ROW: u16 = 0x8809;
 pub const TABLE_REPAIR_FINDING_HEAD_ROW: u16 = 0x880a;
 pub const TABLE_REPAIR_FINDING_ID_ROW: u16 = 0x880b;
+pub const TABLE_BUCKET_ID_ALLOCATOR_ROW: u16 = 0x880c;
+pub const TABLE_BUCKET_EVENT_HEAD_ROW: u16 = 0x880d;
 pub const TABLE_OWNERSHIP_FENCE_ROW: u16 = 0x8901;
 pub const TABLE_PARTITION_OWNER_ROW: u16 = 0x8902;
 pub const TABLE_TASK_LEASE_ROW: u16 = 0x8903;
@@ -150,6 +157,18 @@ pub struct CoreMetaEncodedOwnedRow {
     pub root_key_hash: String,
     pub root_generation: u64,
     pub visibility_state: CoreMetaVisibilityState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreMetaEncodedRowsCursor {
+    pub cf: String,
+    pub core_meta_key: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoreMetaEncodedRowsPage {
+    pub rows: Vec<CoreMetaEncodedOwnedRow>,
+    pub next_cursor: Option<CoreMetaEncodedRowsCursor>,
 }
 
 #[derive(Debug, Clone)]
@@ -494,54 +513,6 @@ impl CoreMetaStore {
         value
             .map(|value| decode_envelope(cf_name, table_id, &value))
             .transpose()
-    }
-
-    pub fn scan_prefix(
-        &self,
-        cf: &'static str,
-        table_id: u16,
-        tuple_prefix: &[u8],
-    ) -> Result<Vec<CoreMetaRecord>> {
-        validate_meta_payload(cf, table_id, 0)?;
-        let prefix = core_meta_key(table_id, 0, tuple_prefix)?;
-        let upper_bound = exclusive_prefix_successor(&prefix)
-            .context("CoreMeta prefix has no finite exclusive upper bound")?;
-        let cf_name = cf;
-        let cf = self.cf(cf_name)?;
-        let mut read_options = ReadOptions::default();
-        read_options.set_iterate_lower_bound(prefix.clone());
-        read_options.set_iterate_upper_bound(upper_bound);
-        let iter = self.db.iterator_cf_opt(
-            &cf,
-            read_options,
-            IteratorMode::From(&prefix, Direction::Forward),
-        );
-        let mut records = Vec::new();
-        let mut scanned = 0_u64;
-        let mut bytes = 0_u64;
-        let started_at = Instant::now();
-        for item in iter {
-            let (key, value) = item?;
-            if !key.starts_with(&prefix) {
-                bail!("bounded CoreMeta prefix iterator returned an out-of-range key");
-            }
-            scanned = scanned.saturating_add(1);
-            bytes = bytes.saturating_add((key.len() + value.len()) as u64);
-            let _ = decode_core_meta_tuple_key(&key)?;
-            records.push(CoreMetaRecord {
-                key: key.to_vec(),
-                payload: decode_envelope(cf_name, table_id, &value)?,
-            });
-        }
-        crate::perf::record_coremeta_duration(
-            "scan_prefix",
-            cf_name,
-            table_id,
-            scanned,
-            bytes,
-            started_at.elapsed(),
-        );
-        Ok(records)
     }
 
     pub fn scan_prefix_page(
@@ -892,17 +863,53 @@ impl CoreMetaStore {
         Ok(rows)
     }
 
-    pub fn scan_all_encoded_rows(&self) -> Result<Vec<CoreMetaEncodedOwnedRow>> {
-        let mut rows = Vec::new();
+    pub fn scan_encoded_rows_page(
+        &self,
+        after: Option<&CoreMetaEncodedRowsCursor>,
+        limit: usize,
+    ) -> Result<CoreMetaEncodedRowsPage> {
+        validate_scan_limit(limit)?;
+        let start_cf_index = match after {
+            Some(cursor) => {
+                if cursor.core_meta_key.is_empty() {
+                    bail!("CoreMeta encoded-row cursor key must not be empty");
+                }
+                let table_id = decode_core_meta_table_id(&cursor.core_meta_key)?;
+                if table_spec(table_id)?.cf != cursor.cf.as_str() {
+                    bail!("CoreMeta encoded-row cursor key is outside its column family");
+                }
+                column_families()
+                    .iter()
+                    .position(|cf| *cf == cursor.cf.as_str())
+                    .context("CoreMeta encoded-row cursor column family is unknown")?
+            }
+            None => 0,
+        };
+        let mut rows = Vec::with_capacity(limit + 1);
         let started_at = Instant::now();
         let mut scanned = 0_u64;
         let mut bytes = 0_u64;
 
-        for cf_name in column_families() {
+        'column_families: for (cf_index, cf_name) in
+            column_families().iter().enumerate().skip(start_cf_index)
+        {
             let cf = self.cf(cf_name)?;
-            let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
+            let after_key = after
+                .filter(|_| cf_index == start_cf_index)
+                .map(|cursor| cursor.core_meta_key.as_slice());
+            let start_key = after_key.unwrap_or_default();
+            let mut read_options = ReadOptions::default();
+            read_options.set_iterate_lower_bound(start_key.to_vec());
+            let iter = self.db.iterator_cf_opt(
+                &cf,
+                read_options,
+                IteratorMode::From(start_key, Direction::Forward),
+            );
             for item in iter {
                 let (key, value) = item?;
+                if after_key.is_some_and(|after_key| key.as_ref() <= after_key) {
+                    continue;
+                }
                 scanned = scanned.saturating_add(1);
                 bytes = bytes.saturating_add((key.len() + value.len()) as u64);
                 let table_id = decode_core_meta_table_id(&key)?;
@@ -918,18 +925,34 @@ impl CoreMetaStore {
                     root_generation: common.root_generation,
                     visibility_state: common.visibility_state_enum(),
                 });
+                if rows.len() > limit {
+                    break 'column_families;
+                }
             }
         }
 
         crate::perf::record_coremeta_duration(
-            "scan_all_encoded_rows",
+            "scan_encoded_rows_page",
             "multi",
             0,
             scanned,
             bytes,
             started_at.elapsed(),
         );
-        Ok(rows)
+        let has_more = rows.len() > limit;
+        if has_more {
+            rows.truncate(limit);
+        }
+        let next_cursor = has_more.then(|| {
+            let row = rows
+                .last()
+                .expect("a full CoreMeta encoded-row page must have a final row");
+            CoreMetaEncodedRowsCursor {
+                cf: row.cf.clone(),
+                core_meta_key: row.core_meta_key.clone(),
+            }
+        });
+        Ok(CoreMetaEncodedRowsPage { rows, next_cursor })
     }
 
     pub fn scan_encoded_rows_for_root(
@@ -1335,7 +1358,7 @@ fn table_spec(table_id: u16) -> Result<CoreMetaTableSpec> {
             cf: CF_OBJECT_HEADS,
             max_payload_bytes: CORE_META_OBJECT_VERSION_MAX_PAYLOAD_BYTES,
         },
-        TABLE_OBJECT_VERSION_META_ROW => CoreMetaTableSpec {
+        TABLE_OBJECT_VERSION_META_ROW | TABLE_OBJECT_WATCH_CURSOR_ROW => CoreMetaTableSpec {
             cf: CF_OBJECT_VERSIONS,
             max_payload_bytes: CORE_META_OBJECT_VERSION_MAX_PAYLOAD_BYTES,
         },
@@ -1359,16 +1382,19 @@ fn table_spec(table_id: u16) -> Result<CoreMetaTableSpec> {
             cf: CF_INDEX_ROWS,
             max_payload_bytes: CORE_META_STREAM_RECORD_INDEX_MAX_PAYLOAD_BYTES,
         },
-        TABLE_BOUNDARY_SCHEMA_ROW | TABLE_BOUNDARY_VALUE_ROW | TABLE_BOUNDARY_MIGRATION_ROW => {
-            CoreMetaTableSpec {
-                cf: CF_BOUNDARY,
-                max_payload_bytes: CORE_META_MAX_VALUE_BYTES,
-            }
-        }
+        TABLE_BOUNDARY_SCHEMA_ROW
+        | TABLE_BOUNDARY_VALUE_ROW
+        | TABLE_BOUNDARY_MIGRATION_ROW
+        | TABLE_BOUNDARY_SCHEMA_CURRENT_ROW => CoreMetaTableSpec {
+            cf: CF_BOUNDARY,
+            max_payload_bytes: CORE_META_MAX_VALUE_BYTES,
+        },
         TABLE_AUTHZ_SCHEMA_ROW
         | TABLE_AUTHZ_TUPLE_PAGE_ROW
         | TABLE_AUTHZ_IDEMPOTENCY_RECEIPT_ROW
-        | TABLE_AUTHZ_HEAD_ROW => CoreMetaTableSpec {
+        | TABLE_AUTHZ_HEAD_ROW
+        | TABLE_AUTHZ_TUPLE_OBJECT_CURRENT_ROW
+        | TABLE_AUTHZ_TUPLE_SUBJECT_CURRENT_ROW => CoreMetaTableSpec {
             cf: CF_AUTHZ,
             max_payload_bytes: CORE_META_MAX_VALUE_BYTES,
         },
@@ -1385,6 +1411,7 @@ fn table_spec(table_id: u16) -> Result<CoreMetaTableSpec> {
         TABLE_REGISTRY_VERSION_ROW
         | TABLE_REGISTRY_BLOB_LOCATOR_ROW
         | TABLE_GATEWAY_METADATA_ROW
+        | TABLE_GATEWAY_MOUNT_ROUTE_ROW
         | TABLE_GIT_SOURCE_MANIFEST_ROW => CoreMetaTableSpec {
             cf: CF_REGISTRY,
             max_payload_bytes: CORE_META_MAX_VALUE_BYTES,
@@ -1396,6 +1423,8 @@ fn table_spec(table_id: u16) -> Result<CoreMetaTableSpec> {
         | TABLE_REPAIR_FINDING_ID_ROW
         | TABLE_BUCKET_CURRENT_BY_NAME_ROW
         | TABLE_BUCKET_CURRENT_BY_ID_ROW
+        | TABLE_BUCKET_ID_ALLOCATOR_ROW
+        | TABLE_BUCKET_EVENT_HEAD_ROW
         | TABLE_CONTROL_CURRENT_ROW
         | TABLE_SYSTEM_BOOTSTRAP_MARKER_ROW
         | TABLE_ROOT_CATALOG_CURRENT_ROW
@@ -1657,6 +1686,7 @@ fn expected_schema_markers(table_id: u16) -> Option<&'static [&'static str]> {
             "anvil.core.object_metadata.v1",
             "anvil.core.object_metadata_counter.v1",
         ]),
+        TABLE_OBJECT_WATCH_CURSOR_ROW => Some(&["anvil.core.object_watch_cursor.v1"]),
         TABLE_STREAM_HEAD_ROW => Some(&["anvil.core.stream_head.v1"]),
         TABLE_STREAM_RECORD_INDEX_ROW => Some(&[
             "anvil.core.watch_event.v1",
@@ -1675,7 +1705,9 @@ fn expected_schema_markers(table_id: u16) -> Option<&'static [&'static str]> {
         ]),
         TABLE_INDEX_ROW => Some(&["anvil.coremeta.index_segment_row.v1"]),
         TABLE_DERIVED_INDEX_PROOF_ROW => Some(&["anvil.coremeta.derived_index_proof.v1"]),
-        TABLE_BOUNDARY_SCHEMA_ROW => Some(&["anvil.core.boundary_schema.v1"]),
+        TABLE_BOUNDARY_SCHEMA_ROW | TABLE_BOUNDARY_SCHEMA_CURRENT_ROW => {
+            Some(&["anvil.core.boundary_schema.v1"])
+        }
         TABLE_BOUNDARY_VALUE_ROW => Some(&["anvil.core.boundary_value_row.v1"]),
         TABLE_BOUNDARY_MIGRATION_ROW => Some(&["anvil.boundary_migration.v1"]),
         TABLE_AUTHZ_SCHEMA_ROW | TABLE_AUTHZ_TUPLE_PAGE_ROW => Some(&[
@@ -1684,7 +1716,11 @@ fn expected_schema_markers(table_id: u16) -> Option<&'static [&'static str]> {
         ]),
         TABLE_AUTHZ_IDEMPOTENCY_RECEIPT_ROW => Some(&["anvil.authz.idempotency_receipt.v1"]),
         TABLE_AUTHZ_HEAD_ROW => Some(&["anvil.authz.head.v1"]),
+        TABLE_AUTHZ_TUPLE_OBJECT_CURRENT_ROW | TABLE_AUTHZ_TUPLE_SUBJECT_CURRENT_ROW => {
+            Some(&["anvil.authz.coremeta_payload_row.v1"])
+        }
         TABLE_GATEWAY_METADATA_ROW => Some(&["anvil.gateway.coremeta_record.v1"]),
+        TABLE_GATEWAY_MOUNT_ROUTE_ROW => Some(&["anvil.gateway.mount_route.v1"]),
         TABLE_GIT_SOURCE_MANIFEST_ROW => Some(&["anvil.coremeta.git_source_manifest.v1"]),
         TABLE_MESH_NODE_ROW => Some(&[
             "anvil.coremeta.mesh_lifecycle_projection.v1",
@@ -1698,6 +1734,8 @@ fn expected_schema_markers(table_id: u16) -> Option<&'static [&'static str]> {
         TABLE_BUCKET_CURRENT_BY_NAME_ROW | TABLE_BUCKET_CURRENT_BY_ID_ROW => {
             Some(&["anvil.core.bucket_current.v1"])
         }
+        TABLE_BUCKET_ID_ALLOCATOR_ROW => Some(&["anvil.core.bucket_id_allocator.v1"]),
+        TABLE_BUCKET_EVENT_HEAD_ROW => Some(&["anvil.core.bucket_event_head.v1"]),
         TABLE_CONTROL_CURRENT_ROW => Some(&["anvil.control.current.v1"]),
         TABLE_ROOT_CATALOG_CURRENT_ROW => {
             Some(&["anvil.control.current.v1", "anvil.core.root_catalog.v1"])
@@ -1707,7 +1745,7 @@ fn expected_schema_markers(table_id: u16) -> Option<&'static [&'static str]> {
         }
         TABLE_REPAIR_FINDING_HEAD_ROW => Some(&["anvil.repair.finding_head.v1"]),
         TABLE_REPAIR_FINDING_ID_ROW => Some(&["anvil.repair.finding_id.v1"]),
-        TABLE_TASK_CURRENT_ROW => Some(&["anvil.core.task_current.v1"]),
+        TABLE_TASK_CURRENT_ROW => Some(&["anvil.core.task_queue_row.v1"]),
         TABLE_CORE_FENCE_ROW => Some(&["anvil.control.current.v1", "anvil.core.fence.v1"]),
         TABLE_MATERIALISATION_CURSOR_ROW => Some(&[
             "anvil.core.materialisation_cursor.v1",
