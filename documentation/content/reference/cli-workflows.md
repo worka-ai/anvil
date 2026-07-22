@@ -240,7 +240,7 @@ For a tenant index issue:
 
 ```bash
 anvil --profile acme diagnostics list documents tutorial_by_status --page-size 20
-anvil --profile acme repair findings index documents/tutorial_by_status --limit 20
+anvil --profile acme repair findings index documents/tutorial_by_status --page-size 20
 anvil --profile acme repair run index documents tutorial_by_status
 ```
 

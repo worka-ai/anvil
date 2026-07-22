@@ -121,12 +121,15 @@ Repair findings are listed by exact scope kind and scope id, not by friendly buc
 When you do know the scope id, list findings like this:
 
 ```bash
-anvil --profile acme repair findings bucket tenant-42-bucket-7 --limit 20
+anvil --profile acme repair findings bucket tenant-42-bucket-7 --page-size 20
 ```
 
 This calls `RepairService.ListRepairFindings`. A successful response proves the caller had `repair:read` on `tenant-42-bucket-7` and that Anvil could read sealed findings for scope kind `bucket` and that scope id. The CLI prints finding id, severity, status, and message.
 
-This command does not prove the latest repair run produced a finding. `up_to_date` and `empty_source` repairs usually do not produce one. It also does not page with a cursor today; `--limit` truncates the returned list. If you need complete finding history, use a direct API path or improve the CLI before depending on it operationally.
+This command does not prove the latest repair run produced a finding.
+`up_to_date` and `empty_source` repairs usually do not produce one. When another
+page exists, the CLI emits `next_page_token=...`; continue with `--page-token`
+and the same scope and page size.
 
 Current repair findings use these scope patterns in the inspected implementation:
 

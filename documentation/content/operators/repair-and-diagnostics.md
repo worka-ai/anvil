@@ -229,7 +229,7 @@ Do not edit CoreStore files to fix a diagnostic. Direct edits bypass authenticat
 Repair findings are durable evidence that a repair or diagnostic path found something worth tracking. The public CLI can list findings when you know the scope kind and scope id returned by repair or diagnostics:
 
 ```bash
-anvil --profile acme repair findings index "$REPAIR_SCOPE_ID" --limit 20
+anvil --profile acme repair findings index "$REPAIR_SCOPE_ID" --page-size 20
 ```
 
 This proves the caller can read repair findings for the exact scope id returned by the repair or diagnostic flow. It does not apply repair, and it does not prove the current symptom still exists. Findings should be paired with the failing request, the repair response, and a post-repair verification command.

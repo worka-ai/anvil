@@ -491,7 +491,7 @@ async fn tenant_tutorial_commands_run_without_admin_port_e2e() {
     let alias_list = run_anvil(&config_dir, &["host-alias", "list"]);
     assert!(stdout(&alias_list).contains(&host));
 
-    let audit = run_anvil(&config_dir, &["audit", "list", "--limit", "20"]);
+    let audit = run_anvil(&config_dir, &["audit", "list", "--page-size", "20"]);
     assert!(stdout(&audit).contains("object_link") || stdout(&audit).contains("host_alias"));
 
     let bad_admin = run_anvil_expect_failure(&config_dir, &["admin", "node", "list"]);

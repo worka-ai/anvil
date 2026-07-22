@@ -396,7 +396,7 @@ A rebuild proves Anvil attempted to reconstruct the derived index from source da
 For application audit history, use stream reads. For Anvil service-recorded tenant audit events, use:
 
 ```bash
-anvil --profile acme audit list --limit 20
+anvil --profile acme audit list --page-size 20
 ```
 
 This lists tenant audit events recorded by Anvil services. It does not list your application append stream events and does not list private admin-plane audit events.

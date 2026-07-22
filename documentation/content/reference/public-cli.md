@@ -419,7 +419,7 @@ anvil --profile acme repair run index documents by_status --rebuild
 anvil --profile acme repair run directory documents --rebuild
 anvil --profile acme repair run authz-derived derived-userset-acme-docs --rebuild
 anvil --profile acme repair run personal-db customer-notes
-anvil --profile acme repair findings index "$REPAIR_SCOPE_ID" --limit 100
+anvil --profile acme repair findings index "$REPAIR_SCOPE_ID" --page-size 100
 ```
 
 Purpose: read index diagnostics, rebuild or validate tenant-derived state, and list repair findings for a known scope id.
@@ -433,16 +433,17 @@ Limitations: there is no general public CoreStore fsck, no universal append-stre
 Tenant audit events record tenant-facing actions that Anvil chooses to audit.
 
 ```bash
-anvil --profile acme audit list --limit 100
+anvil --profile acme audit list --page-size 100
 anvil --profile acme audit list \
   --principal app:docs-writer \
   --resource documents/tutorial/welcome.txt \
   --action object.put \
-  --cursor "$NEXT_CURSOR" \
-  --limit 100
+  --page-token "$NEXT_PAGE_TOKEN" \
+  --page-size 100
 ```
 
-Purpose: list tenant audit events with optional principal, resource, action, cursor, and limit filters.
+Purpose: list tenant audit events with optional principal, resource, action,
+opaque page-token, and page-size filters.
 
 Auth/scope shape: tenant audit listing requires the public authority granted for audit reading in the current service policy. Audit records are tenant-scoped; admin audit is separate and uses `anvil-admin`.
 
