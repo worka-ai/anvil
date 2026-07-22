@@ -2,13 +2,10 @@ use super::{
     WriterSegmentCatalogRecord, validate_record, writer_realm, writer_root_key_hash,
     writer_scope_hash,
 };
-use crate::{
-    core_store::{
-        CF_MATERIALISATION, CoreMetaRowCommonProto, CoreMetaStore, CoreMetaTuplePart,
-        CoreMetaVisibilityState, TABLE_WRITER_HEAD_ROW, core_meta_tuple_key,
-        decode_deterministic_proto, encode_deterministic_proto,
-    },
-    storage::Storage,
+use crate::core_store::{
+    CF_MATERIALISATION, CoreMetaRowCommonProto, CoreMetaTuplePart, CoreMetaVisibilityState,
+    CoreMutationPrecondition, CoreStore, TABLE_WRITER_HEAD_ROW, core_meta_payload_digest,
+    core_meta_tuple_key, decode_deterministic_proto, encode_deterministic_proto,
 };
 use anyhow::{Result, anyhow, bail};
 use prost::Message;
@@ -18,6 +15,7 @@ const WRITER_HEAD_SCHEMA: &str = "anvil.coremeta.writer_head.v1";
 pub(super) struct WriterHead {
     pub(super) record: WriterSegmentCatalogRecord,
     pub(super) publication_generation: u64,
+    expected_payload_hash: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -56,8 +54,8 @@ struct WriterHeadProto {
     publication_transaction_id: String,
 }
 
-pub(super) fn read(storage: &Storage, family: &str, scope: &str) -> Result<Option<WriterHead>> {
-    let Some(payload) = CoreMetaStore::open(storage.core_store_meta_path())?.get(
+pub(super) fn read(store: &CoreStore, family: &str, scope: &str) -> Result<Option<WriterHead>> {
+    let Some(payload) = store.read_coremeta_row(
         CF_MATERIALISATION,
         TABLE_WRITER_HEAD_ROW,
         &tuple_key(family, scope)?,
@@ -66,6 +64,21 @@ pub(super) fn read(storage: &Storage, family: &str, scope: &str) -> Result<Optio
         return Ok(None);
     };
     decode(&payload, family, scope).map(Some)
+}
+
+pub(super) fn precondition(
+    family: &str,
+    scope: &str,
+    current: Option<&WriterHead>,
+) -> Result<CoreMutationPrecondition> {
+    Ok(CoreMutationPrecondition::CoreMetaRow {
+        cf: CF_MATERIALISATION.to_string(),
+        table_id: TABLE_WRITER_HEAD_ROW,
+        tuple_key: tuple_key(family, scope)?,
+        expected_payload_hash: current.map(|head| head.expected_payload_hash.clone()),
+        require_absent: current.is_none(),
+        require_present: current.is_some(),
+    })
 }
 
 pub(super) fn encode(
@@ -148,19 +161,21 @@ fn decode(bytes: &[u8], family: &str, scope: &str) -> Result<WriterHead> {
         created_at_unix_nanos: proto.segment_created_at_unix_nanos,
     };
     validate_record(&record)?;
-    if common
-        != &self::common(
-            &record,
-            proto.publication_generation,
-            &proto.publication_transaction_id,
-            proto.published_at_unix_nanos,
-        )
+    if super::validate_writer_common(
+        &record.family,
+        &record.scope,
+        &proto.publication_transaction_id,
+        proto.published_at_unix_nanos,
+        common,
+    )
+    .is_err()
     {
         bail!("writer head CoreMeta common mismatch");
     }
     Ok(WriterHead {
         record,
         publication_generation: proto.publication_generation,
+        expected_payload_hash: core_meta_payload_digest(TABLE_WRITER_HEAD_ROW, bytes),
     })
 }
 
@@ -178,5 +193,38 @@ fn common(
         visibility_state: CoreMetaVisibilityState::Committed as i32,
         created_at_unix_nanos: published_at_unix_nanos,
         payload_schema_version: 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record() -> WriterSegmentCatalogRecord {
+        WriterSegmentCatalogRecord {
+            family: "test-writer".into(),
+            scope: "tenant/42/index/main".into(),
+            segment_ref: "segment:7".into(),
+            core_object_ref_target: "core-object-ref:test-7".into(),
+            segment_hash: format!("{:064x}", 7),
+            segment_length: 7,
+            generation: 7,
+            source_cursor: 70,
+            created_at_unix_nanos: 700,
+        }
+    }
+
+    #[test]
+    fn writer_head_accepts_independent_physical_root_generation() {
+        let record = record();
+        let payload = encode(&record, 3, "tx-writer", 701).unwrap();
+        let mut common = crate::core_store::core_meta_row_common_from_payload(&payload).unwrap();
+        common.root_generation = 91;
+        let rebound = crate::core_store::replace_core_meta_row_common(&payload, &common).unwrap();
+
+        let decoded = decode(&rebound, &record.family, &record.scope).unwrap();
+        assert_eq!(decoded.record, record);
+        assert_eq!(decoded.publication_generation, 3);
+        assert_ne!(common.root_generation, decoded.publication_generation);
     }
 }
