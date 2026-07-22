@@ -40,8 +40,9 @@ pub async fn put_gateway_mount_record(
 ) -> Result<u64> {
     let ref_name = gateway_mount_ref_name(&record)?;
     let tuple_key = gateway_metadata_tuple_key(GATEWAY_ROW_MOUNT, &ref_name)?;
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
-    let current_payload = meta.get(CF_REGISTRY, TABLE_GATEWAY_METADATA_ROW, &tuple_key)?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let current_payload =
+        store.read_coremeta_row(CF_REGISTRY, TABLE_GATEWAY_METADATA_ROW, &tuple_key)?;
     let current = current_payload
         .as_deref()
         .map(|payload| {
@@ -115,16 +116,27 @@ pub async fn put_gateway_mount_record(
             cf: CF_REGISTRY.to_string(),
             table_id: TABLE_GATEWAY_MOUNT_ROUTE_ROW,
             tuple_key: key,
-            payload: encode_mount_route_row(&record, &ref_name, route, &transaction_id)?,
+            payload: encode_mount_route_row(&record, &ref_name, route)?,
         });
     }
 
-    CoreStore::new(storage.clone())
-        .await?
+    store
         .commit_mutation_batch(CoreMutationBatch {
             transaction_id,
-            scope_partition,
+            scope_partition: scope_partition.clone(),
             committed_by_principal: "gateway-mount-registry".to_string(),
+            root_publications: vec![crate::core_store::CoreMutationRootPublication {
+                root_anchor_key: scope_partition,
+                writer_families: vec![
+                    crate::formats::writer::WriterFamily::CoreControl
+                        .as_str()
+                        .to_string(),
+                    crate::formats::writer::WriterFamily::Registry
+                        .as_str()
+                        .to_string(),
+                ],
+                transaction_coordinator: true,
+            }],
             preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
                 cf: CF_REGISTRY.to_string(),
                 table_id: TABLE_GATEWAY_METADATA_ROW,
@@ -276,14 +288,13 @@ fn encode_mount_route_row(
     record: &GatewayMountRecord,
     ref_name: &str,
     route: &GatewayMountRoute,
-    transaction_id: &str,
 ) -> Result<Vec<u8>> {
     let row = GatewayMountRouteRowProto {
         common: Some(core_meta_committed_row_common(
             gateway_realm_id(record),
             gateway_metadata_root_key_hash(GATEWAY_ROW_MOUNT, ref_name),
-            record.generation,
-            transaction_id.to_string(),
+            GATEWAY_METADATA_CANDIDATE_GENERATION,
+            GATEWAY_METADATA_CANDIDATE_TRANSACTION_ID,
             0,
         )),
         schema: GATEWAY_MOUNT_ROUTE_SCHEMA.to_string(),

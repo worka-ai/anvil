@@ -1,13 +1,13 @@
 use crate::{
     core_store::{
         AppendStreamRecord, AuthzScopeRef, CF_REGISTRY, CoreLogicalFileWrite, CoreMetaBatchOp,
-        CoreMetaBatchOpKind, CoreMetaStore, CoreMetaTuplePart, CoreMutationBatch,
+        CoreMetaBatchOpKind, CoreMetaRootPublication, CoreMetaTuplePart, CoreMutationBatch,
         CoreMutationOperation, CoreMutationPrecondition, CoreObjectRef, CorePipelinePolicy,
         CoreStore, CoreTraceContext, GetBlob, ReadStream, StreamAppendReceipt, StreamRecord,
         TABLE_GATEWAY_METADATA_ROW, TABLE_GATEWAY_MOUNT_ROUTE_ROW, WriteLogicalFileRequest,
         core_meta_committed_row_common, core_meta_payload_digest, core_meta_root_key_hash,
-        core_meta_tuple_key, core_object_ref_from_logical_file_write,
-        decode_deterministic_proto, encode_deterministic_proto,
+        core_meta_tuple_key, core_object_ref_from_logical_file_write, decode_deterministic_proto,
+        encode_deterministic_proto,
     },
     formats::{
         hash32,
@@ -540,7 +540,8 @@ pub async fn update_gateway_tag(
         &record.gateway,
         &record.registry_instance_id,
         &record.target_digest,
-    )?
+    )
+    .await?
     .ok_or_else(|| anyhow!("registry tag target blob is missing CoreMeta locator row"))?;
     let row = put_record_row(
         storage,
@@ -1561,10 +1562,8 @@ mod registry_api;
 use helpers::*;
 use keys::*;
 use metadata_rows::*;
+pub(crate) use metadata_rows::{GatewayStoredHandle, materialize_committed_gateway_transaction};
 pub use mount_routes::{put_gateway_mount_record, resolve_gateway_mount};
-pub(crate) use metadata_rows::{
-    GatewayStoredHandle, encode_gateway_metadata_row, materialize_committed_gateway_transaction,
-};
 use record_codec::*;
 pub use registry_api::*;
 
