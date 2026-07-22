@@ -15,42 +15,30 @@ pub(super) async fn list_diagnostics(
         validate_diagnostic_severity(&req.severity)?;
     }
 
-    let mut diagnostics = Vec::new();
-
-    if source.is_empty() || source == "index" || source == "index_diagnostic_journal" {
-        if req.tenant_id.trim().is_empty() || req.bucket_name.trim().is_empty() {
-            if source == "index" || source == "index_diagnostic_journal" {
-                return Err(Status::invalid_argument(
-                    "tenant_id and bucket_name are required for index diagnostics",
-                ));
-            }
-        } else {
-            let tenant_id = resolve_tenant_id(state, &req.tenant_id).await?;
-            let bucket = state
-                .persistence
-                .get_bucket_by_name(tenant_id, &req.bucket_name)
-                .await
-                .map_err(|err| Status::internal(err.to_string()))?
-                .ok_or_else(|| Status::not_found("Bucket not found"))?;
-            diagnostics.extend(
-                state
+    let index_scope =
+        if source.is_empty() || source == "index" || source == "index_diagnostic_journal" {
+            if req.tenant_id.trim().is_empty() || req.bucket_name.trim().is_empty() {
+                if source == "index" || source == "index_diagnostic_journal" {
+                    return Err(Status::invalid_argument(
+                        "tenant_id and bucket_name are required for index diagnostics",
+                    ));
+                }
+                None
+            } else {
+                let tenant_id = resolve_tenant_id(state, &req.tenant_id).await?;
+                let bucket = state
                     .persistence
-                    .list_index_diagnostics(
-                        tenant_id,
-                        bucket.id,
-                        &req.index_name,
-                        &req.severity,
-                        0,
-                        i32::MAX,
-                    )
+                    .get_bucket_by_name(tenant_id, &req.bucket_name)
                     .await
                     .map_err(|err| Status::internal(err.to_string()))?
-                    .into_iter()
-                    .map(index_diagnostic_to_admin_record)
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
-        }
-    }
+                    .ok_or_else(|| Status::not_found("Bucket not found"))?;
+                Some((tenant_id, bucket.id))
+            }
+        } else {
+            None
+        };
+
+    let mut diagnostics = Vec::new();
 
     if source.is_empty() || source == "mesh" || source == "mesh_lifecycle" {
         diagnostics.extend(mesh_lifecycle_diagnostics(state).await?);
@@ -63,12 +51,26 @@ pub(super) async fn list_diagnostics(
     if !req.severity.trim().is_empty() {
         diagnostics.retain(|diagnostic| diagnostic.severity == req.severity);
     }
-    diagnostics.sort_by(|left, right| diagnostic_position(left).cmp(&diagnostic_position(right)));
-
-    let positions = diagnostics
+    let mut positions = diagnostics
         .iter()
         .map(|diagnostic| (diagnostic_position(diagnostic), diagnostic.cursor))
         .collect::<Vec<_>>();
+    if let Some((tenant_id, bucket_id)) = index_scope {
+        let revision = crate::index_diagnostic_journal::index_diagnostic_revision(
+            &state.storage,
+            tenant_id,
+            bucket_id,
+        )
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?;
+        positions.push((
+            "index_diagnostic_journal:head".to_string(),
+            revision
+                .parse::<u64>()
+                .map_err(|_| Status::internal("Invalid index diagnostic revision"))?,
+        ));
+    }
+    positions.sort_by(|left, right| left.0.cmp(&right.0));
     let revision = admin_cursor::collection_revision(
         positions
             .iter()
@@ -91,6 +93,40 @@ pub(super) async fn list_diagnostics(
     };
     let cursor =
         admin_cursor::decode_page_cursor(page, &binding, state.config.jwt_secret.as_bytes())?;
+    if let Some((tenant_id, bucket_id)) = index_scope {
+        let after_cursor = cursor
+            .as_deref()
+            .map(index_diagnostic_admin_cursor)
+            .transpose()?
+            .flatten()
+            .unwrap_or_default();
+        let cursor_is_after_index = cursor.as_deref().is_some_and(|position| {
+            !position.starts_with("index_diagnostic_journal:")
+                && position > "index_diagnostic_journal:"
+        });
+        if !cursor_is_after_index {
+            let query_limit = i32::try_from(limit + 1)
+                .map_err(|_| Status::invalid_argument("page size exceeds supported range"))?;
+            diagnostics.extend(
+                state
+                    .persistence
+                    .list_index_diagnostics(
+                        tenant_id,
+                        bucket_id,
+                        &req.index_name,
+                        &req.severity,
+                        after_cursor,
+                        query_limit,
+                    )
+                    .await
+                    .map_err(|err| Status::internal(err.to_string()))?
+                    .into_iter()
+                    .map(index_diagnostic_to_admin_record)
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+    }
+    diagnostics.sort_by(|left, right| diagnostic_position(left).cmp(&diagnostic_position(right)));
     let mut diagnostics = diagnostics
         .into_iter()
         .filter(|diagnostic| {
@@ -134,6 +170,21 @@ pub(super) async fn list_diagnostics(
     }))
 }
 
+fn index_diagnostic_admin_cursor(position: &str) -> Result<Option<i64>, Status> {
+    let Some(rest) = position.strip_prefix("index_diagnostic_journal:") else {
+        return Ok(None);
+    };
+    let cursor = rest
+        .split(':')
+        .next()
+        .ok_or_else(|| Status::invalid_argument("Invalid index diagnostic cursor"))?
+        .parse::<u64>()
+        .map_err(|_| Status::invalid_argument("Invalid index diagnostic cursor"))?;
+    i64::try_from(cursor)
+        .map(Some)
+        .map_err(|_| Status::invalid_argument("Invalid index diagnostic cursor"))
+}
+
 pub(super) async fn list_audit_events(
     state: &AppState,
     request: Request<ListAuditEventsRequest>,
@@ -143,29 +194,9 @@ pub(super) async fn list_audit_events(
     let request_id = require_request_id(&req.request_id)?.to_string();
     let page = req.page.as_ref();
     let limit = page_limit(page)?;
-    let mut events = admin_audit::list_audit_events(
-        &state.storage,
-        AuditEventFilter {
-            principal_id: none_if_empty(&req.principal_id),
-            resource_id: none_if_empty(&req.resource_id),
-            action: none_if_empty(&req.action),
-        },
-    )
-    .await
-    .map_err(|err| Status::internal(err.to_string()))?;
-    let revision = admin_cursor::collection_revision(
-        events
-            .iter()
-            .map(|event| {
-                (
-                    audit_cursor_position(event),
-                    admin_audit::audit_event_revision_generation(event),
-                )
-            })
-            .collect::<Vec<_>>()
-            .iter()
-            .map(|(position, generation)| (position.as_str(), *generation)),
-    );
+    let revision = admin_audit::audit_collection_revision(&state.storage)
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
     let filters = [
         ("principal_id", req.principal_id.as_str()),
         ("resource_id", req.resource_id.as_str()),
@@ -181,34 +212,42 @@ pub(super) async fn list_audit_events(
     };
     let cursor =
         admin_cursor::decode_page_cursor(page, &binding, state.config.jwt_secret.as_bytes())?;
-    events.retain(|event| {
-        cursor
-            .as_deref()
-            .is_none_or(|cursor| audit_cursor_position(event).as_str() > cursor)
-    });
-    events.truncate(limit + 1);
-    let has_more = events.len() > limit;
-    if has_more {
-        events.truncate(limit);
+    let after_cursor = cursor
+        .as_deref()
+        .map(hex::decode)
+        .transpose()
+        .map_err(|_| Status::invalid_argument("Invalid admin audit cursor"))?;
+    let page = admin_audit::list_audit_event_page_after(
+        &state.storage,
+        AuditEventFilter {
+            principal_id: none_if_empty(&req.principal_id),
+            resource_id: none_if_empty(&req.resource_id),
+            action: none_if_empty(&req.action),
+        },
+        after_cursor.as_deref(),
+        limit,
+    )
+    .await
+    .map_err(|err| Status::internal(err.to_string()))?;
+    if page.revision != revision {
+        return Err(Status::aborted(
+            "Admin audit collection changed while reading this page",
+        ));
     }
-    let next_cursor = if has_more {
-        events.last().map_or(Ok(String::new()), |event| {
-            admin_cursor::encode_next_cursor(
-                &audit_cursor_position(event),
-                &binding,
-                state.config.jwt_secret.as_bytes(),
-            )
-        })?
-    } else {
-        String::new()
-    };
+    let next_cursor = page.next_cursor.map_or(Ok(String::new()), |cursor| {
+        admin_cursor::encode_next_cursor(
+            &hex::encode(cursor),
+            &binding,
+            state.config.jwt_secret.as_bytes(),
+        )
+    })?;
 
     Ok(Response::new(AuditEventsResponse {
         request_id,
         page: Some(PageResponse {
             next_page_token: next_cursor,
         }),
-        events: events.into_iter().map(audit_event_to_proto).collect(),
+        events: page.events.into_iter().map(audit_event_to_proto).collect(),
         data_source: "admin_audit_log".to_string(),
     }))
 }

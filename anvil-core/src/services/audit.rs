@@ -31,11 +31,10 @@ impl AuditService for AppState {
             resource_id: none_if_empty(&req.resource_id),
             action: none_if_empty(&req.action),
         };
-        let mut events =
-            tenant_audit::list_tenant_audit_events(&self.storage, claims.tenant_id, filter)
+        let revision =
+            tenant_audit::tenant_audit_collection_revision(&self.storage, claims.tenant_id)
                 .await
                 .map_err(|err| Status::internal(err.to_string()))?;
-        let revision = tenant_audit::collection_revision(events.iter());
         let cursor = decode_tenant_audit_cursor(
             req.page.as_ref(),
             &claims,
@@ -44,32 +43,41 @@ impl AuditService for AppState {
             &revision,
             &self.config.anvil_secret_encryption_key.as_bytes(),
         )?;
-        if let Some(cursor) = cursor.as_deref() {
-            events.retain(|event| tenant_audit::audit_event_position(event).as_str() > cursor);
+        let after_cursor = cursor
+            .as_deref()
+            .map(hex::decode)
+            .transpose()
+            .map_err(|_| Status::invalid_argument("Invalid tenant audit cursor"))?;
+        let page = tenant_audit::list_tenant_audit_event_page_after(
+            &self.storage,
+            claims.tenant_id,
+            filter,
+            after_cursor.as_deref(),
+            limit,
+        )
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
+        if page.revision != revision {
+            return Err(Status::aborted(
+                "Tenant audit collection changed while reading this page",
+            ));
         }
-        let has_more = events.len() > limit;
-        if has_more {
-            events.truncate(limit);
-        }
-        let next_cursor = if has_more {
-            let last = events.last().expect("events truncated with non-empty last");
+        let next_cursor = page.next_cursor.map_or(Ok(String::new()), |cursor| {
             encode_tenant_audit_cursor(
-                &tenant_audit::audit_event_position(last),
+                &hex::encode(cursor),
                 &claims,
                 &req,
                 limit,
                 &revision,
                 &self.config.anvil_secret_encryption_key.as_bytes(),
-            )?
-        } else {
-            String::new()
-        };
+            )
+        })?;
         Ok(Response::new(AuditEventsResponse {
             request_id: req.request_id,
             page: Some(PageResponse {
                 next_page_token: next_cursor,
             }),
-            events: events.into_iter().map(audit_event_to_proto).collect(),
+            events: page.events.into_iter().map(audit_event_to_proto).collect(),
             data_source: "tenant_audit_log".to_string(),
         }))
     }
