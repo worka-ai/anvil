@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 #[derive(Debug)]
 pub struct GrpcLostResponseProxy {
     endpoint: String,
-    dropped: Option<oneshot::Receiver<()>>,
+    dropped: Option<oneshot::Receiver<Result<(), String>>>,
     task: JoinHandle<()>,
 }
 
@@ -37,10 +37,13 @@ impl GrpcLostResponseProxy {
         );
         let (dropped_tx, dropped_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
-            let result = proxy_one_response(listener, &target, dropped_tx).await;
-            if let Err(error) = result {
+            let result = proxy_one_response(listener, &target)
+                .await
+                .map_err(|error| error.to_string());
+            if let Err(error) = &result {
                 eprintln!("[anvil-test] lost-response proxy failed: {error}");
             }
+            let _ = dropped_tx.send(result);
         });
         Self {
             endpoint,
@@ -53,15 +56,17 @@ impl GrpcLostResponseProxy {
         &self.endpoint
     }
 
-    pub async fn wait_until_response_dropped(&mut self, timeout: Duration) {
+    pub async fn wait_until_response_dropped(&mut self, timeout: Duration) -> Result<(), String> {
         let receiver = self
             .dropped
             .take()
             .expect("lost-response proxy drop was already observed");
         tokio::time::timeout(timeout, receiver)
             .await
-            .expect("timed out waiting for gRPC response fault")
-            .expect("lost-response proxy exited before dropping response data");
+            .map_err(|_| "timed out waiting for gRPC response fault".to_string())?
+            .map_err(|_| {
+                "lost-response proxy task exited without reporting its result".to_string()
+            })?
     }
 }
 
@@ -71,11 +76,7 @@ impl Drop for GrpcLostResponseProxy {
     }
 }
 
-async fn proxy_one_response(
-    listener: TcpListener,
-    target: &str,
-    dropped: oneshot::Sender<()>,
-) -> io::Result<()> {
+async fn proxy_one_response(listener: TcpListener, target: &str) -> io::Result<()> {
     let (client, _) = listener.accept().await?;
     let server = TcpStream::connect(target).await?;
     let (mut client_read, mut client_write) = client.into_split();
@@ -87,8 +88,7 @@ async fn proxy_one_response(
         result
     });
 
-    let downstream =
-        forward_until_response_data(&mut server_read, &mut client_write, dropped).await;
+    let downstream = forward_until_response_data(&mut server_read, &mut client_write).await;
     let _ = client_write.shutdown().await;
     upstream.abort();
     downstream
@@ -97,14 +97,17 @@ async fn proxy_one_response(
 async fn forward_until_response_data(
     server: &mut tokio::net::tcp::OwnedReadHalf,
     client: &mut tokio::net::tcp::OwnedWriteHalf,
-    dropped: oneshot::Sender<()>,
 ) -> io::Result<()> {
-    let mut dropped = Some(dropped);
     loop {
         let mut header = [0_u8; 9];
         match server.read_exact(&mut header).await {
             Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "upstream gRPC response ended before a non-empty DATA frame",
+                ));
+            }
             Err(error) => return Err(error),
         }
         let payload_len =
@@ -116,9 +119,6 @@ async fn forward_until_response_data(
         server.read_exact(&mut payload).await?;
 
         if frame_type == 0 && stream_id != 0 && payload_len != 0 {
-            if let Some(dropped) = dropped.take() {
-                let _ = dropped.send(());
-            }
             return Ok(());
         }
 

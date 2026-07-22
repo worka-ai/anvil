@@ -3,6 +3,9 @@ use super::*;
 const DOCKER_EQUAL_PEER_COUNT: u8 = 6;
 const DOCKER_METADATA_REPLICA_COUNT: u8 = 3;
 const BLOCK_SHARD_ROOT: &str = "/var/lib/anvil/corestore/blocks/local-cache";
+const BLOCK_SHARD_ERASURE_SET_ID: &str = "local-erasure-set";
+const DEFERRED_PEER_ADMISSION_TIMEOUT: Duration = Duration::from_secs(240);
+const DOCKER_NETWORK_TRANSITION_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DockerPeer {
@@ -65,25 +68,36 @@ impl DockerTestCluster {
         self.start_node(ordinal).await;
     }
 
-    /// Recreates one equal peer with a fresh named volume. This intentionally
-    /// does not call the test bootstrap snapshot installer: recovery must use
-    /// the same production join and catch-up path as a real late peer.
-    pub async fn recreate_node_with_empty_volume(&self, ordinal: u8) {
-        self.stop_node(ordinal).await;
-        let compose_file = self.compose_file.clone();
-        let project_name = self.project_name.clone();
-        let compose_env = self.compose_env.clone();
-        tokio::task::spawn_blocking(move || {
-            docker_recreate_node_with_empty_volume(
-                &compose_file,
-                &project_name,
-                &compose_env,
-                ordinal,
-            );
-        })
-        .await
-        .expect("recreate Docker equal peer with empty volume panicked");
-        self.start_node(ordinal).await;
+    pub async fn admit_deferred_peer(&self, ordinal: u8) {
+        assert!(
+            (1..=DOCKER_EQUAL_PEER_COUNT).contains(&ordinal),
+            "Docker equal-peer ordinal must be between 1 and 6"
+        );
+        let topology = self
+            .deferred_topologies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&ordinal)
+            .unwrap_or_else(|| panic!("Docker peer {ordinal} has no deferred topology admission"));
+        let peer_index = usize::from(ordinal - 1);
+        let mut client =
+            docker_topology::connect_docker_mesh_control(&self.admin_addrs[peer_index]).await;
+        let mut request = tonic::Request::new(topology);
+        add_docker_admin_bearer(&mut request, &self.admin_token);
+        let response = client
+            .bootstrap_mesh_topology(request)
+            .await
+            .expect("deferred Docker peer BootstrapMeshTopology")
+            .into_inner();
+        assert!(
+            !response.already_initialised,
+            "deferred Docker peer unexpectedly had an existing mesh topology"
+        );
+        let addr = &self.grpc_addrs[peer_index];
+        assert!(
+            wait_for_http_ready(addr, DEFERRED_PEER_ADMISSION_TIMEOUT).await,
+            "deferred Docker peer did not become ready after topology admission: {addr}"
+        );
     }
 
     /// Removes only final block shards while preserving the peer's metadata,
@@ -99,6 +113,32 @@ impl DockerTestCluster {
         .await
         .expect("clear Docker equal-peer block shards panicked");
         self.start_node(ordinal).await;
+    }
+
+    /// Removes exact final shard paths from an already stopped peer. The
+    /// caller controls restart ordering so recovery tests cannot accidentally
+    /// introduce an extra stop/start race or erase unrelated shards.
+    pub async fn erase_stopped_node_block_shards(&self, ordinal: u8, paths: &BTreeSet<String>) {
+        assert!(
+            !paths.is_empty(),
+            "Docker block shard deletion requires at least one exact path"
+        );
+        let node_root = self.node_block_shard_root(ordinal);
+        for path in paths {
+            assert!(
+                path.strip_prefix(&node_root)
+                    .is_some_and(|suffix| suffix.starts_with('/') && !suffix.contains("/../")),
+                "Docker block shard path is outside peer {ordinal}'s logical-node root: {path}"
+            );
+        }
+        let project_name = self.project_name.clone();
+        let compose_env = self.compose_env.clone();
+        let paths = paths.iter().cloned().collect::<Vec<_>>();
+        tokio::task::spawn_blocking(move || {
+            docker_remove_node_block_shards(&project_name, &compose_env, ordinal, &paths);
+        })
+        .await
+        .expect("remove exact Docker equal-peer block shards panicked");
     }
 
     pub async fn node_block_shard_count(&self, ordinal: u8) -> u64 {
@@ -124,29 +164,93 @@ impl DockerTestCluster {
             .expect("Docker shard count is numeric")
     }
 
-    pub async fn wait_for_node_block_shard_count_at_least(
+    /// Lists final shards stored for this peer's distributed logical node.
+    /// Synthetic bootstrap `local-node-*` cache shards are outside this path.
+    pub async fn node_block_shard_paths(&self, ordinal: u8) -> BTreeSet<String> {
+        let node_root = self.node_block_shard_root(ordinal);
+        let output = self
+            .exec_node_output(
+                ordinal,
+                &[
+                    "sh",
+                    "-c",
+                    &format!(
+                        "if [ -d '{node_root}' ]; then find '{node_root}' -type f -name 'shard-*.anb' -print; fi"
+                    ),
+                ],
+            )
+            .await;
+        assert!(
+            output.status.success(),
+            "list Docker peer {ordinal} block shard paths: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("Docker shard paths are utf-8")
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Reads one exact final shard for format-level distributed assertions.
+    /// The path must come from `node_block_shard_paths`; arbitrary container
+    /// paths are deliberately rejected.
+    pub async fn node_block_shard_file(&self, ordinal: u8, path: &str) -> Vec<u8> {
+        let node_root = self.node_block_shard_root(ordinal);
+        assert!(
+            path.strip_prefix(&node_root)
+                .is_some_and(|suffix| suffix.starts_with('/') && !suffix.contains("/../")),
+            "Docker block shard path is outside peer {ordinal}'s logical-node root: {path}"
+        );
+        let output = self.exec_node_output(ordinal, &["cat", "--", path]).await;
+        assert!(
+            output.status.success(),
+            "read Docker peer {ordinal} block shard {path}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    /// Waits for every expected identity; unrelated shards cannot substitute
+    /// for a missing path.
+    pub async fn wait_for_node_block_shard_paths(
         &self,
         ordinal: u8,
-        minimum: u64,
+        expected: &BTreeSet<String>,
         timeout: Duration,
     ) {
+        assert!(
+            !expected.is_empty(),
+            "Docker block shard path wait requires at least one expected path"
+        );
         let deadline = Instant::now() + timeout;
-        let mut observed = 0;
-        while Instant::now() < deadline {
-            observed = self.node_block_shard_count(ordinal).await;
-            if observed >= minimum {
+        let observed = loop {
+            let observed = self.node_block_shard_paths(ordinal).await;
+            if expected.is_subset(&observed) {
                 return;
             }
+            if Instant::now() >= deadline {
+                break observed;
+            }
             tokio::time::sleep(Duration::from_millis(250)).await;
-        }
+        };
+        let missing = expected
+            .difference(&observed)
+            .cloned()
+            .collect::<BTreeSet<_>>();
         panic!(
-            "Docker peer {ordinal} did not recover {minimum} block shards before timeout; observed {observed}"
+            "Docker peer {ordinal} did not recover the exact expected block shard paths before timeout; missing={missing:?}; expected={expected:?}; observed={observed:?}"
         );
     }
 
-    /// Splits all six peers into two disjoint Docker bridge networks. Each
-    /// partition retains normal service aliases and host-published endpoints,
-    /// while cross-partition peer traffic is impossible until `heal` runs.
+    fn node_block_shard_root(&self, ordinal: u8) -> String {
+        let node_id = self.equal_peer(ordinal).node_id;
+        format!("{BLOCK_SHARD_ROOT}/{BLOCK_SHARD_ERASURE_SET_ID}/{node_id}")
+    }
+
+    /// Splits all six peers with kernel routing rules inside their Docker
+    /// network namespaces. The peer network and DNS remain stable, while each
+    /// node's independent driver network keeps its published API reachable.
     pub async fn partition_equal_peers(
         &self,
         first: &[u8],
@@ -158,6 +262,12 @@ impl DockerTestCluster {
         tokio::task::spawn_blocking(move || apply_partition(&apply))
             .await
             .expect("apply Docker equal-peer network partition panicked");
+        for addr in &self.grpc_addrs {
+            assert!(
+                wait_for_http_reachable(addr, DOCKER_NETWORK_TRANSITION_TIMEOUT).await,
+                "Docker equal-peer API did not remain reachable after partition: {addr}"
+            );
+        }
         DockerNetworkPartition { state: Some(state) }
     }
 }
@@ -173,9 +283,16 @@ impl DockerNetworkPartition {
             .state
             .clone()
             .expect("Docker network partition was already healed");
+        let grpc_addrs = state.grpc_addrs.clone();
         tokio::task::spawn_blocking(move || heal_partition(&state))
             .await
             .expect("heal Docker equal-peer network partition panicked");
+        for addr in &grpc_addrs {
+            assert!(
+                wait_for_http_reachable(addr, DOCKER_NETWORK_TRANSITION_TIMEOUT).await,
+                "Docker equal-peer API did not become reachable after healing partition: {addr}"
+            );
+        }
         self.state = None;
     }
 }
@@ -191,34 +308,33 @@ impl Drop for DockerNetworkPartition {
 
 #[derive(Debug, Clone)]
 struct DockerNetworkPartitionState {
-    original_network: String,
-    first_network: String,
-    second_network: String,
-    first: Vec<(String, String)>,
-    second: Vec<(String, String)>,
+    blocked_routes: Vec<(String, Vec<String>)>,
+    grpc_addrs: Vec<String>,
 }
 
 impl DockerNetworkPartitionState {
     fn new(cluster: &DockerTestCluster, first: &[u8], second: &[u8]) -> Self {
-        let suffix = uuid::Uuid::new_v4().simple();
-        let original_network = docker_compose_network_name(&cluster.project_name);
-        let peers = |ordinals: &[u8]| {
-            ordinals
+        let peer_network = docker_compose_network_name(&cluster.project_name);
+        let peers = (1..=DOCKER_EQUAL_PEER_COUNT)
+            .map(|ordinal| {
+                let container = docker_container_id(&cluster.project_name, ordinal);
+                let address = docker_network_container_ipv4(&peer_network, &container);
+                (ordinal, (container, address))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut blocked_routes = Vec::with_capacity(DOCKER_EQUAL_PEER_COUNT as usize);
+        for (sources, targets) in [(first, second), (second, first)] {
+            let target_addresses = targets
                 .iter()
-                .map(|ordinal| {
-                    (
-                        docker_container_id(&cluster.project_name, *ordinal),
-                        docker_node_service(*ordinal),
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
+                .map(|ordinal| peers[ordinal].1.clone())
+                .collect::<Vec<_>>();
+            for source in sources {
+                blocked_routes.push((peers[source].0.clone(), target_addresses.clone()));
+            }
+        }
         Self {
-            original_network,
-            first_network: format!("{}-partition-a-{suffix}", cluster.project_name),
-            second_network: format!("{}-partition-b-{suffix}", cluster.project_name),
-            first: peers(first),
-            second: peers(second),
+            blocked_routes,
+            grpc_addrs: cluster.grpc_addrs.clone(),
         }
     }
 }
@@ -243,29 +359,13 @@ fn validate_partition_groups(first: &[u8], second: &[u8]) {
 }
 
 fn apply_partition(state: &DockerNetworkPartitionState) {
-    docker_create_bridge_network(&state.first_network, "anvil-distributed-test");
-    docker_create_bridge_network(&state.second_network, "anvil-distributed-test");
-    for (container, alias) in &state.first {
-        docker_connect_network(&state.first_network, container, alias);
-    }
-    for (container, alias) in &state.second {
-        docker_connect_network(&state.second_network, container, alias);
-    }
-    for (container, _) in state.first.iter().chain(&state.second) {
-        docker_disconnect_network(&state.original_network, container);
+    for (container, peer_addresses) in &state.blocked_routes {
+        docker_set_unreachable_peer_routes(container, peer_addresses, true);
     }
 }
 
 fn heal_partition(state: &DockerNetworkPartitionState) {
-    for (container, alias) in state.first.iter().chain(&state.second) {
-        docker_connect_network(&state.original_network, container, alias);
+    for (container, peer_addresses) in &state.blocked_routes {
+        docker_set_unreachable_peer_routes(container, peer_addresses, false);
     }
-    for (container, _) in &state.first {
-        docker_disconnect_network(&state.first_network, container);
-    }
-    for (container, _) in &state.second {
-        docker_disconnect_network(&state.second_network, container);
-    }
-    docker_remove_network(&state.first_network);
-    docker_remove_network(&state.second_network);
 }
