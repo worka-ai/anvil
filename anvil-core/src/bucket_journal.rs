@@ -1,11 +1,12 @@
 use crate::core_store::{
     CF_MESH, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-    CoreStore, CoreTransaction, CoreTransactionState, CoreTransactionUpdate, ReadStream,
-    TABLE_BUCKET_CURRENT_BY_ID_ROW, TABLE_BUCKET_CURRENT_BY_NAME_ROW, TABLE_BUCKET_EVENT_HEAD_ROW,
-    TABLE_BUCKET_ID_ALLOCATOR_ROW, core_meta_committed_row_common, core_meta_payload_digest,
-    core_meta_record_tuple_key, core_meta_root_key_hash, core_meta_tuple_key,
+    CoreMutationRootPublication, CoreStore, CoreTransaction, CoreTransactionState,
+    CoreTransactionUpdate, ReadStream, TABLE_BUCKET_CURRENT_BY_ID_ROW,
+    TABLE_BUCKET_CURRENT_BY_NAME_ROW, TABLE_BUCKET_EVENT_HEAD_ROW, TABLE_BUCKET_ID_ALLOCATOR_ROW,
+    core_meta_committed_row_common, core_meta_payload_digest, core_meta_record_tuple_key,
+    core_meta_root_key_hash, core_meta_tuple_key,
 };
-use crate::formats::{Hash32, hash32};
+use crate::formats::{Hash32, hash32, writer::WriterFamily};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
 use crate::persistence::{Bucket, BucketMetadataEvent};
 use crate::storage::Storage;
@@ -297,12 +298,15 @@ pub(crate) async fn stage_bucket_mutation_in_transaction(
             common_root_key_hash.clone(),
         )?);
     }
+    let root_publications =
+        bucket_root_publications(&transaction.root_anchor_key, tenant_scope.root_anchor_key());
 
     core_store
         .stage_explicit_transaction_batch(CoreMutationBatch {
             transaction_id: transaction_id.to_string(),
             scope_partition: transaction.scope_partition,
             committed_by_principal: transaction_principal.to_string(),
+            root_publications,
             preconditions,
             operations,
         })
@@ -363,6 +367,7 @@ pub(crate) async fn reserve_next_bucket_id_with_permit(
                 transaction_id: format!("bucket-id-allocation:{mutation_id}"),
                 scope_partition: partition_id.clone(),
                 committed_by_principal: scope.partition_principal(),
+                root_publications: bucket_root_publications(&partition_id, scope.root_anchor_key()),
                 preconditions: vec![
                     partition_precondition,
                     bucket_id_allocator_precondition(&snapshot)?,
@@ -478,6 +483,7 @@ async fn append_bucket_mutation_to_stream(
             transaction_id: format!("bucket-metadata:{stream_id}:{mutation_id}"),
             scope_partition: partition_id.clone(),
             committed_by_principal: scope.partition_principal(),
+            root_publications: bucket_root_publications(&partition_id, scope.root_anchor_key()),
             preconditions,
             operations,
         })
@@ -605,6 +611,7 @@ pub async fn materialize_committed_bucket_metadata_transaction(
             stream_id,
             visible_sequence,
             prepared_record_hash,
+            ..
         } = update
         else {
             continue;
@@ -1181,6 +1188,31 @@ impl BucketJournalScope {
     fn root_key_hash(self) -> String {
         core_meta_root_key_hash(&self.root_anchor_key())
     }
+}
+
+pub(crate) fn tenant_bucket_root_key_hash(tenant_id: i64) -> String {
+    BucketJournalScope::Tenant(tenant_id).root_key_hash()
+}
+
+fn bucket_root_publications(
+    coordinator_root: &str,
+    data_root: String,
+) -> Vec<CoreMutationRootPublication> {
+    if coordinator_root == data_root {
+        return vec![CoreMutationRootPublication {
+            root_anchor_key: data_root,
+            writer_families: vec![
+                WriterFamily::CoreControl.as_str().to_string(),
+                WriterFamily::MeshControl.as_str().to_string(),
+            ],
+            transaction_coordinator: true,
+        }];
+    }
+    vec![
+        CoreMutationRootPublication::new(coordinator_root, WriterFamily::CoreControl.as_str())
+            .coordinator(),
+        CoreMutationRootPublication::new(data_root, WriterFamily::MeshControl.as_str()),
+    ]
 }
 
 fn ensure_bucket_tenant_name_matches(

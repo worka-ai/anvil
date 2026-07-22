@@ -89,8 +89,9 @@ async fn write_bucket_current_rows_without_journal(
                     scope.stream_id(),
                     uuid::Uuid::new_v4()
                 ),
-                scope_partition: partition_id,
+                scope_partition: partition_id.clone(),
                 committed_by_principal: "test-bucket-current".to_string(),
+                root_publications: bucket_root_publications(&partition_id, scope.root_anchor_key()),
                 preconditions: Vec::new(),
                 operations,
             })
