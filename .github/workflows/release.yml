@@ -108,10 +108,6 @@ jobs:
             arch: amd64
             artifact: anvil-test-image-amd64
             native_cargo: "1"
-          - platform: linux/arm64
-            arch: arm64
-            artifact: anvil-test-image-arm64
-            native_cargo: "0"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -134,12 +130,6 @@ jobs:
             protobuf-compiler \
             ripgrep
 
-      - name: Set up QEMU for cross-architecture image smoke checks
-        uses: docker/setup-qemu-action@v3
-
-      - name: Install Zig for release-shaped Rust builds
-        uses: mlugg/setup-zig@v2
-
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
         with:
@@ -154,19 +144,13 @@ jobs:
             ${{ runner.os }}-release-cargo-v2-
             ${{ runner.os }}-cargo-v2-
 
-      - name: Install cargo-zigbuild for release-shaped Rust builds
-        run: |
-          if ! command -v cargo-zigbuild >/dev/null 2>&1; then
-            cargo install cargo-zigbuild --locked
-          fi
-
       - name: Build Docker image from host-built binaries
         env:
           ANVIL_IMAGE: ${{ env.ANVIL_BUILD_IMAGE }}
           ANVIL_DOCKER_PLATFORM: ${{ matrix.platform }}
           ANVIL_BUILD_PROFILE: release
           ANVIL_USE_NATIVE_CARGO: ${{ matrix.native_cargo }}
-          CARGO_BUILD_JOBS: "1"
+          CARGO_BUILD_JOBS: "8"
         run: ./scripts/build-image.sh
 
       - name: Smoke check image binaries
@@ -195,7 +179,7 @@ jobs:
           ANVIL_BUILD_PROFILE: release
           ANVIL_INCLUDE_TEST_TOOLS: "1"
           ANVIL_USE_NATIVE_CARGO: "1"
-          CARGO_BUILD_JOBS: "1"
+          CARGO_BUILD_JOBS: "8"
         run: ./scripts/build-image.sh
 
       - name: Smoke check Docker integration tooling
@@ -521,7 +505,6 @@ jobs:
       id-token: write
     env:
       ANVIL_AMD64_IMAGE: anvil:test-amd64-${{ github.run_id }}-${{ github.run_attempt }}
-      ANVIL_ARM64_IMAGE: anvil:test-arm64-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -572,16 +555,8 @@ jobs:
           name: anvil-test-image-amd64
           path: ${{ runner.temp }}/anvil-image-amd64
 
-      - name: Download arm64 Docker image artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: anvil-test-image-arm64
-          path: ${{ runner.temp }}/anvil-image-arm64
-
       - name: Load tested Docker image artifacts
-        run: |
-          docker load -i "${{ runner.temp }}/anvil-image-amd64/anvil-test-image-amd64.tar"
-          docker load -i "${{ runner.temp }}/anvil-image-arm64/anvil-test-image-arm64.tar"
+        run: docker load -i "${{ runner.temp }}/anvil-image-amd64/anvil-test-image-amd64.tar"
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
@@ -600,7 +575,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push tested multi-arch Docker image
+      - name: Push tested amd64 Docker image
         id: docker-push
         shell: bash
         run: |
@@ -608,16 +583,12 @@ jobs:
           repo="ghcr.io/${{ github.repository }}"
           image="${repo}:${tag}"
           amd64_image="${repo}:${tag}-amd64"
-          arm64_image="${repo}:${tag}-arm64"
           docker tag "$ANVIL_AMD64_IMAGE" "$amd64_image"
-          docker tag "$ANVIL_ARM64_IMAGE" "$arm64_image"
+          docker tag "$ANVIL_AMD64_IMAGE" "$image"
+          docker tag "$ANVIL_AMD64_IMAGE" "${repo}:latest"
           docker push "$amd64_image"
-          docker push "$arm64_image"
-          docker buildx imagetools create \
-            -t "$image" \
-            -t "${repo}:latest" \
-            "$amd64_image" \
-            "$arm64_image"
+          docker push "$image"
+          docker push "${repo}:latest"
           digest="$(docker buildx imagetools inspect "$image" --format '{{.Manifest.Digest}}')"
           if [[ -z "$digest" || "$digest" != sha256:* ]]; then
             echo "failed to resolve published image digest for $image" >&2
@@ -667,9 +638,9 @@ jobs:
           repo="ghcr.io/${{ github.repository }}"
           for image in \
             "$ANVIL_AMD64_IMAGE" \
-            "$ANVIL_ARM64_IMAGE" \
+            "${repo}:${tag}" \
             "${repo}:${tag}-amd64" \
-            "${repo}:${tag}-arm64"; do
+            "${repo}:latest"; do
             if docker image inspect "$image" >/dev/null 2>&1; then
               docker image rm "$image" || echo "::warning::Failed to remove $image"
             fi
