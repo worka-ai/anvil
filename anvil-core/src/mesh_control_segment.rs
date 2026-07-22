@@ -133,6 +133,7 @@ pub async fn write_mesh_control_segment(
         .write_format_build_output(WriterBuildOutput {
             logical_files: vec![built_segment.logical_file],
             core_meta_mutations: Vec::new(),
+            core_meta_root_publications: Vec::new(),
         })
         .await
         .with_context(|| format!("write mesh-control logical file output for {ref_name}"))?;
@@ -159,6 +160,7 @@ pub async fn write_mesh_control_segment(
             source_cursor: write.source_cursor,
             created_at_unix_nanos: unix_nanos_from_rfc3339(&header.created_at),
         },
+        &[],
     )
     .await
     .with_context(|| format!("write mesh-control segment catalog row for {ref_name}"))?;
@@ -181,7 +183,8 @@ pub async fn read_mesh_control_segment(
         )?,
         parsed.generation,
         segment_ref,
-    )?
+    )
+    .await?
     .ok_or_else(|| anyhow!("mesh control segment catalog row is missing"))?;
     let store = CoreStore::new(storage.clone()).await?;
     let bytes = store

@@ -1,6 +1,7 @@
 use super::*;
 use crate::core_store::{
-    CoreMutationBatch, CoreMutationOperation, CoreTransactionUpdate, ReadStream,
+    CoreMutationBatch, CoreMutationBatchReceipt, CoreMutationOperation, CoreTransaction,
+    CoreTransactionUpdate, ReadStream,
 };
 
 const CONTROL_STREAM_PAGE_MAX_ROWS: usize = 4_096;
@@ -21,16 +22,69 @@ pub struct ControlStreamCurrentPage {
     pub next_stream_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedControlStreamAppend {
+    pub(crate) preconditions: Vec<CoreMutationPrecondition>,
+    pub(crate) operations: Vec<CoreMutationOperation>,
+    stream_id: String,
+    record_stream_id: String,
+    metadata: ControlFrameMetadata,
+    cursor: ControlStreamAppendCursor,
+    encoded: Vec<u8>,
+    header: ControlFrameHeaderProto,
+}
+
 pub async fn control_stream_append_cursor(
     storage: &Storage,
     stream_family: &str,
     partition: &str,
 ) -> AnyhowResult<ControlStreamAppendCursor> {
-    let stream_id = control_stream_id(stream_family, partition)?;
     let store = CoreStore::new(storage.clone()).await?;
-    let head_sequence = store.stream_head_sequence(&stream_id).await?;
+    control_stream_append_cursor_with_store(&store, stream_family, partition, None).await
+}
+
+async fn control_stream_append_cursor_with_store(
+    store: &CoreStore,
+    stream_family: &str,
+    partition: &str,
+    transaction: Option<&CoreTransaction>,
+) -> AnyhowResult<ControlStreamAppendCursor> {
+    let stream_id = control_stream_id(stream_family, partition)?;
+    let head_sequence = match store
+        .stream_head_precondition_visible_to_transaction(&stream_id, transaction)
+        .await?
+    {
+        CoreMutationPrecondition::StreamHead {
+            expected_last_sequence,
+            ..
+        } => expected_last_sequence,
+        _ => unreachable!("stream head helper always returns a stream-head precondition"),
+    };
     let byte_offset = if head_sequence == 0 {
         0
+    } else if let Some(encoded) = transaction.and_then(|transaction| {
+        transaction
+            .visible_updates
+            .iter()
+            .rev()
+            .find_map(|update| match update {
+                CoreTransactionUpdate::StreamAppend {
+                    stream_id: update_stream_id,
+                    payload,
+                    visible_sequence,
+                    ..
+                } if update_stream_id == &stream_id && *visible_sequence == head_sequence => {
+                    Some(payload.as_slice())
+                }
+                _ => None,
+            })
+    }) {
+        let (frame, encoded_len) = ControlStreamFrame::decode(encoded)?;
+        let header = decode_control_mutation_header(&frame.header_proto)?;
+        header
+            .byte_offset
+            .checked_add(encoded_len as u64)
+            .ok_or_else(|| anyhow!("CoreStore control stream {stream_id} byte offset overflow"))?
     } else {
         let record = read_exact_stream_record(&store, &stream_id, head_sequence).await?;
         let (frame, encoded_len) = decode_stored_frame(&stream_id, record, "mesh.control.frame")?;
@@ -47,6 +101,173 @@ pub async fn control_stream_append_cursor(
                 .ok_or_else(|| anyhow!("CoreStore control stream {stream_id} sequence overflow"))?,
         )?,
         byte_offset,
+    })
+}
+
+pub(crate) async fn control_stream_append_cursor_visible_to_transaction(
+    storage: &Storage,
+    stream_family: &str,
+    partition: &str,
+    transaction: &CoreTransaction,
+) -> AnyhowResult<ControlStreamAppendCursor> {
+    let store = CoreStore::new(storage.clone()).await?;
+    control_stream_append_cursor_with_store(&store, stream_family, partition, Some(transaction))
+        .await
+}
+
+pub(crate) async fn prepare_control_stream_append(
+    storage: &Storage,
+    stream_family: &str,
+    partition: &str,
+    frame: &ControlStreamFrame,
+    precondition: Option<CoreMutationPrecondition>,
+    transaction: Option<&CoreTransaction>,
+    operation_partition: &str,
+) -> AnyhowResult<PreparedControlStreamAppend> {
+    let stream_id = control_stream_id(stream_family, partition)?;
+    let metadata = frame.metadata()?;
+    let header = decode_control_mutation_header(&frame.header_proto)?;
+    if header.stream_family != stream_family || header.partition != partition {
+        return Err(anyhow!(
+            "control stream header scope {}/{} does not match path {stream_family}/{partition}",
+            header.stream_family,
+            header.partition
+        ));
+    }
+    if header.record_key.trim().is_empty() {
+        return Err(anyhow!("control stream record key must not be empty"));
+    }
+
+    let store = CoreStore::new(storage.clone()).await?;
+    let cursor =
+        control_stream_append_cursor_with_store(&store, stream_family, partition, transaction)
+            .await?;
+    if metadata.sequence != cursor.sequence || header.byte_offset != cursor.byte_offset {
+        return Err(anyhow!(
+            "control stream append cursor changed: frame declares sequence {} offset {}, current sequence {} offset {}",
+            metadata.sequence.get(),
+            header.byte_offset,
+            cursor.sequence.get(),
+            cursor.byte_offset
+        ));
+    }
+
+    let encoded = frame.encode()?;
+    let record_stream_id = control_record_stream_id(stream_family, partition, &header.record_key)?;
+    let mut preconditions: Vec<_> = precondition.into_iter().collect();
+    preconditions.push(
+        store
+            .stream_head_precondition_visible_to_transaction(&stream_id, transaction)
+            .await?,
+    );
+    preconditions.push(
+        store
+            .stream_head_precondition_visible_to_transaction(&record_stream_id, transaction)
+            .await?,
+    );
+    let idempotency_key = header.idempotency_key.as_deref();
+    let idempotency_scope = idempotency_key.map(|key| {
+        format!(
+            "{stream_family}:{partition}:{}:{}:{}:{key}",
+            header.record_key, header.operation, header.new_generation
+        )
+    });
+    let operations = vec![
+        CoreMutationOperation::StreamAppend {
+            partition_id: operation_partition.to_string(),
+            stream_id: stream_id.clone(),
+            record_kind: "mesh.control.frame".to_string(),
+            payload: encoded.clone(),
+            idempotency_key: idempotency_scope
+                .as_deref()
+                .map(|scope| format!("mesh-control-partition:{scope}")),
+        },
+        CoreMutationOperation::StreamAppend {
+            partition_id: operation_partition.to_string(),
+            stream_id: record_stream_id.clone(),
+            record_kind: "mesh.control.record".to_string(),
+            payload: encoded.clone(),
+            idempotency_key: idempotency_scope
+                .as_deref()
+                .map(|scope| format!("mesh-control-record:{scope}")),
+        },
+    ];
+
+    Ok(PreparedControlStreamAppend {
+        preconditions,
+        operations,
+        stream_id,
+        record_stream_id,
+        metadata,
+        cursor,
+        encoded,
+        header,
+    })
+}
+
+pub(crate) async fn finish_control_stream_append(
+    storage: &Storage,
+    prepared: &PreparedControlStreamAppend,
+    receipt: &CoreMutationBatchReceipt,
+) -> AnyhowResult<ControlStreamAppend> {
+    // The authoritative stream records and lifecycle state are already visible
+    // through the committed CoreMutationBatch. This phase only validates the
+    // receipt and materialises an optional derived segment.
+    if receipt.state != crate::core_store::CoreTransactionState::Committed {
+        return Err(anyhow!(
+            "CoreStore control stream batch failed: {}",
+            receipt
+                .finalisation_error
+                .as_deref()
+                .unwrap_or("unknown finalisation failure")
+        ));
+    }
+    let visible_sequence = visible_stream_update(&receipt.visible_updates, &prepared.stream_id)?;
+    let _record_sequence =
+        visible_stream_update(&receipt.visible_updates, &prepared.record_stream_id)?;
+    if visible_sequence != prepared.metadata.sequence.get() {
+        return Err(anyhow!(
+            "CoreStore control stream {} assigned sequence {visible_sequence}, but frame declared {}",
+            prepared.stream_id,
+            prepared.metadata.sequence.get()
+        ));
+    }
+
+    if std::env::var_os("ANVIL_MESH_SYNC_SEGMENTS").is_some() {
+        crate::mesh_control_segment::write_mesh_control_segment(
+            storage,
+            crate::mesh_control_segment::MeshControlSegmentWrite {
+                mesh_id: &prepared.header.mesh_id,
+                stream_family: &prepared.header.stream_family,
+                partition: &prepared.header.partition,
+                generation: visible_sequence,
+                event_kind: &prepared.header.operation,
+                source_cursor: visible_sequence,
+                placement_epoch: prepared.header.writer_fence,
+                boundary_values: &[],
+                records: &[crate::mesh_control_segment::MeshControlSegmentRecord {
+                    key: prepared.header.record_key.as_bytes().to_vec(),
+                    value: prepared.encoded.clone(),
+                }],
+            },
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "write CoreStore mesh-control segment for {}",
+                prepared.stream_id
+            )
+        })?;
+    } else {
+        crate::emit_test_timing(
+            "mesh_control_stream.append_control_stream_frame deferred_writer_segment",
+            std::time::Duration::ZERO,
+        );
+    }
+    Ok(ControlStreamAppend {
+        offset: prepared.cursor.byte_offset,
+        encoded_len: prepared.encoded.len(),
+        position: prepared.metadata.clone().into(),
     })
 }
 
@@ -118,118 +339,49 @@ pub async fn read_control_stream_page(
     })
 }
 
-pub async fn append_control_stream_frame(
+pub(crate) async fn append_control_stream_frame(
     storage: &Storage,
     stream_family: &str,
     partition: &str,
     frame: &ControlStreamFrame,
     precondition: Option<CoreMutationPrecondition>,
 ) -> AnyhowResult<ControlStreamAppend> {
-    let stream_id = control_stream_id(stream_family, partition)?;
-    let metadata = frame.metadata()?;
-    let header = decode_control_mutation_header(&frame.header_proto)?;
-    if header.stream_family != stream_family || header.partition != partition {
-        return Err(anyhow!(
-            "control stream header scope {}/{} does not match path {stream_family}/{partition}",
-            header.stream_family,
-            header.partition
-        ));
-    }
-    if header.record_key.trim().is_empty() {
-        return Err(anyhow!("control stream record key must not be empty"));
-    }
-    let cursor = control_stream_append_cursor(storage, stream_family, partition).await?;
-    if metadata.sequence != cursor.sequence || header.byte_offset != cursor.byte_offset {
-        return Err(anyhow!(
-            "control stream append cursor changed: frame declares sequence {} offset {}, current sequence {} offset {}",
-            metadata.sequence.get(),
-            header.byte_offset,
-            cursor.sequence.get(),
-            cursor.byte_offset
-        ));
-    }
-
-    let encoded = frame.encode()?;
+    let prepared = prepare_control_stream_append(
+        storage,
+        stream_family,
+        partition,
+        frame,
+        precondition,
+        None,
+        partition,
+    )
+    .await?;
     let store = CoreStore::new(storage.clone()).await?;
-    let record_stream_id = control_record_stream_id(stream_family, partition, &header.record_key)?;
-    let mut preconditions: Vec<_> = precondition.into_iter().collect();
-    preconditions.push(store.stream_head_precondition(&stream_id).await?);
-    preconditions.push(store.stream_head_precondition(&record_stream_id).await?);
-    let idempotency_key = header.idempotency_key.as_deref();
     let receipt = store
         .commit_mutation_batch(CoreMutationBatch {
             transaction_id: format!(
                 "mesh-control:{}:{}:{}",
                 stream_family,
                 partition,
-                metadata.sequence.get()
+                prepared.metadata.sequence.get()
             ),
             scope_partition: partition.to_string(),
             committed_by_principal: format!(
                 "partition-owner:mesh_control:{stream_family}:{partition}"
             ),
-            preconditions,
-            operations: vec![
-                CoreMutationOperation::StreamAppend {
-                    partition_id: partition.to_string(),
-                    stream_id: stream_id.clone(),
-                    record_kind: "mesh.control.frame".to_string(),
-                    payload: encoded.clone(),
-                    idempotency_key: idempotency_key
-                        .map(|key| format!("mesh-control-partition:{key}")),
-                },
-                CoreMutationOperation::StreamAppend {
-                    partition_id: partition.to_string(),
-                    stream_id: record_stream_id.clone(),
-                    record_kind: "mesh.control.record".to_string(),
-                    payload: encoded.clone(),
-                    idempotency_key: idempotency_key
-                        .map(|key| format!("mesh-control-record:{key}")),
-                },
+            root_publications: vec![
+                crate::core_store::CoreMutationRootPublication::new(
+                    partition,
+                    crate::formats::writer::WriterFamily::CoreControl.as_str(),
+                )
+                .coordinator(),
             ],
+            preconditions: prepared.preconditions.clone(),
+            operations: prepared.operations.clone(),
         })
         .await
-        .with_context(|| format!("append CoreStore control stream {stream_id}"))?;
-    let visible_sequence = visible_stream_update(&receipt.visible_updates, &stream_id)?;
-    let _record_sequence = visible_stream_update(&receipt.visible_updates, &record_stream_id)?;
-    if visible_sequence != metadata.sequence.get() {
-        return Err(anyhow!(
-            "CoreStore control stream {stream_id} assigned sequence {visible_sequence}, but frame declared {}",
-            metadata.sequence.get()
-        ));
-    }
-
-    if std::env::var_os("ANVIL_MESH_SYNC_SEGMENTS").is_some() {
-        crate::mesh_control_segment::write_mesh_control_segment(
-            storage,
-            crate::mesh_control_segment::MeshControlSegmentWrite {
-                mesh_id: &header.mesh_id,
-                stream_family,
-                partition,
-                generation: visible_sequence,
-                event_kind: &header.operation,
-                source_cursor: visible_sequence,
-                placement_epoch: header.writer_fence,
-                boundary_values: &[],
-                records: &[crate::mesh_control_segment::MeshControlSegmentRecord {
-                    key: header.record_key.as_bytes().to_vec(),
-                    value: encoded.clone(),
-                }],
-            },
-        )
-        .await
-        .with_context(|| format!("write CoreStore mesh-control segment for {stream_id}"))?;
-    } else {
-        crate::emit_test_timing(
-            "mesh_control_stream.append_control_stream_frame deferred_writer_segment",
-            std::time::Duration::ZERO,
-        );
-    }
-    Ok(ControlStreamAppend {
-        offset: cursor.byte_offset,
-        encoded_len: encoded.len(),
-        position: metadata.into(),
-    })
+        .with_context(|| format!("append CoreStore control stream {}", prepared.stream_id))?;
+    finish_control_stream_append(storage, &prepared, &receipt).await
 }
 
 pub async fn latest_projected_record_from_control_stream(
