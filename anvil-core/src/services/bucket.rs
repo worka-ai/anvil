@@ -516,6 +516,9 @@ fn json_string_field(value: &JsonValue, name: &str) -> Result<String, Status> {
 }
 
 fn bucket_core_store_status(error: anyhow::Error) -> Status {
+    if let Some(status) = crate::services::core_store_status::availability_status(&error) {
+        return status;
+    }
     let message = error.to_string();
     if message.contains("TransactionNotFound") {
         Status::not_found("TransactionNotFound")

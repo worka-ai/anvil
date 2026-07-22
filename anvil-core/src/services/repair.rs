@@ -153,6 +153,7 @@ impl RepairService for AppState {
         let revision = self
             .persistence
             .repair_finding_scope_revision(&req.scope_kind, &req.scope_id)
+            .await
             .map_err(|error| Status::internal(error.to_string()))?;
         let revision_text = revision.to_string();
         let filters = [

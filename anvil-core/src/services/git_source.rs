@@ -118,16 +118,6 @@ impl GitSourceService for AppState {
             .map_err(|err| Status::internal(err.to_string()))?;
         let authz_revision = u64::try_from(authz_revision)
             .map_err(|_| Status::internal("Invalid authorization revision"))?;
-        let watch_cursor = git_source_watch::latest_git_source_watch_cursor(
-            &self.storage,
-            claims.tenant_id,
-            &metadata.repository_id,
-        )
-        .await
-        .map_err(|err| Status::internal(err.to_string()))?
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| Status::internal("Git source watch cursor overflow"))?;
         let payload = git_source_watch::GitSourceWatchPayload {
             repository_id: metadata.repository_id.clone(),
             event_type: "index_published".to_string(),
@@ -137,11 +127,10 @@ impl GitSourceService for AppState {
             pack_object_version_id: Some(pack_object.version_id.to_string()),
             emitted_at: updated_at,
         };
-        git_source_watch::append_git_source_watch_record(
+        let watch_cursor = git_source_watch::append_git_source_watch_record(
             &self.storage,
             claims.tenant_id,
             &metadata.repository_id,
-            watch_cursor,
             *pack_object.mutation_id.as_bytes(),
             authz_revision,
             payload,
@@ -307,51 +296,46 @@ impl GitSourceService for AppState {
         .await?;
 
         let after_cursor = join_u128(req.after_cursor_low, req.after_cursor_high);
-        let snapshot = git_source_watch::list_git_source_watch_events(
-            &self.storage,
-            claims.tenant_id,
-            &req.repository_id,
-            after_cursor,
-            1000,
-        )
-        .await
-        .map_err(|err| Status::internal(err.to_string()))?;
-
+        let stream_id =
+            git_source_watch::git_source_watch_stream_id(claims.tenant_id, &req.repository_id);
+        let mut live = self.storage.subscribe_stream(&stream_id);
         let storage = self.storage.clone();
         let repository_id = req.repository_id;
         let tenant_id = claims.tenant_id;
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
             let mut last_cursor = after_cursor;
-            for event in snapshot {
-                last_cursor = last_cursor.max(event.cursor);
-                if tx.send(Ok(watch_git_source_response(event))).await.is_err() {
-                    return;
-                }
-            }
-
             loop {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                let events = match git_source_watch::list_git_source_watch_events(
-                    &storage,
-                    tenant_id,
-                    &repository_id,
-                    last_cursor,
-                    1000,
-                )
-                .await
-                {
-                    Ok(events) => events,
-                    Err(err) => {
-                        let _ = tx.send(Err(Status::internal(err.to_string()))).await;
-                        return;
+                loop {
+                    let page = match git_source_watch::list_git_source_watch_event_page(
+                        &storage,
+                        tenant_id,
+                        &repository_id,
+                        last_cursor,
+                        256,
+                    )
+                    .await
+                    {
+                        Ok(page) => page,
+                        Err(error) => {
+                            let _ = tx.send(Err(Status::internal(error.to_string()))).await;
+                            return;
+                        }
+                    };
+                    let previous_cursor = last_cursor;
+                    for event in page.events {
+                        if tx.send(Ok(watch_git_source_response(event))).await.is_err() {
+                            return;
+                        }
                     }
-                };
-                for event in events {
-                    last_cursor = last_cursor.max(event.cursor);
-                    if tx.send(Ok(watch_git_source_response(event))).await.is_err() {
-                        return;
+                    last_cursor = page.next_cursor;
+                    if !page.has_more || last_cursor == previous_cursor {
+                        break;
                     }
+                }
+                match live.recv().await {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
         });
