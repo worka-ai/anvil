@@ -1,7 +1,7 @@
 use crate::{
     anvil_api::SignatureEnvelopeV1 as WireSignatureEnvelopeV1,
     core_store::{
-        CF_PERSONALDB, CoreMetaRowCommonProto, CoreMetaStore, CoreMetaTuplePart, CoreMutationBatch,
+        CF_PERSONALDB, CoreMetaRowCommonProto, CoreMetaTuplePart, CoreMutationBatch,
         CoreMutationBatchReceipt, CoreMutationOperation, CoreMutationPrecondition, CoreStore,
         CoreTransactionState, TABLE_PERSONALDB_PROPOSAL_CLAIM_ROW,
         TABLE_PERSONALDB_PROPOSAL_RESERVATION_ROW, TABLE_PERSONALDB_PROPOSAL_SLOT_ROW,

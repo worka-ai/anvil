@@ -1,5 +1,9 @@
 use super::codec::*;
 use super::*;
+use crate::{
+    core_store::{CoreMetaStore, CoreMutationRootPublication},
+    formats::writer::WriterFamily,
+};
 
 pub(super) async fn next_group_root_generation(
     storage: &Storage,
@@ -31,12 +35,24 @@ pub(super) async fn commit_group_batch(
     preconditions: Vec<CoreMutationPrecondition>,
     operations: Vec<CoreMutationOperation>,
 ) -> Result<()> {
+    let scope_partition = personaldb_partition_id(tenant_id, database_id);
     let receipt = CoreStore::new(storage.clone())
         .await?
         .commit_mutation_batch(CoreMutationBatch {
             transaction_id,
-            scope_partition: personaldb_partition_id(tenant_id, database_id),
+            scope_partition: scope_partition.clone(),
             committed_by_principal: principal.to_string(),
+            root_publications: vec![
+                CoreMutationRootPublication::new(
+                    scope_partition,
+                    WriterFamily::CoreControl.as_str(),
+                )
+                .coordinator(),
+                CoreMutationRootPublication::new(
+                    personaldb_root_anchor_key(tenant_id, database_id),
+                    WriterFamily::PersonalDb.as_str(),
+                ),
+            ],
             preconditions,
             operations,
         })
@@ -105,6 +121,8 @@ pub(super) fn read_raw_row(
     table_id: u16,
     key: &[u8],
 ) -> Result<Option<Vec<u8>>> {
+    // Proposal claims, slots, reservations, and witness candidates are local
+    // admission state read to construct exact mutation preconditions.
     CoreMetaStore::open(storage.core_store_meta_path())?.get(CF_PERSONALDB, table_id, key)
 }
 
