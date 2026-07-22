@@ -2,14 +2,8 @@ use super::local_transactions::{
     transaction_lists_stream_record, transaction_lists_stream_record_identity,
     validate_core_meta_row_precondition,
 };
-use super::local_tx_rows::OwnedCoreMetaBatchOp;
+use super::local_tx_rows::{CoreTransactionPreconditionRow, OwnedCoreMetaBatchOp};
 use super::*;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamPredecessorVisibility {
-    Visible,
-    TerminalInvisible,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StreamWatchVisibility {
@@ -39,11 +33,29 @@ impl CoreStore {
         match transaction.state {
             CoreTransactionState::Committed => {
                 if !transaction_lists_stream_record(&transaction, record)? {
+                    let published = transaction
+                        .visible_updates
+                        .iter()
+                        .filter_map(|update| match update {
+                            CoreTransactionUpdate::StreamAppend {
+                                stream_id,
+                                visible_sequence,
+                                prepared_record_hash,
+                                ..
+                            } => Some(format!(
+                                "{stream_id}:{visible_sequence}:{prepared_record_hash}"
+                            )),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
                     bail!(
-                        "CoreStore committed transaction {} does not publish stream record {}:{}",
+                        "CoreStore committed transaction {} does not publish stream record {}:{}:{}; published stream records [{}]",
                         transaction_id,
                         record.stream_id,
-                        record.sequence
+                        record.sequence,
+                        record.event_hash,
+                        published
                     );
                 }
                 Ok(StreamWatchVisibility::Visible)
@@ -101,18 +113,10 @@ impl CoreStore {
     ) -> Result<Vec<StreamRecord>> {
         let mut visible = Vec::with_capacity(records.len());
         for record in records {
-            if record.stream_id == CORE_TRANSACTION_STREAM_ID {
-                visible.push(record);
-                continue;
+            match self.stream_record_watch_visibility(&record).await? {
+                StreamWatchVisibility::Visible => visible.push(record),
+                StreamWatchVisibility::Pending | StreamWatchVisibility::TerminalInvisible => {}
             }
-            if let Some(transaction_id) = record.transaction_id.as_deref()
-                && !self
-                    .transaction_makes_stream_record_visible(&record, transaction_id)
-                    .await?
-            {
-                continue;
-            }
-            visible.push(record);
         }
         Ok(visible)
     }
@@ -223,7 +227,7 @@ impl CoreStore {
         Ok(current)
     }
 
-    fn committed_coremeta_payload_unlocked(
+    pub(super) fn committed_coremeta_payload_unlocked(
         &self,
         cf: &str,
         table_id: u16,
@@ -260,18 +264,53 @@ impl CoreStore {
         Ok(())
     }
 
+    pub(super) async fn validate_implicit_transaction_publication_unlocked(
+        &self,
+        transaction: &CoreTransaction,
+        publication_generations: &BTreeMap<String, u64>,
+    ) -> Result<()> {
+        validate_transaction_root_scope(transaction)?;
+        let coordinator_generation = transaction.committed_root_generation.ok_or_else(|| {
+            anyhow!("CoreStore implicit transaction has no coordinator generation")
+        })?;
+        match publication_generations.get(&transaction.root_key_hash) {
+            Some(generation) if *generation == coordinator_generation => {}
+            Some(_) => {
+                bail!(
+                    "TransactionScopeMismatch: implicit transaction coordinator generation does not match publication"
+                )
+            }
+            None => {
+                bail!(
+                    "TransactionScopeMismatch: implicit transaction coordinator root is not published"
+                )
+            }
+        }
+
+        self.validate_implicit_transaction_stream_publications_unlocked(
+            transaction,
+            publication_generations,
+        )
+        .await?;
+        self.validate_implicit_transaction_coremeta_publications_unlocked(
+            transaction,
+            publication_generations,
+        )
+        .await
+    }
+
     pub(super) fn prepare_coremeta_put_update_unlocked(
         &self,
         cf: &str,
         table_id: u16,
         tuple_key: &[u8],
+        previous_payload: Option<Vec<u8>>,
         payload: &[u8],
     ) -> Result<(OwnedCoreMetaBatchOp, CoreTransactionUpdate)> {
         validate_coremeta_operation_payload(cf, table_id, tuple_key, payload)?;
         let cf = canonical_coremeta_cf_name(cf)?;
-        let previous_payload_hash = self
-            .committed_coremeta_payload_unlocked(cf, table_id, tuple_key)?
-            .map(|payload| core_meta_payload_digest(table_id, &payload));
+        let previous_payload_hash =
+            previous_payload.map(|payload| core_meta_payload_digest(table_id, &payload));
         let payload_hash = core_meta_payload_digest(table_id, payload);
         let op = OwnedCoreMetaBatchOp::Put {
             cf,
@@ -297,6 +336,7 @@ impl CoreStore {
         table_id: u16,
         tuple_key: &[u8],
         transaction_id: String,
+        rooted_generation: Option<u64>,
     ) -> Result<(OwnedCoreMetaBatchOp, CoreTransactionUpdate)> {
         validate_coremeta_operation_key(cf, table_id, tuple_key)?;
         let cf = canonical_coremeta_cf_name(cf)?;
@@ -308,14 +348,21 @@ impl CoreStore {
         let delete_common = current_payload
             .as_ref()
             .map(|payload| {
-                core_meta_row_common_from_payload(payload).map(|common| {
-                    core_meta_committed_row_common(
+                core_meta_row_common_from_payload(payload).and_then(|common| {
+                    let root_generation = if common.root_key_hash.is_empty() {
+                        common.root_generation.saturating_add(1)
+                    } else {
+                        rooted_generation.ok_or_else(|| {
+                            anyhow!("CoreMeta rooted delete has no bound publication generation")
+                        })?
+                    };
+                    Ok(core_meta_committed_row_common(
                         common.realm_id,
                         common.root_key_hash,
-                        common.root_generation.saturating_add(1),
+                        root_generation,
                         transaction_id.clone(),
                         deleted_at_unix_nanos,
-                    )
+                    ))
                 })
             })
             .transpose()?;
@@ -338,159 +385,84 @@ impl CoreStore {
         &self,
         transaction: &CoreTransaction,
     ) -> Result<()> {
-        let mut updates_by_stream = BTreeMap::<&str, BTreeMap<u64, &str>>::new();
+        let mut updates_by_stream = BTreeMap::<String, BTreeMap<u64, StreamRecord>>::new();
         for update in &transaction.visible_updates {
-            let CoreTransactionUpdate::StreamAppend {
-                stream_id,
-                visible_sequence,
-                prepared_record_hash,
-            } = update
-            else {
+            let Some(record) = staged_stream_record_from_update(transaction, update)? else {
                 continue;
             };
             let previous = updates_by_stream
-                .entry(stream_id.as_str())
+                .entry(record.stream_id.clone())
                 .or_default()
-                .insert(*visible_sequence, prepared_record_hash.as_str());
+                .insert(record.sequence, record);
             if previous.is_some() {
                 bail!("TransactionConflict: transaction lists a stream sequence more than once");
             }
         }
 
-        let mut predecessor_transactions = BTreeMap::<String, CoreTransaction>::new();
         for (stream_id, updates) in updates_by_stream {
-            let read_started_at = std::time::Instant::now();
-            let first_staged_sequence = *updates
-                .first_key_value()
-                .map(|(sequence, _)| sequence)
-                .ok_or_else(|| anyhow!("TransactionConflict: empty stream update group"))?;
-            let last_staged_sequence = *updates
-                .last_key_value()
-                .map(|(sequence, _)| sequence)
-                .ok_or_else(|| anyhow!("TransactionConflict: empty stream update group"))?;
-            let rows = self.read_stream_record_index_rows_from_meta_range(
-                stream_id,
-                first_staged_sequence.saturating_sub(1),
-                last_staged_sequence,
-                updates.len(),
-            )?;
-            crate::emit_test_timing(
-                format!(
-                    "core_store.commit_explicit_transaction read_staged_stream_window tx={} stream={stream_id} records={}",
-                    transaction.transaction_id,
-                    rows.len()
-                ),
-                read_started_at.elapsed(),
-            );
-
-            for row in rows {
-                if let Some(prepared_record_hash) = updates.get(&row.sequence) {
-                    if row.event_hash != *prepared_record_hash
-                        || row.transaction_id.as_deref()
-                            != Some(transaction.transaction_id.as_str())
-                    {
-                        bail!("TransactionConflict: transaction is missing a staged stream record");
-                    }
-                    continue;
-                }
-                self.classify_stream_predecessor_unlocked(
-                    transaction,
-                    &row,
-                    &mut predecessor_transactions,
+            let (mut previous_sequence, mut previous_event_hash) = self
+                .read_stream_head_from_meta(&stream_id)?
+                .map(|head| (head.last_sequence, head.last_event_hash))
+                .unwrap_or_else(|| (0, ZERO_HASH.to_string()));
+            for record in updates.into_values() {
+                verify_stream_record_after_head(
+                    &stream_id,
+                    previous_sequence,
+                    &previous_event_hash,
+                    &record,
                 )
-                .await?;
-            }
-
-            // A visible record is a validated commit-order barrier: its commit
-            // already established that every earlier staged predecessor was
-            // terminal or visible. Only the invisible suffix immediately before
-            // this transaction can still prevent it from committing.
-            let mut predecessor_sequence = first_staged_sequence.saturating_sub(1);
-            while predecessor_sequence > 0 {
-                let row = self
-                    .read_stream_record_index_row_from_meta(stream_id, predecessor_sequence)?
-                    .ok_or_else(|| {
-                        anyhow!("TransactionConflict: stream predecessor record is missing")
-                    })?;
-                match self
-                    .classify_stream_predecessor_unlocked(
-                        transaction,
-                        &row,
-                        &mut predecessor_transactions,
-                    )
-                    .await?
-                {
-                    StreamPredecessorVisibility::Visible => break,
-                    StreamPredecessorVisibility::TerminalInvisible => {
-                        predecessor_sequence = predecessor_sequence.saturating_sub(1);
-                    }
-                }
+                .map_err(|error| anyhow!("TransactionConflict: {error}"))?;
+                previous_sequence = record.sequence;
+                previous_event_hash = record.event_hash;
             }
         }
         Ok(())
     }
 
-    async fn classify_stream_predecessor_unlocked(
+    async fn validate_implicit_transaction_stream_publications_unlocked(
         &self,
         transaction: &CoreTransaction,
-        row: &StoredStreamRecordIndexRow,
-        predecessor_transactions: &mut BTreeMap<String, CoreTransaction>,
-    ) -> Result<StreamPredecessorVisibility> {
-        let Some(predecessor_transaction_id) = row.transaction_id.as_deref() else {
-            return Ok(StreamPredecessorVisibility::Visible);
-        };
-        if predecessor_transaction_id == transaction.transaction_id {
-            bail!("TransactionConflict: transaction has an unlisted staged stream record");
-        }
-        if !predecessor_transactions.contains_key(predecessor_transaction_id) {
-            let Some(predecessor_transaction) = self
-                .read_transaction_unlocked(predecessor_transaction_id)
-                .await?
-            else {
-                bail!(
-                    "TransactionConflict: transaction has a staged stream predecessor without transaction metadata"
-                );
+        publication_generations: &BTreeMap<String, u64>,
+    ) -> Result<()> {
+        let mut updates_by_stream = BTreeMap::<String, BTreeMap<u64, StreamRecord>>::new();
+        for update in &transaction.visible_updates {
+            let Some(record) = publication_stream_record_from_update(transaction, update)? else {
+                continue;
             };
-            predecessor_transactions.insert(
-                predecessor_transaction_id.to_string(),
-                predecessor_transaction,
-            );
-        }
-        let predecessor_transaction = predecessor_transactions
-            .get(predecessor_transaction_id)
-            .expect("predecessor transaction was inserted");
-        match predecessor_transaction.state {
-            CoreTransactionState::Committed => {
-                if !transaction_lists_stream_record_identity(
-                    predecessor_transaction,
-                    &row.stream_id,
-                    row.sequence,
-                    &row.event_hash,
-                ) {
-                    bail!(
-                        "TransactionConflict: committed predecessor does not include its staged stream record"
-                    );
-                }
-                Ok(StreamPredecessorVisibility::Visible)
-            }
-            CoreTransactionState::Open
-                if predecessor_transaction.expires_at_unix_nanos != 0
-                    && current_unix_nanos_u64()?
-                        >= predecessor_transaction.expires_at_unix_nanos =>
-            {
-                Ok(StreamPredecessorVisibility::TerminalInvisible)
-            }
-            CoreTransactionState::Open | CoreTransactionState::Prepared => {
+            let root_key_hash =
+                super::local_roots_layout::stream_coremeta_root_key_hash(&record.stream_id);
+            if !publication_generations.contains_key(&root_key_hash) {
                 bail!(
-                    "TransactionConflict: transaction would expose a stream record before an uncommitted predecessor"
+                    "TransactionScopeMismatch: implicit stream publication does not declare canonical root {root_key_hash}"
                 );
             }
-            CoreTransactionState::FinalisationFailed
-            | CoreTransactionState::Aborted
-            | CoreTransactionState::RolledBack
-            | CoreTransactionState::Expired
-            | CoreTransactionState::Failed => Ok(StreamPredecessorVisibility::TerminalInvisible),
+            let previous = updates_by_stream
+                .entry(record.stream_id.clone())
+                .or_default()
+                .insert(record.sequence, record);
+            if previous.is_some() {
+                bail!("TransactionConflict: transaction lists a stream sequence more than once");
+            }
         }
+
+        for (stream_id, updates) in updates_by_stream {
+            let (mut previous_sequence, mut previous_event_hash) = self
+                .read_stream_head_from_meta(&stream_id)?
+                .map(|head| (head.last_sequence, head.last_event_hash))
+                .unwrap_or_else(|| (0, ZERO_HASH.to_string()));
+            for record in updates.into_values() {
+                verify_stream_record_after_head(
+                    &stream_id,
+                    previous_sequence,
+                    &previous_event_hash,
+                    &record,
+                )
+                .map_err(|error| anyhow!("TransactionConflict: {error}"))?;
+                previous_sequence = record.sequence;
+                previous_event_hash = record.event_hash;
+            }
+        }
+        Ok(())
     }
 
     async fn validate_explicit_transaction_coremeta_commits_unlocked(
@@ -591,6 +563,86 @@ impl CoreStore {
         Ok(())
     }
 
+    async fn validate_implicit_transaction_coremeta_publications_unlocked(
+        &self,
+        transaction: &CoreTransaction,
+        publication_generations: &BTreeMap<String, u64>,
+    ) -> Result<()> {
+        let mut coremeta_visible = BTreeMap::<(String, u16, Vec<u8>), Option<Vec<u8>>>::new();
+        for update in &transaction.visible_updates {
+            match update {
+                CoreTransactionUpdate::CoreMetaPut {
+                    cf,
+                    table_id,
+                    tuple_key,
+                    previous_payload_hash,
+                    payload,
+                    payload_hash,
+                } => {
+                    validate_coremeta_operation_payload(cf, *table_id, tuple_key, payload)?;
+                    let actual_hash = core_meta_payload_digest(*table_id, payload);
+                    if &actual_hash != payload_hash {
+                        bail!("TransactionConflict: staged CoreMeta payload hash mismatch");
+                    }
+                    validate_implicit_coremeta_put_common(
+                        transaction,
+                        payload,
+                        publication_generations,
+                    )?;
+                    let cf = canonical_coremeta_cf_name(cf)?;
+                    let key = (cf.to_string(), *table_id, tuple_key.clone());
+                    let current_payload = match coremeta_visible.get(&key) {
+                        Some(payload) => payload.clone(),
+                        None => {
+                            self.committed_coremeta_payload_unlocked(cf, *table_id, tuple_key)?
+                        }
+                    };
+                    let current_hash = current_payload
+                        .as_ref()
+                        .map(|payload| core_meta_payload_digest(*table_id, payload));
+                    if &current_hash != previous_payload_hash {
+                        bail!("TransactionConflict: staged CoreMeta put preimage changed");
+                    }
+                    coremeta_visible.insert(key, Some(payload.clone()));
+                }
+                CoreTransactionUpdate::CoreMetaDelete {
+                    cf,
+                    table_id,
+                    tuple_key,
+                    previous_payload_hash,
+                } => {
+                    validate_coremeta_operation_key(cf, *table_id, tuple_key)?;
+                    let cf = canonical_coremeta_cf_name(cf)?;
+                    let key = (cf.to_string(), *table_id, tuple_key.clone());
+                    let (from_overlay, current_payload) = match coremeta_visible.get(&key) {
+                        Some(payload) => (true, payload.clone()),
+                        None => (
+                            false,
+                            self.committed_coremeta_payload_unlocked(cf, *table_id, tuple_key)?,
+                        ),
+                    };
+                    let current_hash = current_payload
+                        .as_ref()
+                        .map(|payload| core_meta_payload_digest(*table_id, payload));
+                    if &current_hash != previous_payload_hash {
+                        bail!("TransactionConflict: staged CoreMeta delete preimage changed");
+                    }
+                    if let Some(payload) = current_payload.as_deref() {
+                        validate_implicit_coremeta_delete_scope(
+                            transaction,
+                            payload,
+                            from_overlay,
+                            publication_generations,
+                        )?;
+                    }
+                    coremeta_visible.insert(key, None);
+                }
+                CoreTransactionUpdate::StreamAppend { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
     pub(super) async fn commit_explicit_transaction_rows_and_coremeta_updates_unlocked(
         &self,
         transaction: &CoreTransaction,
@@ -609,9 +661,43 @@ impl CoreStore {
         let step_started_at = std::time::Instant::now();
         let mut committed_transaction = transaction.clone();
         committed_transaction.committed_root_generation = Some(committed_root_generation);
-        let mut owned_ops =
-            vec![self.transaction_header_as_coremeta_op_unlocked(&committed_transaction)?];
+        let mut preconditions = self
+            .read_transaction_preconditions_unlocked(&transaction.transaction_id)
+            .await?;
+        self.bind_explicit_transaction_preconditions(&committed_transaction, &mut preconditions)?;
+        let mut owned_ops = self
+            .complete_transaction_rows_as_coremeta_ops_unlocked(
+                &committed_transaction,
+                &preconditions,
+            )
+            .await?;
+        let mut staged_streams = BTreeMap::<String, Vec<StreamRecord>>::new();
+        for update in &transaction.visible_updates {
+            if let Some(record) = staged_stream_record_from_update(transaction, update)? {
+                staged_streams
+                    .entry(record.stream_id.clone())
+                    .or_default()
+                    .push(record);
+            }
+        }
+        for (stream_id, records) in &mut staged_streams {
+            records.sort_by_key(|record| record.sequence);
+            let mut prepared = self
+                .prepare_stream_metadata_rows_for_root(
+                    stream_id,
+                    records,
+                    &transaction.root_anchor_key,
+                    committed_root_generation,
+                    &transaction.transaction_id,
+                    WriterFamily::Stream,
+                    true,
+                )
+                .await?;
+            owned_ops.append(&mut prepared.owned_ops);
+        }
         let mut coremeta_batch_overlay = BTreeMap::<(String, u16, Vec<u8>), Option<Vec<u8>>>::new();
+        let mut final_coremeta_ops =
+            BTreeMap::<(String, u16, Vec<u8>), OwnedCoreMetaBatchOp>::new();
         for update in &transaction.visible_updates {
             match update {
                 CoreTransactionUpdate::CoreMetaPut {
@@ -630,13 +716,16 @@ impl CoreStore {
                     }
                     let cf = canonical_coremeta_cf_name(cf)?;
                     let key = (cf.to_string(), *table_id, tuple_key.clone());
-                    owned_ops.push(OwnedCoreMetaBatchOp::Put {
-                        cf,
-                        table_id: *table_id,
-                        tuple_key: tuple_key.clone(),
-                        payload: payload.clone(),
-                        common: None,
-                    });
+                    final_coremeta_ops.insert(
+                        key.clone(),
+                        OwnedCoreMetaBatchOp::Put {
+                            cf,
+                            table_id: *table_id,
+                            tuple_key: tuple_key.clone(),
+                            payload: payload.clone(),
+                            common: None,
+                        },
+                    );
                     coremeta_batch_overlay.insert(key, Some(payload.clone()));
                 }
                 CoreTransactionUpdate::CoreMetaDelete {
@@ -654,22 +743,26 @@ impl CoreStore {
                             self.committed_coremeta_payload_unlocked(cf, *table_id, tuple_key)?
                         }
                     };
-                    owned_ops.push(OwnedCoreMetaBatchOp::Delete {
-                        cf,
-                        table_id: *table_id,
-                        tuple_key: tuple_key.clone(),
-                        common: Some(delete_common_for_committed_transaction(
-                            transaction,
-                            current_payload.as_deref(),
-                            committed_root_generation,
-                            current_unix_nanos_u64()?,
-                        )?),
-                    });
+                    final_coremeta_ops.insert(
+                        key.clone(),
+                        OwnedCoreMetaBatchOp::Delete {
+                            cf,
+                            table_id: *table_id,
+                            tuple_key: tuple_key.clone(),
+                            common: Some(delete_common_for_committed_transaction(
+                                transaction,
+                                current_payload.as_deref(),
+                                committed_root_generation,
+                                current_unix_nanos_u64()?,
+                            )?),
+                        },
+                    );
                     coremeta_batch_overlay.insert(key, None);
                 }
                 _ => {}
             }
         }
+        owned_ops.extend(final_coremeta_ops.into_values());
         let ops = borrow_owned_coremeta_batch_ops(&owned_ops);
         crate::emit_test_timing(
             format!(
@@ -680,12 +773,14 @@ impl CoreStore {
             step_started_at.elapsed(),
         );
         let step_started_at = std::time::Instant::now();
-        self.commit_coremeta_batch_for_root(
-            &committed_transaction.root_key_hash,
-            committed_root_generation.saturating_sub(1),
-            committed_root_generation,
+        self.commit_coremeta_root_groups_prelocked(
             &committed_transaction.transaction_id,
             &ops,
+            &[CoreMetaRootPublication::with_writer_families(
+                committed_transaction.root_anchor_key.clone(),
+                committed_transaction.writer_families.clone(),
+            )
+            .coordinator()],
         )
         .await?;
         crate::emit_test_timing(
@@ -702,90 +797,26 @@ impl CoreStore {
         &self,
         transaction: &CoreTransaction,
     ) -> Result<u64> {
-        let mut coremeta_root_generation = None;
-        let mut fallback_delete_generation = None;
-        let mut coremeta_batch_overlay = BTreeMap::<(String, u16, Vec<u8>), Option<Vec<u8>>>::new();
-
-        for update in &transaction.visible_updates {
-            match update {
-                CoreTransactionUpdate::CoreMetaPut {
-                    cf,
-                    table_id,
-                    tuple_key,
-                    payload,
-                    ..
-                } => {
-                    let common = validate_committed_coremeta_put_common(transaction, payload)?;
-                    merge_coremeta_root_generation(
-                        &mut coremeta_root_generation,
-                        common.root_generation,
-                    )?;
-                    let cf = canonical_coremeta_cf_name(cf)?;
-                    coremeta_batch_overlay.insert(
-                        (cf.to_string(), *table_id, tuple_key.clone()),
-                        Some(payload.clone()),
-                    );
-                }
-                CoreTransactionUpdate::CoreMetaDelete {
-                    cf,
-                    table_id,
-                    tuple_key,
-                    ..
-                } => {
-                    let cf = canonical_coremeta_cf_name(cf)?;
-                    let key = (cf.to_string(), *table_id, tuple_key.clone());
-                    let (from_overlay, current_payload) = match coremeta_batch_overlay.get(&key) {
-                        Some(payload) => (true, payload.clone()),
-                        None => (
-                            false,
-                            self.committed_coremeta_payload_unlocked(cf, *table_id, tuple_key)?,
-                        ),
-                    };
-                    if let Some(payload) = current_payload.as_ref() {
-                        let delete_generation = delete_generation_from_visible_payload(
-                            transaction,
-                            payload,
-                            from_overlay,
-                        )?;
-                        if from_overlay {
-                            if let Some(delete_generation) = delete_generation {
-                                merge_coremeta_root_generation(
-                                    &mut coremeta_root_generation,
-                                    delete_generation,
-                                )?;
-                            }
-                        } else {
-                            validate_delete_visible_payload_scope(transaction, payload)?;
-                            if let Some(delete_generation) = delete_generation {
-                                merge_coremeta_root_generation(
-                                    &mut fallback_delete_generation,
-                                    delete_generation,
-                                )?;
-                            }
-                        }
-                    }
-                    coremeta_batch_overlay.insert(key, None);
-                }
-                _ => {}
-            }
-        }
-
-        if let Some(generation) = coremeta_root_generation {
-            return Ok(generation);
-        }
-        if let Some(generation) = fallback_delete_generation {
-            return Ok(generation);
-        }
-        if let Some(generation) =
-            committed_root_generation_from_updates(&transaction.visible_updates)?
-        {
-            return Ok(generation);
-        }
         if let Some(generation) = transaction
             .committed_root_generation
             .filter(|generation| *generation > 0)
         {
             return Ok(generation);
+        }
+
+        for update in &transaction.visible_updates {
+            let CoreTransactionUpdate::CoreMetaPut { payload, .. } = update else {
+                continue;
+            };
+            let common = core_meta_row_common_from_payload(payload)?;
+            if common.root_key_hash != transaction.root_key_hash {
+                bail!("TransactionScopeMismatch");
+            }
+            if common.root_generation != 0 {
+                bail!(
+                    "TransactionConflict: staged CoreMeta payload unexpectedly reserves a root generation"
+                );
+            }
         }
 
         let current_root_generation = self
@@ -804,6 +835,63 @@ impl CoreStore {
         preconditions: &[CoreMutationPrecondition],
         committed_by_principal: &str,
         transaction_id: Option<&str>,
+    ) -> Result<()> {
+        let transaction = match transaction_id {
+            Some(transaction_id) => Some(
+                self.read_transaction_unlocked(transaction_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("TransactionNotFound"))?,
+            ),
+            None => None,
+        };
+        self.validate_mutation_preconditions_against_transaction_unlocked(
+            preconditions.iter(),
+            committed_by_principal,
+            transaction.as_ref(),
+        )
+        .await
+    }
+
+    pub(super) async fn validate_staged_transaction_preconditions_unlocked(
+        &self,
+        preconditions: &[CoreTransactionPreconditionRow],
+        committed_by_principal: &str,
+        transaction: &CoreTransaction,
+    ) -> Result<()> {
+        let visible_update_count = u64::try_from(transaction.visible_updates.len())
+            .map_err(|_| anyhow!("CoreStore transaction has too many staged updates"))?;
+        let mut by_boundary = BTreeMap::<u64, Vec<&CoreMutationPrecondition>>::new();
+        for persisted in preconditions {
+            if persisted.visible_update_boundary > visible_update_count {
+                bail!("CoreStore transaction precondition boundary exceeds staged update count");
+            }
+            by_boundary
+                .entry(persisted.visible_update_boundary)
+                .or_default()
+                .push(&persisted.precondition);
+        }
+
+        for (visible_update_boundary, boundary_preconditions) in by_boundary {
+            let boundary = usize::try_from(visible_update_boundary).map_err(|_| {
+                anyhow!("CoreStore transaction precondition boundary exceeds usize")
+            })?;
+            let mut transaction_at_boundary = transaction.clone();
+            transaction_at_boundary.visible_updates.truncate(boundary);
+            self.validate_mutation_preconditions_against_transaction_unlocked(
+                boundary_preconditions.into_iter(),
+                committed_by_principal,
+                Some(&transaction_at_boundary),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn validate_mutation_preconditions_against_transaction_unlocked<'a>(
+        &self,
+        preconditions: impl IntoIterator<Item = &'a CoreMutationPrecondition>,
+        committed_by_principal: &str,
+        transaction: Option<&CoreTransaction>,
     ) -> Result<()> {
         for precondition in preconditions {
             match precondition {
@@ -826,16 +914,12 @@ impl CoreStore {
                     require_absent,
                     require_present,
                 } => {
-                    let current = if let Some(transaction_id) = transaction_id {
-                        let transaction = self
-                            .read_transaction_unlocked(transaction_id)
-                            .await?
-                            .ok_or_else(|| anyhow!("TransactionNotFound"))?;
+                    let current = if let Some(transaction) = transaction {
                         self.coremeta_payload_visible_to_transaction_unlocked(
                             cf,
                             *table_id,
                             tuple_key,
-                            &transaction,
+                            transaction,
                         )?
                     } else {
                         self.committed_coremeta_payload_unlocked(cf, *table_id, tuple_key)?
@@ -850,15 +934,51 @@ impl CoreStore {
                         *require_present,
                     )?;
                 }
+                CoreMutationPrecondition::CoreMetaLease {
+                    cf,
+                    table_id,
+                    tuple_key,
+                    expected_payload_hash,
+                    expires_at_unix_nanos,
+                } => {
+                    if *expires_at_unix_nanos == 0
+                        || current_unix_nanos_u64()? >= *expires_at_unix_nanos
+                    {
+                        return Err(CoreStoreCommitError::CoreMetaRowPreconditionFailed {
+                            cf: cf.clone(),
+                            table_id: *table_id,
+                            tuple_key_hex: hex::encode(tuple_key),
+                            reason: "lease expired before commit admission".to_string(),
+                        }
+                        .into());
+                    }
+                    let current = if let Some(transaction) = transaction {
+                        self.coremeta_payload_visible_to_transaction_unlocked(
+                            cf,
+                            *table_id,
+                            tuple_key,
+                            transaction,
+                        )?
+                    } else {
+                        self.committed_coremeta_payload_unlocked(cf, *table_id, tuple_key)?
+                    };
+                    validate_core_meta_row_precondition(
+                        current.as_deref(),
+                        cf,
+                        *table_id,
+                        tuple_key,
+                        Some(expected_payload_hash),
+                        false,
+                        true,
+                    )?;
+                }
                 CoreMutationPrecondition::StreamHead {
                     stream_id,
                     expected_last_sequence,
                     expected_last_event_hash,
                 } => {
-                    let head = self.read_stream_head_from_meta(stream_id)?;
-                    let (actual_sequence, actual_hash) = head
-                        .map(|head| (head.last_sequence, head.last_event_hash))
-                        .unwrap_or_else(|| (0, ZERO_HASH.to_string()));
+                    let (actual_sequence, actual_hash) =
+                        self.stream_head_visible_to_transaction_unlocked(stream_id, transaction)?;
                     if actual_sequence != *expected_last_sequence
                         || actual_hash != *expected_last_event_hash
                     {
@@ -946,6 +1066,79 @@ fn validate_committed_coremeta_put_common(
     Ok(common)
 }
 
+fn validate_implicit_coremeta_put_common(
+    transaction: &CoreTransaction,
+    payload: &[u8],
+    publication_generations: &BTreeMap<String, u64>,
+) -> Result<CoreMetaRowCommonProto> {
+    let common = core_meta_row_common_from_payload(payload)?;
+    if common.visibility_state_enum() != CoreMetaVisibilityState::Committed {
+        bail!("TransactionConflict: staged CoreMeta payload must commit as visible");
+    }
+    if common.root_key_hash.is_empty() {
+        if common.root_generation != 0 {
+            bail!("TransactionConflict: local CoreMeta payload has a root generation");
+        }
+        return Ok(common);
+    }
+    let Some(expected_generation) = publication_generations.get(&common.root_key_hash) else {
+        bail!(
+            "TransactionScopeMismatch: implicit CoreMeta payload references undeclared root {}",
+            common.root_key_hash
+        );
+    };
+    if common.root_generation != *expected_generation {
+        bail!(
+            "TransactionScopeMismatch: implicit CoreMeta payload generation does not match publication"
+        );
+    }
+    if common.transaction_id != transaction.transaction_id {
+        bail!("TransactionScopeMismatch: staged CoreMeta payload transaction id mismatch");
+    }
+    Ok(common)
+}
+
+fn validate_implicit_coremeta_delete_scope(
+    transaction: &CoreTransaction,
+    payload: &[u8],
+    from_overlay: bool,
+    publication_generations: &BTreeMap<String, u64>,
+) -> Result<()> {
+    let common = core_meta_row_common_from_payload(payload)?;
+    if common.root_key_hash.is_empty() {
+        if common.root_generation != 0 {
+            bail!("TransactionConflict: local CoreMeta payload has a root generation");
+        }
+        return Ok(());
+    }
+    let Some(publication_generation) = publication_generations.get(&common.root_key_hash) else {
+        bail!(
+            "TransactionScopeMismatch: implicit CoreMeta delete references undeclared root {}",
+            common.root_key_hash
+        );
+    };
+    if from_overlay {
+        if common.transaction_id != transaction.transaction_id {
+            bail!("TransactionScopeMismatch: staged CoreMeta delete overlay has another owner");
+        }
+        if common.root_generation != *publication_generation {
+            bail!(
+                "TransactionScopeMismatch: implicit CoreMeta delete generation does not match publication"
+            );
+        }
+        return Ok(());
+    }
+    // A canonical row records the generation in which that row last changed,
+    // not the current head of its root. An exact row precondition protects the
+    // preimage while the root-register CAS proves the H -> H+1 publication.
+    if common.root_generation == 0 || common.root_generation >= *publication_generation {
+        bail!(
+            "TransactionScopeMismatch: implicit CoreMeta delete generation does not match publication"
+        );
+    }
+    Ok(())
+}
+
 fn delete_generation_from_visible_payload(
     transaction: &CoreTransaction,
     payload: &[u8],
@@ -1022,20 +1215,4 @@ fn delete_common_for_committed_transaction(
         transaction.transaction_id.clone(),
         created_at_unix_nanos,
     ))
-}
-
-fn merge_coremeta_root_generation(target: &mut Option<u64>, generation: u64) -> Result<()> {
-    if generation == 0 {
-        bail!("CoreStore explicit transaction rooted rows must use non-zero generations");
-    }
-    match target {
-        Some(existing) if *existing != generation => {
-            bail!(
-                "TransactionScopeMismatch: explicit transaction touches multiple root generations"
-            )
-        }
-        Some(_) => {}
-        None => *target = Some(generation),
-    }
-    Ok(())
 }
