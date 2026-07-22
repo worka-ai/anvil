@@ -1,10 +1,10 @@
 use crate::core_store::{
     CF_MESH, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-    CoreStore, CoreTransactionState, TABLE_CONTROL_CURRENT_ROW, core_meta_committed_row_common,
-    core_meta_payload_digest, core_meta_record_tuple_key, core_meta_root_key_hash,
-    core_meta_tuple_key, is_retryable_mutation_conflict,
+    CoreMutationRootPublication, CoreStore, CoreTransactionState, TABLE_CONTROL_CURRENT_ROW,
+    core_meta_committed_row_common, core_meta_payload_digest, core_meta_record_tuple_key,
+    core_meta_root_key_hash, core_meta_tuple_key, is_retryable_mutation_conflict,
 };
-use crate::formats::{Hash32, hash32};
+use crate::formats::{Hash32, hash32, writer::WriterFamily};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
 use crate::persistence::{App, AppDetails, Tenant};
 use crate::storage::Storage;
@@ -674,7 +674,7 @@ async fn append_control_event(
 ) -> Result<()> {
     let core_store = CoreStore::new(storage.clone()).await?;
     let mutation_id = uuid::Uuid::new_v4();
-    let row_generation = current_unix_nanos();
+    let created_at_unix_nanos = current_unix_nanos();
     let stream_precondition = core_store
         .stream_head_precondition(&control_plane_stream_id())
         .await?;
@@ -690,21 +690,23 @@ async fn append_control_event(
         .ok_or_else(|| anyhow!("control journal revision overflow"))?;
     let payload = encode_control_event_body(&event, fence_token, mutation_id)?;
     let partition_id = hex::encode(control_partition_id());
+    let mut current_updates = current_updates;
+    current_updates.push(ControlCurrentRecord::Revision {
+        revision: next_revision,
+    });
+    let root_publications = control_root_publications(&partition_id, current_updates.as_slice());
     let mut operations = Vec::new();
     for record in current_updates {
-        operations.extend(control_current_updates(
-            record,
-            &mutation_id.to_string(),
-            row_generation,
-        )?);
+        operations.extend(
+            control_current_updates(
+                &core_store,
+                record,
+                &mutation_id.to_string(),
+                created_at_unix_nanos,
+            )
+            .await?,
+        );
     }
-    operations.extend(control_current_updates(
-        ControlCurrentRecord::Revision {
-            revision: next_revision,
-        },
-        &mutation_id.to_string(),
-        row_generation,
-    )?);
     let mut preconditions: Vec<_> = partition_precondition.into_iter().collect();
     let mut projection_keys = BTreeSet::new();
     for operation in &operations {
@@ -752,6 +754,7 @@ async fn append_control_event(
             transaction_id: format!("control-plane:{mutation_id}"),
             scope_partition: partition_id,
             committed_by_principal: control_partition_principal(),
+            root_publications,
             preconditions,
             operations,
         })
@@ -809,12 +812,17 @@ fn app_record(app: &StoredControlApp) -> App {
     }
 }
 
-fn control_current_updates(
+async fn control_current_updates(
+    core_store: &CoreStore,
     record: ControlCurrentRecord,
     mutation_id: &str,
-    row_generation: u64,
+    created_at_unix_nanos: u64,
 ) -> Result<Vec<CoreMutationOperation>> {
-    let payload = encode_control_current_row(&record, mutation_id, row_generation)?;
+    let root_generation = core_store
+        .next_root_generation_for_anchor(&control_current_root_anchor_key(&record))
+        .await?;
+    let payload =
+        encode_control_current_row(&record, mutation_id, root_generation, created_at_unix_nanos)?;
     let mut operations = Vec::new();
     match &record {
         ControlCurrentRecord::Revision { .. } => {
@@ -1010,15 +1018,16 @@ fn ensure_deterministic_control_proto(
 fn encode_control_current_row(
     record: &ControlCurrentRecord,
     mutation_id: &str,
-    row_generation: u64,
+    root_generation: u64,
+    created_at_unix_nanos: u64,
 ) -> Result<Vec<u8>> {
     let proto = ControlCurrentProto {
         common: Some(core_meta_committed_row_common(
             control_current_realm_id(record),
             control_current_root_key_hash(record),
-            row_generation,
+            root_generation,
             mutation_id.to_string(),
-            row_generation,
+            created_at_unix_nanos,
         )),
         schema: CONTROL_CURRENT_SCHEMA.to_string(),
         record: Some(match record {
@@ -1208,19 +1217,46 @@ fn control_current_realm_id(record: &ControlCurrentRecord) -> String {
 }
 
 fn control_current_root_key_hash(record: &ControlCurrentRecord) -> String {
+    core_meta_root_key_hash(&control_current_root_anchor_key(record))
+}
+
+fn control_current_root_anchor_key(record: &ControlCurrentRecord) -> String {
     match record {
-        ControlCurrentRecord::Revision { .. } => {
-            core_meta_root_key_hash("control/current-revision")
-        }
-        ControlCurrentRecord::IdAllocator { .. } => core_meta_root_key_hash("control/id-allocator"),
-        ControlCurrentRecord::Region { .. } => core_meta_root_key_hash("control/regions"),
-        ControlCurrentRecord::Tenant { id, .. } => {
-            core_meta_root_key_hash(&format!("control/tenant/{id}"))
-        }
-        ControlCurrentRecord::App { id, .. } => {
-            core_meta_root_key_hash(&format!("control/app/{id}"))
-        }
+        ControlCurrentRecord::Revision { .. } => "control/current-revision".to_string(),
+        ControlCurrentRecord::IdAllocator { .. } => "control/id-allocator".to_string(),
+        ControlCurrentRecord::Region { .. } => "control/regions".to_string(),
+        ControlCurrentRecord::Tenant { id, .. } => format!("control/tenant/{id}"),
+        ControlCurrentRecord::App { id, .. } => format!("control/app/{id}"),
     }
+}
+
+fn control_root_publications(
+    coordinator_root: &str,
+    records: &[ControlCurrentRecord],
+) -> Vec<CoreMutationRootPublication> {
+    let mut data_roots = records
+        .iter()
+        .map(control_current_root_anchor_key)
+        .collect::<BTreeSet<_>>();
+    let coordinator_is_data_root = data_roots.remove(coordinator_root);
+    let coordinator = if coordinator_is_data_root {
+        CoreMutationRootPublication {
+            root_anchor_key: coordinator_root.to_string(),
+            writer_families: vec![
+                WriterFamily::CoreControl.as_str().to_string(),
+                WriterFamily::MeshControl.as_str().to_string(),
+            ],
+            transaction_coordinator: true,
+        }
+    } else {
+        CoreMutationRootPublication::new(coordinator_root, WriterFamily::CoreControl.as_str())
+            .coordinator()
+    };
+    std::iter::once(coordinator)
+        .chain(data_roots.into_iter().map(|root_anchor_key| {
+            CoreMutationRootPublication::new(root_anchor_key, WriterFamily::MeshControl.as_str())
+        }))
+        .collect()
 }
 
 fn current_unix_nanos() -> u64 {
@@ -1453,14 +1489,22 @@ mod tests {
         };
         let mutation_id = uuid::Uuid::new_v4();
         let payload = encode_control_event_body(&event, 0, mutation_id).unwrap();
+        let partition_id = hex::encode(control_partition_id());
         core_store
             .commit_mutation_batch(CoreMutationBatch {
                 transaction_id: format!("history-only:{mutation_id}"),
-                scope_partition: hex::encode(control_partition_id()),
+                scope_partition: partition_id.clone(),
                 committed_by_principal: control_partition_principal(),
+                root_publications: vec![
+                    CoreMutationRootPublication::new(
+                        &partition_id,
+                        WriterFamily::CoreControl.as_str(),
+                    )
+                    .coordinator(),
+                ],
                 preconditions: Vec::new(),
                 operations: vec![CoreMutationOperation::StreamAppend {
-                    partition_id: hex::encode(control_partition_id()),
+                    partition_id,
                     stream_id: control_plane_stream_id(),
                     record_kind: "control_plane".to_string(),
                     payload,
@@ -1495,40 +1539,51 @@ mod tests {
             client_id: "client-a".to_string(),
             client_secret_encrypted: b"secret-a".to_vec(),
         };
+        let partition_id = hex::encode(control_partition_id());
+        let current_records = vec![
+            ControlCurrentRecord::IdAllocator {
+                max_allocated_id: app.id,
+            },
+            ControlCurrentRecord::Region {
+                name: "local".to_string(),
+                active: true,
+            },
+            ControlCurrentRecord::Tenant {
+                id: tenant.id,
+                name: tenant.name.clone(),
+                active: true,
+            },
+            ControlCurrentRecord::App {
+                id: app.id,
+                tenant_id: app.tenant_id,
+                name: app.name.clone(),
+                client_id: app.client_id.clone(),
+                client_secret_encrypted: app.client_secret_encrypted.clone(),
+                active: true,
+            },
+        ];
+        let root_publications = control_root_publications(&partition_id, &current_records);
+        let mut operations = Vec::new();
+        for record in current_records.iter().cloned() {
+            operations.extend(
+                control_current_updates(
+                    &core_store,
+                    record,
+                    "current-row-seed",
+                    current_unix_nanos(),
+                )
+                .await
+                .unwrap(),
+            );
+        }
         core_store
             .commit_mutation_batch(CoreMutationBatch {
                 transaction_id: "current-row-seed".to_string(),
-                scope_partition: hex::encode(control_partition_id()),
+                scope_partition: partition_id,
                 committed_by_principal: control_partition_principal(),
+                root_publications,
                 preconditions: Vec::new(),
-                operations: vec![
-                    ControlCurrentRecord::IdAllocator {
-                        max_allocated_id: app.id,
-                    },
-                    ControlCurrentRecord::Region {
-                        name: "local".to_string(),
-                        active: true,
-                    },
-                    ControlCurrentRecord::Tenant {
-                        id: tenant.id,
-                        name: tenant.name.clone(),
-                        active: true,
-                    },
-                    ControlCurrentRecord::App {
-                        id: app.id,
-                        tenant_id: app.tenant_id,
-                        name: app.name.clone(),
-                        client_id: app.client_id.clone(),
-                        client_secret_encrypted: app.client_secret_encrypted.clone(),
-                        active: true,
-                    },
-                ]
-                .into_iter()
-                .flat_map(|record| {
-                    control_current_updates(record, "current-row-seed", current_unix_nanos())
-                        .unwrap()
-                })
-                .collect(),
+                operations,
             })
             .await
             .unwrap();

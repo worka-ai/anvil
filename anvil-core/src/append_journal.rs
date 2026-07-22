@@ -1,9 +1,9 @@
 use crate::core_store::{
     CoreCompressionDescriptor, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-    CoreObjectEncoding, CoreObjectPlacement, CoreObjectRef, CoreStore, CoreTransaction,
-    CoreTransactionUpdate, ReadStream, StreamRecord,
+    CoreMutationRootPublication, CoreObjectEncoding, CoreObjectPlacement, CoreObjectRef, CoreStore,
+    CoreTransaction, CoreTransactionUpdate, ReadStream, StreamRecord,
 };
-use crate::formats::{Hash32, hash32};
+use crate::formats::{Hash32, hash32, writer::WriterFamily};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
 use crate::persistence::{
     AppendStream, AppendStreamMutation, AppendStreamRecord, AppendStreamRecordMutation,
@@ -305,12 +305,18 @@ async fn create_append_stream_inner(
     transaction_principal: Option<&str>,
 ) -> Result<AppendStreamMutation> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    let id = core_store
-        .stream_head_sequence(&append_metadata_stream_id(tenant_id, bucket_id))
-        .await?
-        .checked_add(1)
-        .and_then(|value| i64::try_from(value).ok())
-        .ok_or_else(|| anyhow!("append stream id overflow"))?;
+    let explicit_transaction =
+        read_optional_explicit_transaction(&core_store, transaction_id, transaction_principal)
+            .await?;
+    let id = i64::try_from(
+        next_stream_sequence_visible_to_transaction(
+            &core_store,
+            &append_metadata_stream_id(tenant_id, bucket_id),
+            explicit_transaction.as_ref(),
+        )
+        .await?,
+    )
+    .map_err(|_| anyhow!("append stream id overflow"))?;
     let stream = AppendStream {
         id,
         tenant_id,
@@ -333,6 +339,7 @@ async fn create_append_stream_inner(
         partition_precondition,
         transaction_id,
         transaction_principal,
+        transaction_principal,
     )
     .await?;
     Ok(AppendStreamMutation { stream, receipt })
@@ -350,6 +357,7 @@ async fn append_stream_record(
         stream,
         payload_object_ref,
         payload_size,
+        None,
         None,
         None,
         None,
@@ -384,6 +392,7 @@ pub(crate) async fn append_stream_record_with_permit(
         Some(partition_precondition),
         None,
         None,
+        None,
     )
     .await
 }
@@ -413,6 +422,7 @@ pub(crate) async fn append_stream_record_with_permit_in_partition(
         user_meta,
         Some(permit),
         Some(partition_precondition),
+        None,
         None,
         Some(authenticated_principal),
     )
@@ -447,6 +457,7 @@ pub(crate) async fn append_stream_record_with_permit_in_partition_transaction(
         Some(partition_precondition),
         Some(transaction_id),
         Some(transaction_principal),
+        Some(transaction_principal),
     )
     .await
 }
@@ -461,6 +472,7 @@ async fn append_stream_record_inner(
     permit: Option<&PartitionWritePermit>,
     partition_precondition: Option<CoreMutationPrecondition>,
     transaction_id: Option<&str>,
+    transaction_principal: Option<&str>,
     authenticated_principal: Option<&str>,
 ) -> Result<AppendStreamRecordMutation> {
     let tenant_id = stream.tenant_id;
@@ -475,7 +487,7 @@ async fn append_stream_record_inner(
         bucket_id,
         &stream.stream_key,
         stream.stream_id,
-        transaction_id.zip(authenticated_principal),
+        transaction_id.zip(transaction_principal),
     )
     .await?
     .ok_or_else(|| anyhow!("append stream not found"))?;
@@ -483,18 +495,27 @@ async fn append_stream_record_inner(
         bail!("append stream row id does not match stream identity");
     }
     let core_store = CoreStore::new(storage.clone()).await?;
-    let next_seq = core_store
-        .stream_head_sequence(&append_record_stream_id(&current)?)
-        .await?
-        .checked_add(1)
-        .and_then(|value| i64::try_from(value).ok())
-        .ok_or_else(|| anyhow!("append record sequence overflow"))?;
-    let next_record_id = core_store
-        .stream_head_sequence(&append_metadata_stream_id(tenant_id, bucket_id))
-        .await?
-        .checked_add(1)
-        .and_then(|value| i64::try_from(value).ok())
-        .ok_or_else(|| anyhow!("append record id overflow"))?;
+    let explicit_transaction =
+        read_optional_explicit_transaction(&core_store, transaction_id, transaction_principal)
+            .await?;
+    let next_seq = i64::try_from(
+        next_stream_sequence_visible_to_transaction(
+            &core_store,
+            &append_record_stream_id(&current)?,
+            explicit_transaction.as_ref(),
+        )
+        .await?,
+    )
+    .map_err(|_| anyhow!("append record sequence overflow"))?;
+    let next_record_id = i64::try_from(
+        next_stream_sequence_visible_to_transaction(
+            &core_store,
+            &append_metadata_stream_id(tenant_id, bucket_id),
+            explicit_transaction.as_ref(),
+        )
+        .await?,
+    )
+    .map_err(|_| anyhow!("append record id overflow"))?;
     let record = AppendStreamRecord {
         id: next_record_id,
         stream_id: stream.id,
@@ -517,6 +538,7 @@ async fn append_stream_record_inner(
         fence_token,
         partition_precondition,
         transaction_id,
+        transaction_principal,
         authenticated_principal,
     )
     .await?;
@@ -650,6 +672,7 @@ async fn seal_append_stream_inner(
         partition_precondition,
         transaction_id,
         transaction_principal,
+        transaction_principal,
     )
     .await?;
     Ok(SealAppendStreamMutation {
@@ -669,6 +692,7 @@ pub async fn materialize_committed_append_streams_transaction(
             stream_id,
             visible_sequence,
             prepared_record_hash,
+            ..
         } = update
         else {
             continue;
@@ -709,9 +733,23 @@ async fn append_body(
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
     transaction_id: Option<&str>,
+    transaction_principal: Option<&str>,
     committed_by_principal: Option<&str>,
 ) -> Result<MetadataMutationReceipt> {
     let core_store = CoreStore::new(storage.clone()).await?;
+    let explicit_transaction = match (transaction_id, transaction_principal) {
+        (Some(transaction_id), Some(transaction_principal)) => Some(
+            core_store
+                .read_explicit_transaction_for_principal(transaction_id, transaction_principal)
+                .await?,
+        ),
+        (None, None) => None,
+        _ => {
+            return Err(anyhow!(
+                "append transaction id and principal must be provided together"
+            ));
+        }
+    };
     let journal_stream_id = append_metadata_stream_id(tenant_id, bucket_id);
     let stream = stream.ok_or_else(|| anyhow!("append event is missing stream identity"))?;
     if stream.tenant_id != tenant_id || stream.bucket_id != bucket_id {
@@ -724,15 +762,28 @@ async fn append_body(
         AppendMutationKind::AppendRecord => append_record_stream_id(&stream)?,
     };
     let journal_precondition = core_store
-        .stream_head_precondition(&journal_stream_id)
+        .stream_head_precondition_visible_to_transaction(
+            &journal_stream_id,
+            explicit_transaction.as_ref(),
+        )
         .await?;
     let exact_precondition = core_store
-        .stream_head_precondition(&exact_stream_id)
+        .stream_head_precondition_visible_to_transaction(
+            &exact_stream_id,
+            explicit_transaction.as_ref(),
+        )
         .await?;
     let record_cursor_stream_id = matches!(event, AppendMutationKind::AppendRecord)
         .then(|| append_record_cursor_stream_id(tenant_id, bucket_id));
     let record_cursor_precondition = if let Some(stream_id) = record_cursor_stream_id.as_deref() {
-        Some(core_store.stream_head_precondition(stream_id).await?)
+        Some(
+            core_store
+                .stream_head_precondition_visible_to_transaction(
+                    stream_id,
+                    explicit_transaction.as_ref(),
+                )
+                .await?,
+        )
     } else {
         None
     };
@@ -775,13 +826,17 @@ async fn append_body(
     let payload = encode_append_body(&body, fence_token, mutation_id)?;
     let payload_hash = hex::encode(hash32(&payload));
     let partition_id = hex::encode(append_metadata_partition_id(tenant_id, bucket_id));
+    let scope_partition = explicit_transaction
+        .as_ref()
+        .map(|transaction| transaction.scope_partition.clone())
+        .unwrap_or(partition_id);
     let mut preconditions: Vec<_> = partition_precondition.into_iter().collect();
     preconditions.push(journal_precondition);
     preconditions.push(exact_precondition);
     preconditions.extend(record_cursor_precondition);
     let mut operations = vec![
         CoreMutationOperation::StreamAppend {
-            partition_id: partition_id.clone(),
+            partition_id: scope_partition.clone(),
             stream_id: journal_stream_id.clone(),
             record_kind: "append_metadata".to_string(),
             payload: payload.clone(),
@@ -790,7 +845,7 @@ async fn append_body(
             )),
         },
         CoreMutationOperation::StreamAppend {
-            partition_id: partition_id.clone(),
+            partition_id: scope_partition.clone(),
             stream_id: exact_stream_id,
             record_kind: match event {
                 AppendMutationKind::CreateStream | AppendMutationKind::SealStream => {
@@ -807,7 +862,7 @@ async fn append_body(
     ];
     if let Some(stream_id) = record_cursor_stream_id {
         operations.push(CoreMutationOperation::StreamAppend {
-            partition_id: partition_id.clone(),
+            partition_id: scope_partition.clone(),
             stream_id,
             record_kind: "append_metadata.record_cursor".to_string(),
             payload,
@@ -820,10 +875,15 @@ async fn append_body(
         transaction_id: transaction_id
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("append-metadata:{tenant_id}:{bucket_id}:{mutation_id}")),
-        scope_partition: partition_id.clone(),
-        committed_by_principal: committed_by_principal
+        scope_partition: scope_partition.clone(),
+        committed_by_principal: transaction_principal
+            .or(committed_by_principal)
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| append_metadata_partition_principal(tenant_id, bucket_id)),
+        root_publications: vec![
+            CoreMutationRootPublication::new(scope_partition, WriterFamily::CoreControl.as_str())
+                .coordinator(),
+        ],
         preconditions,
         operations,
     };
@@ -866,6 +926,35 @@ fn expected_stream_next_sequence(precondition: &CoreMutationPrecondition) -> Res
     expected_last_sequence
         .checked_add(1)
         .ok_or_else(|| anyhow!("append stream sequence overflow"))
+}
+
+async fn read_optional_explicit_transaction(
+    core_store: &CoreStore,
+    transaction_id: Option<&str>,
+    transaction_principal: Option<&str>,
+) -> Result<Option<CoreTransaction>> {
+    match (transaction_id, transaction_principal) {
+        (Some(transaction_id), Some(transaction_principal)) => core_store
+            .read_explicit_transaction_for_principal(transaction_id, transaction_principal)
+            .await
+            .map(Some),
+        (None, None) => Ok(None),
+        _ => Err(anyhow!(
+            "append transaction id and principal must be provided together"
+        )),
+    }
+}
+
+async fn next_stream_sequence_visible_to_transaction(
+    core_store: &CoreStore,
+    stream_id: &str,
+    transaction: Option<&CoreTransaction>,
+) -> Result<u64> {
+    expected_stream_next_sequence(
+        &core_store
+            .stream_head_precondition_visible_to_transaction(stream_id, transaction)
+            .await?,
+    )
 }
 
 fn encode_append_body(
@@ -1282,6 +1371,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1291,6 +1381,7 @@ mod tests {
             &right,
             payload_ref("right-a", 40),
             40,
+            None,
             None,
             None,
             None,
@@ -1466,12 +1557,14 @@ mod tests {
             Some(stale_precondition),
             None,
             None,
+            None,
         )
         .await
         .unwrap_err();
         assert!(
             err.to_string().contains("target mismatch")
-                || err.to_string().contains("generation mismatch"),
+                || err.to_string().contains("generation mismatch")
+                || err.to_string().contains("payload hash mismatch"),
             "unexpected error: {err:?}"
         );
     }
