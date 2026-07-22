@@ -1,7 +1,8 @@
 use crate::{
     core_store::{
-        CF_LEASES_FENCES, CoreMutationPrecondition, TABLE_PARTITION_OWNER_ROW,
-        core_meta_committed_row_common, core_meta_payload_digest, core_meta_root_key_hash,
+        CF_LEASES_FENCES, CoreMutationPrecondition, TABLE_OWNERSHIP_FENCE_ROW,
+        TABLE_PARTITION_OWNER_ROW, core_meta_committed_row_common, core_meta_payload_digest,
+        core_meta_root_key_hash,
     },
     error_codes::AnvilErrorCode,
     formats::hash32,
@@ -40,6 +41,12 @@ pub const MAX_OWNERSHIP_LEASE_MS: u64 = 120_000;
 
 const MAX_PARTITION_FENCE_CAS_ATTEMPTS: usize = 64;
 const EXPIRED_PARTITION_OWNER_NODE_PREFIX: &str = "__anvil_expired_partition_owner__:";
+
+pub(crate) fn partition_owner_root_key_hash(partition_family: &str, partition_id: &str) -> String {
+    core_meta_root_key_hash(&format!(
+        "partition-owner/{partition_family}/{partition_id}"
+    ))
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -553,7 +560,7 @@ fn partition_owner_to_proto(owner: &PartitionOwnerState) -> PartitionOwnerRecord
                 owner.partition_family, owner.partition_id
             )),
             owner.generation,
-            owner.owner_node_id.clone(),
+            coremeta::partition_owner_transaction_id(owner),
             owner.updated_at_nanos.max(0) as u64,
         )),
         format_version: u32::from(owner.format_version),
@@ -630,7 +637,7 @@ fn ownership_fence_record_to_proto(
             format!("tenant/{}", record.owner.tenant_id),
             root_key_hash,
             record.generation,
-            record.last_idempotency_key.clone().unwrap_or_default(),
+            coremeta::ownership_fence_transaction_id(record)?,
             record.last_heartbeat_at_nanos.max(0) as u64,
         )),
         format_version: u32::from(record.format_version),
@@ -1051,6 +1058,50 @@ pub async fn read_ownership_fence(
             .await?
             .map(|(_, record)| record),
     )
+}
+
+/// Returns an exact CoreMeta CAS fence for an active ownership lease.
+///
+/// Callers include this precondition in the same mutation batch as the
+/// authoritative state they publish. A validate-then-write check alone cannot
+/// prevent a stale owner from committing after ownership changes.
+pub async fn ownership_fence_precondition(
+    storage: &Storage,
+    tenant_id: i64,
+    resource: &OwnershipResource,
+    expected_owner: &OwnershipPrincipal,
+    expected_fence: u64,
+    now_nanos: i64,
+    signing_key: &[u8],
+) -> Result<CoreMutationPrecondition> {
+    if now_nanos < 0 {
+        bail!("ownership fence validation timestamp must be nonnegative");
+    }
+    let Some((payload, record)) =
+        read_ownership_fence_state(storage, tenant_id, resource, signing_key).await?
+    else {
+        bail!("{OWNERSHIP_NOT_FOUND}: ownership fence is absent");
+    };
+    if !record.is_active_unexpired(now_nanos) {
+        bail!("{OWNERSHIP_EXPIRED}: ownership fence is not active");
+    }
+    if !record.owner.same_security_owner(expected_owner) {
+        bail!("{OWNERSHIP_OWNER_MISMATCH}: ownership fence owner mismatch");
+    }
+    if record.fence != expected_fence {
+        bail!("{OWNERSHIP_STALE_FENCE}: ownership fence token mismatch");
+    }
+    Ok(CoreMutationPrecondition::CoreMetaRow {
+        cf: CF_LEASES_FENCES.to_string(),
+        table_id: TABLE_OWNERSHIP_FENCE_ROW,
+        tuple_key: ownership_fence_row_key(tenant_id, resource)?,
+        expected_payload_hash: Some(core_meta_payload_digest(
+            TABLE_OWNERSHIP_FENCE_ROW,
+            &payload,
+        )),
+        require_absent: false,
+        require_present: true,
+    })
 }
 
 pub async fn force_expire_partition_owner_for_node(

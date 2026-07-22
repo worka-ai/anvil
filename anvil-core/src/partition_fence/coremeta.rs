@@ -6,10 +6,11 @@ use super::{
 use crate::{
     core_store::{
         CF_LEASES_FENCES, CoreMetaRecord, CoreMetaStore, CoreMetaTuplePart, CoreMutationBatch,
-        CoreMutationOperation, CoreMutationPrecondition, CoreStore, TABLE_OWNERSHIP_FENCE_ROW,
-        TABLE_PARTITION_OWNER_ROW, core_meta_payload_digest, core_meta_record_tuple_key,
-        core_meta_tuple_key, is_retryable_mutation_conflict,
+        CoreMutationOperation, CoreMutationPrecondition, CoreMutationRootPublication, CoreStore,
+        TABLE_OWNERSHIP_FENCE_ROW, TABLE_PARTITION_OWNER_ROW, core_meta_payload_digest,
+        core_meta_record_tuple_key, core_meta_tuple_key, is_retryable_mutation_conflict,
     },
+    formats::writer::WriterFamily,
     storage::Storage,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -67,8 +68,9 @@ pub async fn list_partition_owners_page(
     limit: usize,
     signing_key: &[u8],
 ) -> Result<PartitionOwnerPage> {
+    let store = CoreStore::new(storage.clone()).await?;
     partition_owner_page(
-        storage,
+        &store,
         partition_owner_row_prefix()?,
         cursor,
         limit,
@@ -86,8 +88,9 @@ pub async fn list_partition_owners_for_node_page(
     signing_key: &[u8],
 ) -> Result<PartitionOwnerPage> {
     require_nonempty(owner_node_id, "owner node id")?;
+    let store = CoreStore::new(storage.clone()).await?;
     partition_owner_page(
-        storage,
+        &store,
         partition_owner_by_node_prefix(owner_node_id)?,
         cursor,
         limit,
@@ -103,8 +106,9 @@ pub async fn list_ownership_fences_page(
     limit: usize,
     signing_key: &[u8],
 ) -> Result<OwnershipFencePage> {
+    let store = CoreStore::new(storage.clone()).await?;
     ownership_fence_page(
-        storage,
+        &store,
         ownership_fence_row_prefix()?,
         cursor,
         limit,
@@ -127,8 +131,9 @@ pub async fn list_active_ownership_fences_for_node_page(
     if now_nanos < 0 {
         return Err(anyhow!("ownership fence timestamp must be nonnegative"));
     }
+    let store = CoreStore::new(storage.clone()).await?;
     ownership_fence_page(
-        storage,
+        &store,
         ownership_fence_by_node_prefix(owner_node_id)?,
         cursor,
         limit,
@@ -145,9 +150,16 @@ pub(super) async fn read_ownership_fence_state(
     signing_key: &[u8],
 ) -> Result<Option<(Vec<u8>, OwnershipFenceRecord)>> {
     let row_key = ownership_fence_row_key(tenant_id, resource)?;
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
+    let store = CoreStore::new(storage.clone()).await?;
     record_point_read();
-    let Some(bytes) = meta.get(CF_LEASES_FENCES, TABLE_OWNERSHIP_FENCE_ROW, &row_key)? else {
+    let Some(bytes) = read_committed_fence_row(
+        storage,
+        &store,
+        TABLE_OWNERSHIP_FENCE_ROW,
+        &row_key,
+        "ownership fence",
+    )?
+    else {
         return Ok(None);
     };
     let record = decode_ownership_fence_record(&bytes)?;
@@ -164,17 +176,25 @@ pub(super) async fn write_ownership_fence_state(
     expected_ref: Option<&Vec<u8>>,
 ) -> Result<()> {
     let row_key = ownership_fence_row_key(record.owner.tenant_id, &record.resource)?;
+    let transaction_id = ownership_fence_transaction_id(record)?;
     let payload = encode_ownership_fence_record(record)?;
-    let old_projection_key = expected_ref
+    let previous = expected_ref
         .map(|payload| decode_ownership_fence_record(payload))
-        .transpose()?
+        .transpose()?;
+    let old_projection_key = previous
+        .as_ref()
         .filter(|record| record.owner.principal_kind == "node")
-        .map(|record| ownership_fence_by_node_key(&record))
+        .map(ownership_fence_by_node_key)
         .transpose()?;
     let new_projection_key = (record.owner.principal_kind == "node")
         .then(|| ownership_fence_by_node_key(record))
         .transpose()?;
     let scope_partition = ownership_resource_hash(record.owner.tenant_id, &record.resource)?;
+    let new_root_anchor_key = ownership_fence_root_anchor_key(record)?;
+    let old_root_anchor_key = previous
+        .as_ref()
+        .map(ownership_fence_root_anchor_key)
+        .transpose()?;
     commit_projected_point_put(
         storage,
         TABLE_OWNERSHIP_FENCE_ROW,
@@ -184,7 +204,9 @@ pub(super) async fn write_ownership_fence_state(
         old_projection_key,
         new_projection_key,
         scope_partition,
-        "ownership-fence-cas",
+        new_root_anchor_key,
+        old_root_anchor_key,
+        transaction_id,
     )
     .await
 }
@@ -196,9 +218,16 @@ pub(super) async fn read_partition_owner_state(
     signing_key: &[u8],
 ) -> Result<Option<(Vec<u8>, PartitionOwnerState)>> {
     let row_key = partition_owner_row_key(partition_family, partition_id)?;
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
+    let store = CoreStore::new(storage.clone()).await?;
     record_point_read();
-    let Some(bytes) = meta.get(CF_LEASES_FENCES, TABLE_PARTITION_OWNER_ROW, &row_key)? else {
+    let Some(bytes) = read_committed_fence_row(
+        storage,
+        &store,
+        TABLE_PARTITION_OWNER_ROW,
+        &row_key,
+        "partition owner",
+    )?
+    else {
         return Ok(None);
     };
     let owner = decode_partition_owner_record(&bytes)?;
@@ -215,12 +244,17 @@ pub(super) async fn write_partition_owner_state(
     expected_ref: Option<&Vec<u8>>,
 ) -> Result<()> {
     let row_key = partition_owner_row_key(&owner.partition_family, &owner.partition_id)?;
+    let transaction_id = partition_owner_transaction_id(owner);
     let payload = encode_partition_owner_record(owner)?;
-    let old_projection_key = expected_ref
+    let previous = expected_ref
         .map(|payload| decode_partition_owner_record(payload))
-        .transpose()?
-        .map(|owner| partition_owner_by_node_key(&owner))
         .transpose()?;
+    let old_projection_key = previous
+        .as_ref()
+        .map(partition_owner_by_node_key)
+        .transpose()?;
+    let new_root_anchor_key = partition_owner_root_anchor_key(owner);
+    let old_root_anchor_key = previous.as_ref().map(partition_owner_root_anchor_key);
     commit_projected_point_put(
         storage,
         TABLE_PARTITION_OWNER_ROW,
@@ -230,13 +264,34 @@ pub(super) async fn write_partition_owner_state(
         old_projection_key,
         Some(partition_owner_by_node_key(owner)?),
         owner.partition_id.clone(),
-        "partition-owner-cas",
+        new_root_anchor_key,
+        old_root_anchor_key,
+        transaction_id,
     )
     .await
 }
 
 pub(super) fn is_partition_fence_cas_conflict(error: &anyhow::Error) -> bool {
     is_retryable_mutation_conflict(error)
+}
+
+fn read_committed_fence_row(
+    storage: &Storage,
+    store: &CoreStore,
+    table_id: u16,
+    row_key: &[u8],
+    label: &str,
+) -> Result<Option<Vec<u8>>> {
+    if let Some(payload) = store.read_coremeta_row(CF_LEASES_FENCES, table_id, row_key)? {
+        return Ok(Some(payload));
+    }
+    if CoreMetaStore::open(storage.core_store_meta_path())?
+        .get(CF_LEASES_FENCES, table_id, row_key)?
+        .is_some()
+    {
+        bail!("{label} row exists but is not committed-visible");
+    }
+    Ok(None)
 }
 
 pub(super) fn ownership_fence_row_key(
@@ -287,7 +342,9 @@ async fn commit_projected_point_put(
     old_projection_key: Option<Vec<u8>>,
     new_projection_key: Option<Vec<u8>>,
     scope_partition: String,
-    transaction_prefix: &str,
+    new_root_anchor_key: String,
+    old_root_anchor_key: Option<String>,
+    transaction_id: String,
 ) -> Result<()> {
     let store = CoreStore::new(storage.clone()).await?;
     wait_at_point_cas_barrier().await;
@@ -301,6 +358,7 @@ async fn commit_projected_point_put(
         require_absent: expected_payload.is_none(),
         require_present: expected_payload.is_some(),
     }];
+    let include_old_root = projection_changed && old_projection_key.is_some();
     if projection_changed {
         if let Some(old_key) = old_projection_key.as_ref() {
             preconditions.push(CoreMutationPrecondition::CoreMetaRow {
@@ -349,29 +407,153 @@ async fn commit_projected_point_put(
             payload,
         });
     }
-    store
+    let mut root_anchor_keys = vec![new_root_anchor_key];
+    if include_old_root && let Some(old_root_anchor_key) = old_root_anchor_key {
+        root_anchor_keys.push(old_root_anchor_key);
+    }
+    let receipt = store
         .commit_mutation_batch(CoreMutationBatch {
-            transaction_id: format!("{transaction_prefix}:{}", uuid::Uuid::new_v4()),
+            transaction_id,
             scope_partition: scope_partition.clone(),
             committed_by_principal: "partition-fence".to_string(),
+            root_publications: control_root_publications(&scope_partition, root_anchor_keys),
             preconditions,
             operations,
         })
         .await?;
+    if receipt.state != crate::core_store::CoreTransactionState::Committed {
+        bail!(
+            "partition fence CoreStore mutation failed: {}",
+            receipt
+                .finalisation_error
+                .as_deref()
+                .unwrap_or("unknown finalisation failure")
+        );
+    }
     Ok(())
 }
 
+pub(super) fn partition_owner_transaction_id(owner: &PartitionOwnerState) -> String {
+    let identity = format!(
+        "{}\0{}\0{}\0{}\0{}",
+        owner.partition_family,
+        owner.partition_id,
+        owner.owner_node_id,
+        owner.fence_token,
+        owner.generation
+    );
+    format!(
+        "partition-owner-cas:{}",
+        hex::encode(crate::formats::hash32(identity.as_bytes()))
+    )
+}
+
+pub(super) fn ownership_fence_transaction_id(record: &OwnershipFenceRecord) -> Result<String> {
+    let mut identity = vec![
+        record.format_version.to_string(),
+        record.owner.tenant_id.to_string(),
+        record.resource.resource_kind.as_str().to_string(),
+        ownership_resource_hash(record.owner.tenant_id, &record.resource)?,
+        record.owner.principal_kind.clone(),
+        record.owner.principal_id.clone(),
+        record.owner.actor_instance_id.clone(),
+        record.owner.display_name.clone(),
+        record.owner.region.clone(),
+        record.owner.cell.clone(),
+        record.fence.to_string(),
+        record.state.as_str().to_string(),
+        record.lease_expires_at_nanos.to_string(),
+        record.last_heartbeat_at_nanos.to_string(),
+        record.generation.to_string(),
+        record.last_operation.clone().unwrap_or_default(),
+        record.last_idempotency_key.clone().unwrap_or_default(),
+    ];
+    if let Some(actor) = &record.last_actor {
+        identity.extend([
+            actor.tenant_id.to_string(),
+            actor.principal_kind.clone(),
+            actor.principal_id.clone(),
+            actor.actor_instance_id.clone(),
+            actor.display_name.clone(),
+            actor.region.clone(),
+            actor.cell.clone(),
+        ]);
+    }
+    Ok(format!(
+        "ownership-fence-cas:{}",
+        hex::encode(crate::formats::hash32(identity.join("\0").as_bytes()))
+    ))
+}
+
+fn control_root_publications(
+    coordinator_root: &str,
+    mut data_roots: Vec<String>,
+) -> Vec<CoreMutationRootPublication> {
+    let coordinator_is_data_root = data_roots
+        .iter()
+        .any(|root| root.as_str() == coordinator_root);
+    data_roots.push(coordinator_root.to_string());
+    data_roots.sort();
+    data_roots.dedup();
+    data_roots
+        .into_iter()
+        .map(|root| {
+            let is_coordinator = root.as_str() == coordinator_root;
+            if is_coordinator {
+                if coordinator_is_data_root {
+                    CoreMutationRootPublication {
+                        root_anchor_key: root,
+                        writer_families: vec![
+                            WriterFamily::CoreControl.as_str().to_string(),
+                            WriterFamily::MeshControl.as_str().to_string(),
+                        ],
+                        transaction_coordinator: true,
+                    }
+                } else {
+                    CoreMutationRootPublication::new(root, WriterFamily::CoreControl.as_str())
+                        .coordinator()
+                }
+            } else {
+                CoreMutationRootPublication::new(root, WriterFamily::MeshControl.as_str())
+            }
+        })
+        .collect()
+}
+
+fn partition_owner_root_anchor_key(owner: &PartitionOwnerState) -> String {
+    format!(
+        "partition-owner/{}/{}",
+        owner.partition_family, owner.partition_id
+    )
+}
+
+fn ownership_fence_root_anchor_key(record: &OwnershipFenceRecord) -> Result<String> {
+    match record.format_version {
+        1 => Ok(format!(
+            "ownership-fence/{}/{}",
+            record.resource.resource_kind.as_str(),
+            record.resource.resource_id
+        )),
+        2 => Ok(format!(
+            "ownership-fence/v2/tenant:{}/{}/{}",
+            record.owner.tenant_id,
+            record.resource.resource_kind.as_str(),
+            ownership_resource_hash(record.owner.tenant_id, &record.resource)?
+        )),
+        _ => Err(anyhow!("unsupported ownership fence version")),
+    }
+}
+
 fn partition_owner_page(
-    storage: &Storage,
+    store: &CoreStore,
     prefix: Vec<u8>,
     cursor: Option<&PartitionOwnerPageCursor>,
     limit: usize,
     signing_key: &[u8],
     expected_key: impl Fn(&PartitionOwnerState) -> Result<Vec<u8>>,
 ) -> Result<PartitionOwnerPage> {
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
     let (rows, has_more) = scan_page(
-        &meta,
+        store,
         TABLE_PARTITION_OWNER_ROW,
         &prefix,
         cursor.map(PartitionOwnerPageCursor::as_str),
@@ -400,7 +582,7 @@ fn partition_owner_page(
 }
 
 fn ownership_fence_page(
-    storage: &Storage,
+    store: &CoreStore,
     prefix: Vec<u8>,
     cursor: Option<&OwnershipFencePageCursor>,
     limit: usize,
@@ -408,9 +590,8 @@ fn ownership_fence_page(
     expected_key: impl Fn(&OwnershipFenceRecord) -> Result<Vec<u8>>,
     include: impl Fn(&OwnershipFenceRecord) -> bool,
 ) -> Result<OwnershipFencePage> {
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
     let (rows, has_more) = scan_page(
-        &meta,
+        store,
         TABLE_OWNERSHIP_FENCE_ROW,
         &prefix,
         cursor.map(OwnershipFencePageCursor::as_str),
@@ -441,7 +622,7 @@ fn ownership_fence_page(
 }
 
 fn scan_page(
-    meta: &CoreMetaStore,
+    store: &CoreStore,
     table_id: u16,
     prefix: &[u8],
     cursor: Option<&str>,
@@ -451,7 +632,7 @@ fn scan_page(
     let after = cursor
         .map(|cursor| decode_cursor(cursor, prefix))
         .transpose()?;
-    let mut rows = meta.scan_prefix_page(
+    let mut rows = store.scan_coremeta_prefix_page(
         CF_LEASES_FENCES,
         table_id,
         prefix,
