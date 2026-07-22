@@ -1,11 +1,13 @@
 use super::*;
 use crate::{
     core_store::{
-        CF_LEASES_FENCES, CoreMetaStore, TABLE_TASK_CURRENT_ROW, core_meta_record_tuple_key,
+        CF_LEASES_FENCES, CoreMetaStore, CoreMutationBatchReceipt, CoreStore, CoreTransactionState,
+        TABLE_TASK_CURRENT_ROW, core_meta_record_tuple_key,
     },
     partition_fence::partition_write_precondition,
     persistence::TaskRecord,
     storage::Storage,
+    task_lease::STALE_FENCE,
     tasks::{TaskStatus, TaskType},
 };
 use chrono::Utc;
@@ -63,6 +65,43 @@ async fn task_pages_are_bounded_and_continue_by_physical_key() {
     assert_eq!(ids, vec![1, 2, 3, 4, 5]);
     assert!(list_tasks_page(&storage, None, 0).await.is_err());
     assert!(list_tasks_page(&storage, None, 1_001).await.is_err());
+}
+
+#[test]
+fn failed_task_mutation_receipt_is_not_acknowledged() {
+    let mut receipt = CoreMutationBatchReceipt {
+        transaction_id: "task-receipt-failure".to_string(),
+        scope_partition: "task_queue/global".to_string(),
+        state: CoreTransactionState::FinalisationFailed,
+        visible_updates: Vec::new(),
+        finalisation_error: Some("CoreMetaPublicationTerminal: stale fence".to_string()),
+    };
+    let error = super::store::require_committed_task_mutation(&receipt).unwrap_err();
+    assert!(format!("{error:#}").contains("CoreMetaPublicationTerminal: stale fence"));
+
+    receipt.state = CoreTransactionState::Committed;
+    receipt.finalisation_error = None;
+    super::store::require_committed_task_mutation(&receipt).unwrap();
+}
+
+#[test]
+fn failed_task_row_payload_cas_is_retryable() {
+    let receipt = CoreMutationBatchReceipt {
+        transaction_id: "task-receipt-conflict".to_string(),
+        scope_partition: "task_queue/global".to_string(),
+        state: CoreTransactionState::FinalisationFailed,
+        visible_updates: Vec::new(),
+        finalisation_error: Some(format!(
+            "CoreMeta row {CF_LEASES_FENCES}/{TABLE_TASK_CURRENT_ROW:#06x}/01 precondition failed: payload hash mismatch: expected blake3:old, got blake3:new"
+        )),
+    };
+    let error = super::store::require_committed_task_mutation(&receipt).unwrap_err();
+    assert!(super::store::is_queue_cas_conflict(&error));
+
+    let unrelated = anyhow::anyhow!(
+        "CoreMeta row {CF_LEASES_FENCES}/0x0001/01 precondition failed: payload hash mismatch"
+    );
+    assert!(!super::store::is_queue_cas_conflict(&unrelated));
 }
 
 const KEY: &[u8] = b"task queue partition owner key";
@@ -150,7 +189,7 @@ async fn each_task_transition_uses_one_post_generation_for_its_root_rows() {
         &storage,
         &model::pending_key(&model::TaskOrder::from_task(&enqueued.task).unwrap()).unwrap(),
     );
-    assert_eq!(pending.generation, enqueued_generation);
+    assert_eq!(pending.publication_generation, enqueued_generation);
     assert_eq!(
         task_journal_generations(&storage, 1),
         vec![enqueued_generation]
@@ -160,7 +199,10 @@ async fn each_task_transition_uses_one_post_generation_for_its_root_rows() {
     let (running, running_generation) = task_entry_and_generation(&storage, 1);
     assert_eq!(running_generation, enqueued_generation + 1);
     let running_projection = queue_row(&storage, &model::running_key(&running).unwrap());
-    assert_eq!(running_projection.generation, running_generation);
+    assert_eq!(
+        running_projection.publication_generation,
+        running_generation
+    );
     assert_eq!(
         task_journal_generations(&storage, 1),
         vec![enqueued_generation, running_generation]
@@ -306,6 +348,15 @@ async fn grouped_tasks_supersede_pending_work_and_serialize_followups() {
     update_task_status_with_permit(&storage, running[0].id, TaskStatus::Completed, &permit, KEY)
         .await
         .unwrap();
+    let (parked, parked_generation) = task_entry_and_generation(&storage, 3);
+    let parked_projection = queue_row(
+        &storage,
+        &model::pending_key(&model::TaskOrder::from_task(&parked.task).unwrap()).unwrap(),
+    );
+    assert_ne!(
+        parked_generation, parked_projection.publication_generation,
+        "a grouped task's domain state may span independently published CoreMeta rows"
+    );
     let followup = claim_pending_tasks_with_permit(&storage, 10, &permit, KEY)
         .await
         .unwrap();
@@ -451,9 +502,10 @@ async fn next_due_seek_is_constant_with_retained_tasks_and_pending_priorities() 
     .unwrap();
 
     reset_task_row_visits_for_test();
+    let core_store = CoreStore::new(storage.clone()).await.unwrap();
     let due = store::QueueStore::open(&storage)
         .unwrap()
-        .first_due_task(Utc::now())
+        .first_due_task(&core_store, Utc::now())
         .unwrap()
         .unwrap();
     assert_eq!(due.task.id, next_task_id);
@@ -613,6 +665,74 @@ async fn stale_partition_precondition_cannot_commit_task_transition() {
     );
 }
 
+#[tokio::test]
+async fn stale_execution_attempt_cannot_fail_a_newly_claimed_retry() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let owner = ready_owner(&storage, "node-a").await;
+    let permit = owner.write_permit().unwrap();
+    enqueue_task_with_permit(
+        &storage,
+        TaskType::DeleteBucket,
+        json!({"bucket_id": 7}),
+        100,
+        &permit,
+        KEY,
+    )
+    .await
+    .unwrap();
+    let first = claim_pending_tasks_with_permit(&storage, 1, &permit, KEY)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(first.attempts, 0);
+
+    let first_guard = partition_write_precondition(&storage, &permit, KEY)
+        .await
+        .unwrap();
+    fail_task_with_execution_guard(
+        &storage,
+        first.id,
+        first.attempts,
+        "first attempt expired",
+        &permit,
+        KEY,
+        first_guard,
+    )
+    .await
+    .unwrap();
+    force_task_schedule_for_test(&storage, first.id, Utc::now())
+        .await
+        .unwrap();
+    let retry = claim_pending_tasks_with_permit(&storage, 1, &permit, KEY)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(retry.attempts, 1);
+
+    let stale_guard = partition_write_precondition(&storage, &permit, KEY)
+        .await
+        .unwrap();
+    let error = fail_task_with_execution_guard(
+        &storage,
+        first.id,
+        first.attempts,
+        "late first-attempt recovery",
+        &permit,
+        KEY,
+        stale_guard,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains(STALE_FENCE));
+
+    let current = list_tasks(&storage).await.unwrap().pop().unwrap();
+    assert_eq!(current.status, TaskStatus::Running);
+    assert_eq!(current.attempts, retry.attempts);
+}
+
 fn queue_row(storage: &Storage, key: &[u8]) -> model::DecodedTaskQueueRow {
     let meta = CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
     let payload = meta
@@ -627,7 +747,7 @@ fn task_entry_and_generation(storage: &Storage, task_id: i64) -> (model::TaskEnt
     let model::TaskQueueRow::Task(entry) = decoded.row else {
         panic!("task current key must contain a task row");
     };
-    (entry, decoded.generation)
+    (entry, decoded.publication_generation)
 }
 
 fn task_journal_generations(storage: &Storage, task_id: i64) -> Vec<u64> {
@@ -659,7 +779,7 @@ fn task_journal_generations(storage: &Storage, task_id: i64) -> Vec<u64> {
                 model::journal_key(entry.task_id, &entry.mutation_id, entry.ordinal).unwrap()
             );
             if entry.task_id == task_id {
-                generations.push(decoded.generation);
+                generations.push(decoded.publication_generation);
             }
         }
         if rows.len() < 128 {
