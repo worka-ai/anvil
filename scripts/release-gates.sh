@@ -316,14 +316,29 @@ docker_index_gates() {
 docker_mesh_gates() {
   require_image
   reset_shared_docker_cluster
-  local tests=(
-    distributed_tests
-    docker_cluster_test
-    grpc
+  # Each distributed scenario owns an isolated six-node cluster. Keep the
+  # modules in separate test processes so the step timeout applies to useful
+  # units of work rather than the cumulative startup and fault-injection time
+  # of every scenario in the binary.
+  local distributed_modules=(
+    faults
+    metadata
+    objects
+    publication_recovery
   )
-  for test_name in "${tests[@]}"; do
-    run_docker_cargo_test "Docker mesh integration ${test_name}" -p anvil-server --test "${test_name}"
+  local module
+  for module in "${distributed_modules[@]}"; do
+    run_docker_cargo_test "Docker mesh integration distributed_tests ${module}" \
+      -p anvil-server --test distributed_tests "${module}::"
   done
+  # The remaining binaries share the named Docker cluster. Recreate it between
+  # binaries so fault/restart state from one contract cannot leak into another.
+  reset_shared_docker_cluster
+  run_docker_cargo_test "Docker mesh integration docker_cluster_test" \
+    -p anvil-server --test docker_cluster_test
+  reset_shared_docker_cluster
+  run_docker_cargo_test "Docker mesh integration grpc" \
+    -p anvil-server --test grpc
 }
 
 performance_quick_gates() {

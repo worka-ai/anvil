@@ -117,9 +117,24 @@ stage_dir="tmp/docker-bin"
 
 rm -rf "${stage_dir}"
 mkdir -p "${stage_dir}"
-cp "${bin_dir}/anvil-server" "${stage_dir}/anvil-server"
-cp "${bin_dir}/anvil" "${stage_dir}/anvil"
-cp "${bin_dir}/anvil-admin" "${stage_dir}/anvil-admin"
+stage_binary() {
+  local source="$1"
+  local destination="$2"
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    cp -c "${source}" "${destination}"
+  elif cp --help 2>&1 | grep -q -- '--reflink'; then
+    cp --reflink=auto "${source}" "${destination}"
+  else
+    cp "${source}" "${destination}"
+  fi
+  if [[ "${build_profile}" == "dev" ]] && command -v zig >/dev/null 2>&1; then
+    zig objcopy --strip-debug "${destination}" "${destination}.stripped"
+    mv "${destination}.stripped" "${destination}"
+  fi
+}
+stage_binary "${bin_dir}/anvil-server" "${stage_dir}/anvil-server"
+stage_binary "${bin_dir}/anvil" "${stage_dir}/anvil"
+stage_binary "${bin_dir}/anvil-admin" "${stage_dir}/anvil-admin"
 
 echo "[anvil] packaging runtime image ${image} platform=${platform}"
 iid_file="$(mktemp -t anvil-image.XXXXXX)"
