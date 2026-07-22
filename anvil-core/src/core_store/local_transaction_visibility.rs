@@ -1,3 +1,4 @@
+use super::local_stream_control::control_record_proto::decode_stream_record_index_row;
 use super::local_transactions::{
     transaction_lists_stream_record, transaction_lists_stream_record_identity,
     validate_core_meta_row_precondition,
