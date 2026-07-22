@@ -860,7 +860,7 @@ fn rfc_0007_index_segments_publish_coremeta_rows() {
         &[
             "write_index_segment_coremeta_record",
             "IndexSegmentCoreMetaRecord",
-            "list_index_segment_coremeta_records",
+            "index_segment_coremeta_record_for_family_generation",
             "latest_index_segment_coremeta_record",
         ],
     );
@@ -870,7 +870,7 @@ fn rfc_0007_index_segments_publish_coremeta_rows() {
         &[
             "write_index_segment_coremeta_record",
             "IndexSegmentCoreMetaRecord",
-            "list_index_segment_coremeta_records",
+            "index_segment_coremeta_record_for_family_generation",
             "latest_index_segment_coremeta_record",
         ],
     );

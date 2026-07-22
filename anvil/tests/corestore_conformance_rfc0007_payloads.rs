@@ -1216,19 +1216,25 @@ fn gateway_metadata_uses_coremeta_rows_not_legacy_refs() {
 
 #[test]
 fn task_current_state_uses_coremeta_rows_not_legacy_refs() {
-    let task = workspace_file("anvil-core/src/task_journal.rs");
+    let task = format!(
+        "{}\n{}\n{}\n{}",
+        workspace_file("anvil-core/src/task_journal.rs"),
+        workspace_file("anvil-core/src/task_journal/model.rs"),
+        workspace_file("anvil-core/src/task_journal/queue.rs"),
+        workspace_file("anvil-core/src/task_journal/store.rs"),
+    );
 
     assert_contains_all(
         "task current CoreMeta row path",
         &task,
         &[
-            "TaskCurrentRowProto",
-            "TaskCurrentCoreMetaRow",
+            "TaskQueueRowProto",
+            "TaskQueueRow",
             "TABLE_TASK_CURRENT_ROW",
             "CoreMutationPrecondition::CoreMetaRow",
-            "meta.scan_prefix(",
-            "commit_coremeta_batch_for_storage(",
-            "CoreMetaBatchOpKind::Put(&payload)",
+            "scan_prefix_page(",
+            "CoreMutationBatch",
+            "CoreMutationOperation::CoreMetaPut",
             "core_meta_payload_digest(TABLE_TASK_CURRENT_ROW, payload)",
         ],
     );
@@ -1310,9 +1316,10 @@ fn boundary_schemas_are_public_api_and_coremeta_rows_not_refs() {
         &[
             "CF_BOUNDARY",
             "TABLE_BOUNDARY_SCHEMA_ROW",
+            "TABLE_BOUNDARY_SCHEMA_CURRENT_ROW",
             "boundary_schema_coremeta_key",
-            "boundary_schema_coremeta_prefix",
-            "scan_prefix(CF_BOUNDARY, TABLE_BOUNDARY_SCHEMA_ROW",
+            "boundary_schema_current_coremeta_key",
+            ".get(\n            CF_BOUNDARY,\n            TABLE_BOUNDARY_SCHEMA_CURRENT_ROW",
             "validate_boundary_schema(&schema, current_schema.as_ref(), input.expected_generation)",
         ],
     );
