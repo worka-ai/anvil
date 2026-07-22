@@ -7,9 +7,7 @@ use crate::writer_segment_catalog::{
     latest_writer_segment_catalog_record, read_writer_segment_catalog_record,
 };
 use chrono::Utc;
-use std::time::Duration;
 use tempfile::{TempDir, tempdir};
-use tokio::time::sleep;
 
 const PARTITION_OWNER_KEY: &[u8] = b"task compaction partition owner key";
 const TASK_LEASE_KEY: &[u8] = b"task compaction lease signing key";
@@ -97,14 +95,21 @@ async fn stale_task_precondition_publishes_no_segment_catalog_or_head() {
 #[tokio::test]
 async fn expired_task_precondition_publishes_no_partition_manifest_pointer() {
     let (_temp, storage, bucket, partition_precondition, staged) = staged_compaction().await;
-    let (guard, _) = task_guard(&storage, &bucket, 500_000_000).await;
+    let (guard, _) = task_guard(&storage, &bucket, TASK_LEASE_TTL_NANOS).await;
     let publication_permit = guard.publication_permit().await.unwrap();
     let publication_storage = &storage;
     let publication_bucket = &bucket;
     let partition_manifest = &staged.partition_manifest;
     publication_permit
-        .publish_with(|task_precondition| async move {
-            sleep(Duration::from_millis(550)).await;
+        .publish_with(|mut task_precondition| async move {
+            let CoreMutationPrecondition::CoreMetaLease {
+                expires_at_unix_nanos,
+                ..
+            } = &mut task_precondition
+            else {
+                panic!("task guard must produce a temporal CoreMeta lease precondition");
+            };
+            *expires_at_unix_nanos = 1;
             let preconditions = [partition_precondition, task_precondition];
             publish_partition_manifest(
                 publication_storage,
