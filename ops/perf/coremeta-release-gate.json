@@ -15,6 +15,15 @@
       "point_samples": 1000,
       "page_samples": 250,
       "mutation_samples": 24,
+      "root_publication_warmup_operations": 2,
+      "root_publication_samples": 20,
+      "history_probe_warmup_operations": 4,
+      "history_probe_samples": 20,
+      "history_page_size": 4,
+      "history_max_page_bytes": 16777216,
+      "multi_page_generation_warmup_operations": 1,
+      "multi_page_generation_samples": 3,
+      "multi_page_generation_rows": 256,
       "thresholds": {
         "point_get_p95_ms": 10.0,
         "page_p95_floor_ms": 25.0,
@@ -27,7 +36,15 @@
         "deep_to_early_work_ratio": 3.0,
         "page_size_work_ratio_multiplier": 2.0,
         "page_work_per_item": 16.0,
-        "page_fixed_work": 512.0
+        "page_fixed_work": 512.0,
+        "root_publication_work_growth_ratio": 4.0,
+        "root_publication_row_work_ratio_multiplier": 2.0,
+        "root_publication_work_per_mutation": 256.0,
+        "root_publication_fixed_work": 32768.0,
+        "history_work_growth_ratio": 4.0,
+        "history_page_work_ratio_multiplier": 2.0,
+        "history_work_per_item": 512.0,
+        "history_fixed_work": 65536.0
       }
     },
     "release": {
@@ -42,6 +59,15 @@
       "point_samples": 10000,
       "page_samples": 2000,
       "mutation_samples": 100,
+      "root_publication_warmup_operations": 8,
+      "root_publication_samples": 50,
+      "history_probe_warmup_operations": 16,
+      "history_probe_samples": 100,
+      "history_page_size": 8,
+      "history_max_page_bytes": 16777216,
+      "multi_page_generation_warmup_operations": 1,
+      "multi_page_generation_samples": 5,
+      "multi_page_generation_rows": 1024,
       "thresholds": {
         "point_get_p95_ms": 10.0,
         "page_p95_floor_ms": 25.0,
@@ -54,7 +80,15 @@
         "deep_to_early_work_ratio": 3.0,
         "page_size_work_ratio_multiplier": 2.0,
         "page_work_per_item": 16.0,
-        "page_fixed_work": 512.0
+        "page_fixed_work": 512.0,
+        "root_publication_work_growth_ratio": 4.0,
+        "root_publication_row_work_ratio_multiplier": 2.0,
+        "root_publication_work_per_mutation": 256.0,
+        "root_publication_fixed_work": 32768.0,
+        "history_work_growth_ratio": 4.0,
+        "history_page_work_ratio_multiplier": 2.0,
+        "history_work_per_item": 512.0,
+        "history_fixed_work": 65536.0
       }
     }
   }

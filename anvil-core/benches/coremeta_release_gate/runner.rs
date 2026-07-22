@@ -1,16 +1,22 @@
 use std::hint::black_box;
 use std::time::Instant;
 
+use anvil_core::anvil_api::{CoreMetaHistoryCursor, CoreMetaInventoryCursor};
 use anvil_core::core_store::{
-    CF_INLINE_PAYLOADS, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaStore,
-    TABLE_INLINE_PAYLOAD_ROW,
+    CF_INLINE_PAYLOADS, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaCatchUpProbe,
+    CoreMetaInventoryProbe, CoreMetaStore, CoreMutationBatch, CoreMutationOperation,
+    CoreMutationRootPublication, CoreStore, CoreTransactionState, TABLE_INLINE_PAYLOAD_ROW,
+    core_meta_root_key_hash, reset_coremeta_get_probe, take_coremeta_get_probe,
 };
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use rocksdb::perf::{PerfContext, PerfStatsLevel, set_perf_stats};
+use tokio::runtime::{Builder, Runtime};
 
 use crate::config::{GateManifest, ProfileSpec};
 use crate::dataset::{
-    Dataset, LARGE_PREFIX, MUTATION_PREFIX, SMALL_PREFIX, encoded_payload, prefix_key, row_key,
+    Dataset, LARGE_PREFIX, MULTI_PAGE_GENERATION_PREFIX, MUTATION_PREFIX, PUBLICATION_LARGE_PREFIX,
+    PUBLICATION_SMALL_PREFIX, PublicationDataset, SMALL_PREFIX, encoded_payload, prefix_key,
+    publication_payload, row_key,
 };
 use crate::report::{GateEvidence, ScenarioEvidence, WorkCounters};
 
@@ -19,8 +25,36 @@ pub struct RunResult {
     pub gates: Vec<GateEvidence>,
 }
 
+#[derive(Default)]
+struct HistoryGateAssertions {
+    inventory_snapshot_mismatches: u64,
+    catch_up_cursor_mismatches: u64,
+    traversal_cursor_mismatches: u64,
+    traversal_pages: usize,
+    expected_traversal_pages: usize,
+    publication_small_mutations: usize,
+    publication_large_mutations: usize,
+    multi_page_publication_mutations: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TraversalObservation {
+    delivered_rows: usize,
+    page_hashes: Vec<String>,
+    cursor_mismatches: u64,
+}
+
+struct HistoryPageExpectation {
+    first: CoreMetaHistoryCursor,
+    next: CoreMetaHistoryCursor,
+    complete: bool,
+}
+
 pub fn run(manifest: &GateManifest, profile: &ProfileSpec) -> Result<RunResult> {
-    let dataset = Dataset::create(manifest, profile)?;
+    // RocksDB PerfContext is thread-local, so keep spawned publication work on this thread.
+    let runtime = Builder::new_current_thread().enable_all().build()?;
+    let dataset = Dataset::create(manifest, profile, &runtime)?;
+    let publication_small_dataset = PublicationDataset::create(manifest, profile, &runtime)?;
     set_perf_stats(PerfStatsLevel::EnableCount);
 
     let point_small = measure_point_get(
@@ -85,6 +119,298 @@ pub fn run(manifest: &GateManifest, profile: &ProfileSpec) -> Result<RunResult> 
         profile,
         "transactional_head_read_and_batch",
     )?;
+    let publication_small = measure_atomic_root_publication(
+        &runtime,
+        &publication_small_dataset.core_store,
+        &publication_small_dataset.store,
+        &manifest.seed,
+        profile.small_rows,
+        PUBLICATION_SMALL_PREFIX,
+        "single-small",
+        1,
+        profile.payload_bytes,
+        profile.root_publication_warmup_operations,
+        profile.root_publication_samples,
+        "atomic_root_publication_small_table",
+    )?;
+    let publication_large = measure_atomic_root_publication(
+        &runtime,
+        &dataset.core_store,
+        &dataset.store,
+        &manifest.seed,
+        profile.large_rows,
+        PUBLICATION_LARGE_PREFIX,
+        "single-large",
+        1,
+        profile.payload_bytes,
+        profile.root_publication_warmup_operations,
+        profile.root_publication_samples,
+        "atomic_root_publication_large_table",
+    )?;
+    let multi_page_generation = measure_atomic_root_publication(
+        &runtime,
+        &dataset.core_store,
+        &dataset.store,
+        &manifest.seed,
+        profile.large_rows,
+        MULTI_PAGE_GENERATION_PREFIX,
+        "multi-page-generation",
+        profile.multi_page_generation_rows,
+        profile.payload_bytes,
+        profile.multi_page_generation_warmup_operations,
+        profile.multi_page_generation_samples,
+        "atomic_root_publication_multi_page_generation",
+    )?;
+
+    let publication_generations = publication_operation_count(
+        profile.root_publication_warmup_operations,
+        profile.root_publication_samples,
+    )?;
+    let history_page_size_u64 = profile.history_page_size as u64;
+    let inventory_after = CoreMetaInventoryCursor {
+        generation: publication_generations - history_page_size_u64,
+    };
+    let small_root_anchor = publication_root_anchor_key("single-small");
+    let large_root_anchor = publication_root_anchor_key("single-large");
+    let small_root_hash = core_meta_root_key_hash(&small_root_anchor);
+    let large_root_hash = core_meta_root_key_hash(&large_root_anchor);
+    let small_final_mutations = generation_mutation_count(
+        &publication_small_dataset.core_store,
+        &small_root_hash,
+        publication_generations,
+        profile.history_max_page_bytes,
+    )?;
+    let large_final_mutations = generation_mutation_count(
+        &dataset.core_store,
+        &large_root_hash,
+        publication_generations,
+        profile.history_max_page_bytes,
+    )?;
+    let mut history_assertions = HistoryGateAssertions::default();
+    history_assertions.publication_small_mutations = small_final_mutations;
+    history_assertions.publication_large_mutations = large_final_mutations;
+
+    let inventory_small_expected = publication_small_dataset
+        .core_store
+        .probe_coremeta_generation_inventory(
+            &small_root_hash,
+            Some(&inventory_after),
+            publication_generations,
+            profile.history_page_size,
+            profile.history_max_page_bytes,
+        )?;
+    history_assertions.inventory_snapshot_mismatches = history_assertions
+        .inventory_snapshot_mismatches
+        .saturating_add(inventory_probe_mismatches(
+            &inventory_small_expected,
+            &inventory_after,
+            publication_generations,
+            profile.history_page_size,
+        ));
+    let (inventory_small, inventory_small_mismatches) = measure_generation_inventory(
+        &publication_small_dataset.core_store,
+        &small_root_hash,
+        &inventory_after,
+        publication_generations,
+        profile,
+        profile.small_rows,
+        &inventory_small_expected,
+        "generation_inventory_small_table",
+    )?;
+    history_assertions.inventory_snapshot_mismatches = history_assertions
+        .inventory_snapshot_mismatches
+        .saturating_add(inventory_small_mismatches);
+
+    let inventory_large_expected = dataset.core_store.probe_coremeta_generation_inventory(
+        &large_root_hash,
+        Some(&inventory_after),
+        publication_generations,
+        profile.history_page_size,
+        profile.history_max_page_bytes,
+    )?;
+    history_assertions.inventory_snapshot_mismatches = history_assertions
+        .inventory_snapshot_mismatches
+        .saturating_add(inventory_probe_mismatches(
+            &inventory_large_expected,
+            &inventory_after,
+            publication_generations,
+            profile.history_page_size,
+        ));
+    let (inventory_large, inventory_large_mismatches) = measure_generation_inventory(
+        &dataset.core_store,
+        &large_root_hash,
+        &inventory_after,
+        publication_generations,
+        profile,
+        profile.large_rows,
+        &inventory_large_expected,
+        "generation_inventory_large_table",
+    )?;
+    history_assertions.inventory_snapshot_mismatches = history_assertions
+        .inventory_snapshot_mismatches
+        .saturating_add(inventory_large_mismatches);
+
+    let grown_generation = publication_generations
+        .checked_add(1)
+        .context("CoreMeta history growth generation overflow")?;
+    publish_atomic_root_generation(
+        &runtime,
+        &dataset.core_store,
+        &manifest.seed,
+        PUBLICATION_LARGE_PREFIX,
+        "single-large",
+        grown_generation,
+        1,
+        profile.payload_bytes,
+    )?;
+    let latest_inventory_after = CoreMetaInventoryCursor {
+        generation: publication_generations,
+    };
+    let latest_inventory = dataset.core_store.probe_coremeta_generation_inventory(
+        &large_root_hash,
+        Some(&latest_inventory_after),
+        0,
+        1,
+        profile.history_max_page_bytes,
+    )?;
+    history_assertions.inventory_snapshot_mismatches = history_assertions
+        .inventory_snapshot_mismatches
+        .saturating_add(inventory_probe_mismatches(
+            &latest_inventory,
+            &latest_inventory_after,
+            grown_generation,
+            1,
+        ));
+    let (inventory_after_growth, immutable_inventory_mismatches) = measure_generation_inventory(
+        &dataset.core_store,
+        &large_root_hash,
+        &inventory_after,
+        publication_generations,
+        profile,
+        profile.large_rows,
+        &inventory_large_expected,
+        "generation_inventory_captured_after_growth",
+    )?;
+    history_assertions.inventory_snapshot_mismatches = history_assertions
+        .inventory_snapshot_mismatches
+        .saturating_add(immutable_inventory_mismatches);
+
+    let early_large_expectation = history_page_expectation(
+        &dataset.core_store,
+        &large_root_hash,
+        None,
+        publication_generations,
+        profile.history_page_size,
+        profile.history_max_page_bytes,
+    )?;
+    let (catch_up_early_large, early_catch_up_mismatches) = measure_catch_up_page(
+        &dataset.core_store,
+        &large_root_hash,
+        None,
+        publication_generations,
+        early_large_expectation.first,
+        early_large_expectation.next,
+        early_large_expectation.complete,
+        profile,
+        profile.large_rows,
+        "generation_catch_up_early_large",
+    )?;
+    let small_deep_after = history_cursor_before_tail_rows(
+        &publication_small_dataset.core_store,
+        &small_root_hash,
+        publication_generations,
+        profile.history_page_size,
+        profile.history_max_page_bytes,
+    )?;
+    let small_deep_expectation = history_page_expectation(
+        &publication_small_dataset.core_store,
+        &small_root_hash,
+        small_deep_after.as_ref(),
+        publication_generations,
+        profile.history_page_size,
+        profile.history_max_page_bytes,
+    )?;
+    let (catch_up_deep_small, deep_small_mismatches) = measure_catch_up_page(
+        &publication_small_dataset.core_store,
+        &small_root_hash,
+        small_deep_after,
+        publication_generations,
+        small_deep_expectation.first,
+        small_deep_expectation.next,
+        small_deep_expectation.complete,
+        profile,
+        profile.small_rows,
+        "generation_catch_up_deep_small",
+    )?;
+    let large_deep_after = history_cursor_before_tail_rows(
+        &dataset.core_store,
+        &large_root_hash,
+        publication_generations,
+        profile.history_page_size,
+        profile.history_max_page_bytes,
+    )?;
+    let large_deep_expectation = history_page_expectation(
+        &dataset.core_store,
+        &large_root_hash,
+        large_deep_after.as_ref(),
+        publication_generations,
+        profile.history_page_size,
+        profile.history_max_page_bytes,
+    )?;
+    let (catch_up_deep_large, deep_large_mismatches) = measure_catch_up_page(
+        &dataset.core_store,
+        &large_root_hash,
+        large_deep_after,
+        publication_generations,
+        large_deep_expectation.first,
+        large_deep_expectation.next,
+        large_deep_expectation.complete,
+        profile,
+        profile.large_rows,
+        "generation_catch_up_deep_large",
+    )?;
+    history_assertions.catch_up_cursor_mismatches = early_catch_up_mismatches
+        .saturating_add(deep_small_mismatches)
+        .saturating_add(deep_large_mismatches);
+
+    let multi_page_generations = publication_operation_count(
+        profile.multi_page_generation_warmup_operations,
+        profile.multi_page_generation_samples,
+    )?;
+    let multi_page_root_anchor = publication_root_anchor_key("multi-page-generation");
+    let multi_page_root_hash = core_meta_root_key_hash(&multi_page_root_anchor);
+    let previous_multi_page_mutations = generation_mutation_count(
+        &dataset.core_store,
+        &multi_page_root_hash,
+        multi_page_generations - 1,
+        profile.history_max_page_bytes,
+    )?;
+    let multi_page_publication_mutations = generation_mutation_count(
+        &dataset.core_store,
+        &multi_page_root_hash,
+        multi_page_generations,
+        profile.history_max_page_bytes,
+    )?;
+    let traversal_start = CoreMetaHistoryCursor {
+        generation: multi_page_generations - 1,
+        ordinal: previous_multi_page_mutations as u64 - 1,
+    };
+    let (multi_page_traversal, traversal, traversal_mismatches) =
+        measure_multi_page_generation_traversal(
+            &dataset.core_store,
+            &multi_page_root_hash,
+            traversal_start,
+            multi_page_generations,
+            multi_page_publication_mutations,
+            profile,
+            profile.large_rows,
+            "generation_catch_up_multi_page_traversal",
+        )?;
+    history_assertions.traversal_cursor_mismatches = traversal_mismatches;
+    history_assertions.traversal_pages = traversal.page_hashes.len();
+    history_assertions.expected_traversal_pages =
+        multi_page_publication_mutations.div_ceil(profile.history_page_size);
+    history_assertions.multi_page_publication_mutations = multi_page_publication_mutations;
 
     set_perf_stats(PerfStatsLevel::Disable);
 
@@ -97,8 +423,18 @@ pub fn run(manifest: &GateManifest, profile: &ProfileSpec) -> Result<RunResult> 
         page_scaled_large,
         durable_single,
         transactional_head,
+        publication_small,
+        publication_large,
+        multi_page_generation,
+        inventory_small,
+        inventory_large,
+        inventory_after_growth,
+        catch_up_early_large,
+        catch_up_deep_small,
+        catch_up_deep_large,
+        multi_page_traversal,
     ];
-    let gates = evaluate_gates(&scenarios, profile)?;
+    let gates = evaluate_gates(&scenarios, profile, &history_assertions)?;
     Ok(RunResult { scenarios, gates })
 }
 
@@ -275,6 +611,653 @@ fn measure_transactional_head_batch(
     Ok(evidence)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn measure_atomic_root_publication(
+    runtime: &Runtime,
+    store: &CoreStore,
+    meta: &CoreMetaStore,
+    seed: &str,
+    dataset_rows: u64,
+    prefix: &str,
+    fixture_id: &str,
+    mutation_rows: usize,
+    payload_bytes: usize,
+    warmup_operations: usize,
+    samples: usize,
+    name: &str,
+) -> Result<ScenarioEvidence> {
+    let operation_count = warmup_operations
+        .checked_add(samples)
+        .context("CoreMeta publication operation count overflow")?;
+    let root_anchor_key = publication_root_anchor_key(fixture_id);
+    let keys = (0..mutation_rows)
+        .map(|ordinal| row_key(prefix, ordinal as u64))
+        .collect::<Result<Vec<_>>>()?;
+    let mut batches = (0..operation_count)
+        .map(|operation_index| {
+            let generation = operation_index as u64 + 1;
+            publication_batch(
+                seed,
+                prefix,
+                fixture_id,
+                &root_anchor_key,
+                generation,
+                &keys,
+                payload_bytes,
+            )
+            .map(Some)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let diagnostics = std::env::var_os("ANVIL_COREMETA_PERF_DIAGNOSTICS").is_some();
+    if diagnostics {
+        reset_coremeta_get_probe();
+    }
+    let evidence = measure(
+        name,
+        dataset_rows,
+        mutation_rows,
+        warmup_operations,
+        samples,
+        |operation_index| {
+            let batch = batches
+                .get_mut(operation_index)
+                .and_then(Option::take)
+                .context("CoreMeta publication benchmark reused an operation")?;
+            let receipt = runtime.block_on(store.commit_mutation_batch(batch))?;
+            if receipt.state != CoreTransactionState::Committed
+                || receipt.finalisation_error.is_some()
+            {
+                bail!(
+                    "CoreMeta publication {} did not commit cleanly: state={:?}, error={:?}",
+                    receipt.transaction_id,
+                    receipt.state,
+                    receipt.finalisation_error
+                );
+            }
+            Ok(receipt.visible_updates.len())
+        },
+    )?;
+    if diagnostics {
+        eprintln!(
+            "[coremeta-perf-gate] scenario={name} coremeta_gets={:?}",
+            take_coremeta_get_probe()
+        );
+    }
+
+    let final_generation = operation_count as u64;
+    let anchor =
+        runtime.block_on(store.read_internal_root_anchor(&root_anchor_key, final_generation))?;
+    if anchor.generation != final_generation {
+        bail!(
+            "CoreMeta publication root stopped at generation {}, expected {final_generation}",
+            anchor.generation
+        );
+    }
+    let final_transaction_id = publication_transaction_id(fixture_id, final_generation);
+    for ordinal in [0, mutation_rows - 1] {
+        let expected = publication_payload(
+            seed,
+            prefix,
+            ordinal as u64,
+            payload_bytes,
+            &root_anchor_key,
+            final_generation,
+            &final_transaction_id,
+        )?;
+        let actual = meta
+            .get(CF_INLINE_PAYLOADS, TABLE_INLINE_PAYLOAD_ROW, &keys[ordinal])?
+            .context("CoreMeta publication row is missing after root publication")?;
+        if actual != expected {
+            bail!(
+                "CoreMeta publication row {ordinal} does not match root generation {final_generation}"
+            );
+        }
+    }
+
+    Ok(evidence)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn measure_generation_inventory(
+    store: &CoreStore,
+    root_key_hash: &str,
+    after: &CoreMetaInventoryCursor,
+    through_generation: u64,
+    profile: &ProfileSpec,
+    dataset_rows: u64,
+    expected: &CoreMetaInventoryProbe,
+    name: &str,
+) -> Result<(ScenarioEvidence, u64)> {
+    let mut probe_mismatches = 0_u64;
+    let evidence = measure(
+        name,
+        dataset_rows,
+        profile.history_page_size,
+        profile.history_probe_warmup_operations,
+        profile.history_probe_samples,
+        |_| {
+            let probe = store.probe_coremeta_generation_inventory(
+                root_key_hash,
+                Some(after),
+                through_generation,
+                profile.history_page_size,
+                profile.history_max_page_bytes,
+            )?;
+            probe_mismatches = probe_mismatches.saturating_add(mismatch(&probe != expected));
+            black_box(&probe.page_hash);
+            Ok(probe.generations.len())
+        },
+    )?;
+    Ok((evidence, probe_mismatches))
+}
+
+fn inventory_probe_mismatches(
+    probe: &CoreMetaInventoryProbe,
+    after: &CoreMetaInventoryCursor,
+    through_generation: u64,
+    expected_entries: usize,
+) -> u64 {
+    [
+        probe.generations.len() != expected_entries,
+        probe.generations.first().map(|item| item.generation)
+            != Some(after.generation.saturating_add(1)),
+        probe.generations.last().map(|item| item.generation) != Some(through_generation),
+        probe.next_cursor.as_ref().map(|cursor| cursor.generation) != Some(through_generation),
+        !probe.inventory_complete,
+        probe.final_generation != through_generation,
+        probe.encoded_bytes == 0,
+        probe.page_hash.is_empty(),
+    ]
+    .into_iter()
+    .map(mismatch)
+    .sum()
+}
+
+fn generation_mutation_count(
+    store: &CoreStore,
+    root_key_hash: &str,
+    generation: u64,
+    max_bytes: u64,
+) -> Result<usize> {
+    let after = (generation > 1).then_some(CoreMetaInventoryCursor {
+        generation: generation - 1,
+    });
+    let inventory = store.probe_coremeta_generation_inventory(
+        root_key_hash,
+        after.as_ref(),
+        generation,
+        1,
+        max_bytes,
+    )?;
+    let [descriptor] = inventory.generations.as_slice() else {
+        bail!("CoreMeta generation {generation} did not produce one inventory descriptor");
+    };
+    if descriptor.generation != generation || !inventory.inventory_complete {
+        bail!("CoreMeta generation {generation} inventory did not stop at its captured boundary");
+    }
+    usize::try_from(descriptor.mutation_count)
+        .context("CoreMeta generation mutation count exceeds usize")
+}
+
+fn history_page_expectation(
+    store: &CoreStore,
+    root_key_hash: &str,
+    after: Option<&CoreMetaHistoryCursor>,
+    through_generation: u64,
+    rows: usize,
+    max_bytes: u64,
+) -> Result<HistoryPageExpectation> {
+    let mut generation = after.map_or(1, |cursor| cursor.generation);
+    let mut ordinal = after.map_or(0, |cursor| cursor.ordinal.saturating_add(1));
+    let mut generation_rows =
+        generation_mutation_count(store, root_key_hash, generation, max_bytes)?;
+    if ordinal as usize >= generation_rows {
+        generation = generation.saturating_add(1);
+        ordinal = 0;
+        generation_rows = generation_mutation_count(store, root_key_hash, generation, max_bytes)?;
+    }
+    let first = CoreMetaHistoryCursor {
+        generation,
+        ordinal,
+    };
+    let mut remaining = rows;
+    let next = loop {
+        if generation > through_generation {
+            bail!("CoreMeta history does not contain the requested expectation page");
+        }
+        let available = generation_rows.saturating_sub(ordinal as usize);
+        if remaining <= available {
+            break CoreMetaHistoryCursor {
+                generation,
+                ordinal: ordinal.saturating_add(remaining as u64 - 1),
+            };
+        }
+        remaining -= available;
+        generation = generation.saturating_add(1);
+        ordinal = 0;
+        generation_rows = generation_mutation_count(store, root_key_hash, generation, max_bytes)?;
+    };
+    let complete = next.generation == through_generation
+        && next.ordinal.saturating_add(1)
+            == generation_mutation_count(store, root_key_hash, through_generation, max_bytes)?
+                as u64;
+    Ok(HistoryPageExpectation {
+        first,
+        next,
+        complete,
+    })
+}
+
+fn history_cursor_before_tail_rows(
+    store: &CoreStore,
+    root_key_hash: &str,
+    through_generation: u64,
+    rows: usize,
+    max_bytes: u64,
+) -> Result<Option<CoreMetaHistoryCursor>> {
+    if rows == 0 {
+        bail!("CoreMeta history tail page must request at least one row");
+    }
+    let mut generation = through_generation;
+    let mut remaining = rows;
+    loop {
+        let generation_rows =
+            generation_mutation_count(store, root_key_hash, generation, max_bytes)?;
+        if remaining < generation_rows {
+            return Ok(Some(CoreMetaHistoryCursor {
+                generation,
+                ordinal: (generation_rows - remaining - 1) as u64,
+            }));
+        }
+        remaining -= generation_rows;
+        if generation == 1 {
+            if remaining == 0 {
+                return Ok(None);
+            }
+            bail!("CoreMeta history is shorter than the requested tail page");
+        }
+        generation -= 1;
+        if remaining == 0 {
+            let previous_rows =
+                generation_mutation_count(store, root_key_hash, generation, max_bytes)?;
+            return Ok(Some(CoreMetaHistoryCursor {
+                generation,
+                ordinal: previous_rows as u64 - 1,
+            }));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn measure_catch_up_page(
+    store: &CoreStore,
+    root_key_hash: &str,
+    after: Option<CoreMetaHistoryCursor>,
+    through_generation: u64,
+    expected_first_cursor: CoreMetaHistoryCursor,
+    expected_next_cursor: CoreMetaHistoryCursor,
+    expected_history_complete: bool,
+    profile: &ProfileSpec,
+    dataset_rows: u64,
+    name: &str,
+) -> Result<(ScenarioEvidence, u64)> {
+    let expected = store.probe_coremeta_generation_catch_up(
+        root_key_hash,
+        after.as_ref(),
+        through_generation,
+        profile.history_page_size,
+        profile.history_max_page_bytes,
+    )?;
+    let mut probe_mismatches = catch_up_page_mismatches(
+        &expected,
+        &expected_first_cursor,
+        &expected_next_cursor,
+        through_generation,
+        profile.history_page_size,
+        expected_history_complete,
+    );
+    let evidence = measure(
+        name,
+        dataset_rows,
+        profile.history_page_size,
+        profile.history_probe_warmup_operations,
+        profile.history_probe_samples,
+        |_| {
+            let probe = store.probe_coremeta_generation_catch_up(
+                root_key_hash,
+                after.as_ref(),
+                through_generation,
+                profile.history_page_size,
+                profile.history_max_page_bytes,
+            )?;
+            probe_mismatches = probe_mismatches.saturating_add(mismatch(probe != expected));
+            black_box(probe.encoded_bytes);
+            Ok(probe.delivered_mutation_count)
+        },
+    )?;
+    Ok((evidence, probe_mismatches))
+}
+
+fn catch_up_page_mismatches(
+    probe: &CoreMetaCatchUpProbe,
+    expected_first_cursor: &CoreMetaHistoryCursor,
+    expected_next_cursor: &CoreMetaHistoryCursor,
+    through_generation: u64,
+    expected_rows: usize,
+    expected_history_complete: bool,
+) -> u64 {
+    let mut mismatches = [
+        probe.delivered_mutation_count != expected_rows,
+        probe.next_cursor.as_ref() != Some(expected_next_cursor),
+        probe.history_complete != expected_history_complete,
+        probe.final_generation != through_generation,
+        probe.encoded_bytes == 0,
+        probe.frames.is_empty(),
+    ]
+    .into_iter()
+    .map(mismatch)
+    .sum::<u64>();
+
+    let mut expected_generation = expected_first_cursor.generation;
+    let mut expected_ordinal = expected_first_cursor.ordinal;
+    let mut delivered_rows = 0_usize;
+    for frame in &probe.frames {
+        let delivered = frame.delivered_mutation_count;
+        let expected_last_ordinal =
+            expected_ordinal.saturating_add((delivered as u64).saturating_sub(1));
+        let generation_mutation_count = frame.generation_mutation_count.unwrap_or(0);
+        let generation_complete =
+            expected_last_ordinal.saturating_add(1) == generation_mutation_count;
+        let history_complete = generation_complete && expected_generation == through_generation;
+        mismatches = mismatches.saturating_add(
+            [
+                frame.generation != Some(expected_generation),
+                generation_mutation_count == 0,
+                delivered == 0,
+                frame.first_ordinal != Some(expected_ordinal),
+                frame.last_ordinal != Some(expected_last_ordinal),
+                frame.next_cursor.as_ref()
+                    != Some(&CoreMetaHistoryCursor {
+                        generation: expected_generation,
+                        ordinal: expected_last_ordinal,
+                    }),
+                frame.generation_complete != generation_complete,
+                frame.history_complete != history_complete,
+                frame.encoded_bytes == 0,
+                frame.frame_hash.is_empty(),
+            ]
+            .into_iter()
+            .map(mismatch)
+            .sum::<u64>(),
+        );
+        delivered_rows = delivered_rows.saturating_add(delivered);
+        if generation_complete {
+            expected_generation = expected_generation.saturating_add(1);
+            expected_ordinal = 0;
+        } else {
+            expected_ordinal = expected_last_ordinal.saturating_add(1);
+        }
+    }
+    mismatches.saturating_add(mismatch(delivered_rows != expected_rows))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn measure_multi_page_generation_traversal(
+    store: &CoreStore,
+    root_key_hash: &str,
+    start_cursor: CoreMetaHistoryCursor,
+    through_generation: u64,
+    generation_rows: usize,
+    profile: &ProfileSpec,
+    dataset_rows: u64,
+    name: &str,
+) -> Result<(ScenarioEvidence, TraversalObservation, u64)> {
+    let expected = traverse_multi_page_generation(
+        store,
+        root_key_hash,
+        &start_cursor,
+        through_generation,
+        generation_rows,
+        profile.history_page_size,
+        profile.history_max_page_bytes,
+    )?;
+    let mut traversal_mismatches = expected.cursor_mismatches;
+    let evidence = measure(
+        name,
+        dataset_rows,
+        generation_rows,
+        profile.multi_page_generation_warmup_operations,
+        profile.multi_page_generation_samples,
+        |_| {
+            let observation = traverse_multi_page_generation(
+                store,
+                root_key_hash,
+                &start_cursor,
+                through_generation,
+                generation_rows,
+                profile.history_page_size,
+                profile.history_max_page_bytes,
+            )?;
+            traversal_mismatches = traversal_mismatches
+                .saturating_add(observation.cursor_mismatches)
+                .saturating_add(mismatch(
+                    observation.page_hashes.as_slice() != expected.page_hashes.as_slice(),
+                ));
+            Ok(observation.delivered_rows)
+        },
+    )?;
+    Ok((evidence, expected, traversal_mismatches))
+}
+
+fn traverse_multi_page_generation(
+    store: &CoreStore,
+    root_key_hash: &str,
+    start_cursor: &CoreMetaHistoryCursor,
+    through_generation: u64,
+    generation_rows: usize,
+    page_size: usize,
+    max_bytes: u64,
+) -> Result<TraversalObservation> {
+    let expected_pages = generation_rows.div_ceil(page_size);
+    let mut cursor = start_cursor.clone();
+    let mut delivered_rows = 0_usize;
+    let mut page_hashes = Vec::with_capacity(expected_pages);
+    let mut cursor_mismatches = 0_u64;
+
+    while delivered_rows < generation_rows {
+        if page_hashes.len() >= expected_pages {
+            bail!("CoreMeta multi-page traversal exceeded its bounded page count");
+        }
+        let probe = store.probe_coremeta_generation_catch_up(
+            root_key_hash,
+            Some(&cursor),
+            through_generation,
+            page_size,
+            max_bytes,
+        )?;
+        if probe.delivered_mutation_count == 0 {
+            bail!("CoreMeta multi-page traversal made no cursor progress");
+        }
+        let expected_first_ordinal = delivered_rows as u64;
+        let next_delivered = delivered_rows.saturating_add(probe.delivered_mutation_count);
+        let expected_last_ordinal = next_delivered.saturating_sub(1) as u64;
+        let expected_complete = next_delivered == generation_rows;
+        let expected_cursor = CoreMetaHistoryCursor {
+            generation: through_generation,
+            ordinal: expected_last_ordinal,
+        };
+        let page_mismatches = [
+            probe.frames.len() != 1,
+            probe.delivered_mutation_count > page_size,
+            next_delivered > generation_rows,
+            probe.next_cursor.as_ref() != Some(&expected_cursor),
+            probe.history_complete != expected_complete,
+            probe.final_generation != through_generation,
+            probe.encoded_bytes == 0,
+        ]
+        .into_iter()
+        .map(mismatch)
+        .sum::<u64>();
+        cursor_mismatches = cursor_mismatches.saturating_add(page_mismatches);
+
+        if let [frame] = probe.frames.as_slice() {
+            let frame_mismatches = [
+                frame.generation != Some(through_generation),
+                frame.generation_mutation_count != Some(generation_rows as u64),
+                frame.delivered_mutation_count != probe.delivered_mutation_count,
+                frame.first_ordinal != Some(expected_first_ordinal),
+                frame.last_ordinal != Some(expected_last_ordinal),
+                frame.next_cursor.as_ref() != Some(&expected_cursor),
+                frame.generation_complete != expected_complete,
+                frame.history_complete != expected_complete,
+                frame.encoded_bytes == 0,
+                frame.frame_hash.is_empty(),
+            ]
+            .into_iter()
+            .map(mismatch)
+            .sum::<u64>();
+            cursor_mismatches = cursor_mismatches.saturating_add(frame_mismatches);
+            if page_mismatches != 0 || frame_mismatches != 0 {
+                eprintln!(
+                    "[coremeta-perf-gate] traversal expectation mismatch delivered_before={delivered_rows} page_mismatches={page_mismatches} frame_mismatches={frame_mismatches} expected_cursor={expected_cursor:?} expected_complete={expected_complete} probe={probe:#?}"
+                );
+            }
+            page_hashes.push(frame.frame_hash.clone());
+        } else {
+            page_hashes.push(String::new());
+        }
+
+        cursor = probe
+            .next_cursor
+            .context("CoreMeta multi-page traversal returned no next cursor")?;
+        delivered_rows = next_delivered;
+        if probe.history_complete {
+            break;
+        }
+    }
+
+    cursor_mismatches = cursor_mismatches.saturating_add(
+        [
+            delivered_rows != generation_rows,
+            page_hashes.len() != expected_pages,
+            cursor.generation != through_generation,
+            cursor.ordinal != generation_rows as u64 - 1,
+        ]
+        .into_iter()
+        .map(mismatch)
+        .sum::<u64>(),
+    );
+    Ok(TraversalObservation {
+        delivered_rows,
+        page_hashes,
+        cursor_mismatches,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_atomic_root_generation(
+    runtime: &Runtime,
+    store: &CoreStore,
+    seed: &str,
+    prefix: &str,
+    fixture_id: &str,
+    generation: u64,
+    mutation_rows: usize,
+    payload_bytes: usize,
+) -> Result<()> {
+    let root_anchor_key = publication_root_anchor_key(fixture_id);
+    let keys = (0..mutation_rows)
+        .map(|ordinal| row_key(prefix, ordinal as u64))
+        .collect::<Result<Vec<_>>>()?;
+    let batch = publication_batch(
+        seed,
+        prefix,
+        fixture_id,
+        &root_anchor_key,
+        generation,
+        &keys,
+        payload_bytes,
+    )?;
+    let receipt = runtime.block_on(store.commit_mutation_batch(batch))?;
+    if receipt.state != CoreTransactionState::Committed
+        || receipt.finalisation_error.is_some()
+        || receipt.visible_updates.len() != mutation_rows
+    {
+        bail!("CoreMeta history growth publication did not commit exactly {mutation_rows} rows");
+    }
+    let anchor = runtime.block_on(store.read_internal_root_anchor(&root_anchor_key, generation))?;
+    if anchor.generation != generation {
+        bail!(
+            "CoreMeta history growth publication reached generation {}, expected {generation}",
+            anchor.generation
+        );
+    }
+    Ok(())
+}
+
+fn publication_operation_count(warmup_operations: usize, samples: usize) -> Result<u64> {
+    let count = warmup_operations
+        .checked_add(samples)
+        .context("CoreMeta publication operation count overflow")?;
+    u64::try_from(count).context("CoreMeta publication operation count exceeds u64")
+}
+
+fn publication_root_anchor_key(fixture_id: &str) -> String {
+    format!("coremeta-release-gate/publication/{fixture_id}")
+}
+
+fn mismatch(condition: bool) -> u64 {
+    if condition { 1 } else { 0 }
+}
+
+fn publication_batch(
+    seed: &str,
+    prefix: &str,
+    fixture_id: &str,
+    root_anchor_key: &str,
+    generation: u64,
+    keys: &[Vec<u8>],
+    payload_bytes: usize,
+) -> Result<CoreMutationBatch> {
+    let transaction_id = publication_transaction_id(fixture_id, generation);
+    let operations = keys
+        .iter()
+        .enumerate()
+        .map(|(ordinal, tuple_key)| {
+            Ok(CoreMutationOperation::CoreMetaPut {
+                partition_id: root_anchor_key.to_string(),
+                cf: CF_INLINE_PAYLOADS.to_string(),
+                table_id: TABLE_INLINE_PAYLOAD_ROW,
+                tuple_key: tuple_key.clone(),
+                payload: publication_payload(
+                    seed,
+                    prefix,
+                    ordinal as u64,
+                    payload_bytes,
+                    root_anchor_key,
+                    generation,
+                    &transaction_id,
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(CoreMutationBatch {
+        transaction_id,
+        scope_partition: root_anchor_key.to_string(),
+        committed_by_principal: "coremeta-release-gate".to_string(),
+        root_publications: vec![
+            CoreMutationRootPublication::new(root_anchor_key, "core_control").coordinator(),
+        ],
+        preconditions: Vec::new(),
+        operations,
+    })
+}
+
+fn publication_transaction_id(fixture_id: &str, generation: u64) -> String {
+    format!("coremeta-perf-{fixture_id}-{generation:020}")
+}
+
 fn write_one(store: &CoreMetaStore, key: &[u8], payload: &[u8]) -> Result<()> {
     store.write_batch(&[CoreMetaBatchOp {
         cf: CF_INLINE_PAYLOADS,
@@ -331,6 +1314,7 @@ fn measure(
 fn evaluate_gates(
     scenarios: &[ScenarioEvidence],
     profile: &ProfileSpec,
+    history_assertions: &HistoryGateAssertions,
 ) -> Result<Vec<GateEvidence>> {
     let point_small = scenario(scenarios, "point_get_small")?;
     let point_large = scenario(scenarios, "point_get_large")?;
@@ -340,6 +1324,17 @@ fn evaluate_gates(
     let page_scaled = scenario(scenarios, "bounded_list_scaled_page_large")?;
     let durable_single = scenario(scenarios, "durable_single_row")?;
     let transactional = scenario(scenarios, "transactional_head_read_and_batch")?;
+    let publication_small = scenario(scenarios, "atomic_root_publication_small_table")?;
+    let publication_large = scenario(scenarios, "atomic_root_publication_large_table")?;
+    let multi_page_generation =
+        scenario(scenarios, "atomic_root_publication_multi_page_generation")?;
+    let inventory_small = scenario(scenarios, "generation_inventory_small_table")?;
+    let inventory_large = scenario(scenarios, "generation_inventory_large_table")?;
+    let inventory_after_growth = scenario(scenarios, "generation_inventory_captured_after_growth")?;
+    let catch_up_early = scenario(scenarios, "generation_catch_up_early_large")?;
+    let catch_up_deep_small = scenario(scenarios, "generation_catch_up_deep_small")?;
+    let catch_up_deep_large = scenario(scenarios, "generation_catch_up_deep_large")?;
+    let multi_page_traversal = scenario(scenarios, "generation_catch_up_multi_page_traversal")?;
     let thresholds = &profile.thresholds;
     let mut gates = Vec::new();
 
@@ -362,6 +1357,13 @@ fn evaluate_gates(
         page_deep_small,
         page_deep_large,
         page_scaled,
+        inventory_small,
+        inventory_large,
+        inventory_after_growth,
+        catch_up_early,
+        catch_up_deep_small,
+        catch_up_deep_large,
+        multi_page_traversal,
     ]
     .iter()
     .map(|evidence| evidence.work.logical_work())
@@ -490,6 +1492,182 @@ fn evaluate_gates(
             "Absolute iterator work is capped by page size plus fixed seek overhead.",
         ));
     }
+
+    gates.push(ratio_gate(
+        "atomic_root_publication_work_is_table_size_independent",
+        "complexity",
+        "logical_work_per_operation_ratio",
+        publication_large.logical_work_per_operation,
+        publication_small.logical_work_per_operation,
+        thresholds.root_publication_work_growth_ratio,
+        "ratio",
+        "Publishing one rooted mutation must not scan canonical or history tables as they grow.",
+    ));
+    let generation_row_ratio_limit = profile.multi_page_generation_rows as f64
+        * thresholds.root_publication_row_work_ratio_multiplier;
+    gates.push(ratio_gate(
+        "atomic_root_publication_work_scales_with_generation_rows",
+        "complexity",
+        "logical_work_per_operation_ratio",
+        multi_page_generation.logical_work_per_operation,
+        publication_large.logical_work_per_operation,
+        generation_row_ratio_limit,
+        "ratio",
+        "A page-spanning generation may add work per declared mutation, not per table row.",
+    ));
+    for (publication, mutation_rows) in [
+        (
+            publication_small,
+            history_assertions.publication_small_mutations,
+        ),
+        (
+            publication_large,
+            history_assertions.publication_large_mutations,
+        ),
+        (
+            multi_page_generation,
+            history_assertions.multi_page_publication_mutations,
+        ),
+    ] {
+        let work_limit = mutation_rows as f64 * thresholds.root_publication_work_per_mutation
+            + thresholds.root_publication_fixed_work;
+        gates.push(max_gate(
+            &format!("{}_bounded_work", publication.name),
+            "complexity",
+            "logical_work_per_operation",
+            publication.logical_work_per_operation,
+            work_limit,
+            work_limit,
+            "count/op",
+            "Root publication work is capped by declared mutations plus fixed protocol overhead.",
+        ));
+    }
+
+    gates.push(exact_gate(
+        "generation_inventory_snapshot_is_immutable",
+        "correctness",
+        "probe_mismatches",
+        history_assertions.inventory_snapshot_mismatches as f64,
+        0.0,
+        "probes",
+        "A captured generation inventory must remain identical after a later root publication.",
+    ));
+    gates.push(exact_gate(
+        "deep_catch_up_cursor_progress_is_exact",
+        "correctness",
+        "cursor_mismatches",
+        history_assertions.catch_up_cursor_mismatches as f64,
+        0.0,
+        "checks",
+        "Early and deep catch-up pages must resume at exactly the generation/ordinal cursor.",
+    ));
+    gates.push(exact_gate(
+        "multi_page_generation_cursor_progress_is_exact",
+        "correctness",
+        "cursor_mismatches",
+        history_assertions.traversal_cursor_mismatches as f64,
+        0.0,
+        "checks",
+        "Every page of one generation must advance without gaps, duplicates, or early completion.",
+    ));
+    gates.push(exact_gate(
+        "multi_page_generation_uses_expected_page_count",
+        "correctness",
+        "pages",
+        history_assertions.traversal_pages as f64,
+        history_assertions.expected_traversal_pages as f64,
+        "pages",
+        "A generation larger than the page bound must drain in the exact bounded page count.",
+    ));
+
+    gates.push(ratio_gate(
+        "generation_inventory_work_is_table_size_independent",
+        "complexity",
+        "logical_work_per_operation_ratio",
+        inventory_large.logical_work_per_operation,
+        inventory_small.logical_work_per_operation,
+        thresholds.history_work_growth_ratio,
+        "ratio",
+        "A fixed inventory page must seek by root and generation rather than scan history tables.",
+    ));
+    gates.push(ratio_gate(
+        "captured_generation_inventory_work_stays_bounded_after_growth",
+        "complexity",
+        "logical_work_per_operation_ratio",
+        inventory_after_growth.logical_work_per_operation,
+        inventory_large.logical_work_per_operation,
+        thresholds.history_work_growth_ratio,
+        "ratio",
+        "Reading a captured inventory page must not inspect generations published afterward.",
+    ));
+    gates.push(ratio_gate(
+        "deep_catch_up_work_is_table_size_independent",
+        "complexity",
+        "logical_work_per_operation_ratio",
+        catch_up_deep_large.logical_work_per_operation,
+        catch_up_deep_small.logical_work_per_operation,
+        thresholds.history_work_growth_ratio,
+        "ratio",
+        "A deep generation cursor must not scan unrelated canonical or history rows.",
+    ));
+    gates.push(ratio_gate(
+        "deep_catch_up_work_is_comparable_to_early_page",
+        "complexity",
+        "logical_work_per_operation_ratio",
+        catch_up_deep_large.logical_work_per_operation,
+        catch_up_early.logical_work_per_operation,
+        thresholds.history_work_growth_ratio,
+        "ratio",
+        "Equal catch-up pages must do comparable work regardless of cursor depth.",
+    ));
+    let traversal_ratio_limit = history_assertions.expected_traversal_pages as f64
+        * thresholds.history_page_work_ratio_multiplier;
+    gates.push(ratio_gate(
+        "multi_page_generation_work_scales_with_pages",
+        "complexity",
+        "logical_work_per_operation_ratio",
+        multi_page_traversal.logical_work_per_operation,
+        catch_up_deep_large.logical_work_per_operation,
+        traversal_ratio_limit,
+        "ratio",
+        "Draining one generation may scale with delivered pages, not total history-table rows.",
+    ));
+
+    let history_page_work_limit = profile.history_page_size as f64
+        * thresholds.history_work_per_item
+        + thresholds.history_fixed_work;
+    for history_page in [
+        inventory_small,
+        inventory_large,
+        inventory_after_growth,
+        catch_up_early,
+        catch_up_deep_small,
+        catch_up_deep_large,
+    ] {
+        gates.push(max_gate(
+            &format!("{}_bounded_work", history_page.name),
+            "complexity",
+            "logical_work_per_operation",
+            history_page.logical_work_per_operation,
+            history_page_work_limit,
+            history_page_work_limit,
+            "count/op",
+            "History-page work is capped by the requested page plus fixed seek and validation overhead.",
+        ));
+    }
+    let traversal_work_limit = history_assertions.multi_page_publication_mutations as f64
+        * thresholds.history_work_per_item
+        + history_assertions.expected_traversal_pages as f64 * thresholds.history_fixed_work;
+    gates.push(max_gate(
+        "generation_catch_up_multi_page_traversal_bounded_work",
+        "complexity",
+        "logical_work_per_operation",
+        multi_page_traversal.logical_work_per_operation,
+        traversal_work_limit,
+        traversal_work_limit,
+        "count/op",
+        "Whole-generation traversal is capped by delivered mutations plus fixed work per page.",
+    ));
 
     Ok(gates)
 }

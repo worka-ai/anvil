@@ -36,6 +36,15 @@ pub struct ProfileSpec {
     pub point_samples: usize,
     pub page_samples: usize,
     pub mutation_samples: usize,
+    pub root_publication_warmup_operations: usize,
+    pub root_publication_samples: usize,
+    pub history_probe_warmup_operations: usize,
+    pub history_probe_samples: usize,
+    pub history_page_size: usize,
+    pub history_max_page_bytes: u64,
+    pub multi_page_generation_warmup_operations: usize,
+    pub multi_page_generation_samples: usize,
+    pub multi_page_generation_rows: usize,
     pub thresholds: Thresholds,
 }
 
@@ -53,6 +62,14 @@ pub struct Thresholds {
     pub page_size_work_ratio_multiplier: f64,
     pub page_work_per_item: f64,
     pub page_fixed_work: f64,
+    pub root_publication_work_growth_ratio: f64,
+    pub root_publication_row_work_ratio_multiplier: f64,
+    pub root_publication_work_per_mutation: f64,
+    pub root_publication_fixed_work: f64,
+    pub history_work_growth_ratio: f64,
+    pub history_page_work_ratio_multiplier: f64,
+    pub history_work_per_item: f64,
+    pub history_fixed_work: f64,
 }
 
 #[derive(Debug)]
@@ -190,6 +207,34 @@ fn validate_profile(name: &str, profile: &ProfileSpec) -> Result<()> {
     if profile.warmup_operations == 0 {
         bail!("{name}: warmup_operations must be non-zero");
     }
+    if profile.root_publication_warmup_operations == 0 || profile.root_publication_samples < 20 {
+        bail!("{name}: root publication needs a warmup and at least 20 samples");
+    }
+    let publication_generations = profile
+        .root_publication_warmup_operations
+        .checked_add(profile.root_publication_samples)
+        .context("root publication operation count overflow")?;
+    if profile.history_probe_warmup_operations == 0
+        || profile.history_probe_samples < 20
+        || profile.history_page_size == 0
+        || profile.history_page_size > 4096
+        || profile.history_page_size >= publication_generations
+        || !(128 * 1024..=16 * 1024 * 1024).contains(&profile.history_max_page_bytes)
+    {
+        bail!(
+            "{name}: history probes need a warmup, at least 20 samples, a 1 to 4096 item page smaller than the publication history, and a 128 KiB to 16 MiB byte limit"
+        );
+    }
+    if profile.multi_page_generation_warmup_operations == 0
+        || profile.multi_page_generation_samples < 3
+        || profile.multi_page_generation_rows <= profile.page_size
+        || profile.multi_page_generation_rows <= profile.history_page_size
+        || profile.multi_page_generation_rows > 4096
+    {
+        bail!(
+            "{name}: multi-page generation settings need a warmup, at least 3 samples, more rows than both page bounds, and at most 4096 rows"
+        );
+    }
 
     let thresholds = &profile.thresholds;
     let values = [
@@ -205,6 +250,14 @@ fn validate_profile(name: &str, profile: &ProfileSpec) -> Result<()> {
         thresholds.page_size_work_ratio_multiplier,
         thresholds.page_work_per_item,
         thresholds.page_fixed_work,
+        thresholds.root_publication_work_growth_ratio,
+        thresholds.root_publication_row_work_ratio_multiplier,
+        thresholds.root_publication_work_per_mutation,
+        thresholds.root_publication_fixed_work,
+        thresholds.history_work_growth_ratio,
+        thresholds.history_page_work_ratio_multiplier,
+        thresholds.history_work_per_item,
+        thresholds.history_fixed_work,
     ];
     if values
         .iter()
