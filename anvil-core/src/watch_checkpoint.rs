@@ -489,10 +489,17 @@ async fn write_watch_checkpoint(
             transaction_id,
             scope_partition: checkpoint.partition_id.clone(),
             committed_by_principal: format!("watch-consumer:{}", checkpoint.updated_by_node),
-            root_publications: vec![CoreMutationRootPublication::new(
-                root_anchor,
-                crate::formats::writer::WriterFamily::CoreControl.as_str(),
-            )],
+            root_publications: vec![
+                CoreMutationRootPublication::new(
+                    checkpoint.partition_id.clone(),
+                    crate::formats::writer::WriterFamily::CoreControl.as_str(),
+                )
+                .coordinator(),
+                CoreMutationRootPublication::new(
+                    root_anchor,
+                    crate::formats::writer::WriterFamily::CoreControl.as_str(),
+                ),
+            ],
             preconditions,
             operations: vec![CoreMutationOperation::CoreMetaPut {
                 partition_id: checkpoint.partition_id.clone(),

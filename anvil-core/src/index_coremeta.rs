@@ -235,10 +235,20 @@ pub async fn write_index_segment_coremeta_record(
             transaction_id,
             scope_partition: format!("index/{}/segments", record.index_id),
             committed_by_principal: format!("index-builder:{}", record.index_id),
-            root_publications: vec![CoreMutationRootPublication::new(
-                format!("index/{}/segments", record.index_id),
-                crate::formats::writer::WriterFamily::TypedMetadata.as_str(),
-            )],
+            root_publications: vec![
+                CoreMutationRootPublication::with_writer_families(
+                    format!("index/{}/segments", record.index_id),
+                    vec![
+                        crate::formats::writer::WriterFamily::CoreControl
+                            .as_str()
+                            .to_string(),
+                        crate::formats::writer::WriterFamily::TypedMetadata
+                            .as_str()
+                            .to_string(),
+                    ],
+                )
+                .coordinator(),
+            ],
             preconditions,
             operations,
         })

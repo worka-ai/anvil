@@ -887,9 +887,16 @@ pub struct CoreMutationRootPublication {
 
 impl CoreMutationRootPublication {
     pub fn new(root_anchor_key: impl Into<String>, writer_family: impl Into<String>) -> Self {
+        Self::with_writer_families(root_anchor_key, vec![writer_family.into()])
+    }
+
+    pub fn with_writer_families(
+        root_anchor_key: impl Into<String>,
+        writer_families: Vec<String>,
+    ) -> Self {
         Self {
             root_anchor_key: root_anchor_key.into(),
-            writer_families: vec![writer_family.into()],
+            writer_families,
             transaction_coordinator: false,
         }
     }

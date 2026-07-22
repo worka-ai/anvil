@@ -401,10 +401,20 @@ async fn write_derived_index_proof_rows(
             transaction_id,
             scope_partition: partition.clone(),
             committed_by_principal: format!("index-builder:{}", proof.built_by_node),
-            root_publications: vec![CoreMutationRootPublication::new(
-                partition.clone(),
-                crate::formats::writer::WriterFamily::TypedMetadata.as_str(),
-            )],
+            root_publications: vec![
+                CoreMutationRootPublication::with_writer_families(
+                    partition.clone(),
+                    vec![
+                        crate::formats::writer::WriterFamily::CoreControl
+                            .as_str()
+                            .to_string(),
+                        crate::formats::writer::WriterFamily::TypedMetadata
+                            .as_str()
+                            .to_string(),
+                    ],
+                )
+                .coordinator(),
+            ],
             preconditions,
             operations: vec![
                 CoreMutationOperation::CoreMetaPut {

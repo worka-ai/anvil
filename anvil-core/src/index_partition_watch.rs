@@ -190,10 +190,13 @@ pub(crate) async fn publish_prepared_index_partition_watch(
             transaction_id,
             scope_partition: prepared.partition_id.clone(),
             committed_by_principal: "index-partition-watch".to_string(),
-            root_publications: vec![CoreMutationRootPublication::new(
-                prepared.partition_id.clone(),
-                crate::formats::writer::WriterFamily::CoreControl.as_str(),
-            )],
+            root_publications: vec![
+                CoreMutationRootPublication::new(
+                    prepared.partition_id.clone(),
+                    crate::formats::writer::WriterFamily::CoreControl.as_str(),
+                )
+                .coordinator(),
+            ],
             preconditions,
             operations: vec![CoreMutationOperation::StreamAppend {
                 partition_id: prepared.partition_id,
