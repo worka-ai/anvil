@@ -356,7 +356,7 @@ async fn tenant_tutorial_commands_run_without_admin_port_e2e() {
     );
     let indexes = run_anvil(&config_dir, &["index", "list", &bucket]);
     assert!(stdout(&indexes).contains("by-path"));
-    run_anvil_eventually(
+    let query = run_anvil_eventually(
         &config_dir,
         &[
             "index",
@@ -370,6 +370,9 @@ async fn tenant_tutorial_commands_run_without_admin_port_e2e() {
         ],
         Duration::from_secs(30),
     );
+    let query_output = stdout(&query);
+    assert!(query_output.contains("app-v1.txt"), "{query_output}");
+    assert!(query_output.contains("app-v2.txt"), "{query_output}");
     run_anvil(
         &config_dir,
         &["diagnostics", "list", &bucket, "by-path", "--limit", "5"],

@@ -4,7 +4,7 @@ use crate::routing::CrossRegionRoutingPolicy;
 use anyhow::Result;
 
 /// A distributed storage and compute system.
-#[derive(Parser, Debug, Clone, Default)]
+#[derive(Parser, Debug, Clone, PartialEq, Eq)]
 #[command(version, about, long_about = None)]
 pub struct Config {
     /// The secret key used for signing JWTs.
@@ -139,6 +139,44 @@ pub struct Config {
     /// Seconds that an in-process background task lease remains valid without renewal.
     #[arg(long, env, default_value_t = 300)]
     pub task_lease_ttl_secs: u64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            jwt_secret: String::new(),
+            anvil_secret_encryption_key: String::new(),
+            anvil_secret_encryption_key_id: "primary".to_string(),
+            anvil_secret_encryption_previous_keys: String::new(),
+            corestore_internal_bearer_token: String::new(),
+            public_api_addr: String::new(),
+            api_listen_addr: "0.0.0.0:50051".to_string(),
+            admin_listen_addr: "127.0.0.1:50052".to_string(),
+            allow_public_admin_listener: false,
+            mesh_id: "default".to_string(),
+            bootstrap_system_admin_app_name: String::new(),
+            bootstrap_system_admin_credential_output_path: String::new(),
+            bootstrap_system_admin_subject_kind: String::new(),
+            bootstrap_system_admin_subject_id: String::new(),
+            bootstrap_node_ids: Vec::new(),
+            region: String::new(),
+            cell_id: "default".to_string(),
+            public_region_base_domain: String::new(),
+            trusted_proxy_source_ranges: Vec::new(),
+            cross_region_routing_policy: CrossRegionRoutingPolicy::RedirectPreferred,
+            node_id: String::new(),
+            storage_path: "anvil-data".to_string(),
+            personaldb_snapshot_entry_threshold: 1024,
+            personaldb_snapshot_payload_bytes_threshold: 64 * 1024 * 1024,
+            allow_test_only_embedding_provider: false,
+            vector_embedding_providers_json: String::new(),
+            object_metadata_compaction_frame_threshold: 4096,
+            object_metadata_compaction_bytes_threshold: 64 * 1024 * 1024,
+            run_background_worker: true,
+            background_worker_concurrency: 4,
+            task_lease_ttl_secs: 300,
+        }
+    }
 }
 
 fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
@@ -284,6 +322,17 @@ mod tests {
         let mut invalid_args = required_args().to_vec();
         invalid_args.extend(["--background-worker-concurrency", "0"]);
         assert!(Config::try_parse_from(invalid_args).is_err());
+    }
+
+    #[test]
+    fn rust_default_matches_cli_defaults() {
+        let mut cli_default = Config::try_parse_from(required_args()).unwrap();
+        cli_default.jwt_secret.clear();
+        cli_default.anvil_secret_encryption_key.clear();
+        cli_default.public_api_addr.clear();
+        cli_default.region.clear();
+
+        assert_eq!(Config::default(), cli_default);
     }
 
     #[test]
