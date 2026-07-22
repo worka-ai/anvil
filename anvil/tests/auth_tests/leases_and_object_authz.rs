@@ -44,6 +44,10 @@ async fn test_coordination_task_lease_grpc_flow() {
         fence_token: acquired.fence_token,
         checkpoint_cursor_low: 42,
         checkpoint_cursor_high: 0,
+        expected_root_generation: acquired.root_generation,
+        expected_lease_epoch: acquired.lease_epoch,
+        expected_expires_at_nanos: acquired.expires_at_nanos,
+        expected_lease_hash: acquired.lease_hash.clone(),
     });
     add_bearer(&mut checkpoint, &token);
     let checkpointed = coordination_client
@@ -70,9 +74,13 @@ async fn test_coordination_task_lease_grpc_flow() {
 
     let mut commit = Request::new(CommitTaskLeaseRequest {
         task_id: task_id.to_string(),
-        fence_token: acquired.fence_token,
+        fence_token: checkpointed.fence_token,
         committed_cursor_low: 50,
         committed_cursor_high: 0,
+        expected_root_generation: checkpointed.root_generation,
+        expected_lease_epoch: checkpointed.lease_epoch,
+        expected_expires_at_nanos: checkpointed.expires_at_nanos,
+        expected_lease_hash: checkpointed.lease_hash.clone(),
     });
     add_bearer(&mut commit, &token);
     let committed = coordination_client
@@ -221,6 +229,10 @@ async fn test_coordination_task_lease_security_invariants() {
         fence_token: first.fence_token,
         checkpoint_cursor_low: 8,
         checkpoint_cursor_high: 0,
+        expected_root_generation: first.root_generation,
+        expected_lease_epoch: first.lease_epoch,
+        expected_expires_at_nanos: first.expires_at_nanos,
+        expected_lease_hash: first.lease_hash.clone(),
     });
     add_bearer(&mut wrong_owner_checkpoint, &token_b);
     let err = client
@@ -332,6 +344,10 @@ async fn test_coordination_task_lease_security_invariants() {
         fence_token: stale_first.fence_token,
         checkpoint_cursor_low: 3,
         checkpoint_cursor_high: 0,
+        expected_root_generation: stale_first.root_generation,
+        expected_lease_epoch: stale_first.lease_epoch,
+        expected_expires_at_nanos: stale_first.expires_at_nanos,
+        expected_lease_hash: stale_first.lease_hash.clone(),
     });
     add_bearer(&mut stale_checkpoint, &token_a);
     let err = client
@@ -346,6 +362,10 @@ async fn test_coordination_task_lease_security_invariants() {
         fence_token: stale_first.fence_token,
         committed_cursor_low: 3,
         committed_cursor_high: 0,
+        expected_root_generation: stale_first.root_generation,
+        expected_lease_epoch: stale_first.lease_epoch,
+        expected_expires_at_nanos: stale_first.expires_at_nanos,
+        expected_lease_hash: stale_first.lease_hash.clone(),
     });
     add_bearer(&mut stale_commit, &token_a);
     let err = client.commit_task_lease(stale_commit).await.unwrap_err();
@@ -382,6 +402,10 @@ async fn test_coordination_task_lease_security_invariants() {
         fence_token: tenant_b_lease.fence_token,
         checkpoint_cursor_low: 2,
         checkpoint_cursor_high: 0,
+        expected_root_generation: tenant_b_lease.root_generation,
+        expected_lease_epoch: tenant_b_lease.lease_epoch,
+        expected_expires_at_nanos: tenant_b_lease.expires_at_nanos,
+        expected_lease_hash: tenant_b_lease.lease_hash.clone(),
     });
     add_bearer(&mut tenant_a_checkpoint, &token_a);
     assert!(

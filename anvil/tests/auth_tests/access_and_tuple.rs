@@ -480,7 +480,7 @@ async fn test_authz_batch_read_and_list_operations() {
 }
 
 #[tokio::test]
-async fn test_authz_batch_watch_and_pagination_are_revision_bound() {
+async fn test_authz_batch_watch_and_current_pagination_rejects_stale_revision() {
     let cluster = shared_docker_test_cluster().await;
     let actor = create_docker_storage_test_actor(&cluster, "authz-batch-watch").await;
     grant_docker_authz_realm(&cluster, &actor, "default").await;
@@ -586,15 +586,12 @@ async fn test_authz_batch_watch_and_pagination_are_revision_bound() {
     let revision_bound_page = auth_client
         .read_authz_tuples(revision_bound_page)
         .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(revision_bound_page.revision, 1);
+        .unwrap_err();
+    assert_eq!(revision_bound_page.code(), tonic::Code::FailedPrecondition);
     assert!(
         revision_bound_page
-            .tuples
-            .iter()
-            .all(|tuple| tuple.object_id != "delta"),
-        "a follow-up page must keep reading the original revision"
+            .message()
+            .contains("historical authz list reads are not supported")
     );
 
     let mut latest_page = Request::new(ReadAuthzTuplesRequest {
