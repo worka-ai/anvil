@@ -96,17 +96,19 @@ static_gates() {
 }
 
 rust_unit_gates() {
-  run_cargo_test "core library tests" -p anvil-storage-core --lib --bins
-  run_cargo_test "server library and binary tests" -p anvil-server --lib --bins
-  run_cargo_test "public CLI binary/unit tests" -p anvil-storage-cli --bins
+  # Exercise the public command contract before the long-running core suite so
+  # CLI/docs drift fails quickly instead of consuming most of the CI timeout.
   run_cargo_test "public CLI non-Docker integration tests" -p anvil-storage-cli \
     --test binary_names \
     --test confy_test \
     --test public_command_surface
+  run_cargo_test "public CLI binary/unit tests" -p anvil-storage-cli --bins
   run_cargo_test "Rust client package tests" -p anvil-storage --lib --tests
   run_cargo_test "test utils package tests" -p anvil-storage-test-utils --lib
   run_cargo_test "CoreStore model package tests" -p anvil-corestore-model --lib --tests
   run_cargo_test "documentation package tests" -p anvil-documentation --lib --bins
+  run_cargo_test "core library tests" -p anvil-storage-core --lib --bins
+  run_cargo_test "server library and binary tests" -p anvil-server --lib --bins
 }
 
 server_core_integration_gates() {
