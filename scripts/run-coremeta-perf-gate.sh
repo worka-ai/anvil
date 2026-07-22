@@ -32,6 +32,7 @@ echo "[coremeta-perf-gate] output=${output}"
 set -o pipefail
 cargo bench --locked \
   -p anvil-storage-core \
+  --features coremeta-perf-gate \
   --bench coremeta_release_gate \
   -- \
   --profile "${profile}" \
