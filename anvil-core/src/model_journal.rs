@@ -1,11 +1,11 @@
 use crate::anvil_api::{ModelManifest, TensorIndexRow};
 use crate::core_store::{
-    CF_OBSERVABILITY, CoreMetaStore, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation,
-    CoreMutationPrecondition, CoreStore, TABLE_OBSERVABILITY_CURSOR_ROW,
-    core_meta_committed_row_common, core_meta_record_tuple_key, core_meta_root_key_hash,
-    core_meta_tuple_key,
+    CF_OBSERVABILITY, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation,
+    CoreMutationPrecondition, CoreMutationRootPublication, CoreStore,
+    TABLE_OBSERVABILITY_CURSOR_ROW, core_meta_committed_row_common, core_meta_record_tuple_key,
+    core_meta_root_key_hash, core_meta_tuple_key,
 };
-use crate::formats::{Hash32, hash32};
+use crate::formats::{Hash32, hash32, writer::WriterFamily};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
 use crate::storage::Storage;
 use anyhow::{Result, anyhow};
@@ -227,13 +227,15 @@ pub async fn list_tensor_page(
             "model tensor page size must be between 1 and {MODEL_TENSOR_PAGE_MAX}"
         ));
     }
-    let mut rows = CoreMetaStore::open(storage.core_store_meta_path())?.scan_prefix_page(
-        CF_OBSERVABILITY,
-        TABLE_OBSERVABILITY_CURSOR_ROW,
-        &model_tensor_prefix(artifact_id)?,
-        after_cursor,
-        limit + 1,
-    )?;
+    let mut rows = CoreStore::new(storage.clone())
+        .await?
+        .scan_coremeta_prefix_page(
+            CF_OBSERVABILITY,
+            TABLE_OBSERVABILITY_CURSOR_ROW,
+            &model_tensor_prefix(artifact_id)?,
+            after_cursor,
+            limit + 1,
+        )?;
     let has_more = rows.len() > limit;
     if has_more {
         rows.truncate(limit);
@@ -266,7 +268,7 @@ pub async fn get_tensor_metadata(
     artifact_id: &str,
     tensor_name: &str,
 ) -> Result<Option<TensorIndexRow>> {
-    let Some(payload) = CoreMetaStore::open(storage.core_store_meta_path())?.get(
+    let Some(payload) = CoreStore::new(storage.clone()).await?.read_coremeta_row(
         CF_OBSERVABILITY,
         TABLE_OBSERVABILITY_CURSOR_ROW,
         &model_tensor_key(artifact_id, tensor_name)?,
@@ -281,7 +283,7 @@ pub async fn get_model_artifact(
     storage: &Storage,
     artifact_id: &str,
 ) -> Result<Option<ModelManifest>> {
-    let Some(payload) = CoreMetaStore::open(storage.core_store_meta_path())?.get(
+    let Some(payload) = CoreStore::new(storage.clone()).await?.read_coremeta_row(
         CF_OBSERVABILITY,
         TABLE_OBSERVABILITY_CURSOR_ROW,
         &model_artifact_key(artifact_id)?,
@@ -309,6 +311,24 @@ async fn append_model_event(
     let stream_precondition = core_store.stream_head_precondition(&stream_id).await?;
     let root_generation = next_stream_generation(&stream_precondition)?;
     let transaction_id = format!("model-metadata:{mutation_id}");
+    let projection_operations = model_projection_operations(
+        &core_store,
+        &event,
+        &stream_id,
+        root_generation,
+        &transaction_id,
+        &partition_id,
+    )?;
+    let mut root_publications = vec![
+        CoreMutationRootPublication::new(partition_id.clone(), WriterFamily::CoreControl.as_str())
+            .coordinator(),
+    ];
+    if !projection_operations.is_empty() {
+        root_publications.push(CoreMutationRootPublication::new(
+            model_projection_root_anchor_key(&stream_id),
+            WriterFamily::Vector.as_str(),
+        ));
+    }
     let mut operations = vec![CoreMutationOperation::StreamAppend {
         partition_id: partition_id.clone(),
         stream_id: stream_id.clone(),
@@ -316,14 +336,7 @@ async fn append_model_event(
         payload,
         idempotency_key: Some(transaction_id.clone()),
     }];
-    operations.extend(model_projection_operations(
-        storage,
-        &event,
-        &stream_id,
-        root_generation,
-        &transaction_id,
-        &partition_id,
-    )?);
+    operations.extend(projection_operations);
     let mut preconditions: Vec<_> = partition_precondition.into_iter().collect();
     preconditions.push(stream_precondition);
     core_store
@@ -331,6 +344,7 @@ async fn append_model_event(
             transaction_id,
             scope_partition: partition_id.clone(),
             committed_by_principal: model_partition_principal(),
+            root_publications,
             preconditions,
             operations,
         })
@@ -356,14 +370,14 @@ fn next_stream_generation(precondition: &CoreMutationPrecondition) -> Result<u64
 }
 
 fn model_projection_operations(
-    storage: &Storage,
+    core_store: &CoreStore,
     event: &ModelEventBody,
     stream_id: &str,
     root_generation: u64,
     transaction_id: &str,
     partition_id: &str,
 ) -> Result<Vec<CoreMutationOperation>> {
-    let root_key_hash = core_meta_root_key_hash(&format!("stream/{stream_id}"));
+    let root_key_hash = core_meta_root_key_hash(&model_projection_root_anchor_key(stream_id));
     match event {
         ModelEventBody::ArtifactUpsert {
             artifact_id,
@@ -405,12 +419,11 @@ fn model_projection_operations(
                 }
                 replacement_keys.insert(model_tensor_key(artifact_id, &tensor.tensor_name)?);
             }
-            let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
             let prefix = model_tensor_prefix(artifact_id)?;
             let mut after = None;
             let mut operations = Vec::new();
             loop {
-                let rows = meta.scan_prefix_page(
+                let rows = core_store.scan_coremeta_prefix_page(
                     CF_OBSERVABILITY,
                     TABLE_OBSERVABILITY_CURSOR_ROW,
                     &prefix,
@@ -469,6 +482,10 @@ fn model_projection_operations(
             Ok(operations)
         }
     }
+}
+
+fn model_projection_root_anchor_key(stream_id: &str) -> String {
+    format!("stream/{stream_id}")
 }
 
 fn model_artifact_key(artifact_id: &str) -> Result<Vec<u8>> {

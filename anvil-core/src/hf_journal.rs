@@ -1,7 +1,8 @@
 use crate::core_store::{
-    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreStore,
+    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
+    CoreMutationRootPublication, CoreStore,
 };
-use crate::formats::{Hash32, hash32};
+use crate::formats::{Hash32, hash32, writer::WriterFamily};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
 use crate::persistence::{HfIngestion, HfIngestionItem, HfIngestionJob, HfKey};
 use crate::storage::Storage;
@@ -243,7 +244,8 @@ async fn create_key_inner(
     note: Option<&str>,
     guard: HfWriteGuard,
 ) -> Result<()> {
-    if projection::get_key_by_name(storage, tenant_id, name)?.is_some() {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    if projection::get_key_by_name(&core_store, tenant_id, name)?.is_some() {
         return Err(anyhow!("hugging face key already exists"));
     }
     let (stream_precondition, id) = next_hf_entity_id(storage).await?;
@@ -291,7 +293,8 @@ async fn delete_key_inner(
     name: &str,
     guard: HfWriteGuard,
 ) -> Result<u64> {
-    let key = projection::get_key_by_name(storage, tenant_id, name)?;
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let key = projection::get_key_by_name(&core_store, tenant_id, name)?;
     if let Some(key) = key {
         append_body(
             storage,
@@ -314,7 +317,8 @@ pub async fn get_key_encrypted(
     tenant_id: i64,
     name: &str,
 ) -> Result<Option<(i64, Vec<u8>)>> {
-    Ok(projection::get_key_by_name(storage, tenant_id, name)?
+    let core_store = CoreStore::new(storage.clone()).await?;
+    Ok(projection::get_key_by_name(&core_store, tenant_id, name)?
         .map(|key| (key.id, key.token_encrypted)))
 }
 
@@ -323,7 +327,8 @@ pub async fn get_key_encrypted_by_id(
     tenant_id: i64,
     id: i64,
 ) -> Result<Option<Vec<u8>>> {
-    Ok(projection::get_key_by_id(storage, id)?
+    let core_store = CoreStore::new(storage.clone()).await?;
+    Ok(projection::get_key_by_id(&core_store, id)?
         .filter(|key| key.tenant_id == tenant_id)
         .map(|key| key.token_encrypted))
 }
@@ -333,7 +338,8 @@ pub(crate) async fn list_encrypted_key_page(
     after_cursor: Option<&[u8]>,
     limit: usize,
 ) -> Result<HfKeyPage> {
-    projection::list_all_keys(storage, after_cursor, limit)
+    let core_store = CoreStore::new(storage.clone()).await?;
+    projection::list_all_keys(&core_store, after_cursor, limit)
 }
 
 pub(crate) async fn update_key_encrypted_with_permit(
@@ -344,7 +350,8 @@ pub(crate) async fn update_key_encrypted_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
     let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
-    let mut key = projection::get_key_by_id(storage, id)?
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let mut key = projection::get_key_by_id(&core_store, id)?
         .ok_or_else(|| anyhow!("hugging face key not found"))?;
     key.token_encrypted = token_encrypted.to_vec();
     key.updated_at = Utc::now();
@@ -367,7 +374,8 @@ pub(crate) async fn list_key_page(
     after_cursor: Option<&[u8]>,
     limit: usize,
 ) -> Result<HfKeyPage> {
-    projection::list_tenant_keys(storage, tenant_id, after_cursor, limit)
+    let core_store = CoreStore::new(storage.clone()).await?;
+    projection::list_tenant_keys(&core_store, tenant_id, after_cursor, limit)
 }
 
 pub(crate) async fn hf_collection_revision(storage: &Storage) -> Result<String> {
@@ -492,8 +500,9 @@ async fn create_ingestion_inner(
 }
 
 pub async fn get_ingestion_job(storage: &Storage, id: i64) -> Result<Option<HfIngestionJob>> {
+    let core_store = CoreStore::new(storage.clone()).await?;
     Ok(
-        projection::get_ingestion(storage, id)?.map(|job| HfIngestionJob {
+        projection::get_ingestion(&core_store, id)?.map(|job| HfIngestionJob {
             key_id: job.key_id,
             tenant_id: job.tenant_id,
             requester_app_id: job.requester_app_id,
@@ -537,7 +546,8 @@ async fn update_ingestion_state_inner(
     error: Option<&str>,
     guard: HfWriteGuard,
 ) -> Result<()> {
-    let Some(mut job) = projection::get_ingestion(storage, id)? else {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let Some(mut job) = projection::get_ingestion(&core_store, id)? else {
         return Ok(());
     };
     job.state = state_value;
@@ -577,7 +587,8 @@ pub(crate) async fn cancel_ingestion_with_permit(
 }
 
 async fn cancel_ingestion_inner(storage: &Storage, id: i64, guard: HfWriteGuard) -> Result<u64> {
-    let Some(mut job) = projection::get_ingestion(storage, id)? else {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let Some(mut job) = projection::get_ingestion(&core_store, id)? else {
         return Ok(0);
     };
     if !matches!(
@@ -642,7 +653,8 @@ async fn add_item_inner(
     etag: Option<&str>,
     guard: HfWriteGuard,
 ) -> Result<i64> {
-    let existing = projection::get_item_by_path(storage, ingestion_id, path)?;
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let existing = projection::get_item_by_path(&core_store, ingestion_id, path)?;
     let (stream_precondition, id) = if let Some(item) = existing.as_ref() {
         (None, item.id)
     } else {
@@ -697,7 +709,8 @@ async fn update_item_state_inner(
     error: Option<&str>,
     guard: HfWriteGuard,
 ) -> Result<()> {
-    let Some(mut item) = projection::get_item(storage, id)? else {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let Some(mut item) = projection::get_item(&core_store, id)? else {
         return Ok(());
     };
     item.state = state_value;
@@ -750,7 +763,8 @@ async fn update_item_success_inner(
     etag: &str,
     guard: HfWriteGuard,
 ) -> Result<()> {
-    let Some(mut item) = projection::get_item(storage, id)? else {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let Some(mut item) = projection::get_item(&core_store, id)? else {
         return Ok(());
     };
     item.state = crate::tasks::HFIngestionItemState::Stored;
@@ -776,7 +790,8 @@ pub async fn list_stored_ingestion_item_page(
     after_cursor: Option<&[u8]>,
     limit: usize,
 ) -> Result<HfStoredItemPage> {
-    projection::list_stored_items_for_ingestion(storage, ingestion_id, after_cursor, limit)
+    let core_store = CoreStore::new(storage.clone()).await?;
+    projection::list_stored_items_for_ingestion(&core_store, ingestion_id, after_cursor, limit)
 }
 
 pub async fn list_stored_target_item_page(
@@ -787,8 +802,9 @@ pub async fn list_stored_target_item_page(
     after_cursor: Option<&[u8]>,
     limit: usize,
 ) -> Result<HfStoredItemPage> {
+    let core_store = CoreStore::new(storage.clone()).await?;
     projection::list_stored_items_for_target(
-        storage,
+        &core_store,
         tenant_id,
         bucket,
         prefix,
@@ -798,7 +814,8 @@ pub async fn list_stored_target_item_page(
 }
 
 pub async fn get_ingestion_status(storage: &Storage, id: i64) -> Result<HfIngestionStatus> {
-    projection::get_ingestion_status(storage, id)?.ok_or_else(|| anyhow!("ingestion not found"))
+    let core_store = CoreStore::new(storage.clone()).await?;
+    projection::get_ingestion_status(&core_store, id)?.ok_or_else(|| anyhow!("ingestion not found"))
 }
 
 async fn append_body(
@@ -846,13 +863,14 @@ async fn append_body(
         idempotency_key: Some(transaction_id.clone()),
     }];
     operations.extend(projection::projection_operations(
-        storage,
+        &core_store,
         &body,
         &stream_id,
         root_generation,
         &transaction_id,
         &partition_id,
     )?);
+    let projection_root = projection::projection_root_anchor_key(&stream_id);
     let mut preconditions: Vec<_> = guard.partition_precondition.into_iter().collect();
     preconditions.push(stream_precondition);
     core_store
@@ -860,6 +878,14 @@ async fn append_body(
             transaction_id,
             scope_partition: partition_id.clone(),
             committed_by_principal: hf_partition_principal(),
+            root_publications: vec![
+                CoreMutationRootPublication::new(partition_id, WriterFamily::CoreControl.as_str())
+                    .coordinator(),
+                CoreMutationRootPublication::new(
+                    projection_root,
+                    WriterFamily::ObjectBlob.as_str(),
+                ),
+            ],
             preconditions,
             operations,
         })

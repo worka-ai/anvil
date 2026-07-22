@@ -4,12 +4,11 @@ use super::{
     hf_ingestion_to_proto, hf_key_from_proto, hf_key_to_proto,
 };
 use crate::core_store::{
-    CF_OBSERVABILITY, CoreMetaStore, CoreMetaTuplePart, CoreMutationOperation,
+    CF_OBSERVABILITY, CoreMetaTuplePart, CoreMutationOperation, CoreStore,
     TABLE_OBSERVABILITY_CURSOR_ROW, core_meta_committed_row_common, core_meta_record_tuple_key,
     core_meta_root_key_hash, core_meta_tuple_key,
 };
 use crate::persistence::{HfIngestion, HfIngestionItem, HfKey};
-use crate::storage::Storage;
 use anyhow::{Result, anyhow};
 use prost::Message;
 
@@ -127,11 +126,11 @@ struct HfTargetItemProjectionProto {
 }
 
 pub(super) fn get_key_by_name(
-    storage: &Storage,
+    store: &CoreStore,
     tenant_id: i64,
     name: &str,
 ) -> Result<Option<HfKey>> {
-    let key = read_key(storage, &key_name_key(tenant_id, name)?)?;
+    let key = read_key(store, &key_name_key(tenant_id, name)?)?;
     if key
         .as_ref()
         .is_some_and(|key| key.tenant_id != tenant_id || key.name != name)
@@ -141,8 +140,8 @@ pub(super) fn get_key_by_name(
     Ok(key)
 }
 
-pub(super) fn get_key_by_id(storage: &Storage, id: i64) -> Result<Option<HfKey>> {
-    let key = read_key(storage, &key_id_key(id)?)?;
+pub(super) fn get_key_by_id(store: &CoreStore, id: i64) -> Result<Option<HfKey>> {
+    let key = read_key(store, &key_id_key(id)?)?;
     if key.as_ref().is_some_and(|key| key.id != id) {
         return Err(anyhow!("hf key-id projection scope mismatch"));
     }
@@ -150,12 +149,12 @@ pub(super) fn get_key_by_id(storage: &Storage, id: i64) -> Result<Option<HfKey>>
 }
 
 pub(super) fn list_tenant_keys(
-    storage: &Storage,
+    store: &CoreStore,
     tenant_id: i64,
     after_cursor: Option<&[u8]>,
     limit: usize,
 ) -> Result<HfKeyPage> {
-    let page = read_key_page(storage, &key_name_prefix(tenant_id)?, after_cursor, limit)?;
+    let page = read_key_page(store, &key_name_prefix(tenant_id)?, after_cursor, limit)?;
     if page.keys.iter().any(|key| key.tenant_id != tenant_id) {
         return Err(anyhow!("hf tenant key projection scope mismatch"));
     }
@@ -163,15 +162,15 @@ pub(super) fn list_tenant_keys(
 }
 
 pub(super) fn list_all_keys(
-    storage: &Storage,
+    store: &CoreStore,
     after_cursor: Option<&[u8]>,
     limit: usize,
 ) -> Result<HfKeyPage> {
-    read_key_page(storage, &key_id_prefix()?, after_cursor, limit)
+    read_key_page(store, &key_id_prefix()?, after_cursor, limit)
 }
 
-pub(super) fn get_ingestion(storage: &Storage, id: i64) -> Result<Option<HfIngestion>> {
-    let Some(payload) = read_payload(storage, &ingestion_key(id)?)? else {
+pub(super) fn get_ingestion(store: &CoreStore, id: i64) -> Result<Option<HfIngestion>> {
+    let Some(payload) = read_payload(store, &ingestion_key(id)?)? else {
         return Ok(None);
     };
     let row = HfIngestionProjectionProto::decode(payload.as_slice())?;
@@ -189,8 +188,8 @@ pub(super) fn get_ingestion(storage: &Storage, id: i64) -> Result<Option<HfInges
     Ok(Some(ingestion))
 }
 
-pub(super) fn get_item(storage: &Storage, id: i64) -> Result<Option<HfIngestionItem>> {
-    let item = read_item(storage, &item_id_key(id)?)?;
+pub(super) fn get_item(store: &CoreStore, id: i64) -> Result<Option<HfIngestionItem>> {
+    let item = read_item(store, &item_id_key(id)?)?;
     if item.as_ref().is_some_and(|item| item.id != id) {
         return Err(anyhow!("hf item-id projection scope mismatch"));
     }
@@ -198,11 +197,11 @@ pub(super) fn get_item(storage: &Storage, id: i64) -> Result<Option<HfIngestionI
 }
 
 pub(super) fn get_item_by_path(
-    storage: &Storage,
+    store: &CoreStore,
     ingestion_id: i64,
     path: &str,
 ) -> Result<Option<HfIngestionItem>> {
-    let item = read_item(storage, &item_path_key(ingestion_id, path)?)?;
+    let item = read_item(store, &item_path_key(ingestion_id, path)?)?;
     if item
         .as_ref()
         .is_some_and(|item| item.ingestion_id != ingestion_id || item.path != path)
@@ -213,13 +212,13 @@ pub(super) fn get_item_by_path(
 }
 
 pub(super) fn list_stored_items_for_ingestion(
-    storage: &Storage,
+    store: &CoreStore,
     ingestion_id: i64,
     after_cursor: Option<&[u8]>,
     limit: usize,
 ) -> Result<HfStoredItemPage> {
     read_stored_item_page(
-        storage,
+        store,
         &stored_item_ingestion_prefix(ingestion_id)?,
         after_cursor,
         limit,
@@ -236,7 +235,7 @@ pub(super) fn list_stored_items_for_ingestion(
 }
 
 pub(super) fn list_stored_items_for_target(
-    storage: &Storage,
+    store: &CoreStore,
     tenant_id: i64,
     bucket: &str,
     prefix: &str,
@@ -244,7 +243,7 @@ pub(super) fn list_stored_items_for_target(
     limit: usize,
 ) -> Result<HfStoredItemPage> {
     read_stored_item_page(
-        storage,
+        store,
         &stored_item_target_prefix(tenant_id, bucket, prefix)?,
         after_cursor,
         limit,
@@ -253,11 +252,11 @@ pub(super) fn list_stored_items_for_target(
 }
 
 pub(super) fn get_ingestion_status(
-    storage: &Storage,
+    store: &CoreStore,
     ingestion_id: i64,
 ) -> Result<Option<HfIngestionStatus>> {
     Ok(
-        read_status_projection(storage, ingestion_id)?.map(|projection| HfIngestionStatus {
+        read_status_projection(store, ingestion_id)?.map(|projection| HfIngestionStatus {
             state: projection.ingestion.state,
             queued: projection.queued,
             downloading: projection.downloading,
@@ -272,14 +271,14 @@ pub(super) fn get_ingestion_status(
 }
 
 pub(super) fn projection_operations(
-    storage: &Storage,
+    store: &CoreStore,
     body: &HfBody,
     stream_id: &str,
     root_generation: u64,
     transaction_id: &str,
     partition_id: &str,
 ) -> Result<Vec<CoreMutationOperation>> {
-    let root_hash = core_meta_root_key_hash(&format!("stream/{stream_id}"));
+    let root_hash = core_meta_root_key_hash(&projection_root_anchor_key(stream_id));
     match body {
         HfBody::KeyUpsert { key, .. } => {
             let payload = encode_key_projection(key, &root_hash, root_generation, transaction_id)?;
@@ -308,7 +307,7 @@ pub(super) fn projection_operations(
                 root_generation,
                 transaction_id,
             )?;
-            let existing_status = read_status_projection(storage, ingestion.id)?;
+            let existing_status = read_status_projection(store, ingestion.id)?;
             if existing_status.as_ref().is_some_and(|status| {
                 status.ingestion.tenant_id != ingestion.tenant_id
                     || status.ingestion.target_bucket != ingestion.target_bucket
@@ -338,13 +337,13 @@ pub(super) fn projection_operations(
             ])
         }
         HfBody::ItemUpsert { item, .. } => {
-            let previous = get_item(storage, item.id)?;
+            let previous = get_item(store, item.id)?;
             if previous.as_ref().is_some_and(|previous| {
                 previous.ingestion_id != item.ingestion_id || previous.path != item.path
             }) {
                 return Err(anyhow!("hf item identity cannot change during an upsert"));
             }
-            let mut status = read_status_projection(storage, item.ingestion_id)?
+            let mut status = read_status_projection(store, item.ingestion_id)?
                 .ok_or_else(|| anyhow!("hf item ingestion status projection is missing"))?;
             apply_item_transition(
                 &mut status,
@@ -399,8 +398,12 @@ pub(super) fn projection_operations(
     }
 }
 
-fn read_key(storage: &Storage, tuple_key: &[u8]) -> Result<Option<HfKey>> {
-    let Some(payload) = read_payload(storage, tuple_key)? else {
+pub(super) fn projection_root_anchor_key(stream_id: &str) -> String {
+    format!("stream/{stream_id}")
+}
+
+fn read_key(store: &CoreStore, tuple_key: &[u8]) -> Result<Option<HfKey>> {
+    let Some(payload) = read_payload(store, tuple_key)? else {
         return Ok(None);
     };
     let row = HfKeyProjectionProto::decode(payload.as_slice())?;
@@ -414,7 +417,7 @@ fn read_key(storage: &Storage, tuple_key: &[u8]) -> Result<Option<HfKey>> {
 }
 
 fn read_key_page(
-    storage: &Storage,
+    store: &CoreStore,
     prefix: &[u8],
     after_cursor: Option<&[u8]>,
     limit: usize,
@@ -424,7 +427,7 @@ fn read_key_page(
             "hf key page size must be between 1 and {HF_PROJECTION_PAGE_MAX}"
         ));
     }
-    let mut rows = CoreMetaStore::open(storage.core_store_meta_path())?.scan_prefix_page(
+    let mut rows = store.scan_coremeta_prefix_page(
         CF_OBSERVABILITY,
         TABLE_OBSERVABILITY_CURSOR_ROW,
         prefix,
@@ -467,8 +470,8 @@ fn read_key_payload(payload: &[u8]) -> Result<HfKey> {
     )
 }
 
-fn read_item(storage: &Storage, tuple_key: &[u8]) -> Result<Option<HfIngestionItem>> {
-    let Some(payload) = read_payload(storage, tuple_key)? else {
+fn read_item(store: &CoreStore, tuple_key: &[u8]) -> Result<Option<HfIngestionItem>> {
+    let Some(payload) = read_payload(store, tuple_key)? else {
         return Ok(None);
     };
     Ok(Some(read_item_payload(&payload)?))
@@ -487,14 +490,14 @@ fn read_item_payload(payload: &[u8]) -> Result<HfIngestionItem> {
 }
 
 fn read_stored_item_page(
-    storage: &Storage,
+    store: &CoreStore,
     prefix: &[u8],
     after_cursor: Option<&[u8]>,
     limit: usize,
     decode: impl Fn(&[u8]) -> Result<HfStoredItem>,
 ) -> Result<HfStoredItemPage> {
     validate_page_limit(limit, "hf stored item")?;
-    let mut rows = CoreMetaStore::open(storage.core_store_meta_path())?.scan_prefix_page(
+    let mut rows = store.scan_coremeta_prefix_page(
         CF_OBSERVABILITY,
         TABLE_OBSERVABILITY_CURSOR_ROW,
         prefix,
@@ -549,10 +552,10 @@ fn read_target_item_payload(
 }
 
 fn read_status_projection(
-    storage: &Storage,
+    store: &CoreStore,
     ingestion_id: i64,
 ) -> Result<Option<HfIngestionStatusProjection>> {
-    let Some(payload) = read_payload(storage, &ingestion_status_key(ingestion_id)?)? else {
+    let Some(payload) = read_payload(store, &ingestion_status_key(ingestion_id)?)? else {
         return Ok(None);
     };
     let row = HfIngestionStatusProjectionProto::decode(payload.as_slice())?;
@@ -642,12 +645,8 @@ fn adjust_item_count(
     Ok(())
 }
 
-fn read_payload(storage: &Storage, tuple_key: &[u8]) -> Result<Option<Vec<u8>>> {
-    CoreMetaStore::open(storage.core_store_meta_path())?.get(
-        CF_OBSERVABILITY,
-        TABLE_OBSERVABILITY_CURSOR_ROW,
-        tuple_key,
-    )
+fn read_payload(store: &CoreStore, tuple_key: &[u8]) -> Result<Option<Vec<u8>>> {
+    store.read_coremeta_row(CF_OBSERVABILITY, TABLE_OBSERVABILITY_CURSOR_ROW, tuple_key)
 }
 
 fn encode_key_projection(
