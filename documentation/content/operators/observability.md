@@ -64,7 +64,7 @@ Consider a stale search incident. A user uploads `contracts/acme-2026.pdf` and i
 The tenant-facing diagnostic command is a safe first check for one index:
 
 ```bash
-anvil diagnostics list documents body_text --severity warning --limit 50
+anvil diagnostics list documents body_text --severity warning --page-size 50
 ```
 
 This reads diagnostics for the `body_text` index in the `documents` bucket using the current public CLI profile. It proves that the caller can authenticate to the public API and read diagnostics for that tenant-scoped index. It does not prove the whole bucket is indexed, that search is caught up, or that another index has no findings.

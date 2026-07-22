@@ -375,7 +375,14 @@ async fn tenant_tutorial_commands_run_without_admin_port_e2e() {
     assert!(query_output.contains("app-v2.txt"), "{query_output}");
     run_anvil(
         &config_dir,
-        &["diagnostics", "list", &bucket, "by-path", "--limit", "5"],
+        &[
+            "diagnostics",
+            "list",
+            &bucket,
+            "by-path",
+            "--page-size",
+            "5",
+        ],
     );
     run_anvil(
         &config_dir,

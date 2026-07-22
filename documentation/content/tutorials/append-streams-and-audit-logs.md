@@ -178,7 +178,7 @@ Inspect index diagnostics when expected rows are missing:
 
 ```bash
 anvil --profile acme index diagnostics documents audit_events \
-  --limit 20
+  --page-size 20
 ```
 
 This command proves the caller has `index:read` on `documents` and that Anvil can read diagnostics for the index. It does not prove there are no stream records. No output only means no diagnostics were returned in that page.

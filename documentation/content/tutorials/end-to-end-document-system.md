@@ -374,7 +374,7 @@ Do not expose the admin API to make public delivery work. Public API, S3, and st
 When a dashboard, search result, or listing looks wrong, start read-only. For the typed index:
 
 ```bash
-anvil --profile acme diagnostics list documents docs_workflow --limit 20
+anvil --profile acme diagnostics list documents docs_workflow --page-size 20
 ```
 
 This calls the public index diagnostics path and prints cursor, severity, code, and message. A successful response proves the caller has `index:read` on `documents` and that Anvil can read diagnostics for that index. No output does not prove the index is perfect; it only means no matching diagnostics were returned in that page.

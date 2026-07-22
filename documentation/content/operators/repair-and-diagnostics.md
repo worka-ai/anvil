@@ -32,7 +32,7 @@ A quick public index diagnostic reads tenant-owned findings:
 ```bash
 anvil --profile acme diagnostics list documents body_text \
   --severity warning \
-  --limit 50
+  --page-size 50
 ```
 
 This proves the tenant profile can authenticate, has authority to read diagnostics for the `documents/body_text` index, and can receive diagnostic records from the public index diagnostic surface. It does not prove the index is complete, that other indexes are healthy, or that the source object exists.

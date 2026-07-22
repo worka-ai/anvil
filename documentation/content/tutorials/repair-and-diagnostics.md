@@ -50,7 +50,7 @@ Suppose the typed index from the earlier tutorial is missing rows. Do not rebuil
 ```bash
 anvil --profile acme diagnostics list documents invoices_by_due \
   --severity error \
-  --limit 20
+  --page-size 20
 ```
 
 This calls `IndexService.ListIndexDiagnostics` for bucket `documents` and index `invoices_by_due`. A successful command proves the active profile authenticated, the caller had `index:read` on `documents`, the bucket existed, the severity filter was valid, and Anvil could read matching index diagnostic rows. The CLI output is compact:
@@ -59,24 +59,27 @@ This calls `IndexService.ListIndexDiagnostics` for bucket `documents` and index 
 <cursor>    <severity>    <code>    <message>
 ```
 
-This command does not prove the index is healthy when it prints no rows. It only proves that no matching diagnostics were returned after the cursor you supplied, within the page limit. It also does not prove the caller can see every object that a query might return, because query results can still be filtered through `inherit_object` authorisation.
+This command does not prove the index is healthy when it prints no rows. It only proves that no matching diagnostics were returned in that page. It also does not prove the caller can see every object that a query might return, because query results can still be filtered through `inherit_object` authorisation.
 
-For long lists, page manually with the numeric cursor. If the last row printed cursor `125`, continue after that cursor:
+For long lists, the CLI prints an opaque `next_page_token`. Continue with that
+exact token while preserving the same caller and filters:
 
 ```bash
 anvil --profile acme diagnostics list documents invoices_by_due \
-  --after-cursor 125 \
-  --limit 20
+  --page-token "$NEXT_PAGE_TOKEN" \
+  --page-size 20
 ```
 
-The `after_cursor` value is not a signed page token. It is a simple lower bound over index diagnostic cursor positions. Keep the same bucket, index, severity, and caller when paging so you do not accidentally skip or mix evidence from different investigations.
+The page token is signed and bound to the diagnostic request. Do not treat it as
+a cursor that can be edited or reused with another bucket, index, severity, or
+caller.
 
 You can use the index command spelling for the same public API call:
 
 ```bash
 anvil --profile acme index diagnostics documents invoices_by_due \
   --severity warning \
-  --limit 20
+  --page-size 20
 ```
 
 This proves the same things as `anvil diagnostics list`. It does not inspect directory indexes, PersonalDB logs, admin mesh state, or tenant audit events.

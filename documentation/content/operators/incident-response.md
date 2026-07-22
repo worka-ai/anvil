@@ -123,7 +123,7 @@ Next inspect diagnostics for the affected index:
 ```bash
 anvil --profile acme diagnostics list documents body_text \
   --severity warning \
-  --limit 50
+  --page-size 50
 ```
 
 This proves tenant-facing diagnostics for `documents/body_text` can be read. It does not prove the index is caught up. Use query catch-up fields where the index family supports them, and inspect index or watch lag where it does not.

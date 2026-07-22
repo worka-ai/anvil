@@ -275,7 +275,7 @@ anvil --profile acme index query documents by_status \
   --require-caught-up-to-watch-cursor "$WATCH_CURSOR" \
   --lag-timeout-ms 2000
 
-anvil --profile acme index diagnostics documents by_status --severity warning --after-cursor 0 --limit 100
+anvil --profile acme index diagnostics documents by_status --severity warning --page-size 100
 ```
 
 Purpose: create/update/drop definitions, list definitions, query path/metadata/typed/full-text/vector/hybrid indexes, and inspect diagnostics.
@@ -402,16 +402,17 @@ Public diagnostics and repair are tenant-scoped. System-wide repair belongs to t
 ```bash
 anvil --profile acme diagnostics list documents by_status \
   --severity warning \
-  --after-cursor 0 \
-  --limit 100
+  --page-size 100
 
 anvil --profile acme index diagnostics documents by_status \
   --severity warning \
-  --after-cursor 0 \
-  --limit 100
+  --page-size 100
 ```
 
 `diagnostics list` and `index diagnostics` currently call the same index diagnostic API shape.
+Both commands print `next_page_token=...` when another page exists. Pass that
+opaque value back with `--page-token` while keeping the caller, bucket, index,
+severity, and page size unchanged.
 
 ```bash
 anvil --profile acme repair run index documents by_status --rebuild
