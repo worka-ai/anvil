@@ -269,7 +269,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 120
     env:
-      CARGO_BUILD_JOBS: "1"
+      CARGO_BUILD_JOBS: "8"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       ANVIL_GATE_STEP_TIMEOUT_SECONDS: "5400"
@@ -318,7 +318,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 180
     env:
-      CARGO_BUILD_JOBS: "1"
+      CARGO_BUILD_JOBS: "8"
       ANVIL_MACHINE_CLASS: "worka-builder-2-linux-x64"
       ANVIL_GATE_STEP_TIMEOUT_SECONDS: "9900"
       ANVIL_EXPECTED_GIT_COMMIT: ${{ needs.release-context.outputs.commit }}
@@ -374,7 +374,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 60
     env:
-      CARGO_BUILD_JOBS: "1"
+      CARGO_BUILD_JOBS: "8"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       ANVIL_RUST_TEST_THREADS: "8"
@@ -425,7 +425,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 120
     env:
-      CARGO_BUILD_JOBS: "1"
+      CARGO_BUILD_JOBS: "8"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       ANVIL_DOCKER_TEST_THREADS: "2"
