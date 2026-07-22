@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 #[path = "distributed_tests/common.rs"]
 mod common;
 #[path = "distributed_tests/faults.rs"]

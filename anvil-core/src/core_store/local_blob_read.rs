@@ -412,20 +412,55 @@ impl CoreStore {
                 .await;
         }
 
+        let manifest = self.read_object_manifest(&object_ref).await?;
+        validate_manifest_for_object_ref(
+            &manifest,
+            &object_ref,
+            strip_sha256_prefix(&object_ref.hash)?,
+        )?;
+
+        // A range read currently validates a complete systematic data shard.
+        // Batch callbacks at shard boundaries so a small response chunk does
+        // not cause the same shard to be read and hashed repeatedly.
+        let data_shards = usize::from(manifest.encoding.data_shards);
+        if data_shards == 0 {
+            bail!("CoreStore range read requires at least one data shard");
+        }
+        if manifest.encoding.compression.algorithm != "none" {
+            let batch = self
+                .get_blob_range(GetBlobRange {
+                    object_ref,
+                    range: read_range,
+                })
+                .await?;
+            for chunk in batch.chunks(chunk_size) {
+                on_chunk(chunk.to_vec()).await?;
+            }
+            return Ok(());
+        }
+        let shard_len = object_ref.logical_size.div_ceil(data_shards as u64).max(1);
         let mut cursor = read_range.start;
         while cursor < read_range.end_exclusive {
-            let next = (cursor + chunk_size as u64).min(read_range.end_exclusive);
-            let chunk = self
+            let shard_end = cursor
+                .checked_div(shard_len)
+                .and_then(|index| index.checked_add(1))
+                .and_then(|index| index.checked_mul(shard_len))
+                .unwrap_or(object_ref.logical_size)
+                .min(object_ref.logical_size);
+            let batch_end = shard_end.min(read_range.end_exclusive);
+            let batch = self
                 .get_blob_range(GetBlobRange {
                     object_ref: object_ref.clone(),
                     range: CoreByteRange {
                         start: cursor,
-                        end_exclusive: next,
+                        end_exclusive: batch_end,
                     },
                 })
                 .await?;
-            on_chunk(chunk).await?;
-            cursor = next;
+            for chunk in batch.chunks(chunk_size) {
+                on_chunk(chunk.to_vec()).await?;
+            }
+            cursor = batch_end;
         }
         Ok(())
     }

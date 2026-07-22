@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use anvil::anvil_api::git_source_service_client::GitSourceServiceClient;
 use anvil::anvil_api::{
     GetGitBlobByPathRequest, GetGitObjectRequest, GitPackMetadata, ListGitTreeRequest,

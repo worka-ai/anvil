@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use anvil::anvil_api::internal_proxy_service_client::InternalProxyServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::{

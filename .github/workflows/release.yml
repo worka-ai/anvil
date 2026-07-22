@@ -27,7 +27,7 @@ env:
 jobs:
   release-context:
     name: Resolve immutable release context
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 10
     outputs:
       tag: ${{ steps.release.outputs.tag }}
@@ -94,7 +94,7 @@ jobs:
   build-image:
     name: Build release image (${{ matrix.platform }})
     needs: release-context
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 90
     env:
       ANVIL_BUILD_IMAGE: anvil:test-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -107,9 +107,11 @@ jobs:
           - platform: linux/amd64
             arch: amd64
             artifact: anvil-test-image-amd64
+            native_cargo: "1"
           - platform: linux/arm64
             arch: arm64
             artifact: anvil-test-image-arm64
+            native_cargo: "0"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -163,7 +165,8 @@ jobs:
           ANVIL_IMAGE: ${{ env.ANVIL_BUILD_IMAGE }}
           ANVIL_DOCKER_PLATFORM: ${{ matrix.platform }}
           ANVIL_BUILD_PROFILE: release
-          CARGO_BUILD_JOBS: "2"
+          ANVIL_USE_NATIVE_CARGO: ${{ matrix.native_cargo }}
+          CARGO_BUILD_JOBS: "1"
         run: ./scripts/build-image.sh
 
       - name: Smoke check image binaries
@@ -191,7 +194,8 @@ jobs:
           ANVIL_DOCKER_PLATFORM: linux/amd64
           ANVIL_BUILD_PROFILE: release
           ANVIL_INCLUDE_TEST_TOOLS: "1"
-          CARGO_BUILD_JOBS: "2"
+          ANVIL_USE_NATIVE_CARGO: "1"
+          CARGO_BUILD_JOBS: "1"
         run: ./scripts/build-image.sh
 
       - name: Smoke check Docker integration tooling
@@ -224,7 +228,7 @@ jobs:
   static-and-docs:
     name: Static gates and docs artifact
     needs: release-context
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 45
     steps:
       - name: Checkout repository
@@ -278,7 +282,7 @@ jobs:
   rust-unit:
     name: Rust unit and client tests
     needs: [release-context, build-image, static-and-docs]
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 120
     env:
       CARGO_BUILD_JOBS: "1"
@@ -327,7 +331,7 @@ jobs:
   coremeta-performance:
     name: CoreMeta ordered-access release performance gate
     needs: [release-context, rust-unit]
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 180
     env:
       CARGO_BUILD_JOBS: "1"
@@ -383,7 +387,7 @@ jobs:
   server-core:
     name: Server core integration tests
     needs: [release-context, coremeta-performance]
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: "1"
@@ -434,7 +438,7 @@ jobs:
   docker-integration:
     name: Docker integration tests (${{ matrix.group }})
     needs: [release-context, build-image, server-core]
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 120
     env:
       CARGO_BUILD_JOBS: "1"
@@ -505,7 +509,7 @@ jobs:
   publish:
     name: Publish release artifacts
     needs: [release-context, build-image, static-and-docs, rust-unit, coremeta-performance, server-core, docker-integration]
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 45
     environment:
       name: github-pages

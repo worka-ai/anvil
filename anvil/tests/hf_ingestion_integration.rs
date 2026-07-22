@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use anvil_test_utils::*;
 use std::time::Duration;
 

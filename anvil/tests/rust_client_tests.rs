@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use anvil_storage::AnvilClient;
 use anvil_storage::proto::get_object_response;
 use anvil_storage::proto::put_object_request;

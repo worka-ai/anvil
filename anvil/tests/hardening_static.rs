@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::process::Command;
 
 fn repo_root() -> std::path::PathBuf {
