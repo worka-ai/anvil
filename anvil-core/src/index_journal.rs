@@ -1,8 +1,9 @@
 use crate::core_store::{
-    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreStore, CoreTransaction,
-    CoreTransactionState, CoreTransactionUpdate, ReadStream,
+    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
+    CoreMutationRootPublication, CoreStore, CoreTransaction, CoreTransactionState,
+    CoreTransactionUpdate, ReadStream,
 };
-use crate::formats::{Hash32, hash32};
+use crate::formats::{Hash32, hash32, writer::WriterFamily};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
 #[cfg(test)]
 use crate::persistence::Bucket;
@@ -176,18 +177,46 @@ async fn append_index_definition_event_inner(
         event.tenant_id,
         event.bucket_id,
     ));
+    let data_root =
+        current_definitions::projection_root_anchor_key(event.tenant_id, event.bucket_id);
+    let explicit_transaction = match (transaction_id, transaction_principal) {
+        (Some(transaction_id), Some(transaction_principal)) => Some(
+            core_store
+                .read_explicit_transaction_for_principal(transaction_id, transaction_principal)
+                .await?,
+        ),
+        (None, None) => None,
+        _ => {
+            return Err(anyhow!(
+                "index definition transaction id and principal must be provided together"
+            ));
+        }
+    };
+    if explicit_transaction
+        .as_ref()
+        .is_some_and(|transaction| transaction.root_anchor_key != data_root)
+    {
+        return Err(anyhow!(
+            "index definition transaction targets a different CoreMeta root"
+        ));
+    }
+    let scope_partition = explicit_transaction
+        .as_ref()
+        .map(|transaction| transaction.scope_partition.clone())
+        .unwrap_or_else(|| partition_id.clone());
+    let root_publications = index_definition_root_publications(data_root, scope_partition.clone());
     let projection = current_definitions::prepare_projection_mutation(
         storage,
         event,
         &payload,
-        &partition_id,
+        &scope_partition,
         &effective_transaction_id,
     )
     .await?;
     let mut preconditions: Vec<_> = partition_precondition.into_iter().collect();
     preconditions.push(projection.precondition);
     let mut operations = vec![CoreMutationOperation::StreamAppend {
-        partition_id: partition_id.clone(),
+        partition_id: scope_partition.clone(),
         stream_id,
         record_kind: INDEX_DEFINITION_RECORD_KIND.to_string(),
         payload,
@@ -200,10 +229,11 @@ async fn append_index_definition_event_inner(
     let batch =
         CoreMutationBatch {
             transaction_id: effective_transaction_id,
-            scope_partition: partition_id,
+            scope_partition,
             committed_by_principal: transaction_principal.map(ToOwned::to_owned).unwrap_or_else(
                 || index_definition_partition_principal(event.tenant_id, event.bucket_id),
             ),
+            root_publications,
             preconditions,
             operations,
         };
@@ -236,6 +266,7 @@ pub async fn materialize_committed_index_definition_transaction(
             stream_id,
             visible_sequence,
             prepared_record_hash,
+            ..
         } = update
         else {
             continue;
@@ -667,6 +698,10 @@ async fn write_index_current_coremeta_rows(
         &transaction_id,
     )
     .await?;
+    let root_publications = index_definition_root_publications(
+        current_definitions::projection_root_anchor_key(event.tenant_id, event.bucket_id),
+        partition_id.clone(),
+    );
     CoreStore::new(storage.clone())
         .await?
         .commit_mutation_batch(CoreMutationBatch {
@@ -676,11 +711,34 @@ async fn write_index_current_coremeta_rows(
                 event.tenant_id,
                 event.bucket_id,
             ),
+            root_publications,
             preconditions: vec![projection.precondition],
             operations: projection.operations,
         })
         .await?;
     Ok(())
+}
+
+fn index_definition_root_publications(
+    data_root: String,
+    coordinator_root: String,
+) -> Vec<CoreMutationRootPublication> {
+    if data_root == coordinator_root {
+        return vec![CoreMutationRootPublication {
+            root_anchor_key: data_root,
+            writer_families: vec![
+                WriterFamily::CoreControl.as_str().to_string(),
+                WriterFamily::TypedMetadata.as_str().to_string(),
+            ],
+            transaction_coordinator: true,
+        }];
+    }
+
+    vec![
+        CoreMutationRootPublication::new(coordinator_root, WriterFamily::CoreControl.as_str())
+            .coordinator(),
+        CoreMutationRootPublication::new(data_root, WriterFamily::TypedMetadata.as_str()),
+    ]
 }
 
 async fn read_index_current_row(

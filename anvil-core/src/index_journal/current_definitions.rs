@@ -400,7 +400,6 @@ fn decode_current_record(
             .ok_or_else(|| anyhow!("index definition current row is missing common fields"))?,
         tenant_id,
         bucket_id,
-        proto.cursor,
         proto.updated_at_unix_nanos,
     )?;
     Ok(CurrentDefinitionRecord {
@@ -452,7 +451,6 @@ fn decode_state(payload: &[u8], tenant_id: i64, bucket_id: i64) -> Result<IndexC
             .ok_or_else(|| anyhow!("index definition state row is missing common fields"))?,
         tenant_id,
         bucket_id,
-        proto.latest_cursor,
         proto.updated_at_unix_nanos,
     )?;
     Ok(IndexCurrentState {
@@ -481,12 +479,11 @@ fn validate_common(
     common: &CoreMetaRowCommonProto,
     tenant_id: i64,
     bucket_id: i64,
-    cursor: i64,
     updated_at_unix_nanos: u64,
 ) -> Result<()> {
     if common.realm_id != format!("tenant:{tenant_id}")
         || common.root_key_hash != projection_root_key_hash(tenant_id, bucket_id)
-        || common.root_generation != u64::try_from(cursor)?
+        || common.root_generation == 0
         || common.transaction_id.trim().is_empty()
         || common.visibility_state_enum() != CoreMetaVisibilityState::Committed
         || common.created_at_unix_nanos != updated_at_unix_nanos
@@ -539,9 +536,11 @@ fn state_tuple_key(tenant_id: i64, bucket_id: i64) -> Result<Vec<u8>> {
 }
 
 fn projection_root_key_hash(tenant_id: i64, bucket_id: i64) -> String {
-    core_meta_root_key_hash(&format!(
-        "tenant/{tenant_id}/bucket/{bucket_id}/index_definition"
-    ))
+    core_meta_root_key_hash(&projection_root_anchor_key(tenant_id, bucket_id))
+}
+
+pub(super) fn projection_root_anchor_key(tenant_id: i64, bucket_id: i64) -> String {
+    format!("tenant/{tenant_id}/bucket/{bucket_id}/index_definition")
 }
 
 fn validate_scope(tenant_id: i64, bucket_id: i64) -> Result<()> {
@@ -556,4 +555,20 @@ fn validate_index_name(index_name: &str) -> Result<()> {
         bail!("index definition name is invalid");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn projection_common_accepts_independent_physical_root_generation() {
+        let cursor = 3;
+        let updated_at = 17;
+        let mut common = projection_common(42, 7, cursor, "tx-index", updated_at).unwrap();
+        common.root_generation = 91;
+
+        validate_common(&common, 42, 7, updated_at).unwrap();
+        assert_ne!(common.root_generation, cursor as u64);
+    }
 }
