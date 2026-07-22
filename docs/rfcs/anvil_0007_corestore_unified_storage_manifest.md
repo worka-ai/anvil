@@ -2761,12 +2761,14 @@ On restart with empty memory:
 1. load local mesh genesis hints from bootstrap config;
 2. scan the ordered local committed-root index through bounded root-directory pages;
 3. call `ExchangeRootDirectory` on equal peers, advancing the exclusive
-   `after_root_key_hash` cursor until at least one complete peer pass has been
-   observed; retain incomplete cursors across recovery rounds;
+   `after_root_key_hash` cursor until a complete read quorum of the canonical R3
+   register cohort has been observed; retain incomplete cursors across recovery
+   rounds; directory responses from equal peers outside that cohort are useful
+   discovery hints but MUST NOT satisfy the read quorum;
 4. union locally known roots with every peer-discovered root, compare each
    advertised `(generation, root_anchor_hash)` with the local head, and exchange
-   per-root register and CoreMeta inventories only for roots whose remote
-   generation is ahead or whose same-generation head hash disagrees;
+   per-root register and CoreMeta inventories only for roots whose authoritative
+   remote generation is ahead or whose same-generation head hash disagrees;
 5. decode each changed generation's immutable publication bundle and identify
    its one declared coordinator root;
 6. group physical register shards for the coordinator by root key and generation,
@@ -2805,12 +2807,25 @@ cursor are discovered by the next pass.
 
 The recovery loop MUST retain the latest bounded root-directory entries per
 peer. It MUST NOT issue one inventory RPC per known root during every steady
-state round. Matching local and remote `(generation, root_anchor_hash)` values
-are sufficient to prove that a root needs no catch-up in that round. A remote
-generation ahead of the local generation selects the root for bounded inventory
-and `CatchUpPartition`; a same-generation hash mismatch is divergence and fails
-closed. Consequently idle recovery performs work proportional to root-directory
-pages and changed roots, rather than `known_roots * equal_peers` RPCs.
+state round. A recovery pass is complete only when the locally selected canonical
+register cohort contributes a read quorum of complete directory passes: local
+state may count only when the local node is a cohort member, and every remaining
+vote must come from a distinct remote cohort member. Non-cohort equal peers may
+advertise cached roots, but their responses never substitute for an authoritative
+register vote. Matching local and authoritative remote
+`(generation, root_anchor_hash)` values are sufficient to prove that a root needs
+no catch-up in that round. A remote generation ahead of the local generation
+selects the root for bounded inventory and `CatchUpPartition`; a same-generation
+hash mismatch is divergence and fails closed. Consequently idle recovery performs
+work proportional to root-directory pages and changed roots, rather than
+`known_roots * equal_peers` RPCs, without mistaking a quorum of stale cache peers
+for committed state.
+
+If a register replica receives a prepared or committed anchor whose generation
+skips its local head, that replica MUST immediately mark its public data plane
+unready and enter bounded anti-entropy. It MUST NOT continue serving routed reads
+or writes from the stale head. Internal recovery RPCs remain available so the
+replica can prove and install every missing generation before readiness returns.
 
 Distributed process readiness is subordinate to this recovery barrier. Startup
 MUST launch distributed CoreMeta recovery before any worker, shard-repair,

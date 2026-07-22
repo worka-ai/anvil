@@ -560,6 +560,14 @@ impl CoreStore {
             bail!("CoreStore root owner transition conflicts at the current generation");
         }
         if current.root_generation.saturating_add(1) != new_anchor.root_generation {
+            if current.root_generation < new_anchor.root_generation
+                && self.startup_recovery_deferred()
+            {
+                // This register replica missed one or more committed
+                // generations. It must stop serving the public plane until
+                // anti-entropy proves and installs the missing history.
+                self.mark_coremeta_recovery_unready();
+            }
             bail!(
                 "CoreStore root owner transition generation mismatch: root={} current={} proposed={}",
                 new_anchor.root_key_hash,

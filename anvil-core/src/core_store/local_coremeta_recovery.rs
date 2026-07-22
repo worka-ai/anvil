@@ -638,11 +638,13 @@ impl CoreStore {
         }
 
         let profile = self.default_coremeta_quorum_profile()?;
-        let local_is_replica = self
-            .select_coremeta_replicas(&profile)
-            .await?
+        let selected_replicas = self.select_coremeta_replicas(&profile).await?;
+        let local_is_replica = selected_replicas.iter().any(|replica| replica.is_local);
+        let authoritative_remote_peers = selected_replicas
             .iter()
-            .any(|replica| replica.is_local);
+            .filter(|replica| !replica.is_local)
+            .map(|replica| replica.node_id.clone())
+            .collect::<BTreeSet<_>>();
         if local_is_replica {
             // Counting the local node toward Q requires its canonical root
             // directory to be readable, not merely its presence in topology.
@@ -656,6 +658,7 @@ impl CoreStore {
             let next = if root_directory_quorum_is_settled(
                 &self.coremeta_recovery.root_directory,
                 &reachable_peers,
+                &authoritative_remote_peers,
                 minimum_remote_recovery_peers,
             ) {
                 match tokio::time::timeout(RECOVERY_QUORUM_SETTLE_INTERVAL, pending.next()).await {
@@ -683,15 +686,17 @@ impl CoreStore {
             }
         }
 
+        let complete = root_directory_quorum_is_settled(
+            &self.coremeta_recovery.root_directory,
+            &reachable_peers,
+            &authoritative_remote_peers,
+            minimum_remote_recovery_peers,
+        );
         let state = self
             .coremeta_recovery
             .root_directory
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let complete = state
-            .peers_with_complete_pass
-            .iter()
-            .any(|node_id| reachable_peers.contains(node_id));
         if reachable_peers.is_empty() && !complete {
             bail!(
                 "CoreMeta root-directory discovery failed: {}",
@@ -1399,9 +1404,17 @@ fn is_stale_recovery_publication(error: &anyhow::Error) -> bool {
 fn root_directory_quorum_is_settled(
     state: &StdMutex<RootDirectoryScanState>,
     reachable_peers: &BTreeSet<String>,
+    authoritative_remote_peers: &BTreeSet<String>,
     minimum_remote_recovery_peers: usize,
 ) -> bool {
-    if reachable_peers.len() < minimum_remote_recovery_peers {
+    if minimum_remote_recovery_peers == 0 {
+        return true;
+    }
+    if reachable_peers
+        .intersection(authoritative_remote_peers)
+        .count()
+        < minimum_remote_recovery_peers
+    {
         return false;
     }
     let state = state
@@ -1410,7 +1423,11 @@ fn root_directory_quorum_is_settled(
     state
         .peers_with_complete_pass
         .iter()
-        .any(|node_id| reachable_peers.contains(node_id))
+        .filter(|node_id| {
+            reachable_peers.contains(*node_id) && authoritative_remote_peers.contains(*node_id)
+        })
+        .count()
+        >= minimum_remote_recovery_peers
 }
 
 fn remote_recovery_acknowledgements(prepare_quorum: usize, local_is_replica: bool) -> usize {
@@ -1747,17 +1764,57 @@ mod tests {
     #[test]
     fn root_directory_quorum_settle_requires_current_complete_and_quorum() {
         let state = StdMutex::new(RootDirectoryScanState {
-            peers_with_complete_pass: BTreeSet::from(["node-a".into()]),
+            peers_with_complete_pass: BTreeSet::from(["node-a".into(), "node-b".into()]),
             ..RootDirectoryScanState::default()
         });
+        let authoritative = BTreeSet::from(["node-a".into(), "node-b".into(), "node-c".into()]);
         let mut reachable = BTreeSet::from(["node-b".into(), "node-c".into()]);
-        assert!(!root_directory_quorum_is_settled(&state, &reachable, 2));
+        assert!(!root_directory_quorum_is_settled(
+            &state,
+            &reachable,
+            &authoritative,
+            2,
+        ));
 
         reachable.insert("node-a".into());
-        assert!(root_directory_quorum_is_settled(&state, &reachable, 2));
+        assert!(root_directory_quorum_is_settled(
+            &state,
+            &reachable,
+            &authoritative,
+            2,
+        ));
 
         reachable.remove("node-c");
-        assert!(!root_directory_quorum_is_settled(&state, &reachable, 3));
+        assert!(!root_directory_quorum_is_settled(
+            &state,
+            &reachable,
+            &authoritative,
+            3,
+        ));
+    }
+
+    #[test]
+    fn root_directory_quorum_ignores_non_register_peers() {
+        let state = StdMutex::new(RootDirectoryScanState {
+            peers_with_complete_pass: BTreeSet::from([
+                "register-a".into(),
+                "cache-d".into(),
+                "cache-e".into(),
+            ]),
+            ..RootDirectoryScanState::default()
+        });
+        let authoritative = BTreeSet::from([
+            "register-a".into(),
+            "register-b".into(),
+            "register-c".into(),
+        ]);
+        let reachable = BTreeSet::from(["register-a".into(), "cache-d".into(), "cache-e".into()]);
+        assert!(!root_directory_quorum_is_settled(
+            &state,
+            &reachable,
+            &authoritative,
+            2,
+        ));
     }
 
     #[test]
@@ -1768,15 +1825,18 @@ mod tests {
             peers_with_complete_pass: BTreeSet::from(["node-b".into()]),
             ..RootDirectoryScanState::default()
         });
+        let authoritative = BTreeSet::from(["node-a".into(), "node-b".into(), "node-c".into()]);
         let reachable = BTreeSet::from(["node-b".into()]);
         assert!(root_directory_quorum_is_settled(
             &state,
             &reachable,
+            &authoritative,
             remote_recovery_acknowledgements(2, true),
         ));
         assert!(!root_directory_quorum_is_settled(
             &state,
             &reachable,
+            &authoritative,
             remote_recovery_acknowledgements(2, false),
         ));
     }
