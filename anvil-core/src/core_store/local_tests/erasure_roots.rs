@@ -620,13 +620,20 @@ async fn core_store_transaction_stream_is_root_anchored() {
         count_root_cache_generations(&store, &root_key_hash) >= 2,
         "CoreStore root anchors must be committed as CoreMeta generation rows"
     );
+    let latest_anchor = store
+        .read_latest_root_anchor(core_transaction_root_anchor_key())
+        .await
+        .unwrap()
+        .expect("latest transaction root anchor");
+    let register = store
+        .inspect_root_register_generation(&root_key_hash, latest_anchor.root_generation)
+        .await
+        .unwrap()
+        .expect("latest transaction root-register generation");
     assert_eq!(
-        count_files_with_extension(
-            &tmp.path().join("corestore").join("blocks").join("register"),
-            "anr"
-        ),
-        0,
-        "CoreStore must not create root-anchor sidecar shard files"
+        register.shard_indexes,
+        BTreeSet::from([0, 1, 2]),
+        "normal root publication must durably prepare the root-register-r3 cohort"
     );
 
     drop(store);

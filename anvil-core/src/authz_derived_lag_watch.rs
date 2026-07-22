@@ -391,6 +391,7 @@ mod tests {
 
     const TASK_LEASE_KEY: &[u8] = b"authz lag watch task lease test key";
     const LONG_TASK_LEASE_TTL_NANOS: i64 = 60_000_000_000;
+    const EXPIRING_TASK_LEASE_TTL_NANOS: i64 = 30_000_000_000;
 
     #[tokio::test]
     async fn authz_derived_lag_watch_appends_lists_and_reports_latest() {
@@ -571,9 +572,9 @@ mod tests {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let (expired_guard, expired_lease) =
-            acquire_guard(&storage, "authz-lag-expired", 1_000_000_000).await;
+            acquire_guard(&storage, "authz-lag-expired", EXPIRING_TASK_LEASE_TTL_NANOS).await;
         let expired_permit = expired_guard.publication_permit().await.unwrap();
-        sleep(Duration::from_millis(1_200)).await;
+        sleep_until_lease_expires(&expired_lease).await;
 
         expired_permit
             .publish_with(|precondition| async {
@@ -757,5 +758,11 @@ mod tests {
 
     fn now_nanos() -> i64 {
         chrono::Utc::now().timestamp_nanos_opt().unwrap()
+    }
+
+    async fn sleep_until_lease_expires(lease: &TaskLease) {
+        let remaining = lease.expires_at_nanos.saturating_sub(now_nanos());
+        let wait_nanos = remaining.max(0).saturating_add(200_000_000);
+        sleep(Duration::from_nanos(u64::try_from(wait_nanos).unwrap())).await;
     }
 }

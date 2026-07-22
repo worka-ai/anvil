@@ -193,7 +193,7 @@ fn external_control_token(transaction_id: &str) -> String {
 
 #[cfg(test)]
 mod in_process {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashMap};
     use std::sync::{Arc, LazyLock, Mutex as StdMutex};
     use tokio::sync::Notify;
 
@@ -205,14 +205,17 @@ mod in_process {
         release: Arc<Notify>,
     }
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
     enum PublicationPausePoint {
         BeforeCoordinator,
         AfterRootRegisterQuorum,
     }
 
-    static PUBLICATION_PAUSE: LazyLock<StdMutex<Option<PublicationPauseState>>> =
-        LazyLock::new(|| StdMutex::new(None));
+    type PublicationPauseKey = (String, PublicationPausePoint);
+
+    static PUBLICATION_PAUSES: LazyLock<
+        StdMutex<HashMap<PublicationPauseKey, PublicationPauseState>>,
+    > = LazyLock::new(|| StdMutex::new(HashMap::new()));
     static PUBLICATION_FAILURES: LazyLock<StdMutex<BTreeSet<String>>> =
         LazyLock::new(|| StdMutex::new(BTreeSet::new()));
 
@@ -236,14 +239,10 @@ mod in_process {
     impl Drop for PublicationPause {
         fn drop(&mut self) {
             self.release.notify_one();
-            let mut state = PUBLICATION_PAUSE
+            let mut pauses = PUBLICATION_PAUSES
                 .lock()
                 .expect("publication pause lock poisoned");
-            if state.as_ref().is_some_and(|state| {
-                state.transaction_id == self.transaction_id && state.point == self.point
-            }) {
-                *state = None;
-            }
+            pauses.remove(&(self.transaction_id.clone(), self.point));
         }
     }
 
@@ -270,11 +269,14 @@ mod in_process {
             reached: Arc::clone(&reached),
             release: Arc::clone(&release),
         };
-        let mut slot = PUBLICATION_PAUSE
+        let mut pauses = PUBLICATION_PAUSES
             .lock()
             .expect("publication pause lock poisoned");
-        assert!(slot.is_none(), "only one publication pause may be active");
-        *slot = Some(state);
+        let key = (transaction_id.to_string(), point);
+        assert!(
+            pauses.insert(key, state).is_none(),
+            "a publication pause is already active for this transaction and point"
+        );
         PublicationPause {
             transaction_id: transaction_id.to_string(),
             point,
@@ -296,11 +298,10 @@ mod in_process {
     }
 
     async fn pause_at(transaction_id: &str, point: PublicationPausePoint) {
-        let state = PUBLICATION_PAUSE
+        let state = PUBLICATION_PAUSES
             .lock()
             .expect("publication pause lock poisoned")
-            .as_ref()
-            .filter(|state| state.transaction_id == transaction_id && state.point == point)
+            .get(&(transaction_id.to_string(), point))
             .cloned();
         let Some(state) = state else {
             return;

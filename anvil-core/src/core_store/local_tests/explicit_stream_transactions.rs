@@ -435,7 +435,7 @@ async fn explicit_stream_sequence_is_independent_of_transaction_root_generation(
 }
 
 #[tokio::test]
-async fn competing_committed_stream_append_causes_deterministic_transaction_conflict() {
+async fn competing_committed_stream_append_causes_deterministic_stream_head_conflict() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = Storage::new_at(tmp.path()).await.unwrap();
     let store = CoreStore::new(storage).await.unwrap();
@@ -464,7 +464,7 @@ async fn competing_committed_stream_append_causes_deterministic_transaction_conf
         .await
         .unwrap_err();
 
-    assert!(first_error.to_string().contains("TransactionConflict"));
+    assert!(is_stream_head_mismatch(&first_error));
     assert_eq!(first_error.to_string(), second_error.to_string());
     let retained = store
         .read_transaction(&transaction.transaction_id)
