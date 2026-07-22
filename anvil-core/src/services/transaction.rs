@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::anvil_api::transaction_service_server::TransactionService;
 use crate::anvil_api::*;
-use crate::core_store::{CoreBeginTransaction, CoreTransaction, CoreTransactionState};
+use crate::core_store::{
+    CoreBeginTransaction, CoreTransaction, CoreTransactionState, is_retryable_mutation_conflict,
+};
 use crate::{
     AppState, auth, index_journal, manifest_journal, mesh_lifecycle, metadata_journal, middleware,
     services::object::enforce_write_precondition,
@@ -425,6 +427,10 @@ fn core_store_status(error: anyhow::Error) -> Status {
     if let Some(status) = crate::services::core_store_status::availability_status(&error) {
         return status;
     }
+    if is_retryable_mutation_conflict(&error) {
+        tracing::warn!(error = %error, "explicit transaction conflicted");
+        return Status::aborted("TransactionConflict");
+    }
     let message = error.to_string();
     if message.contains("TransactionConflict") {
         tracing::warn!(error = %message, "explicit transaction conflicted");
@@ -468,8 +474,8 @@ mod tests {
     use crate::core_store::{
         CF_TRANSACTIONS, CoreMetaRowCommonProto, CoreMetaStore, CoreMetaTuplePart,
         CoreMetaVisibilityState, CoreMutationBatch, CoreMutationOperation,
-        CoreMutationRootPublication, CoreStore, ReadStream, TABLE_NATIVE_IDEMPOTENCY_ROW,
-        core_meta_committed_row_common, core_meta_tuple_key,
+        CoreMutationRootPublication, CoreStore, CoreStoreCommitError, ReadStream,
+        TABLE_NATIVE_IDEMPOTENCY_ROW, core_meta_committed_row_common, core_meta_tuple_key,
     };
     use crate::formats::writer::WriterFamily;
     use tempfile::TempDir;
@@ -1448,5 +1454,22 @@ mod tests {
             .into_inner();
         assert_eq!(status.state, "expired");
         assert!(status.error.is_some());
+    }
+
+    #[test]
+    fn transaction_service_maps_stream_head_race_to_retryable_conflict() {
+        let status = core_store_status(
+            CoreStoreCommitError::StreamHeadMismatch {
+                stream_id: "object_metadata:tenant:2:bucket:1".to_string(),
+                expected_last_sequence: 4,
+                expected_last_event_hash: "sha256:expected".to_string(),
+                actual_sequence: 5,
+                actual_event_hash: "sha256:actual".to_string(),
+            }
+            .into(),
+        );
+
+        assert_eq!(status.code(), tonic::Code::Aborted);
+        assert_eq!(status.message(), "TransactionConflict");
     }
 }
