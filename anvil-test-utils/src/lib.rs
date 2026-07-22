@@ -1228,6 +1228,8 @@ pub struct TestCluster {
     pub config: Arc<anvil_core::config::Config>,
     pub storage_path: PathBuf,
     cleanup_path: PathBuf,
+    pending_listeners: Vec<tokio::net::TcpListener>,
+    pending_admin_listeners: Vec<tokio::net::TcpListener>,
     _cluster_permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -1302,8 +1304,21 @@ impl TestCluster {
                 .try_init();
         });
 
+        let cluster_id = uuid::Uuid::new_v4().simple().to_string();
         let cluster_storage_root =
-            std::env::temp_dir().join(format!("anvil-test-storage-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("anvil-test-storage-{cluster_id}"));
+        let mut grpc_addrs = Vec::with_capacity(regions.len());
+        let mut admin_addrs = Vec::with_capacity(regions.len());
+        let mut pending_listeners = Vec::with_capacity(regions.len());
+        let mut pending_admin_listeners = Vec::with_capacity(regions.len());
+        for _ in regions {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            grpc_addrs.push(format!("http://{}", listener.local_addr().unwrap()));
+            admin_addrs.push(format!("http://{}", admin_listener.local_addr().unwrap()));
+            pending_listeners.push(listener);
+            pending_admin_listeners.push(admin_listener);
+        }
         let mut config = anvil_core::config::Config {
             jwt_secret: "test-secret".to_string(),
             anvil_secret_encryption_key:
@@ -1335,12 +1350,24 @@ impl TestCluster {
         let mut states = Vec::new();
         for (node_index, region_name) in regions.iter().enumerate() {
             let mut node_config = config.deref().clone();
+            node_config.node_id = format!("test-{cluster_id}-node-{node_index:03}");
             node_config.region = (*region_name).to_string();
             node_config.cell_id = format!("test-cell-{}", node_index + 1);
             node_config.storage_path = cluster_storage_root
                 .join(format!("node-{node_index:03}-{region_name}"))
                 .to_string_lossy()
                 .into_owned();
+            node_config.public_api_addr = grpc_addrs[node_index].clone();
+            node_config.api_listen_addr = grpc_addrs[node_index]
+                .trim_start_matches("http://")
+                .to_string();
+            node_config.admin_listen_addr = admin_addrs[node_index]
+                .trim_start_matches("http://")
+                .to_string();
+            node_config.corestore_internal_bearer_token =
+                anvil_core::auth::JwtManager::new(node_config.jwt_secret.clone())
+                    .mint_token(node_config.node_id.clone(), 0)
+                    .unwrap();
             let state = AppState::new(node_config, personaldb_test_protocol_keyring())
                 .await
                 .unwrap();
@@ -1394,13 +1421,15 @@ impl TestCluster {
         Self {
             nodes: Vec::new(),
             states,
-            grpc_addrs: Vec::new(),
-            admin_addrs: Vec::new(),
+            grpc_addrs,
+            admin_addrs,
             token: String::new(),
             admin_state_path: admin_state_path.to_string_lossy().into_owned(),
             config,
             storage_path: admin_state_path,
             cleanup_path: cluster_storage_root,
+            pending_listeners,
+            pending_admin_listeners,
             _cluster_permit: cluster_permit,
         }
     }
@@ -1418,30 +1447,24 @@ impl TestCluster {
         let node_count = self.states.len();
 
         let node_spawn_start = Instant::now();
-        let mut listeners = Vec::new();
-        let mut admin_listeners = Vec::new();
-        for _ in 0..self.states.len() {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let admin_addr = admin_listener.local_addr().unwrap();
-            self.grpc_addrs.push(format!("http://{}", addr));
-            self.admin_addrs.push(format!("http://{}", admin_addr));
-            listeners.push(listener);
-            admin_listeners.push(admin_listener);
+        let mut listeners = std::mem::take(&mut self.pending_listeners);
+        let mut admin_listeners = std::mem::take(&mut self.pending_admin_listeners);
+        if listeners.is_empty() && admin_listeners.is_empty() {
+            for (grpc_addr, admin_addr) in self.grpc_addrs.iter().zip(&self.admin_addrs) {
+                listeners.push(
+                    tokio::net::TcpListener::bind(grpc_addr.trim_start_matches("http://"))
+                        .await
+                        .unwrap(),
+                );
+                admin_listeners.push(
+                    tokio::net::TcpListener::bind(admin_addr.trim_start_matches("http://"))
+                        .await
+                        .unwrap(),
+                );
+            }
         }
-
-        for i in 0..self.states.len() {
-            let mut cfg = anvil_core::config::Config::from_ref(self.states[i].config.deref());
-            cfg.public_api_addr = self.grpc_addrs[i].clone();
-            cfg.corestore_internal_bearer_token = self.states[i]
-                .jwt_manager
-                .mint_token(cfg.node_id.clone(), 0)
-                .unwrap();
-            self.states[i] = AppState::new(cfg, personaldb_test_protocol_keyring())
-                .await
-                .unwrap();
-        }
+        assert_eq!(listeners.len(), self.states.len());
+        assert_eq!(admin_listeners.len(), self.states.len());
 
         for i in 0..self.states.len() {
             let state = self.states[i].clone();
@@ -1663,11 +1686,13 @@ impl TestCluster {
 
     #[allow(unused)]
     pub async fn restart(&mut self, timeout: Duration) {
-        for node in self.nodes.drain(..) {
+        let nodes = self.nodes.drain(..).collect::<Vec<_>>();
+        for node in &nodes {
             node.abort();
         }
-        self.grpc_addrs.clear();
-        self.admin_addrs.clear();
+        for node in nodes {
+            let _ = node.await;
+        }
         self.start_and_converge(timeout).await;
     }
 
