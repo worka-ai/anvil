@@ -564,6 +564,107 @@ async fn direct_and_admitted_writers_publish_contiguous_root_generations() {
     assert_eq!(published, vec![1, 2]);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admitted_same_root_writers_reserve_successor_generations_serially() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let store = Arc::new(CoreStore::new(storage).await.unwrap());
+    let root_anchor_key = "test/group/admitted-successors";
+    let root_hash = core_meta_root_key_hash(root_anchor_key);
+    let make_batch = |ordinal: u64| {
+        let transaction_id = format!("admitted-successor-{ordinal}");
+        let tuple_key = core_meta_tuple_key(&[
+            CoreMetaTuplePart::Utf8("admitted-successor"),
+            CoreMetaTuplePart::U64(ordinal),
+        ])
+        .unwrap();
+        let payload = encode_core_meta_inline_payload_row(
+            format!("value-{ordinal}").as_bytes(),
+            core_meta_committed_row_common(
+                "test/group",
+                root_hash.clone(),
+                0,
+                transaction_id.clone(),
+                ordinal,
+            ),
+        )
+        .unwrap();
+        (
+            tuple_key.clone(),
+            CoreMutationBatch {
+                transaction_id,
+                scope_partition: root_anchor_key.to_string(),
+                committed_by_principal: "principal:successor-writer".to_string(),
+                root_publications: vec![
+                    CoreMutationRootPublication::new(
+                        root_anchor_key,
+                        WriterFamily::CoreControl.as_str(),
+                    )
+                    .coordinator(),
+                ],
+                preconditions: Vec::new(),
+                operations: vec![CoreMutationOperation::CoreMetaPut {
+                    partition_id: root_anchor_key.to_string(),
+                    cf: CF_INLINE_PAYLOADS.to_string(),
+                    table_id: TABLE_INLINE_PAYLOAD_ROW,
+                    tuple_key,
+                    payload,
+                }],
+            },
+        )
+    };
+    let (first_key, first_batch) = make_batch(1);
+    let first_transaction_id = first_batch.transaction_id.clone();
+    let pause =
+        super::super::local_root_publication_test_control::pause_publication(&first_transaction_id);
+    let first_store = Arc::clone(&store);
+    let first = tokio::spawn(async move { first_store.commit_mutation_batch(first_batch).await });
+    tokio::time::timeout(Duration::from_secs(10), pause.wait_until_reached())
+        .await
+        .expect("first publication did not reach its coordinator pause");
+
+    let (second_key, second_batch) = make_batch(2);
+    let second_store = Arc::clone(&store);
+    let second =
+        tokio::spawn(async move { second_store.commit_mutation_batch(second_batch).await });
+    tokio::task::yield_now().await;
+    pause.release();
+
+    let (first_receipt, second_receipt) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(first, second)
+    })
+    .await
+    .expect("same-root admitted writers did not complete");
+    assert_eq!(
+        first_receipt.unwrap().unwrap().state,
+        CoreTransactionState::Committed
+    );
+    assert_eq!(
+        second_receipt.unwrap().unwrap().state,
+        CoreTransactionState::Committed
+    );
+
+    let anchor = store
+        .read_latest_root_anchor(root_anchor_key)
+        .await
+        .unwrap()
+        .expect("both successor generations are published");
+    assert_eq!(anchor.root_generation, 2);
+    let generations = [first_key, second_key]
+        .into_iter()
+        .map(|tuple_key| {
+            let payload = store
+                .read_coremeta_row(CF_INLINE_PAYLOADS, TABLE_INLINE_PAYLOAD_ROW, &tuple_key)
+                .unwrap()
+                .expect("admitted successor row is visible");
+            core_meta_row_common_from_payload(&payload)
+                .unwrap()
+                .root_generation
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(generations, vec![1, 2]);
+}
+
 #[tokio::test]
 async fn core_store_put_get_blob_verifies_hash() {
     let tmp = tempfile::tempdir().unwrap();

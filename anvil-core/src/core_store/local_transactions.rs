@@ -3,6 +3,17 @@ use super::local_tx_rows::CoreTransactionPreconditionRow;
 use super::*;
 use crate::formats::writer::WriterFamily;
 
+struct CoreStoreMutationLocks {
+    _root_plan_guards: Vec<CoreStoreLock>,
+    mutable_guards: Vec<CoreStoreLock>,
+}
+
+impl CoreStoreMutationLocks {
+    fn release_mutable_guards(&mut self) {
+        self.mutable_guards.clear();
+    }
+}
+
 fn insert_coremeta_root_lock_from_payload(
     lock_keys: &mut BTreeSet<(String, String)>,
     payload: &[u8],
@@ -26,11 +37,33 @@ impl CoreStore {
         Ok(guards)
     }
 
-    async fn acquire_batch_locks(&self, batch: &CoreMutationBatch) -> Result<Vec<CoreStoreLock>> {
+    async fn acquire_mutation_lock_keys(
+        &self,
+        lock_keys: &BTreeSet<(String, String)>,
+    ) -> Result<CoreStoreMutationLocks> {
+        let mut locks = CoreStoreMutationLocks {
+            _root_plan_guards: Vec::new(),
+            mutable_guards: Vec::new(),
+        };
+        for (kind, id) in lock_keys {
+            let guard = self.acquire_named_lock(kind, id).await?;
+            if kind == "coremeta-root" {
+                locks._root_plan_guards.push(guard);
+            } else {
+                locks.mutable_guards.push(guard);
+            }
+        }
+        Ok(locks)
+    }
+
+    async fn acquire_batch_locks(
+        &self,
+        batch: &CoreMutationBatch,
+    ) -> Result<CoreStoreMutationLocks> {
         let mut acquired_keys = BTreeSet::new();
         for _ in 0..CORE_PROCESS_LOCK_RETRY_ATTEMPTS {
             let lock_keys = self.batch_lock_keys(batch)?;
-            let guards = self.acquire_sorted_lock_keys(&lock_keys).await?;
+            let guards = self.acquire_mutation_lock_keys(&lock_keys).await?;
 
             // Deletions discover their root from the current row. Recompute while
             // row locks are held so a concurrent writer cannot make us miss a
@@ -135,7 +168,7 @@ impl CoreStore {
         &self,
         transaction_id: &str,
     ) -> Result<(
-        Vec<CoreStoreLock>,
+        CoreStoreMutationLocks,
         CoreTransaction,
         Vec<CoreTransactionPreconditionRow>,
     )> {
@@ -149,7 +182,7 @@ impl CoreStore {
                 .read_transaction_preconditions_unlocked(transaction_id)
                 .await?;
             let lock_keys = self.explicit_transaction_lock_keys(&transaction, &preconditions)?;
-            let guards = self.acquire_sorted_lock_keys(&lock_keys).await?;
+            let guards = self.acquire_mutation_lock_keys(&lock_keys).await?;
             let current = self
                 .read_transaction_unlocked(transaction_id)
                 .await?
@@ -354,7 +387,7 @@ impl CoreStore {
         let finalisation_timing_name = timing_name.clone();
         let finalisation: tokio::task::JoinHandle<Result<CoreMutationBatchReceipt>> = tokio::spawn(
             async move {
-                let operation_guards = operation_guards;
+                let mut operation_guards = operation_guards;
                 let pending_mutation_payload =
                     if batch_payload.len() <= CORE_PENDING_MUTATION_MAX_INLINE_PAYLOAD_BYTES {
                         CorePendingMutationPayload::Inline(&batch_payload)
@@ -383,14 +416,15 @@ impl CoreStore {
                     ),
                     step_start.elapsed(),
                 );
-                // Admission is protected by the optimistic operation locks. The
-                // durable publication intent carries the same guards, and final
-                // publication reacquires them in canonical order so async quorum
-                // work cannot turn an admission-time check into authority.
-                drop(operation_guards);
+                // Mutable row, stream, and fence guards are revalidated at the
+                // publication linearization point. Keep only the canonical root
+                // planning guards so a concurrent writer cannot reserve the same
+                // successor generation before this publication is durable.
+                operation_guards.release_mutable_guards();
                 let first_attempt = store
                     .finalise_admitted_mutation_batch(&batch, &admission, &finalisation_timing_name)
                     .await;
+                drop(operation_guards);
                 match first_attempt {
                     Ok(receipt) => Ok(receipt),
                     Err(first_error) => {
@@ -553,7 +587,7 @@ impl CoreStore {
         &self,
         batch: CoreMutationBatch,
         admission: &CorePendingMutationRecord,
-        operation_guards: Vec<CoreStoreLock>,
+        mut operation_guards: CoreStoreMutationLocks,
     ) -> Result<CoreMutationBatchReceipt> {
         validate_logical_id(&batch.transaction_id, "transaction id")?;
         validate_logical_id(&batch.scope_partition, "transaction scope partition")?;
@@ -632,7 +666,7 @@ impl CoreStore {
             .err()
             .map(|error| format!("{error:#}"))
         };
-        drop(operation_guards);
+        operation_guards.release_mutable_guards();
         let result = self
             .finalise_admitted_mutation_batch_with_error(
                 &batch,
@@ -641,6 +675,7 @@ impl CoreStore {
                 precondition_error,
             )
             .await;
+        drop(operation_guards);
         match result {
             Err(error)
                 if super::local_root_publication_recovery::publication_terminal_reason(&error)
@@ -1378,7 +1413,7 @@ impl CoreStore {
         validate_logical_id(transaction_id, "transaction id")?;
         validate_logical_id(principal, "transaction principal")?;
         let step_started_at = std::time::Instant::now();
-        let (guards, transaction, preconditions) = self
+        let (mut guards, transaction, preconditions) = self
             .acquire_current_explicit_transaction_locks(transaction_id)
             .await?;
         crate::emit_test_timing(
@@ -1439,10 +1474,14 @@ impl CoreStore {
             None,
         )?;
         committed.committed_root_generation = Some(committed_root_generation);
-        drop(guards);
+        // The publication intent revalidates mutable guards at final
+        // linearization. Retain the root planning guard until its successor
+        // generation has been durably published.
+        guards.release_mutable_guards();
         let committed_transaction = self
             .commit_explicit_transaction_rows_and_coremeta_updates_unlocked(&committed)
             .await?;
+        drop(guards);
         crate::emit_test_timing(
             format!("core_store.commit_explicit_transaction commit_rows tx={transaction_id}"),
             step_started_at.elapsed(),
