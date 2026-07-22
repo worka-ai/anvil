@@ -430,7 +430,7 @@ impl Persistence {
             ownership_cursor = Some(next_cursor);
         }
 
-        let mut task_cursor = None;
+        let mut task_cursor: Option<Vec<u8>> = None;
         loop {
             let page = task_lease::list_active_task_leases_for_node_page(
                 &self.storage,
@@ -581,7 +581,7 @@ impl Persistence {
             ownership_cursor = Some(next_cursor);
         }
 
-        let mut task_cursor = None;
+        let mut task_cursor: Option<Vec<u8>> = None;
         loop {
             let page = task_lease::list_active_task_leases_for_node_page(
                 &self.storage,
