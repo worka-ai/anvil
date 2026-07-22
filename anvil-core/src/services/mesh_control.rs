@@ -107,33 +107,10 @@ impl MeshControlService for AppState {
                 },
             )
             .map_err(mesh_status)?;
-            let mut exported_rows = Vec::new();
-            let mut cursor = None;
-            loop {
-                let page = self
-                    .core_store
-                    .export_portable_coremeta_bootstrap_rows_page(cursor.as_ref(), 512)
-                    .map_err(mesh_status)?;
-                if exported_rows.len().saturating_add(page.rows.len()) > MAX_BOOTSTRAP_COREMETA_ROWS
-                {
-                    return Err(Status::resource_exhausted(format!(
-                        "bootstrap snapshot exceeds {MAX_BOOTSTRAP_COREMETA_ROWS} CoreMeta rows"
-                    )));
-                }
-                exported_rows.extend(page.rows);
-                let Some(next_cursor) = page.next_cursor else {
-                    break;
-                };
-                if cursor.as_ref().is_some_and(|current| {
-                    current.cf == next_cursor.cf
-                        && current.core_meta_key.as_slice() >= next_cursor.core_meta_key.as_slice()
-                }) {
-                    return Err(Status::internal(
-                        "portable CoreMeta bootstrap cursor did not advance",
-                    ));
-                }
-                cursor = Some(next_cursor);
-            }
+            let exported_rows = self
+                .core_store
+                .export_portable_coremeta_bootstrap_rows(MAX_BOOTSTRAP_COREMETA_ROWS)
+                .map_err(mesh_status)?;
             encode_bootstrap_snapshot_rows(exported_rows)
         } else {
             let rows = decode_bootstrap_snapshot_rows(req.canonical_coremeta_rows)?;
