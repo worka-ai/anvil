@@ -94,10 +94,14 @@ pub(super) async fn acquire_native_lock_key(
 ) -> Result<OwnedMutexGuard<()>, Status> {
     let lock = {
         let mut locks = state.native_mutation_locks.lock().await;
-        locks
-            .entry(lock_key)
-            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&lock_key).and_then(std::sync::Weak::upgrade) {
+            lock
+        } else {
+            let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+            locks.insert(lock_key, std::sync::Arc::downgrade(&lock));
+            lock
+        }
     };
     Ok(lock.lock_owned().await)
 }

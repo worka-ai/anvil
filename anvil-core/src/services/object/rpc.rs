@@ -116,6 +116,99 @@ fn ensure_transactional_mutation_batch_supported(
     Ok(())
 }
 
+pub(crate) async fn execute_native_put(
+    state: &AppState,
+    claims: auth::Claims,
+    metadata: ObjectMetadata,
+    data_stream: impl futures_core::Stream<Item = Result<Vec<u8>, Status>> + Unpin,
+) -> Result<PutObjectResponse, Status> {
+    let ObjectMetadata {
+        bucket_name,
+        object_key,
+        mutation_context,
+        content_type,
+        user_metadata_json,
+        storage_class,
+    } = metadata;
+    let user_metadata = parse_user_metadata_json(&user_metadata_json)?;
+    validate_native_mutation_context(state, &claims, &bucket_name, mutation_context.as_ref())
+        .await?;
+    let transaction_id = native_transaction_id(mutation_context.as_ref())?;
+    let write_visibility = object_write_visibility(mutation_context.as_ref())?;
+    let target = NativeIdempotencyTarget::new("PutObject", &bucket_name, &object_key);
+    let (attempt, replay) = begin_native_mutation::<PutObjectResponse>(
+        state,
+        mutation_context.as_ref(),
+        &target,
+        &claims,
+        AnvilAction::ObjectWrite,
+    )
+    .await?;
+    if let Some(response) = replay {
+        return Ok(response);
+    }
+    enforce_native_mutation_precondition(
+        state,
+        &claims,
+        &bucket_name,
+        &object_key,
+        mutation_context.as_ref(),
+        AnvilAction::ObjectWrite,
+    )
+    .await?;
+
+    let object = state
+        .object_manager
+        .put_object(
+            &claims,
+            &bucket_name,
+            &object_key,
+            data_stream,
+            ObjectWriteOptions {
+                content_type,
+                user_metadata,
+                transaction_id: transaction_id.map(ToOwned::to_owned),
+                transaction_principal: transaction_id
+                    .map(|_| crate::object_manager::transaction_principal_from_claims(&claims)),
+                storage_class_id: storage_class,
+                visibility: write_visibility,
+            },
+        )
+        .await?;
+    let watch_cursor = if transaction_id.is_some() || !write_visibility.requires_watch_visible() {
+        0
+    } else {
+        object_watch_cursor(state, &object).await?
+    };
+    let response = PutObjectResponse {
+        etag: object.etag,
+        version_id: object.version_id.to_string(),
+        mutation_id: object.mutation_id.to_string(),
+        payload_hash: object.content_hash,
+        record_hash: object.record_hash,
+        authz_revision: u64::try_from(object.authz_revision)
+            .map_err(|_| Status::internal("Invalid authz revision"))?,
+        index_policy_snapshot: object.index_policy_snapshot,
+        watch_cursor,
+        write_state: write_state_for_transaction(transaction_id),
+    };
+    complete_native_mutation(state, &attempt, &target, &response).await?;
+    Ok(response)
+}
+
+pub(crate) fn native_put_data_chunk(
+    chunk_result: Result<PutObjectRequest, Status>,
+) -> Result<Vec<u8>, Status> {
+    match chunk_result? {
+        PutObjectRequest {
+            data: Some(put_object_request::Data::Chunk(bytes)),
+        } => Ok(bytes),
+        _ => Err(Status::invalid_argument(
+            "PutObject metadata may appear only in the first chunk",
+        )),
+    }
+}
+
 #[tonic::async_trait]
 impl ObjectService for AppState {
     type GetObjectStream = std::pin::Pin<
@@ -140,93 +233,20 @@ impl ObjectService for AppState {
 
         let mut stream = request.into_inner();
 
-        let (bucket_name, object_key, mutation_context, content_type, user_metadata, storage_class) =
-            match stream.next().await {
-                Some(Ok(chunk)) => match chunk.data {
-                    Some(put_object_request::Data::Metadata(meta)) => (
-                        meta.bucket_name,
-                        meta.object_key,
-                        meta.mutation_context,
-                        meta.content_type,
-                        parse_user_metadata_json(&meta.user_metadata_json)?,
-                        meta.storage_class,
-                    ),
-                    _ => return Err(Status::invalid_argument("First chunk must be metadata")),
-                },
-                _ => return Err(Status::invalid_argument("Empty stream")),
-            };
-        validate_native_mutation_context(self, &claims, &bucket_name, mutation_context.as_ref())
-            .await?;
-        let transaction_id = native_transaction_id(mutation_context.as_ref())?;
-        let write_visibility = object_write_visibility(mutation_context.as_ref())?;
-        let target = NativeIdempotencyTarget::new("PutObject", &bucket_name, &object_key);
-        let (attempt, replay) = begin_native_mutation::<PutObjectResponse>(
-            self,
-            mutation_context.as_ref(),
-            &target,
-            &claims,
-            AnvilAction::ObjectWrite,
-        )
-        .await?;
-        if let Some(response) = replay {
+        let metadata = match stream.next().await {
+            Some(Ok(chunk)) => match chunk.data {
+                Some(put_object_request::Data::Metadata(metadata)) => metadata,
+                _ => return Err(Status::invalid_argument("First chunk must be metadata")),
+            },
+            _ => return Err(Status::invalid_argument("Empty stream")),
+        };
+        if let Some(target) = native_put_route_target(self, &claims, &metadata).await? {
+            let response = proxy_native_put(self, &target, &claims, metadata, stream).await?;
             return Ok(Response::new(response));
         }
-        enforce_native_mutation_precondition(
-            self,
-            &claims,
-            &bucket_name,
-            &object_key,
-            mutation_context.as_ref(),
-            AnvilAction::ObjectWrite,
-        )
-        .await?;
 
-        let data_stream = stream.map(|chunk_result| match chunk_result {
-            Ok(chunk) => match chunk.data {
-                Some(put_object_request::Data::Chunk(bytes)) => Ok(bytes),
-                _ => Ok(vec![]), // Or handle as an error, but must be Vec<u8>
-            },
-            Err(e) => Err(e),
-        });
-
-        let object = self
-            .object_manager
-            .put_object(
-                &claims,
-                &bucket_name,
-                &object_key,
-                data_stream,
-                ObjectWriteOptions {
-                    content_type,
-                    user_metadata,
-                    transaction_id: transaction_id.map(ToOwned::to_owned),
-                    transaction_principal: transaction_id
-                        .map(|_| crate::object_manager::transaction_principal_from_claims(&claims)),
-                    storage_class_id: storage_class,
-                    visibility: write_visibility,
-                },
-            )
-            .await?;
-        let watch_cursor = if transaction_id.is_some() || !write_visibility.requires_watch_visible()
-        {
-            0
-        } else {
-            object_watch_cursor(self, &object).await?
-        };
-
-        let response = PutObjectResponse {
-            etag: object.etag,
-            version_id: object.version_id.to_string(),
-            mutation_id: object.mutation_id.to_string(),
-            payload_hash: object.content_hash,
-            record_hash: object.record_hash,
-            authz_revision: u64::try_from(object.authz_revision)
-                .map_err(|_| Status::internal("Invalid authz revision"))?,
-            index_policy_snapshot: object.index_policy_snapshot,
-            watch_cursor,
-            write_state: write_state_for_transaction(transaction_id),
-        };
-        complete_native_mutation(self, &attempt, &target, &response).await?;
+        let data_stream = stream.map(native_put_data_chunk);
+        let response = execute_native_put(self, claims, metadata, data_stream).await?;
         Ok(Response::new(response))
     }
 
@@ -238,6 +258,13 @@ impl ObjectService for AppState {
         let claims = request.extensions().get::<auth::Claims>().cloned();
         let req = request.into_inner();
         let consistency = object_read_consistency(req.consistency.as_ref())?;
+
+        if let Some(stream) =
+            proxy_get_object_if_needed(self, claims.as_ref(), route_tenant_id, &req, consistency)
+                .await?
+        {
+            return Ok(Response::new(stream));
+        }
 
         let result = self
             .object_manager
@@ -408,12 +435,22 @@ impl ObjectService for AppState {
         &self,
         request: Request<HeadObjectRequest>,
     ) -> Result<Response<HeadObjectResponse>, Status> {
+        let request_id = request
+            .extensions()
+            .get::<crate::middleware::AnvilRequestId>()
+            .cloned();
         let claims = request
             .extensions()
             .get::<auth::Claims>()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.get_ref();
         let consistency = object_read_consistency(req.consistency.as_ref())?;
+
+        if let Some(response) =
+            proxy_head_object_if_needed(self, claims, request_id.as_ref(), req, consistency).await?
+        {
+            return Ok(Response::new(response));
+        }
 
         let object = self
             .object_manager
@@ -479,6 +516,8 @@ impl ObjectService for AppState {
             .as_ref()
             .map(|token| token.last_key.as_str())
             .unwrap_or(req.start_after.as_str());
+        let source_limit = i32::try_from(limit.saturating_add(1))
+            .map_err(|_| Status::internal("Object listing limit exceeds i32"))?;
 
         let (mut objects, common_prefixes) = self
             .object_manager
@@ -488,7 +527,7 @@ impl ObjectService for AppState {
                 &req.bucket_name,
                 &req.prefix,
                 effective_start_after,
-                i32::try_from(limit.saturating_add(1)).unwrap_or(i32::MAX),
+                source_limit,
                 &req.delimiter,
                 consistency,
             )
@@ -568,6 +607,8 @@ impl ObjectService for AppState {
             .as_ref()
             .map(|token| token.last_version_id.as_str())
             .unwrap_or(req.version_id_marker.as_str());
+        let source_limit = i32::try_from(limit)
+            .map_err(|_| Status::internal("Object version listing limit exceeds i32"))?;
 
         let versions = self
             .object_manager
@@ -578,7 +619,7 @@ impl ObjectService for AppState {
                 &req.prefix,
                 effective_key_marker,
                 effective_version_marker,
-                i32::try_from(limit).unwrap_or(i32::MAX),
+                source_limit,
                 consistency,
             )
             .await?;
@@ -987,51 +1028,53 @@ impl ObjectService for AppState {
         let req = request.into_inner();
         let tenant_id = claims.tenant_id;
         let prefix = req.prefix.clone();
-        let (bucket_id, snapshot, mut live) = self
+        let after_cursor = i64::try_from(req.after_cursor)
+            .map_err(|_| Status::invalid_argument("after_cursor exceeds supported range"))?;
+        let bucket_id = self
             .object_manager
-            .watch_prefix_snapshot(claims, &req.bucket_name, &req.prefix, req.after_cursor)
+            .resolve_prefix_watch_scope(claims, &req.bucket_name, &req.prefix)
             .await?;
+        let stream_id = watch_log::object_watch_stream_id(tenant_id, bucket_id);
+        let mut live = self.storage.subscribe_stream(&stream_id);
+        let storage = self.storage.clone();
 
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
-            let mut last_cursor = req.after_cursor;
-            for event in snapshot {
-                if let Some(response) = watch_event_response(&event) {
-                    last_cursor = last_cursor.max(response.cursor);
-                    if tx.send(Ok(response)).await.is_err() {
-                        return;
-                    }
-                }
-            }
-
+            let mut last_cursor = after_cursor;
             loop {
-                match live.recv().await {
-                    Ok(event) => {
-                        if event.tenant_id != tenant_id
-                            || event.bucket_id != bucket_id
-                            || !event.key.starts_with(&prefix)
+                loop {
+                    let page = match watch_log::list_object_watch_event_page(
+                        &storage,
+                        tenant_id,
+                        bucket_id,
+                        &prefix,
+                        last_cursor,
+                        256,
+                    )
+                    .await
+                    {
+                        Ok(page) => page,
+                        Err(error) => {
+                            let _ = tx.send(Err(Status::internal(error.to_string()))).await;
+                            return;
+                        }
+                    };
+                    let previous_cursor = last_cursor;
+                    for event in page.events {
+                        if let Some(response) = watch_event_response(&event)
+                            && tx.send(Ok(response)).await.is_err()
                         {
-                            continue;
-                        }
-                        let Some(response) = watch_event_response(&event) else {
-                            continue;
-                        };
-                        if response.cursor <= last_cursor {
-                            continue;
-                        }
-                        last_cursor = response.cursor;
-                        if tx.send(Ok(response)).await.is_err() {
                             return;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let _ = tx
-                            .send(Err(Status::data_loss(
-                                "Watch cursor fell behind retained live event window",
-                            )))
-                            .await;
-                        return;
+                    last_cursor = page.next_cursor;
+                    if !page.has_more || last_cursor == previous_cursor {
+                        break;
                     }
+                }
+
+                match live.recv().await {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
@@ -1319,12 +1362,23 @@ impl ObjectService for AppState {
                         ));
                     }
                     let owner = lease_owner_from_claims(&claims);
+                    let expected = self
+                        .persistence
+                        .read_expected_named_task_lease(
+                            &owner,
+                            &op.task_id,
+                            op.fence_token,
+                            op.expected_root_generation,
+                            op.expected_lease_epoch,
+                            op.expected_expires_at_nanos,
+                            &op.expected_lease_hash,
+                        )
+                        .await
+                        .map_err(lease_error_status)?;
                     let lease = self
                         .persistence
                         .checkpoint_named_task_lease(
-                            &op.task_id,
-                            &owner,
-                            op.fence_token,
+                            &expected,
                             join_u128(op.checkpoint_cursor_low, op.checkpoint_cursor_high),
                         )
                         .await
@@ -1348,12 +1402,23 @@ impl ObjectService for AppState {
                         ));
                     }
                     let owner = lease_owner_from_claims(&claims);
+                    let expected = self
+                        .persistence
+                        .read_expected_named_task_lease(
+                            &owner,
+                            &op.task_id,
+                            op.fence_token,
+                            op.expected_root_generation,
+                            op.expected_lease_epoch,
+                            op.expected_expires_at_nanos,
+                            &op.expected_lease_hash,
+                        )
+                        .await
+                        .map_err(lease_error_status)?;
                     let lease = self
                         .persistence
                         .commit_named_task_lease(
-                            &op.task_id,
-                            &owner,
-                            op.fence_token,
+                            &expected,
                             join_u128(op.committed_cursor_low, op.committed_cursor_high),
                         )
                         .await
