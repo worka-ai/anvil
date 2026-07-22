@@ -1432,12 +1432,28 @@ mod list_bucket_pagination_tests {
 }
 
 pub(super) async fn readiness_check(State(state): State<AppState>) -> Response {
-    // Cluster readiness: at least 1 peer known (self included).
     let peers = state.cluster.read().await.len();
-    if peers >= 1 {
+    let coremeta = state.core_store.coremeta_recovery_snapshot();
+    if peers >= 1 && coremeta.ready {
         (axum::http::StatusCode::OK, "READY").into_response()
     } else {
-        let body = serde_json::json!({"status":"not_ready","peers":peers});
+        let body = serde_json::json!({
+            "status": "not_ready",
+            "peers": peers,
+            "coremeta": {
+                "ready": coremeta.ready,
+                "distributed_required": coremeta.distributed_required,
+                "in_progress": coremeta.in_progress,
+                "reachable_peers": coremeta.reachable_peers,
+                "known_roots": coremeta.known_roots,
+                "lagging_roots": coremeta.lagging_roots,
+                "root_directory_complete": coremeta.root_directory_complete,
+                "canonical_settlement_complete": coremeta.canonical_settlement_complete,
+                "physical_register_quorum_complete": coremeta.physical_register_quorum_complete,
+                "completed_rounds": coremeta.completed_rounds,
+                "last_error": coremeta.last_error,
+            }
+        });
         (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             axum::response::Json(body),

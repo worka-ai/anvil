@@ -16,6 +16,7 @@ pub use anvil_core::*;
 pub mod s3_gateway;
 
 pub mod s3_auth;
+mod startup_readiness;
 
 pub async fn run(
     listener: tokio::net::TcpListener,
@@ -54,20 +55,69 @@ pub async fn start_node_with_admin_listener(
         swarm.dial(multiaddr)?;
     }
 
+    // Distributed nodes must fail closed before any background mutation can
+    // race the canonical topology/bootstrap import.
+    let distributed_recovery_required = state.config.requires_distributed_coremeta_recovery();
+    let startup_recovery_deferred = state.core_store.startup_recovery_deferred();
+    let public_readiness = startup_readiness::PublicReadiness::new(
+        state.core_store.clone(),
+        !startup_recovery_deferred,
+    );
+    let _coremeta_recovery_task = state
+        .core_store
+        .start_coremeta_distributed_recovery(distributed_recovery_required);
+    if startup_recovery_deferred {
+        let startup_state = state.clone();
+        let startup_readiness = public_readiness.clone();
+        tokio::spawn(async move {
+            loop {
+                startup_state
+                    .core_store
+                    .wait_for_coremeta_recovery_ready()
+                    .await;
+                match startup_state.ensure_system_realm_bootstrapped().await {
+                    Ok(()) => {
+                        startup_readiness.mark_system_realm_ready();
+                        break;
+                    }
+                    Err(error) => {
+                        error!(%error, "deferred system realm bootstrap failed");
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                }
+            }
+        });
+    }
+
     if state.config.run_background_worker {
         let worker_state = state.clone();
+        let worker_readiness = public_readiness.clone();
         tokio::spawn(async move {
-            if let Err(e) = anvil_core::worker::run(
+            // Recovery and system-realm bootstrap establish the canonical
+            // metadata view. Background maintenance must not race either one.
+            worker_readiness.wait_until_ready().await;
+            // Queue scanning must share the worker capability and cancellation scope.
+            let shard_recovery_store = worker_state.core_store.clone();
+            let shard_recovery = async move {
+                shard_recovery_store.run_distributed_shard_recovery().await;
+                std::future::pending::<()>().await;
+            };
+            let worker = anvil_core::worker::run(
                 worker_state.persistence.clone(),
+                worker_state.core_store.clone(),
                 worker_state.cluster.clone(),
                 worker_state.jwt_manager.clone(),
                 worker_state.object_manager.clone(),
                 worker_state.secret_keyring.clone(),
                 worker_state.config.background_worker_concurrency,
-            )
-            .await
-            {
-                error!("Worker process failed: {}", e);
+            );
+            tokio::select! {
+                result = worker => {
+                    if let Err(error) = result {
+                        error!("Worker process failed: {}", error);
+                    }
+                }
+                _ = shard_recovery => unreachable!("shard recovery supervisor completed"),
             }
         });
     }
@@ -93,16 +143,17 @@ pub async fn start_node_with_admin_listener(
             middleware::admin_auth_interceptor(req, &admin_auth_state)
         });
     let admin_axum = admin_listener.as_ref().map(|_| {
-        anvil_core::services::create_axum_router(anvil_core::services::create_admin_grpc_router(
+        anvil_core::services::create_admin_axum_router(
             state.clone(),
             admin_auth_interceptor.clone(),
-        ))
+        )
     });
     let s3_app = s3_gateway::app(state.clone());
 
     let app = tower::service_fn(move |req: axum::extract::Request| {
         let grpc_router = grpc_axum.clone();
         let s3_router = s3_app.clone();
+        let public_readiness = public_readiness.clone();
 
         async move {
             let started_at = Instant::now();
@@ -120,6 +171,16 @@ pub async fn start_node_with_admin_listener(
             } else {
                 "s3"
             };
+            if !public_readiness.public_api_ready()
+                && !startup_readiness::may_bypass_public_readiness(
+                    &path,
+                    public_readiness.coremeta_ready(),
+                )
+            {
+                return Ok(startup_readiness::unavailable_response(
+                    content_type.starts_with("application/grpc"),
+                ));
+            }
             let mux_request_id = uuid::Uuid::new_v4().simple().to_string();
             let context = vec![
                 ("mux_request_id".to_string(), mux_request_id.clone()),
