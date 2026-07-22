@@ -217,7 +217,7 @@ impl Persistence {
     ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::NodeDescriptor> {
         let record_key = format!("{}/{}/{}", input.region, input.cell_id, input.node_id);
         let node_id = input.node_id.clone();
-        let receipt_signing_public_key_proto = input.receipt_signing_public_key_proto.clone();
+        let receipt_signing_public_key = input.receipt_signing_public_key.clone();
         let partition = crate::mesh_lifecycle::lifecycle_control_partition(
             crate::mesh_lifecycle::NODE_DESCRIPTOR_STREAM_FAMILY,
             &record_key,
@@ -244,7 +244,7 @@ impl Persistence {
             .await
             .map_err(|err| crate::mesh_lifecycle::LifecycleError::Other(err.into()))?;
         store
-            .register_node_receipt_signing_public_key(&node_id, &receipt_signing_public_key_proto)
+            .register_node_receipt_signing_public_key(&node_id, &receipt_signing_public_key)
             .map_err(|err| crate::mesh_lifecycle::LifecycleError::Other(err.into()))?;
         Ok(descriptor)
     }

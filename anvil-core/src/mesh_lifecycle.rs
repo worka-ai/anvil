@@ -185,10 +185,8 @@ pub struct NodeDescriptor {
     pub node_id: String,
     pub region: String,
     pub cell_id: String,
-    pub libp2p_peer_id: String,
-    pub receipt_signing_public_key_proto: Vec<u8>,
+    pub receipt_signing_public_key: Vec<u8>,
     pub public_api_addr: String,
-    pub public_cluster_addrs: Vec<String>,
     pub capabilities: Vec<NodeCapability>,
     pub capacity_json_hash: String,
     pub state: LifecycleState,
@@ -253,10 +251,8 @@ pub struct RegisterNodeDescriptor {
     pub node_id: String,
     pub region: String,
     pub cell_id: String,
-    pub libp2p_peer_id: String,
-    pub receipt_signing_public_key_proto: Vec<u8>,
+    pub receipt_signing_public_key: Vec<u8>,
     pub public_api_addr: String,
-    pub public_cluster_addrs: Vec<String>,
     pub capabilities: Vec<NodeCapability>,
     pub capacity_json: String,
 }
@@ -719,7 +715,7 @@ fn lifecycle_projection_row_key(kind: &str, record_key: &str) -> LifecycleResult
 }
 
 fn lifecycle_projection_root_anchor_key(kind: &str, record_key: &str) -> String {
-    format!("mesh/lifecycle/{kind}/{record_key}")
+    record_proto::projection_root_anchor_key(kind, record_key)
 }
 
 fn lifecycle_projection_root_publications(

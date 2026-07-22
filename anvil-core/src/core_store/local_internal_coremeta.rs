@@ -776,23 +776,26 @@ fn validate_visible_scan_limit(limit: usize) -> Result<()> {
 }
 
 fn is_node_local_bootstrap_row(row: &CoreMetaEncodedOwnedRow) -> bool {
-    if row.cf != CF_MESH || encoded_coremeta_table_id(row) != Some(TABLE_NODE_SIGNING_KEYPAIR_ROW) {
+    if row.cf != CF_MESH {
         return false;
     }
+    let Some(table_id) = encoded_coremeta_table_id(row) else {
+        return false;
+    };
     let Ok(tuple_key) = crate::core_store::core_meta_record_tuple_key(&row.core_meta_key) else {
         return false;
     };
-    let local_tuples = [
-        core_meta_tuple_key(&[CoreMetaTuplePart::Raw(b"node-signing-keypair")]),
-        core_meta_tuple_key(&[
-            CoreMetaTuplePart::Utf8("cluster-identity"),
+    let expected_tuple = match table_id {
+        TABLE_NODE_SIGNING_KEYPAIR_ROW => {
+            core_meta_tuple_key(&[CoreMetaTuplePart::Raw(b"node-signing-keypair")])
+        }
+        TABLE_LOCAL_NODE_IDENTITY_ROW => core_meta_tuple_key(&[
+            CoreMetaTuplePart::Utf8("node-identity"),
             CoreMetaTuplePart::Utf8("local"),
         ]),
-    ];
-    local_tuples
-        .iter()
-        .filter_map(|result| result.as_ref().ok())
-        .any(|local_tuple| tuple_key == local_tuple.as_slice())
+        _ => return false,
+    };
+    expected_tuple.is_ok_and(|local_tuple| tuple_key == local_tuple.as_slice())
 }
 
 fn is_runtime_local_bootstrap_row(row: &CoreMetaEncodedOwnedRow) -> bool {

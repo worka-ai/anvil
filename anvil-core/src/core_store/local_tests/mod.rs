@@ -351,7 +351,7 @@ fn test_object_ref_for_payload(
             written_at_unix_nanos,
             receipt_signature: store.sign_core_receipt(&signed_payload_hash).unwrap(),
             signed_payload_hash,
-            signature_algorithm: "ed25519-libp2p".to_string(),
+            signature_algorithm: "ed25519".to_string(),
         });
     }
     CoreObjectRef {

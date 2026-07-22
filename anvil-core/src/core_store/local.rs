@@ -30,14 +30,15 @@ use super::meta::{
     CoreMetaVisibilityState, TABLE_BOUNDARY_SCHEMA_CURRENT_ROW, TABLE_BOUNDARY_SCHEMA_ROW,
     TABLE_BOUNDARY_VALUE_ROW, TABLE_CORE_FENCE_ROW, TABLE_EXPLICIT_TRANSACTION_ROW,
     TABLE_INLINE_MANIFEST_BODY_ROW, TABLE_INLINE_PAYLOAD_ROW, TABLE_LANDED_BYTE_REF_ROW,
-    TABLE_LOCAL_ADMISSION_EVIDENCE_ROW, TABLE_MATERIALISATION_CURSOR_ROW,
-    TABLE_NODE_SIGNING_KEYPAIR_ROW, TABLE_OBJECT_HEAD_ROW, TABLE_OBJECT_SHARD_REPAIR_ROW,
-    TABLE_OBJECT_VERSION_META_ROW, TABLE_PENDING_MUTATION_ROW, TABLE_QUORUM_PROFILE_CURRENT_ROW,
-    TABLE_REFCOUNT_ROW, TABLE_ROOT_CACHE_ROW, TABLE_ROOT_CATALOG_CURRENT_ROW,
-    TABLE_ROOT_FAILOVER_CERTIFICATE_ROW, TABLE_ROOT_FAILOVER_VOTE_ROW,
-    TABLE_ROOT_PUBLICATION_INTENT_ROW, TABLE_STREAM_HEAD_ROW, TABLE_STREAM_IDEMPOTENCY_ROW,
-    TABLE_STREAM_RECORD_INDEX_ROW, TABLE_TRANSACTION_COMMIT_EVIDENCE_ROW,
-    TABLE_TRANSACTION_LOCATOR_ROW, TABLE_TRANSACTION_MANIFEST_BODY_ROW, canonical_coremeta_cf_name,
+    TABLE_LOCAL_ADMISSION_EVIDENCE_ROW, TABLE_LOCAL_NODE_IDENTITY_ROW,
+    TABLE_MATERIALISATION_CURSOR_ROW, TABLE_NODE_SIGNING_KEYPAIR_ROW, TABLE_OBJECT_HEAD_ROW,
+    TABLE_OBJECT_SHARD_REPAIR_ROW, TABLE_OBJECT_VERSION_META_ROW, TABLE_PENDING_MUTATION_ROW,
+    TABLE_QUORUM_PROFILE_CURRENT_ROW, TABLE_REFCOUNT_ROW, TABLE_ROOT_CACHE_ROW,
+    TABLE_ROOT_CATALOG_CURRENT_ROW, TABLE_ROOT_FAILOVER_CERTIFICATE_ROW,
+    TABLE_ROOT_FAILOVER_VOTE_ROW, TABLE_ROOT_PUBLICATION_INTENT_ROW, TABLE_STREAM_HEAD_ROW,
+    TABLE_STREAM_IDEMPOTENCY_ROW, TABLE_STREAM_RECORD_INDEX_ROW,
+    TABLE_TRANSACTION_COMMIT_EVIDENCE_ROW, TABLE_TRANSACTION_LOCATOR_ROW,
+    TABLE_TRANSACTION_MANIFEST_BODY_ROW, canonical_coremeta_cf_name,
     core_meta_bootstrap_row_common, core_meta_committed_row_common,
     core_meta_locator_from_manifest_locator, core_meta_locator_to_manifest_locator,
     core_meta_payload_digest, core_meta_pending_row_common, core_meta_record_table_id,
@@ -61,6 +62,7 @@ use super::transaction_manifest_proto::{
 use super::types::*;
 use crate::error_codes::AnvilErrorCode;
 use crate::formats::writer::{WriterFamily, canonical_logical_file_id};
+use crate::node_signing::NodeSigningKeypair;
 use crate::storage::Storage;
 use aes_gcm_siv::aead::{Aead, AeadCore, OsRng, Payload};
 use aes_gcm_siv::{Aes256GcmSiv, Nonce};
@@ -70,7 +72,6 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
 use fs2::FileExt;
 use hmac::{Hmac, Mac};
-use libp2p::identity;
 #[cfg(test)]
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -369,7 +370,7 @@ pub struct CoreStore {
     root_owner_failure_tracker: Arc<Mutex<local_root_failover::RootOwnerFailureTracker>>,
     pipeline_keyring: Option<Arc<CorePipelineKeyring>>,
     storage_classes: CoreStorageClassCatalog,
-    node_signing_keypair: Arc<identity::Keypair>,
+    node_signing_keypair: Arc<NodeSigningKeypair>,
     admission_mutation_epoch: u64,
     node_identity: CoreStoreNodeIdentity,
     startup_recovery_deferred: bool,

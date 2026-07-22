@@ -120,7 +120,7 @@ async fn claim_authz_materialization_guard(
 #[tokio::test]
 async fn authz_tuple_write_enqueues_and_materializes_bounded_authorization_state() {
     let temp = tempdir().unwrap();
-    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    let persistence = Persistence::new(&test_config(temp.path())).unwrap();
     bind_persistence_test_authz_schema(&persistence, 1).await;
 
     let record = persistence
@@ -219,7 +219,7 @@ async fn authz_materialization_job_latency_with_retained_history_perf() {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(100);
     let temp = tempdir().unwrap();
-    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    let persistence = Persistence::new(&test_config(temp.path())).unwrap();
     bind_persistence_test_authz_schema(&persistence, 42).await;
 
     let seed_started = std::time::Instant::now();
@@ -305,7 +305,7 @@ async fn measure_authz_permission_checks(
 #[tokio::test]
 async fn empty_bucket_index_build_materialises_an_empty_typed_json_segment() {
     let temp = tempdir().unwrap();
-    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    let persistence = Persistence::new(&test_config(temp.path())).unwrap();
     let tenant = persistence
         .create_tenant("empty-index-tenant", "empty-index-tenant")
         .await
@@ -410,7 +410,7 @@ async fn empty_bucket_index_build_materialises_an_empty_typed_json_segment() {
 #[tokio::test]
 async fn tenant_and_bucket_creation_materialise_mesh_directory_locators() {
     let temp = tempdir().unwrap();
-    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    let persistence = Persistence::new(&test_config(temp.path())).unwrap();
 
     let tenant = persistence
         .create_tenant("tenant-a", "unused")
@@ -485,7 +485,7 @@ async fn tenant_and_bucket_creation_materialise_mesh_directory_locators() {
 #[tokio::test]
 async fn region_drain_blocks_bucket_creation_and_completion_with_active_locator() {
     let temp = tempdir().unwrap();
-    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    let persistence = Persistence::new(&test_config(temp.path())).unwrap();
     let (region, _, _) = register_active_mesh_placement(&persistence).await;
     let tenant = persistence
         .create_tenant("tenant-a", "unused")
@@ -533,7 +533,7 @@ async fn region_drain_blocks_bucket_creation_and_completion_with_active_locator(
 #[tokio::test]
 async fn region_drain_applies_read_only_exceptions_to_bucket_locators() {
     let temp = tempdir().unwrap();
-    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    let persistence = Persistence::new(&test_config(temp.path())).unwrap();
     let (region, _, _) = register_active_mesh_placement(&persistence).await;
     let tenant = persistence
         .create_tenant("tenant-a", "unused")
@@ -634,7 +634,7 @@ async fn region_drain_applies_read_only_exceptions_to_bucket_locators() {
 #[tokio::test]
 async fn region_drain_delete_after_retention_keeps_region_from_exception_completion() {
     let temp = tempdir().unwrap();
-    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    let persistence = Persistence::new(&test_config(temp.path())).unwrap();
     let (region, _, _) = register_active_mesh_placement(&persistence).await;
     let tenant = persistence
         .create_tenant("tenant-a", "unused")
@@ -686,7 +686,7 @@ async fn node_drain_completion_requires_no_runtime_ownership_and_force_offline_e
     let temp = tempdir().unwrap();
     let mut config = test_config(temp.path());
     config.public_api_addr = "admin-node".to_string();
-    let persistence = Persistence::new(&config, None).unwrap();
+    let persistence = Persistence::new(&config).unwrap();
     let now_nanos = current_time_nanos()
         .unwrap()
         .saturating_add(3_600_000_000_000);
@@ -738,12 +738,11 @@ async fn node_drain_completion_requires_no_runtime_ownership_and_force_offline_e
             node_id: "worker-node".to_string(),
             region: "test-region".to_string(),
             cell_id: "default".to_string(),
-            libp2p_peer_id: "peer-worker-node".to_string(),
-            receipt_signing_public_key_proto: libp2p::identity::Keypair::generate_ed25519()
-                .public()
-                .encode_protobuf(),
+            receipt_signing_public_key: crate::node_signing::NodeSigningKeypair::generate()
+                .unwrap()
+                .public_key_bytes()
+                .to_vec(),
             public_api_addr: "worker-node".to_string(),
-            public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7444/quic-v1".to_string()],
             capabilities: vec![crate::mesh_lifecycle::NodeCapability::Object],
             capacity_json: "{}".to_string(),
         })
@@ -922,7 +921,7 @@ async fn node_drain_completion_requires_no_runtime_ownership_and_force_offline_e
 #[tokio::test]
 async fn mesh_routing_projection_diagnostics_detect_bucket_locator_mismatch() {
     let temp = tempdir().unwrap();
-    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    let persistence = Persistence::new(&test_config(temp.path())).unwrap();
     register_active_mesh_placement(&persistence).await;
     let tenant = persistence
         .create_tenant("tenant-a", "unused")
@@ -1006,7 +1005,7 @@ fn persistence_replays_anvil_owned_state_after_fresh_instance() {
 async fn persistence_replays_anvil_owned_state_after_fresh_instance_body() {
     let temp = tempdir().unwrap();
     let first_config = test_config(temp.path());
-    let persistence = Persistence::new(&first_config, None).unwrap();
+    let persistence = Persistence::new(&first_config).unwrap();
 
     persistence.create_region("local").await.unwrap();
     let tenant = persistence
@@ -1172,7 +1171,7 @@ async fn persistence_replays_anvil_owned_state_after_fresh_instance_body() {
 
     drop(persistence);
 
-    let replayed = Persistence::new(&first_config, None).unwrap();
+    let replayed = Persistence::new(&first_config).unwrap();
 
     assert!(
         replayed
@@ -1361,7 +1360,7 @@ async fn persistence_replays_anvil_owned_state_after_fresh_instance_body() {
 async fn persistence_compacts_object_metadata_and_restarts_from_manifest() {
     let temp = tempdir().unwrap();
     let first_config = test_config(temp.path());
-    let persistence = Persistence::new(&first_config, None).unwrap();
+    let persistence = Persistence::new(&first_config).unwrap();
 
     persistence.create_region("local").await.unwrap();
     let bucket = persistence
@@ -1410,7 +1409,7 @@ async fn persistence_compacts_object_metadata_and_restarts_from_manifest() {
     assert_eq!(sealed.directory_record_count, 2);
 
     drop(persistence);
-    let restarted = Persistence::new(&first_config, None).unwrap();
+    let restarted = Persistence::new(&first_config).unwrap();
 
     let replayed = restarted
         .get_object(bucket.id, "docs/a.txt")
@@ -1479,7 +1478,7 @@ async fn persistence_compacts_object_metadata_and_restarts_from_manifest() {
 #[tokio::test]
 async fn object_metadata_writes_use_one_authoritative_partition_fence() {
     let temp = tempdir().unwrap();
-    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    let persistence = Persistence::new(&test_config(temp.path())).unwrap();
     register_active_mesh_placement(&persistence).await;
     let tenant = persistence
         .create_tenant("tenant-a", "unused")
@@ -1548,7 +1547,7 @@ async fn persistence_schedules_deduplicated_object_metadata_compaction_tasks() {
         object_metadata_compaction_bytes_threshold: 0,
         ..test_config(temp.path())
     };
-    let persistence = Persistence::new(&config, None).unwrap();
+    let persistence = Persistence::new(&config).unwrap();
 
     persistence.create_region("local").await.unwrap();
     let bucket = persistence
@@ -1702,7 +1701,7 @@ async fn persistence_schedules_deduplicated_object_metadata_compaction_tasks() {
 #[tokio::test]
 async fn persistence_serializes_concurrent_task_queue_writes() {
     let temp = tempdir().unwrap();
-    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    let persistence = Persistence::new(&test_config(temp.path())).unwrap();
 
     let writes = (0..12).map(|bucket_id| {
         let persistence = persistence.clone();
@@ -1742,7 +1741,7 @@ fn task_queue_retries_coremeta_target_conflicts() {
 async fn persistence_task_execution_lease_targets_object_metadata_partition() {
     let temp = tempdir().unwrap();
     let config = test_config(temp.path());
-    let persistence = Persistence::new(&config, None).unwrap();
+    let persistence = Persistence::new(&config).unwrap();
 
     persistence.create_region("local").await.unwrap();
     let bucket = persistence
@@ -1806,7 +1805,7 @@ async fn persistence_task_execution_lease_targets_object_metadata_partition() {
         public_api_addr: "other-worker-node".to_string(),
         ..config
     };
-    let competing = Persistence::new(&competing_config, None).unwrap();
+    let competing = Persistence::new(&competing_config).unwrap();
     let err = competing
         .acquire_task_execution_lease(&task)
         .await

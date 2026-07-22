@@ -26,35 +26,21 @@ pub async fn run(
     config.validate_admin_listener_bind()?;
     let personaldb_protocol_keyring =
         anvil_core::personaldb_signing::PersonalDbProtocolKeyring::disabled();
-    let (tx, rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(config, Some(tx), personaldb_protocol_keyring).await?;
-    let swarm = anvil_core::cluster::create_swarm(state.config.clone()).await?;
+    let state = AppState::new(config, personaldb_protocol_keyring).await?;
 
     // Then start the node
-    start_node_with_admin_listener(listener, Some(admin_listener), state, swarm, rx).await
+    start_node_with_admin_listener(listener, Some(admin_listener), state).await
 }
 
-pub async fn start_node(
-    listener: tokio::net::TcpListener,
-    state: AppState,
-    swarm: libp2p::Swarm<anvil_core::cluster::ClusterBehaviour>,
-    outbound_events_rx: tokio::sync::mpsc::Receiver<anvil_core::cluster::MetadataEvent>,
-) -> Result<()> {
-    start_node_with_admin_listener(listener, None, state, swarm, outbound_events_rx).await
+pub async fn start_node(listener: tokio::net::TcpListener, state: AppState) -> Result<()> {
+    start_node_with_admin_listener(listener, None, state).await
 }
 
 pub async fn start_node_with_admin_listener(
     listener: tokio::net::TcpListener,
     admin_listener: Option<tokio::net::TcpListener>,
     state: AppState,
-    mut swarm: libp2p::Swarm<anvil_core::cluster::ClusterBehaviour>,
-    outbound_events_rx: tokio::sync::mpsc::Receiver<anvil_core::cluster::MetadataEvent>,
 ) -> Result<()> {
-    for addr in &state.config.bootstrap_addrs {
-        let multiaddr: libp2p::Multiaddr = addr.parse()?;
-        swarm.dial(multiaddr)?;
-    }
-
     // Distributed nodes must fail closed before any background mutation can
     // race the canonical topology/bootstrap import.
     let distributed_recovery_required = state.config.requires_distributed_coremeta_recovery();
@@ -105,7 +91,6 @@ pub async fn start_node_with_admin_listener(
             let worker = anvil_core::worker::run(
                 worker_state.persistence.clone(),
                 worker_state.core_store.clone(),
-                worker_state.cluster.clone(),
                 worker_state.jwt_manager.clone(),
                 worker_state.object_manager.clone(),
                 worker_state.secret_keyring.clone(),
@@ -229,15 +214,6 @@ pub async fn start_node_with_admin_listener(
         info!("Anvil admin gRPC listener available on {}", admin_addr);
     }
 
-    // Spawn the gossip service to run in the background.
-    let gossip_task = tokio::spawn(anvil_core::cluster::run_gossip(
-        swarm,
-        state.cluster.clone(),
-        state.config.public_api_addr.clone(),
-        state.config.cluster_secret.clone(),
-        state.persistence.cache().clone(),
-        outbound_events_rx,
-    ));
     let server_task = tokio::spawn(async move {
         let listener = listener.tap_io(|stream| {
             if let Err(error) = stream.set_nodelay(true) {
@@ -263,17 +239,13 @@ pub async fn start_node_with_admin_listener(
             })
         });
 
-    // Run both tasks concurrently.
+    // Run the public and optional admin gRPC servers concurrently.
     if let Some(admin_server_task) = admin_server_task {
-        let (server_result, admin_result, gossip_result) =
-            tokio::join!(server_task, admin_server_task, gossip_task);
+        let (server_result, admin_result) = tokio::join!(server_task, admin_server_task);
         server_result??;
         admin_result??;
-        gossip_result??;
     } else {
-        let (server_result, gossip_result) = tokio::join!(server_task, gossip_task);
-        server_result??;
-        gossip_result??;
+        server_task.await??;
     }
 
     Ok(())

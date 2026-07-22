@@ -1138,7 +1138,7 @@ mod tests {
             fsync_sequence: 1,
             written_at_unix_nanos: 1,
             signed_payload_hash: format!("sha256:{}", "2".repeat(64)),
-            signature_algorithm: "ed25519-libp2p".to_string(),
+            signature_algorithm: "ed25519".to_string(),
             receipt_signature: vec![1],
         }
     }
@@ -1341,7 +1341,7 @@ mod tests {
                 fsync_sequence: 1,
                 written_at_unix_nanos: 1,
                 signed_payload_hash: format!("sha256:{}", "2".repeat(64)),
-                signature_algorithm: "ed25519-libp2p".to_string(),
+                signature_algorithm: "ed25519".to_string(),
                 receipt_signature: vec![1],
             })
             .collect::<Vec<_>>();
@@ -1393,7 +1393,7 @@ mod tests {
                 fsync_sequence: 1,
                 written_at_unix_nanos: 1,
                 signed_payload_hash: format!("sha256:{}", "2".repeat(64)),
-                signature_algorithm: "ed25519-libp2p".to_string(),
+                signature_algorithm: "ed25519".to_string(),
                 receipt_signature: vec![1],
             })
             .collect::<Vec<_>>();

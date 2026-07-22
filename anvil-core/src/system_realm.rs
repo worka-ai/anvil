@@ -1403,12 +1403,11 @@ mod tests {
                 node_id: node_id.to_string(),
                 region: region.region,
                 cell_id: cell.cell_id,
-                libp2p_peer_id: "test-peer".to_string(),
-                receipt_signing_public_key_proto: libp2p::identity::Keypair::generate_ed25519()
-                    .public()
-                    .encode_protobuf(),
+                receipt_signing_public_key: crate::node_signing::NodeSigningKeypair::generate()
+                    .unwrap()
+                    .public_key_bytes()
+                    .to_vec(),
                 public_api_addr: "http://127.0.0.1:50051".to_string(),
-                public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
                 capabilities: vec![NodeCapability::Metadata, NodeCapability::Object],
                 capacity_json: "{}".to_string(),
             },
@@ -1450,7 +1449,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let config = test_config(temp.path());
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let persistence = Persistence::new(&config, None).unwrap();
+        let persistence = Persistence::new(&config).unwrap();
         let keyring = config.secret_keyring().unwrap();
 
         ensure_bootstrapped(&config, &persistence, &storage, &keyring)
@@ -1494,7 +1493,7 @@ mod tests {
         let mut config = test_config(temp.path());
         config.bootstrap_node_ids = vec!["node-a".to_string()];
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let persistence = Persistence::new(&config, None).unwrap();
+        let persistence = Persistence::new(&config).unwrap();
         let keyring = config.secret_keyring().unwrap();
 
         install_active_internal_node(&storage, &config.mesh_id, "node-a").await;
@@ -1568,7 +1567,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let config = test_config(temp.path());
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let persistence = Persistence::new(&config, None).unwrap();
+        let persistence = Persistence::new(&config).unwrap();
         let keyring = config.secret_keyring().unwrap();
 
         ensure_bootstrapped(&config, &persistence, &storage, &keyring)
@@ -1602,7 +1601,7 @@ mod tests {
         config.bootstrap_system_admin_subject_kind.clear();
         config.bootstrap_system_admin_subject_id.clear();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let persistence = Persistence::new(&config, None).unwrap();
+        let persistence = Persistence::new(&config).unwrap();
         let keyring = config.secret_keyring().unwrap();
 
         let err = ensure_bootstrapped(&config, &persistence, &storage, &keyring)
@@ -1625,7 +1624,7 @@ mod tests {
             credential_path.to_string_lossy().to_string();
 
         let storage = Storage::new_at(&storage_path).await.unwrap();
-        let persistence = Persistence::new(&config, None).unwrap();
+        let persistence = Persistence::new(&config).unwrap();
         let keyring = config.secret_keyring().unwrap();
 
         ensure_bootstrapped(&config, &persistence, &storage, &keyring)
@@ -1708,13 +1707,9 @@ mod tests {
         config.bootstrap_system_admin_subject_kind.clear();
         config.bootstrap_system_admin_subject_id.clear();
 
-        let err = crate::AppState::new(
-            config,
-            None,
-            crate::test_support::personaldb_protocol_keyring(),
-        )
-        .await
-        .unwrap_err();
+        let err = crate::AppState::new(config, crate::test_support::personaldb_protocol_keyring())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("system realm is missing"));
     }
 
@@ -1723,7 +1718,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let config = test_config(temp.path());
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let persistence = Persistence::new(&config, None).unwrap();
+        let persistence = Persistence::new(&config).unwrap();
         let keyring = config.secret_keyring().unwrap();
 
         let (left, right) = tokio::join!(
@@ -1758,7 +1753,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let config = test_config(temp.path());
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let persistence = Persistence::new(&config, None).unwrap();
+        let persistence = Persistence::new(&config).unwrap();
         let keyring = config.secret_keyring().unwrap();
 
         install_system_schema(&storage, &persistence).await.unwrap();
@@ -1802,7 +1797,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let config = test_config(temp.path());
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let persistence = Persistence::new(&config, None).unwrap();
+        let persistence = Persistence::new(&config).unwrap();
         let keyring = config.secret_keyring().unwrap();
 
         ensure_bootstrapped(&config, &persistence, &storage, &keyring)

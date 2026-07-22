@@ -4,6 +4,7 @@ use crate::core_store::{
     core_meta_committed_row_common, core_meta_root_key_hash, core_meta_tuple_key,
     decode_deterministic_proto, encode_deterministic_proto,
 };
+use crate::node_signing::{NodeSigningKeypair, NodeVerifyingKey, validate_public_key_bytes};
 use prost::Message;
 
 #[derive(Clone, PartialEq, Message)]
@@ -11,7 +12,7 @@ struct NodeSigningKeypairRowProto {
     #[prost(message, optional, tag = "1")]
     common: Option<CoreMetaRowCommonProto>,
     #[prost(bytes, tag = "2")]
-    keypair_protobuf: Vec<u8>,
+    secret_key_bytes: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -21,7 +22,7 @@ struct NodeReceiptSigningPublicKeyRowProto {
     #[prost(string, tag = "2")]
     node_id: String,
     #[prost(bytes, tag = "3")]
-    public_key_protobuf: Vec<u8>,
+    public_key_bytes: Vec<u8>,
     #[prost(string, tag = "4")]
     public_key_hash: String,
     #[prost(uint64, tag = "5")]
@@ -238,16 +239,16 @@ pub(super) fn node_receipt_signing_public_key_key(node_id: &str) -> Vec<u8> {
 
 pub(super) fn load_or_create_node_signing_keypair(
     meta: &CoreMetaStore,
-) -> Result<identity::Keypair> {
+) -> Result<NodeSigningKeypair> {
     let key = node_signing_keypair_key();
     // Node identity is required before publication visibility can initialise.
     if let Some(bytes) = meta.get(CF_MESH, TABLE_NODE_SIGNING_KEYPAIR_ROW, &key)? {
         let row = decode_node_signing_keypair_row(&bytes)?;
-        return identity::Keypair::from_protobuf_encoding(&row.keypair_protobuf)
-            .context("CoreStore node signing keypair metadata is not a valid libp2p keypair");
+        return NodeSigningKeypair::from_secret_key_bytes(&row.secret_key_bytes)
+            .context("CoreStore node signing keypair metadata is invalid");
     }
 
-    let keypair = identity::Keypair::generate_ed25519();
+    let keypair = NodeSigningKeypair::generate()?;
     let row = NodeSigningKeypairRowProto {
         common: Some(core_meta_committed_row_common(
             "system/corestore",
@@ -256,7 +257,7 @@ pub(super) fn load_or_create_node_signing_keypair(
             "node-signing-keypair",
             u64::try_from(Utc::now().timestamp_nanos_opt().unwrap_or_default()).unwrap_or_default(),
         )),
-        keypair_protobuf: keypair.to_protobuf_encoding()?,
+        secret_key_bytes: keypair.secret_key_bytes().to_vec(),
     };
     let bytes = encode_deterministic_proto(&row);
     meta.write_local_committed_batch(&[CoreMetaBatchOp {
@@ -269,19 +270,19 @@ pub(super) fn load_or_create_node_signing_keypair(
     Ok(keypair)
 }
 
-pub(super) fn node_receipt_signing_public_key_hash(public_key_protobuf: &[u8]) -> String {
+pub(super) fn node_receipt_signing_public_key_hash(public_key_bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"anvil.corestore.node_receipt_signing_public_key.v1");
     hasher.update([0]);
-    hasher.update(public_key_protobuf);
+    hasher.update(public_key_bytes);
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
-pub(super) fn node_admission_mutation_epoch(public_key_protobuf: &[u8]) -> u64 {
+pub(super) fn node_admission_mutation_epoch(public_key_bytes: &[u8]) -> u64 {
     let mut hasher = Sha256::new();
     hasher.update(b"anvil.corestore.admission_mutation_epoch.v1");
     hasher.update([0]);
-    hasher.update(public_key_protobuf);
+    hasher.update(public_key_bytes);
     let digest = hasher.finalize();
     let mut bytes = [0_u8; 8];
     bytes.copy_from_slice(&digest[..8]);
@@ -291,55 +292,52 @@ pub(super) fn node_admission_mutation_epoch(public_key_protobuf: &[u8]) -> u64 {
 pub(super) fn store_node_receipt_signing_public_key(
     meta: &CoreMetaStore,
     node_id: &str,
-    public_key_protobuf: &[u8],
+    public_key_bytes: &[u8],
 ) -> Result<String> {
-    let public_key_hash = validate_node_receipt_signing_public_key(node_id, public_key_protobuf)?;
+    let public_key_hash = validate_node_receipt_signing_public_key(node_id, public_key_bytes)?;
     let key = node_receipt_signing_public_key_key(node_id);
     if let Some(existing_bytes) = meta.get(CF_MESH, TABLE_NODE_SIGNING_KEYPAIR_ROW, &key)? {
         let existing = decode_node_receipt_signing_public_key_row(node_id, &existing_bytes)?;
         if existing.public_key_hash == public_key_hash
-            && existing.public_key_protobuf == public_key_protobuf
+            && existing.public_key_bytes == public_key_bytes
         {
             return Ok(public_key_hash);
         }
         bail!("CoreStore receipt signing identity replacement rejected for node {node_id}");
     }
-    write_node_receipt_signing_public_key(meta, node_id, public_key_protobuf, &public_key_hash)?;
+    write_node_receipt_signing_public_key(meta, node_id, public_key_bytes, &public_key_hash)?;
     Ok(public_key_hash)
 }
 
 pub(super) fn seed_node_receipt_signing_public_key_if_absent(
     meta: &CoreMetaStore,
     node_id: &str,
-    public_key_protobuf: &[u8],
+    public_key_bytes: &[u8],
 ) -> Result<String> {
-    let public_key_hash = validate_node_receipt_signing_public_key(node_id, public_key_protobuf)?;
+    let public_key_hash = validate_node_receipt_signing_public_key(node_id, public_key_bytes)?;
     let key = node_receipt_signing_public_key_key(node_id);
     if let Some(existing_bytes) = meta.get(CF_MESH, TABLE_NODE_SIGNING_KEYPAIR_ROW, &key)? {
         let existing = decode_node_receipt_signing_public_key_row(node_id, &existing_bytes)?;
         return Ok(existing.public_key_hash);
     }
-    write_node_receipt_signing_public_key(meta, node_id, public_key_protobuf, &public_key_hash)?;
+    write_node_receipt_signing_public_key(meta, node_id, public_key_bytes, &public_key_hash)?;
     Ok(public_key_hash)
 }
 
 fn validate_node_receipt_signing_public_key(
     node_id: &str,
-    public_key_protobuf: &[u8],
+    public_key_bytes: &[u8],
 ) -> Result<String> {
     validate_logical_id(node_id, "node receipt signing public key node id")?;
-    let public_key = identity::PublicKey::try_decode_protobuf(public_key_protobuf)
-        .context("node receipt signing public key protobuf is invalid")?;
-    if public_key.encode_protobuf() != public_key_protobuf {
-        bail!("node receipt signing public key protobuf is not canonical");
-    }
-    Ok(node_receipt_signing_public_key_hash(public_key_protobuf))
+    validate_public_key_bytes(public_key_bytes)
+        .context("node receipt signing public key is invalid")?;
+    Ok(node_receipt_signing_public_key_hash(public_key_bytes))
 }
 
 fn write_node_receipt_signing_public_key(
     meta: &CoreMetaStore,
     node_id: &str,
-    public_key_protobuf: &[u8],
+    public_key_bytes: &[u8],
     public_key_hash: &str,
 ) -> Result<()> {
     let key = node_receipt_signing_public_key_key(node_id);
@@ -354,7 +352,7 @@ fn write_node_receipt_signing_public_key(
             updated_at_unix_nanos,
         )),
         node_id: node_id.to_string(),
-        public_key_protobuf: public_key_protobuf.to_vec(),
+        public_key_bytes: public_key_bytes.to_vec(),
         public_key_hash: public_key_hash.to_string(),
         updated_at_unix_nanos,
     };
@@ -372,7 +370,7 @@ fn write_node_receipt_signing_public_key(
 pub(super) fn load_node_receipt_signing_public_key(
     meta: &CoreMetaStore,
     node_id: &str,
-) -> Result<Option<identity::PublicKey>> {
+) -> Result<Option<NodeVerifyingKey>> {
     validate_logical_id(node_id, "node receipt signing public key node id")?;
     // Receipt verification keys bootstrap the visibility machinery they authenticate.
     let Some(bytes) = meta.get(
@@ -385,8 +383,8 @@ pub(super) fn load_node_receipt_signing_public_key(
     };
     let row = decode_node_receipt_signing_public_key_row(node_id, &bytes)?;
     Ok(Some(
-        identity::PublicKey::try_decode_protobuf(&row.public_key_protobuf)
-            .context("stored node receipt signing public key protobuf is invalid")?,
+        NodeVerifyingKey::from_bytes(&row.public_key_bytes)
+            .context("stored node receipt signing public key is invalid")?,
     ))
 }
 
@@ -408,7 +406,7 @@ fn decode_node_signing_keypair_row(bytes: &[u8]) -> Result<NodeSigningKeypairRow
     if common.visibility_state_enum() != CoreMetaVisibilityState::Committed {
         bail!("node signing keypair row is not committed");
     }
-    if row.keypair_protobuf.is_empty() {
+    if row.secret_key_bytes.is_empty() {
         bail!("node signing keypair row payload is empty");
     }
     Ok(row)
@@ -441,10 +439,12 @@ fn decode_node_receipt_signing_public_key_row(
     if row.node_id != expected_node_id {
         bail!("node receipt signing public key row node id mismatch");
     }
-    if row.public_key_protobuf.is_empty() {
+    if row.public_key_bytes.is_empty() {
         bail!("node receipt signing public key row payload is empty");
     }
-    if row.public_key_hash != node_receipt_signing_public_key_hash(&row.public_key_protobuf) {
+    validate_public_key_bytes(&row.public_key_bytes)
+        .context("node receipt signing public key row payload is invalid")?;
+    if row.public_key_hash != node_receipt_signing_public_key_hash(&row.public_key_bytes) {
         bail!("node receipt signing public key row hash mismatch");
     }
     Ok(row)

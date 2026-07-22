@@ -233,10 +233,8 @@ message NodeDescriptor {
   string node_id = 3;
   string region = 4;
   string cell_id = 5;
-  string libp2p_peer_id = 6;
   string public_api_addr = 7;
-  bytes receipt_signing_public_key_proto = 16;
-  repeated string public_cluster_addrs = 8;
+  bytes receipt_signing_public_key = 16;
   repeated NodeCapability capabilities = 9;
   LifecycleState state = 10;
   NodeDrainDescriptor drain = 11;
@@ -684,11 +682,9 @@ message RegisterNodeRequest {
   string node_id = 2;
   string region = 3;
   string cell_id = 4;
-  string libp2p_peer_id = 5;
-  repeated string public_cluster_addrs = 6;
   string public_api_addr = 7;
   repeated NodeCapability capabilities = 8;
-  bytes receipt_signing_public_key_proto = 9;
+  bytes receipt_signing_public_key = 9;
   string capacity_json = 10;
 }
 
@@ -2497,9 +2493,7 @@ message PutNodeRequest {
     string state = 5;
     string capacity_json = 6;
     WriteOptions options = 7;
-    string libp2p_peer_id = 8;
-    bytes receipt_signing_public_key_proto = 9;
-    repeated string cluster_addrs = 10;
+    bytes receipt_signing_public_key = 9;
     repeated string capabilities = 11;
 }
 

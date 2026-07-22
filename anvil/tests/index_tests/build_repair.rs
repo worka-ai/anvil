@@ -1223,7 +1223,7 @@ async fn test_index_build_followup_waits_for_running_build_and_catches_up_after_
         "follow-up for a running index build must wait for the active build"
     );
 
-    let restarted = anvil::persistence::Persistence::new(&cluster.states[0].config, None).unwrap();
+    let restarted = anvil::persistence::Persistence::new(&cluster.states[0].config).unwrap();
     restarted
         .rebuild_index_direct(
             tenant_id,

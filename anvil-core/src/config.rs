@@ -29,14 +29,6 @@ pub struct Config {
     #[arg(long, env, default_value = "")]
     pub corestore_internal_bearer_token: String,
 
-    /// The address to bind the QUIC peer-to-peer endpoint to.
-    #[arg(long, env, default_value = "/ip4/0.0.0.0/udp/7443/quic-v1")]
-    pub cluster_listen_addr: String,
-
-    /// The publicly reachable addresses for this node.
-    #[arg(long, env, use_value_delimiter = true, value_delimiter = ',')]
-    pub public_cluster_addrs: Vec<String>,
-
     /// The publicly reachable gRPC address for this node.
     #[arg(long, env)]
     pub public_api_addr: String,
@@ -102,26 +94,6 @@ pub struct Config {
     /// identity; subsequent starts must supply the same value or omit it.
     #[arg(long, env, default_value = "")]
     pub node_id: String,
-
-    /// A list of bootstrap addresses for joining a cluster.
-    #[arg(long, env, use_value_delimiter = true, value_delimiter = ',')]
-    pub bootstrap_addrs: Vec<String>,
-
-    /// Initialize a new cluster.
-    #[arg(long, env, default_value_t = false)]
-    pub init_cluster: bool,
-
-    /// Enable mDNS for local peer discovery.
-    #[arg(long, env, default_value_t = true)]
-    pub enable_mdns: bool,
-
-    /// The shared secret for cluster authentication.
-    #[arg(long, env)]
-    pub cluster_secret: Option<String>,
-
-    /// TTL for metadata cache entries in seconds.
-    #[arg(long, env, default_value_t = 300)]
-    pub metadata_cache_ttl_secs: u64,
 
     /// Directory used for Anvil-owned object bytes, metadata journals, indexes, and manifests.
     #[arg(long, env, default_value = "anvil-data")]
@@ -193,7 +165,7 @@ impl Config {
     /// path before data-plane readiness. A node restart must not try to mutate
     /// that topology while constructing its local application state.
     pub fn requires_distributed_coremeta_recovery(&self) -> bool {
-        self.bootstrap_node_ids.len() > 1 || !self.bootstrap_addrs.is_empty()
+        self.bootstrap_node_ids.len() > 1
     }
 
     pub fn secret_keyring(&self) -> Result<crate::crypto::EncryptionKeyring> {
@@ -236,7 +208,7 @@ impl Config {
     pub async fn with_persisted_identity(mut self) -> Result<Self> {
         let requested_node_id = (!self.node_id.trim().is_empty()).then_some(self.node_id.as_str());
         let identity =
-            crate::cluster_identity::load_or_create_cluster_identity_with_core_store_configuration(
+            crate::node_identity::load_or_create_node_identity_with_core_store_configuration(
                 &self.storage_path,
                 requested_node_id,
                 self.core_pipeline_keyring()?,
@@ -315,18 +287,11 @@ mod tests {
     }
 
     #[test]
-    fn distributed_coremeta_is_derived_from_join_or_multi_node_configuration() {
+    fn distributed_coremeta_is_derived_from_committed_topology_bootstrap_configuration() {
         assert!(!Config::default().requires_distributed_coremeta_recovery());
         assert!(
             Config {
                 bootstrap_node_ids: vec!["node-a".into(), "node-b".into()],
-                ..Config::default()
-            }
-            .requires_distributed_coremeta_recovery()
-        );
-        assert!(
-            Config {
-                bootstrap_addrs: vec!["/dns4/node-a/udp/7443/quic-v1".into()],
                 ..Config::default()
             }
             .requires_distributed_coremeta_recovery()
@@ -408,7 +373,6 @@ mod tests {
 
         assert_eq!(first.node_id, restarted.node_id);
         assert!(!storage_path.join("node-id").exists());
-        assert!(!storage_path.join("cluster-keypair.pb").exists());
         assert!(
             storage_path
                 .join("corestore")

@@ -85,7 +85,7 @@ impl CoreStore {
         // Node signing identity is needed to verify publication evidence before
         // a visibility-aware CoreStore instance can finish initialising.
         let node_signing_keypair = Arc::new(load_or_create_node_signing_keypair(&meta)?);
-        let receipt_signing_public_key = node_signing_keypair.public().encode_protobuf();
+        let receipt_signing_public_key = node_signing_keypair.public_key_bytes().to_vec();
         let admission_mutation_epoch = node_admission_mutation_epoch(&receipt_signing_public_key);
         store_node_receipt_signing_public_key(
             &meta,
@@ -170,14 +170,14 @@ impl CoreStore {
         }
     }
 
-    pub fn local_receipt_signing_public_key_proto(&self) -> Vec<u8> {
-        self.node_signing_keypair.public().encode_protobuf()
+    pub fn local_receipt_signing_public_key(&self) -> Vec<u8> {
+        self.node_signing_keypair.public_key_bytes().to_vec()
     }
 
     pub(super) fn sign_core_receipt(&self, signed_payload_hash: &str) -> Result<Vec<u8>> {
-        self.node_signing_keypair
-            .sign(signed_payload_hash.as_bytes())
-            .map_err(|error| anyhow!("sign CoreStore shard receipt: {error}"))
+        Ok(self
+            .node_signing_keypair
+            .sign(signed_payload_hash.as_bytes()))
     }
 
     pub(super) fn verify_core_receipt_signature(
@@ -188,7 +188,7 @@ impl CoreStore {
     ) -> Result<()> {
         let public_key = if is_local_shard_node_id(node_id) || node_id == self.node_identity.node_id
         {
-            self.node_signing_keypair.public()
+            self.node_signing_keypair.public_key()
         } else {
             // Receipt identity is required during startup and recovery before
             // the corresponding mesh root can be publication-visible.
@@ -196,10 +196,11 @@ impl CoreStore {
                 anyhow!("CoreStore shard receipt references unknown node {node_id}")
             })?
         };
-        if !public_key.verify(signed_payload_hash.as_bytes(), receipt_signature) {
-            bail!("CoreStore shard receipt signature verification failed for node {node_id}");
-        }
-        Ok(())
+        public_key
+            .verify(signed_payload_hash.as_bytes(), receipt_signature)
+            .with_context(|| {
+                format!("CoreStore shard receipt signature verification failed for node {node_id}")
+            })
     }
 
     pub(super) fn verify_core_admission_signature(
@@ -211,16 +212,14 @@ impl CoreStore {
         if node_id != self.node_identity.node_id {
             bail!("CoreStore admission receipt references unknown source node {node_id}");
         }
-        if !self
-            .node_signing_keypair
-            .public()
+        self.node_signing_keypair
+            .public_key()
             .verify(signed_payload_hash.as_bytes(), receipt_signature)
-        {
-            bail!(
-                "CoreStore admission receipt signature verification failed for source node {node_id}"
-            );
-        }
-        Ok(())
+            .with_context(|| {
+                format!(
+                    "CoreStore admission receipt signature verification failed for source node {node_id}"
+                )
+            })
     }
 
     pub(super) fn verify_object_placement_receipt(

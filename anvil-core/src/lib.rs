@@ -3,11 +3,10 @@
 use crate::auth::JwtManager;
 use crate::config::Config;
 use anyhow::{Context, Result};
-use cluster::ClusterState;
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tracing::warn;
 
 pub(crate) fn emit_test_timing(label: impl AsRef<str>, elapsed: Duration) {
@@ -43,9 +42,6 @@ pub mod authz_segment;
 pub mod authz_userset_index;
 pub mod bucket_journal;
 pub mod bucket_manager;
-pub mod cache;
-pub mod cluster;
-pub mod cluster_identity;
 pub mod config;
 pub mod control_journal;
 pub mod core_store;
@@ -83,6 +79,8 @@ pub mod middleware;
 pub mod model_journal;
 pub mod multipart_journal;
 pub mod native_idempotency;
+pub mod node_identity;
+pub mod node_signing;
 pub mod object_links;
 pub mod object_manager;
 pub mod observability;
@@ -112,7 +110,6 @@ pub mod personaldb_snapshot_builder;
 pub mod personaldb_snapshot_store;
 pub mod personaldb_submit;
 pub mod personaldb_watch;
-pub mod placement;
 pub mod query_planner;
 pub mod registry_segment;
 pub mod repair_finding;
@@ -154,9 +151,7 @@ pub struct AppState {
     pub persistence: persistence::Persistence,
     pub storage: storage::Storage,
     pub core_store: core_store::CoreStore,
-    pub cluster: ClusterState,
     pub sharder: sharding::ShardManager,
-    pub placer: placement::PlacementManager,
     pub jwt_manager: Arc<JwtManager>,
     pub region: String,
     pub bucket_manager: bucket_manager::BucketManager,
@@ -173,7 +168,6 @@ pub struct AppState {
 impl AppState {
     pub async fn new(
         config: Config,
-        event_publisher: Option<tokio::sync::mpsc::Sender<cluster::MetadataEvent>>,
         personaldb_protocol_keyring: personaldb_signing::PersonalDbProtocolKeyring,
     ) -> Result<Self> {
         let config = config.with_persisted_identity().await?;
@@ -223,8 +217,7 @@ impl AppState {
             }
         };
         let personaldb_protocol_keyring = Arc::new(personaldb_protocol_keyring);
-        let cluster_state = Arc::new(RwLock::new(HashMap::new()));
-        let persistence = persistence::Persistence::new(&arc_config, event_publisher)?;
+        let persistence = persistence::Persistence::new(&arc_config)?;
         core_store.install_repair_task_scheduler(persistence.clone())?;
         if !arc_config.region.is_empty() && !arc_config.requires_distributed_coremeta_recovery() {
             // A standalone node owns its local region bootstrap. Distributed
@@ -237,7 +230,6 @@ impl AppState {
                 .context("bootstrap standalone region")?;
         }
         let sharder = sharding::ShardManager::new();
-        let placer = placement::PlacementManager::default();
         let personaldb_commit_locks = Arc::new(Mutex::new(HashMap::new()));
         let native_mutation_locks = Arc::new(Mutex::new(HashMap::new()));
         let observability = observability::Observability::default();
@@ -268,9 +260,7 @@ impl AppState {
             persistence,
             storage,
             core_store,
-            cluster: cluster_state,
             sharder,
-            placer,
             jwt_manager,
             region: arc_config.region.clone(),
             bucket_manager,
@@ -308,16 +298,11 @@ mod app_state_tests {
             jwt_secret: "test-secret".to_string(),
             anvil_secret_encryption_key:
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            cluster_secret: Some("test-cluster-secret".to_string()),
-            cluster_listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".to_string(),
             public_api_addr: "127.0.0.1:0".to_string(),
             api_listen_addr: "127.0.0.1:0".to_string(),
             region: "local".to_string(),
             bootstrap_system_admin_subject_kind: "app".to_string(),
             bootstrap_system_admin_subject_id: "admin-principal".to_string(),
-            bootstrap_addrs: Vec::new(),
-            init_cluster: false,
-            enable_mdns: false,
             storage_path: directory
                 .path()
                 .join("storage")
@@ -328,7 +313,6 @@ mod app_state_tests {
 
         let state = AppState::new(
             config,
-            None,
             personaldb_signing::PersonalDbProtocolKeyring::disabled(),
         )
         .await
@@ -351,16 +335,12 @@ mod app_state_tests {
             jwt_secret: "test-secret".to_string(),
             anvil_secret_encryption_key:
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            cluster_secret: Some("test-cluster-secret".to_string()),
-            cluster_listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".to_string(),
             public_api_addr: "127.0.0.1:0".to_string(),
             api_listen_addr: "127.0.0.1:0".to_string(),
             region: "distributed-region".to_string(),
             bootstrap_system_admin_subject_kind: "app".to_string(),
             bootstrap_system_admin_subject_id: "admin-principal".to_string(),
             bootstrap_node_ids: vec!["node-a".to_string(), "node-b".to_string()],
-            init_cluster: false,
-            enable_mdns: false,
             storage_path: directory
                 .path()
                 .join("storage")
@@ -371,7 +351,6 @@ mod app_state_tests {
 
         let state = AppState::new(
             config,
-            None,
             personaldb_signing::PersonalDbProtocolKeyring::disabled(),
         )
         .await

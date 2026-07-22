@@ -218,34 +218,12 @@ impl Persistence {
             "persistence.create_bucket write_mesh_bucket_locator",
             step_start.elapsed(),
         );
-        let step_start = std::time::Instant::now();
-        self.cache
-            .insert_bucket(tenant_id, name.to_string(), bucket.clone())
-            .await;
-        self.publish_event(MetadataEvent::BucketUpdated {
-            tenant_id,
-            name: name.to_string(),
-        })
-        .await;
-        crate::emit_test_timing(
-            "persistence.create_bucket cache_and_publish",
-            step_start.elapsed(),
-        );
         crate::emit_test_timing("persistence.create_bucket total", total_start.elapsed());
         Ok(bucket)
     }
 
     pub async fn get_bucket_by_name(&self, tenant_id: i64, name: &str) -> Result<Option<Bucket>> {
-        if let Some(bucket) = self.cache.get_bucket(tenant_id, name).await {
-            return Ok(Some(bucket));
-        }
-        let bucket = bucket_journal::read_current_bucket(&self.storage, tenant_id, name).await?;
-        if let Some(bucket) = bucket.clone() {
-            self.cache
-                .insert_bucket(tenant_id, name.to_string(), bucket)
-                .await;
-        }
-        Ok(bucket)
+        bucket_journal::read_current_bucket(&self.storage, tenant_id, name).await
     }
 
     pub async fn set_bucket_public_access(
@@ -269,7 +247,6 @@ impl Persistence {
             &self.partition_owner_signing_key,
         )
         .await?;
-        self.cache.invalidate_bucket(tenant_id, bucket_name).await;
         Ok(out)
     }
 
@@ -289,7 +266,6 @@ impl Persistence {
             .await?;
             self.mark_mesh_bucket_locator_deleted(bucket).await?;
         }
-        self.cache.invalidate_bucket(tenant_id, name).await;
         Ok(deleted)
     }
 

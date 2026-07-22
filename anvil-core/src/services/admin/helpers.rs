@@ -1234,9 +1234,7 @@ pub(super) fn node_audit_details(node: &mesh_lifecycle::NodeDescriptor) -> serde
         "node_id": &node.node_id,
         "region": &node.region,
         "cell_id": &node.cell_id,
-        "libp2p_peer_id": &node.libp2p_peer_id,
         "public_api_addr": &node.public_api_addr,
-        "public_cluster_addrs": &node.public_cluster_addrs,
         "capabilities": &node.capabilities,
         "capacity_json_hash": &node.capacity_json_hash,
         "state": node.state,
@@ -1606,10 +1604,8 @@ pub(super) fn node_descriptor_to_proto(value: mesh_lifecycle::NodeDescriptor) ->
         node_id: value.node_id,
         region: value.region,
         cell_id: value.cell_id,
-        libp2p_peer_id: value.libp2p_peer_id,
-        receipt_signing_public_key_proto: value.receipt_signing_public_key_proto,
+        receipt_signing_public_key: value.receipt_signing_public_key,
         public_api_addr: value.public_api_addr,
-        public_cluster_addrs: value.public_cluster_addrs,
         capabilities: value
             .capabilities
             .into_iter()

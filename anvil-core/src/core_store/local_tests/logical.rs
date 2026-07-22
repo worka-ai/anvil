@@ -5,7 +5,7 @@ async fn core_store_node_signing_keypair_is_rocksdb_metadata_not_sidecar() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = Storage::new_at(tmp.path()).await.unwrap();
     let first = CoreStore::new(storage.clone()).await.unwrap();
-    let first_peer = first.node_signing_keypair.public().to_peer_id();
+    let first_public_key = first.node_signing_keypair.public_key_bytes();
     let first_admission_epoch = first.admission_mutation_epoch;
     assert_ne!(first_admission_epoch, 0);
     assert!(
@@ -23,8 +23,8 @@ async fn core_store_node_signing_keypair_is_rocksdb_metadata_not_sidecar() {
     drop(first);
     let restarted = CoreStore::new(storage).await.unwrap();
     assert_eq!(
-        first_peer,
-        restarted.node_signing_keypair.public().to_peer_id()
+        first_public_key,
+        restarted.node_signing_keypair.public_key_bytes()
     );
     assert_eq!(first_admission_epoch, restarted.admission_mutation_epoch);
 }
@@ -68,8 +68,8 @@ async fn unchanged_receipt_signing_key_registration_is_a_storage_noop() {
     let storage = Storage::new_at(tmp.path()).await.unwrap();
     let store = CoreStore::new(storage).await.unwrap();
     let node_id = "receipt-node-a";
-    let keypair = identity::Keypair::generate_ed25519();
-    let public_key = keypair.public().encode_protobuf();
+    let keypair = crate::node_signing::NodeSigningKeypair::generate().unwrap();
+    let public_key = keypair.public_key_bytes().to_vec();
 
     store
         .register_node_receipt_signing_public_key(node_id, &public_key)
@@ -103,12 +103,14 @@ async fn receipt_signing_identity_replacement_is_rejected() {
     let storage = Storage::new_at(tmp.path()).await.unwrap();
     let store = CoreStore::new(storage).await.unwrap();
     let node_id = "receipt-node-immutable";
-    let first_public_key = identity::Keypair::generate_ed25519()
-        .public()
-        .encode_protobuf();
-    let replacement_public_key = identity::Keypair::generate_ed25519()
-        .public()
-        .encode_protobuf();
+    let first_public_key = crate::node_signing::NodeSigningKeypair::generate()
+        .unwrap()
+        .public_key_bytes()
+        .to_vec();
+    let replacement_public_key = crate::node_signing::NodeSigningKeypair::generate()
+        .unwrap()
+        .public_key_bytes()
+        .to_vec();
 
     store
         .register_node_receipt_signing_public_key(node_id, &first_public_key)
@@ -126,7 +128,8 @@ async fn receipt_signing_identity_replacement_is_rejected() {
         load_node_receipt_signing_public_key(&store.meta, node_id)
             .unwrap()
             .unwrap()
-            .encode_protobuf(),
+            .to_bytes()
+            .to_vec(),
         first_public_key,
         "rejected registration must preserve the original verification identity"
     );
@@ -138,9 +141,9 @@ async fn receipt_verification_reports_topology_unavailable_before_bootstrap() {
     let store = CoreStore::new(Storage::new_at(tmp.path()).await.unwrap())
         .await
         .unwrap();
-    let remote = identity::Keypair::generate_ed25519();
+    let remote = crate::node_signing::NodeSigningKeypair::generate().unwrap();
     let payload_hash = "sha256:bootstrap-race";
-    let signature = remote.sign(payload_hash.as_bytes()).unwrap();
+    let signature = remote.sign(payload_hash.as_bytes());
 
     let error = store
         .verify_internal_core_receipt_signature("node-b", payload_hash, &signature)
@@ -164,8 +167,8 @@ async fn receipt_verification_materialises_canonical_bootstrap_key_on_demand() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = Storage::new_at(tmp.path()).await.unwrap();
     let store = CoreStore::new(storage.clone()).await.unwrap();
-    let remote = identity::Keypair::generate_ed25519();
-    let remote_public_key = remote.public().encode_protobuf();
+    let remote = crate::node_signing::NodeSigningKeypair::generate().unwrap();
+    let remote_public_key = remote.public_key_bytes().to_vec();
 
     install_bootstrap_lifecycle_projection(
         &storage,
@@ -191,10 +194,8 @@ async fn receipt_verification_materialises_canonical_bootstrap_key_on_demand() {
                 node_id: "node-b".to_string(),
                 region: "eu-west-1".to_string(),
                 cell_id: "cell-a".to_string(),
-                libp2p_peer_id: "peer-node-b".to_string(),
-                receipt_signing_public_key_proto: remote_public_key,
+                receipt_signing_public_key: remote_public_key,
                 public_api_addr: "http://127.0.0.1:50052".to_string(),
-                public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7444/quic-v1".to_string()],
                 capabilities: vec![NodeCapability::Metadata, NodeCapability::Object],
                 capacity_json: "{}".to_string(),
             }],
@@ -210,7 +211,7 @@ async fn receipt_verification_materialises_canonical_bootstrap_key_on_demand() {
     );
 
     let payload_hash = "sha256:canonical-bootstrap-key";
-    let signature = remote.sign(payload_hash.as_bytes()).unwrap();
+    let signature = remote.sign(payload_hash.as_bytes());
     store
         .verify_internal_core_receipt_signature("node-b", payload_hash, &signature)
         .unwrap();
@@ -921,7 +922,7 @@ async fn core_store_logical_file_publish_returns_self_contained_manifest_locator
     for receipt in &block.shard_receipts {
         assert_ne!(receipt.written_at_unix_nanos, 0);
         assert!(receipt.signed_payload_hash.starts_with("sha256:"));
-        assert_eq!(receipt.signature_algorithm, "ed25519-libp2p");
+        assert_eq!(receipt.signature_algorithm, "ed25519");
         assert!(!receipt.receipt_signature.is_empty());
     }
     assert_ne!(

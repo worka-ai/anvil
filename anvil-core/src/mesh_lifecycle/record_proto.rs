@@ -145,14 +145,10 @@ struct NodeDescriptorProto {
     region: String,
     #[prost(string, tag = "5")]
     cell_id: String,
-    #[prost(string, tag = "6")]
-    libp2p_peer_id: String,
     #[prost(bytes, tag = "16")]
-    receipt_signing_public_key_proto: Vec<u8>,
+    receipt_signing_public_key: Vec<u8>,
     #[prost(string, tag = "7")]
     public_api_addr: String,
-    #[prost(string, repeated, tag = "8")]
-    public_cluster_addrs: Vec<String>,
     #[prost(uint32, repeated, tag = "9")]
     capabilities: Vec<u32>,
     #[prost(uint32, tag = "10")]
@@ -559,18 +555,7 @@ fn encode_projection_row(
     generation: u64,
     descriptor_payload_proto: Vec<u8>,
 ) -> LifecycleResult<EncodedLifecycleProjectionRow> {
-    let root_anchor_key = if matches!(
-        kind,
-        LIFECYCLE_PROJECTION_REGION_KIND
-            | LIFECYCLE_PROJECTION_CELL_KIND
-            | LIFECYCLE_PROJECTION_NODE_KIND
-            | LIFECYCLE_PROJECTION_TOPOLOGY_ACTIVATION_KIND
-            | LIFECYCLE_PROJECTION_TOPOLOGY_HEAD_KIND
-    ) {
-        LIFECYCLE_TOPOLOGY_ROOT_ANCHOR_KEY.to_string()
-    } else {
-        format!("mesh/lifecycle/{kind}/{record_key}")
-    };
+    let root_anchor_key = projection_root_anchor_key(kind, &record_key);
     let row = MeshLifecycleProjectionRowProto {
         common: Some(core_meta_committed_row_common(
             "mesh",
@@ -590,6 +575,21 @@ fn encode_projection_row(
         record_key,
         payload: encode_deterministic_proto(&row),
     })
+}
+
+pub(super) fn projection_root_anchor_key(kind: &str, record_key: &str) -> String {
+    if matches!(
+        kind,
+        LIFECYCLE_PROJECTION_REGION_KIND
+            | LIFECYCLE_PROJECTION_CELL_KIND
+            | LIFECYCLE_PROJECTION_NODE_KIND
+            | LIFECYCLE_PROJECTION_TOPOLOGY_ACTIVATION_KIND
+            | LIFECYCLE_PROJECTION_TOPOLOGY_HEAD_KIND
+    ) {
+        LIFECYCLE_TOPOLOGY_ROOT_ANCHOR_KEY.to_string()
+    } else {
+        format!("mesh/lifecycle/{kind}/{record_key}")
+    }
 }
 
 fn ensure_projection_row_scope(
@@ -771,10 +771,8 @@ fn node_to_proto(descriptor: &NodeDescriptor) -> NodeDescriptorProto {
         node_id: descriptor.node_id.clone(),
         region: descriptor.region.clone(),
         cell_id: descriptor.cell_id.clone(),
-        libp2p_peer_id: descriptor.libp2p_peer_id.clone(),
-        receipt_signing_public_key_proto: descriptor.receipt_signing_public_key_proto.clone(),
+        receipt_signing_public_key: descriptor.receipt_signing_public_key.clone(),
         public_api_addr: descriptor.public_api_addr.clone(),
-        public_cluster_addrs: descriptor.public_cluster_addrs.clone(),
         capabilities: descriptor
             .capabilities
             .iter()
@@ -798,10 +796,8 @@ fn node_from_proto(proto: NodeDescriptorProto) -> LifecycleResult<NodeDescriptor
         node_id: proto.node_id,
         region: proto.region,
         cell_id: proto.cell_id,
-        libp2p_peer_id: proto.libp2p_peer_id,
-        receipt_signing_public_key_proto: proto.receipt_signing_public_key_proto,
+        receipt_signing_public_key: proto.receipt_signing_public_key,
         public_api_addr: proto.public_api_addr,
-        public_cluster_addrs: proto.public_cluster_addrs,
         capabilities: proto
             .capabilities
             .into_iter()
@@ -824,15 +820,15 @@ fn node_from_proto(proto: NodeDescriptorProto) -> LifecycleResult<NodeDescriptor
     require_identifier(&descriptor.node_id, "node id")?;
     require_identifier(&descriptor.region, "node region")?;
     require_identifier(&descriptor.cell_id, "node cell id")?;
-    if descriptor.receipt_signing_public_key_proto.is_empty() {
+    if descriptor.receipt_signing_public_key.is_empty() {
         return Err(LifecycleError::InvalidArgument(
-            "node receipt signing public key protobuf must not be empty".to_string(),
+            "node receipt signing public key must not be empty".to_string(),
         ));
     }
-    libp2p::identity::PublicKey::try_decode_protobuf(&descriptor.receipt_signing_public_key_proto)
+    crate::node_signing::NodeVerifyingKey::from_bytes(&descriptor.receipt_signing_public_key)
         .map_err(|err| {
             LifecycleError::InvalidArgument(format!(
-                "node receipt signing public key protobuf is invalid: {err}"
+                "node receipt signing public key is invalid: {err}"
             ))
         })?;
     if descriptor.capabilities.is_empty() {

@@ -558,7 +558,7 @@ async fn core_store_object_manifest_includes_boundary_values() {
     for placement in &manifest.placements {
         assert_ne!(placement.written_at_unix_nanos, 0);
         assert!(placement.signed_payload_hash.starts_with("sha256:"));
-        assert_eq!(placement.signature_algorithm, "ed25519-libp2p");
+        assert_eq!(placement.signature_algorithm, "ed25519");
         assert!(!placement.receipt_signature.is_empty());
     }
 

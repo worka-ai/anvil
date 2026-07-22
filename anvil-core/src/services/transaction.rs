@@ -507,26 +507,17 @@ mod tests {
             jwt_secret: "test-secret".to_string(),
             anvil_secret_encryption_key:
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            cluster_secret: Some("test-cluster-secret".to_string()),
-            cluster_listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".to_string(),
             public_api_addr: "127.0.0.1:0".to_string(),
             api_listen_addr: "127.0.0.1:0".to_string(),
             region: "local".to_string(),
             bootstrap_system_admin_subject_kind: "app".to_string(),
             bootstrap_system_admin_subject_id: "admin-principal".to_string(),
-            bootstrap_addrs: Vec::new(),
-            init_cluster: false,
-            enable_mdns: false,
             storage_path: temp.path().join("storage").to_string_lossy().into_owned(),
             ..Config::default()
         };
-        let state = AppState::new(
-            config,
-            None,
-            crate::test_support::personaldb_protocol_keyring(),
-        )
-        .await
-        .unwrap();
+        let state = AppState::new(config, crate::test_support::personaldb_protocol_keyring())
+            .await
+            .unwrap();
         (temp, state)
     }
 

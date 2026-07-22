@@ -1025,7 +1025,7 @@ impl CoreStore {
             }
             self.register_node_receipt_signing_public_key(
                 &node.node_id,
-                &node.receipt_signing_public_key_proto,
+                &node.receipt_signing_public_key,
             )?;
             let is_local = node.node_id == self.node_identity.node_id;
             let placement = LocalShardPlacement {

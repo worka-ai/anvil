@@ -73,11 +73,9 @@ fn ensure_bootstrap_input_matches(
                     current.mesh_id == candidate.mesh_id
                         && current.region == candidate.region
                         && current.cell_id == candidate.cell_id
-                        && current.libp2p_peer_id == candidate.libp2p_peer_id
-                        && current.receipt_signing_public_key_proto
-                            == candidate.receipt_signing_public_key_proto
+                        && current.receipt_signing_public_key
+                            == candidate.receipt_signing_public_key
                         && current.public_api_addr == candidate.public_api_addr
-                        && current.public_cluster_addrs == candidate.public_cluster_addrs
                         && current.capabilities == candidate.capabilities
                         && capacity_json_hash(&candidate.capacity_json)
                             .is_ok_and(|hash| current.capacity_json_hash == hash)
@@ -167,18 +165,17 @@ fn bootstrap_lifecycle_state(
         require_identifier(&input.node_id, "bootstrap node id")?;
         require_identifier(&input.region, "bootstrap node region")?;
         require_identifier(&input.cell_id, "bootstrap node cell id")?;
-        require_nonempty(&input.libp2p_peer_id, "bootstrap node libp2p peer id")?;
-        if input.receipt_signing_public_key_proto.is_empty() {
+        if input.receipt_signing_public_key.is_empty() {
             return Err(LifecycleError::InvalidArgument(
-                "bootstrap node receipt signing public key protobuf must not be empty".to_string(),
+                "bootstrap node receipt signing public key must not be empty".to_string(),
             ));
         }
-        libp2p::identity::PublicKey::try_decode_protobuf(&input.receipt_signing_public_key_proto)
+        crate::node_signing::NodeVerifyingKey::from_bytes(&input.receipt_signing_public_key)
             .map_err(|err| {
-            LifecycleError::InvalidArgument(format!(
-                "bootstrap node receipt signing public key protobuf is invalid: {err}"
-            ))
-        })?;
+                LifecycleError::InvalidArgument(format!(
+                    "bootstrap node receipt signing public key is invalid: {err}"
+                ))
+            })?;
         require_nonempty(&input.public_api_addr, "bootstrap node public api addr")?;
         if input.capabilities.is_empty() {
             return Err(LifecycleError::InvalidArgument(
@@ -210,10 +207,8 @@ fn bootstrap_lifecycle_state(
             node_id: input.node_id.clone(),
             region: input.region,
             cell_id: input.cell_id,
-            libp2p_peer_id: input.libp2p_peer_id,
-            receipt_signing_public_key_proto: input.receipt_signing_public_key_proto,
+            receipt_signing_public_key: input.receipt_signing_public_key,
             public_api_addr: input.public_api_addr,
-            public_cluster_addrs: input.public_cluster_addrs,
             capabilities: input.capabilities,
             capacity_json_hash: capacity_json_hash(&input.capacity_json)?,
             state: LifecycleState::Active,

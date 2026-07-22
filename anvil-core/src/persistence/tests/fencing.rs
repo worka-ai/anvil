@@ -4,7 +4,7 @@ use super::*;
 async fn persistence_global_journal_writes_use_current_fence_tokens() {
     Box::pin(async {
         let temp = tempdir().unwrap();
-        let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+        let persistence = Persistence::new(&test_config(temp.path())).unwrap();
 
         persistence.create_region("local").await.unwrap();
         bind_persistence_test_authz_schema(&persistence, 1).await;
@@ -229,7 +229,7 @@ async fn persistence_global_journal_writes_use_current_fence_tokens() {
 #[tokio::test]
 async fn force_expired_partition_is_recovered_under_a_higher_fence() {
     let temp = tempdir().unwrap();
-    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    let persistence = Persistence::new(&test_config(temp.path())).unwrap();
     let partition_family = "object_metadata";
     let partition_id = hex::encode([42; 32]);
     let manifest_hash = hex::encode([7; 32]);

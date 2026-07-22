@@ -1633,7 +1633,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_sources_prefer_highest_generation_then_stable_peer_id() {
+    fn recovery_sources_prefer_highest_generation_then_stable_node_id() {
         let mut sources = [
             RecoverySource {
                 peer: RecoveryPeer {

@@ -37,13 +37,11 @@ fn is_partition_owner_cas_conflict(err: &anyhow::Error) -> bool {
 }
 
 impl Persistence {
-    pub fn new(config: &Config, event_publisher: Option<Sender<MetadataEvent>>) -> Result<Self> {
+    pub fn new(config: &Config) -> Result<Self> {
         let owner_node_id = persistence_owner_node_id(config);
         Ok(Self {
             storage: Storage::new_at_sync(&config.storage_path)?,
-            cache: MetadataCache::new(config),
             core_store: Arc::new(OnceCell::new()),
-            event_publisher,
             task_notify: Arc::new(Notify::new()),
             mesh_id: nonempty_or(&config.mesh_id, "default"),
             region: nonempty_or(&config.region, "default"),
@@ -69,12 +67,6 @@ impl Persistence {
             .get_or_try_init(|| async { CoreStore::new(self.storage.clone()).await })
             .await
             .cloned()
-    }
-
-    pub(super) async fn publish_event(&self, event: MetadataEvent) {
-        if let Some(sender) = &self.event_publisher {
-            let _ = sender.send(event).await;
-        }
     }
 
     pub fn task_notify(&self) -> Arc<Notify> {
@@ -517,10 +509,6 @@ impl Persistence {
         })
     }
 
-    pub fn cache(&self) -> &MetadataCache {
-        &self.cache
-    }
-
     pub(super) async fn bucket_locators_in_region(
         &self,
         region: &str,
@@ -623,12 +611,6 @@ impl Persistence {
             &self.partition_owner_signing_key,
         )
         .await?;
-        self.cache.invalidate_bucket(tenant_id, bucket_name).await;
-        self.publish_event(MetadataEvent::BucketUpdated {
-            tenant_id,
-            name: bucket_name.to_string(),
-        })
-        .await;
         Ok(bucket)
     }
 

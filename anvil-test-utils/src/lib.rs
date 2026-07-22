@@ -15,7 +15,6 @@ use anvil_core::{AppState, access_control};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::config::Credentials;
-use futures_util::StreamExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tonic::transport::Channel;
@@ -1297,9 +1296,7 @@ impl TestCluster {
         INIT_LOGGER.call_once(|| {
             let filter = std::env::var("ANVIL_TEST_LOG")
                 .or_else(|_| std::env::var("RUST_LOG"))
-                .unwrap_or_else(|_| {
-                    "warn,anvil=debug,anvil_core=debug,anvil_core::cluster=warn".to_string()
-                });
+                .unwrap_or_else(|_| "warn,anvil=debug,anvil_core=debug".to_string());
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(EnvFilter::new(filter))
                 .try_init();
@@ -1308,14 +1305,10 @@ impl TestCluster {
         let cluster_storage_root =
             std::env::temp_dir().join(format!("anvil-test-storage-{}", uuid::Uuid::new_v4()));
         let mut config = anvil_core::config::Config {
-            cluster_secret: Some("test-cluster-secret".to_string()),
             jwt_secret: "test-secret".to_string(),
             anvil_secret_encryption_key:
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            cluster_listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".to_string(),
-            public_cluster_addrs: vec![],
             corestore_internal_bearer_token: "test-corestore-internal-token".to_string(),
-            metadata_cache_ttl_secs: 1,
             public_api_addr: "127.0.0.1:0".to_string(),
             api_listen_addr: "127.0.0.1:0".to_string(),
             mesh_id: "test-mesh".to_string(),
@@ -1323,9 +1316,6 @@ impl TestCluster {
             cell_id: "test-cell-1".to_string(),
             bootstrap_system_admin_subject_kind: "app".to_string(),
             bootstrap_system_admin_subject_id: "admin-principal".to_string(),
-            bootstrap_addrs: vec![],
-            init_cluster: false,
-            enable_mdns: false,
             storage_path: cluster_storage_root
                 .join("template")
                 .to_string_lossy()
@@ -1347,12 +1337,11 @@ impl TestCluster {
             let mut node_config = config.deref().clone();
             node_config.region = (*region_name).to_string();
             node_config.cell_id = format!("test-cell-{}", node_index + 1);
-            node_config.metadata_cache_ttl_secs = 1;
             node_config.storage_path = cluster_storage_root
                 .join(format!("node-{node_index:03}-{region_name}"))
                 .to_string_lossy()
                 .into_owned();
-            let state = AppState::new(node_config, None, personaldb_test_protocol_keyring())
+            let state = AppState::new(node_config, personaldb_test_protocol_keyring())
                 .await
                 .unwrap();
             state.persistence.create_region(region_name).await.unwrap();
@@ -1428,57 +1417,7 @@ impl TestCluster {
         let total_start = Instant::now();
         let node_count = self.states.len();
 
-        let swarms_start = Instant::now();
-        let mut swarms = Vec::new();
-        for state in &self.states {
-            swarms.push(
-                anvil_core::cluster::create_swarm(state.config.clone())
-                    .await
-                    .unwrap(),
-            );
-        }
-        emit_test_timing(
-            format!("start_and_converge swarm_create nodes={node_count}"),
-            swarms_start.elapsed(),
-        );
-
-        let swarm_listen_start = Instant::now();
-        let mut listen_addrs = Vec::new();
-        for swarm in &mut swarms {
-            let address = loop {
-                if let Some(event) = swarm.next().await {
-                    if let libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } = event {
-                        break address;
-                    }
-                } else {
-                    panic!("Swarm stream ended before a listener was established");
-                }
-            };
-            listen_addrs.push(address);
-        }
-        emit_test_timing(
-            format!("start_and_converge swarm_listen nodes={node_count}"),
-            swarm_listen_start.elapsed(),
-        );
-
-        let swarm_dial_start = Instant::now();
-        for i in 0..swarms.len() {
-            for (j, addr) in listen_addrs.iter().enumerate() {
-                if i != j {
-                    swarms[i].dial(addr.clone()).unwrap();
-                }
-            }
-        }
-        emit_test_timing(
-            format!("start_and_converge swarm_dial nodes={node_count}"),
-            swarm_dial_start.elapsed(),
-        );
-
         let node_spawn_start = Instant::now();
-        let peer_ids = swarms
-            .iter()
-            .map(|swarm| swarm.local_peer_id().to_string())
-            .collect::<Vec<_>>();
         let mut listeners = Vec::new();
         let mut admin_listeners = Vec::new();
         for _ in 0..self.states.len() {
@@ -1499,28 +1438,20 @@ impl TestCluster {
                 .jwt_manager
                 .mint_token(cfg.node_id.clone(), 0)
                 .unwrap();
-            self.states[i] = AppState::new(cfg, None, personaldb_test_protocol_keyring())
+            self.states[i] = AppState::new(cfg, personaldb_test_protocol_keyring())
                 .await
                 .unwrap();
         }
 
         for i in 0..self.states.len() {
             let state = self.states[i].clone();
-            let swarm = swarms.remove(0);
             let listener = listeners.remove(0);
             let admin_listener = admin_listeners.remove(0);
 
             let handle = tokio::spawn(async move {
-                let (_tx, rx) = tokio::sync::mpsc::channel(1);
-                anvil::start_node_with_admin_listener(
-                    listener,
-                    Some(admin_listener),
-                    state,
-                    swarm,
-                    rx,
-                )
-                .await
-                .unwrap();
+                anvil::start_node_with_admin_listener(listener, Some(admin_listener), state)
+                    .await
+                    .unwrap();
             });
             self.nodes.push(handle);
         }
@@ -1579,8 +1510,7 @@ impl TestCluster {
                     http_ready_start.elapsed(),
                 );
                 let lifecycle_seed_start = Instant::now();
-                self.seed_corestore_mesh_lifecycle(&peer_ids, &listen_addrs)
-                    .await;
+                self.seed_corestore_mesh_lifecycle().await;
                 emit_test_timing(
                     format!("start_and_converge mesh_lifecycle_seed nodes={node_count}"),
                     lifecycle_seed_start.elapsed(),
@@ -1598,31 +1528,28 @@ impl TestCluster {
                 return;
             }
             if start.elapsed() >= timeout {
-                let mut cluster_sizes = Vec::with_capacity(self.states.len());
-                for state in &self.states {
-                    cluster_sizes.push(state.cluster.read().await.len());
-                }
+                let recovery = self
+                    .states
+                    .iter()
+                    .map(|state| state.core_store.coremeta_recovery_snapshot())
+                    .collect::<Vec<_>>();
                 panic!(
-                    "Cluster ports did not become ready in time; observed gossip membership sizes: {:?}",
-                    cluster_sizes
+                    "Cluster ports did not become ready in time; CoreMeta recovery snapshots: {:?}",
+                    recovery
                 );
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
-    async fn seed_corestore_mesh_lifecycle(
-        &self,
-        peer_ids: &[String],
-        listen_addrs: &[libp2p::Multiaddr],
-    ) {
+    async fn seed_corestore_mesh_lifecycle(&self) {
         let mut seen_regions = BTreeSet::new();
         let mut regions = Vec::new();
         let mut seen_cells = BTreeSet::new();
         let mut cells = Vec::new();
         let mut nodes = Vec::new();
 
-        for (index, source) in self.states.iter().enumerate() {
+        for source in &self.states {
             if seen_regions.insert(source.config.region.clone()) {
                 regions.push(anvil_core::mesh_lifecycle::CreateRegionDescriptor {
                     mesh_id: source.config.mesh_id.clone(),
@@ -1650,12 +1577,8 @@ impl TestCluster {
                 node_id: source.config.node_id.clone(),
                 region: source.config.region.clone(),
                 cell_id: source.config.cell_id.clone(),
-                libp2p_peer_id: peer_ids[index].clone(),
-                receipt_signing_public_key_proto: source
-                    .core_store
-                    .local_receipt_signing_public_key_proto(),
+                receipt_signing_public_key: source.core_store.local_receipt_signing_public_key(),
                 public_api_addr: source.config.public_api_addr.clone(),
-                public_cluster_addrs: vec![listen_addrs[index].to_string()],
                 capabilities: vec![
                     anvil_core::mesh_lifecycle::NodeCapability::Object,
                     anvil_core::mesh_lifecycle::NodeCapability::Index,
@@ -1694,7 +1617,7 @@ impl TestCluster {
                 .core_store
                 .register_node_receipt_signing_public_key(
                     &source.config.node_id,
-                    &source.core_store.local_receipt_signing_public_key_proto(),
+                    &source.core_store.local_receipt_signing_public_key(),
                 )
                 .unwrap();
         }

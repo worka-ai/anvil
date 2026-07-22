@@ -1,8 +1,7 @@
 # This Docker Compose file is exclusively for the end-to-end test.
 # It uses environment variables to dynamically set the image and optional host
 # API ports. Each public API is published through a proxy on a node-private
-# driver network so tests retain a control channel while partitioning the peer
-# network. Cluster UDP ports are intentionally not published to the host.
+# driver network so tests retain a control channel while partitioning authenticated gRPC traffic.
 
 networks:
   driver1net:
@@ -41,7 +40,6 @@ services:
       - JWT_SECRET=${ANVIL_DOCKER_TEST_JWT_SECRET:-docker-test-secret}
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - ANVIL_SECRET_ENCRYPTION_KEY_ID=docker-test-primary
-      - CLUSTER_SECRET=docker-cluster-secret
       - API_LISTEN_ADDR=0.0.0.0:50051
       - ADMIN_LISTEN_ADDR=0.0.0.0:50052
       - ALLOW_PUBLIC_ADMIN_LISTENER=true
@@ -50,12 +48,8 @@ services:
       - BOOTSTRAP_NODE_IDS=anvil-test-node-1,anvil-test-node-2,anvil-test-node-3,anvil-test-node-4,anvil-test-node-5,anvil-test-node-6
       - ANVIL_PUBLIC_ENDPOINT=http://127.0.0.1:50051
       - ANVIL_ADMIN_ENDPOINT=http://127.0.0.1:50052
-      - CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/7443/quic-v1
-      - PUBLIC_CLUSTER_ADDRS=/dns4/anvil1-internal/udp/7443/quic-v1
       - PUBLIC_API_ADDR=http://anvil1-internal:50051
-      - ENABLE_MDNS=false
       - STORAGE_PATH=/var/lib/anvil
-    command: ["anvil-server", "--init-cluster"]
     ports:
       - "${ANVIL_TEST_API1_PORT:-55051}:50051"
       - "${ANVIL_TEST_ADMIN1_PORT:-56051}:50052"
@@ -94,7 +88,6 @@ services:
       - JWT_SECRET=${ANVIL_DOCKER_TEST_JWT_SECRET:-docker-test-secret}
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - ANVIL_SECRET_ENCRYPTION_KEY_ID=docker-test-primary
-      - CLUSTER_SECRET=docker-cluster-secret
       - API_LISTEN_ADDR=0.0.0.0:50051
       - ADMIN_LISTEN_ADDR=0.0.0.0:50052
       - ALLOW_PUBLIC_ADMIN_LISTENER=true
@@ -103,11 +96,7 @@ services:
       - BOOTSTRAP_NODE_IDS=anvil-test-node-1,anvil-test-node-2,anvil-test-node-3,anvil-test-node-4,anvil-test-node-5,anvil-test-node-6
       - ANVIL_PUBLIC_ENDPOINT=http://127.0.0.1:50051
       - ANVIL_ADMIN_ENDPOINT=http://127.0.0.1:50052
-      - CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/7444/quic-v1
-      - PUBLIC_CLUSTER_ADDRS=/dns4/anvil2-internal/udp/7444/quic-v1
       - PUBLIC_API_ADDR=http://anvil2-internal:50051
-      - ENABLE_MDNS=false
-      - BOOTSTRAP_ADDRS=/dns4/anvil1-internal/udp/7443/quic-v1
       - STORAGE_PATH=/var/lib/anvil
     ports:
       - "${ANVIL_TEST_API2_PORT:-55052}:50051"
@@ -142,7 +131,6 @@ services:
       - JWT_SECRET=${ANVIL_DOCKER_TEST_JWT_SECRET:-docker-test-secret}
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - ANVIL_SECRET_ENCRYPTION_KEY_ID=docker-test-primary
-      - CLUSTER_SECRET=docker-cluster-secret
       - API_LISTEN_ADDR=0.0.0.0:50051
       - ADMIN_LISTEN_ADDR=0.0.0.0:50052
       - ALLOW_PUBLIC_ADMIN_LISTENER=true
@@ -151,11 +139,7 @@ services:
       - BOOTSTRAP_NODE_IDS=anvil-test-node-1,anvil-test-node-2,anvil-test-node-3,anvil-test-node-4,anvil-test-node-5,anvil-test-node-6
       - ANVIL_PUBLIC_ENDPOINT=http://127.0.0.1:50051
       - ANVIL_ADMIN_ENDPOINT=http://127.0.0.1:50052
-      - CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/7445/quic-v1
-      - PUBLIC_CLUSTER_ADDRS=/dns4/anvil3-internal/udp/7445/quic-v1
       - PUBLIC_API_ADDR=http://anvil3-internal:50051
-      - ENABLE_MDNS=false
-      - BOOTSTRAP_ADDRS=/dns4/anvil1-internal/udp/7443/quic-v1
       - STORAGE_PATH=/var/lib/anvil
     ports:
       - "${ANVIL_TEST_API3_PORT:-55053}:50051"
@@ -190,7 +174,6 @@ services:
       - JWT_SECRET=${ANVIL_DOCKER_TEST_JWT_SECRET:-docker-test-secret}
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - ANVIL_SECRET_ENCRYPTION_KEY_ID=docker-test-primary
-      - CLUSTER_SECRET=docker-cluster-secret
       - API_LISTEN_ADDR=0.0.0.0:50051
       - ADMIN_LISTEN_ADDR=0.0.0.0:50052
       - ALLOW_PUBLIC_ADMIN_LISTENER=true
@@ -199,11 +182,7 @@ services:
       - BOOTSTRAP_NODE_IDS=anvil-test-node-1,anvil-test-node-2,anvil-test-node-3,anvil-test-node-4,anvil-test-node-5,anvil-test-node-6
       - ANVIL_PUBLIC_ENDPOINT=http://127.0.0.1:50051
       - ANVIL_ADMIN_ENDPOINT=http://127.0.0.1:50052
-      - CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/7446/quic-v1
-      - PUBLIC_CLUSTER_ADDRS=/dns4/anvil4-internal/udp/7446/quic-v1
       - PUBLIC_API_ADDR=http://anvil4-internal:50051
-      - ENABLE_MDNS=false
-      - BOOTSTRAP_ADDRS=/dns4/anvil1-internal/udp/7443/quic-v1
       - STORAGE_PATH=/var/lib/anvil
     ports:
       - "${ANVIL_TEST_API4_PORT:-55054}:50051"
@@ -238,7 +217,6 @@ services:
       - JWT_SECRET=${ANVIL_DOCKER_TEST_JWT_SECRET:-docker-test-secret}
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - ANVIL_SECRET_ENCRYPTION_KEY_ID=docker-test-primary
-      - CLUSTER_SECRET=docker-cluster-secret
       - API_LISTEN_ADDR=0.0.0.0:50051
       - ADMIN_LISTEN_ADDR=0.0.0.0:50052
       - ALLOW_PUBLIC_ADMIN_LISTENER=true
@@ -247,11 +225,7 @@ services:
       - BOOTSTRAP_NODE_IDS=anvil-test-node-1,anvil-test-node-2,anvil-test-node-3,anvil-test-node-4,anvil-test-node-5,anvil-test-node-6
       - ANVIL_PUBLIC_ENDPOINT=http://127.0.0.1:50051
       - ANVIL_ADMIN_ENDPOINT=http://127.0.0.1:50052
-      - CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/7447/quic-v1
-      - PUBLIC_CLUSTER_ADDRS=/dns4/anvil5-internal/udp/7447/quic-v1
       - PUBLIC_API_ADDR=http://anvil5-internal:50051
-      - ENABLE_MDNS=false
-      - BOOTSTRAP_ADDRS=/dns4/anvil1-internal/udp/7443/quic-v1
       - STORAGE_PATH=/var/lib/anvil
     ports:
       - "${ANVIL_TEST_API5_PORT:-55055}:50051"
@@ -286,7 +260,6 @@ services:
       - JWT_SECRET=${ANVIL_DOCKER_TEST_JWT_SECRET:-docker-test-secret}
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - ANVIL_SECRET_ENCRYPTION_KEY_ID=docker-test-primary
-      - CLUSTER_SECRET=docker-cluster-secret
       - API_LISTEN_ADDR=0.0.0.0:50051
       - ADMIN_LISTEN_ADDR=0.0.0.0:50052
       - ALLOW_PUBLIC_ADMIN_LISTENER=true
@@ -295,11 +268,7 @@ services:
       - BOOTSTRAP_NODE_IDS=anvil-test-node-1,anvil-test-node-2,anvil-test-node-3,anvil-test-node-4,anvil-test-node-5,anvil-test-node-6
       - ANVIL_PUBLIC_ENDPOINT=http://127.0.0.1:50051
       - ANVIL_ADMIN_ENDPOINT=http://127.0.0.1:50052
-      - CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/7448/quic-v1
-      - PUBLIC_CLUSTER_ADDRS=/dns4/anvil6-internal/udp/7448/quic-v1
       - PUBLIC_API_ADDR=http://anvil6-internal:50051
-      - ENABLE_MDNS=false
-      - BOOTSTRAP_ADDRS=/dns4/anvil1-internal/udp/7443/quic-v1
       - STORAGE_PATH=/var/lib/anvil
     ports:
       - "${ANVIL_TEST_API6_PORT:-55056}:50051"

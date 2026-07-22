@@ -3,6 +3,13 @@ use super::*;
 use std::collections::BTreeMap;
 use tempfile::tempdir;
 
+fn test_receipt_signing_public_key() -> Vec<u8> {
+    crate::node_signing::NodeSigningKeypair::generate()
+        .unwrap()
+        .public_key_bytes()
+        .to_vec()
+}
+
 #[test]
 fn node_state_machine_rejects_invalid_transitions() {
     validate_node_transition(LifecycleState::Joining, LifecycleState::Active).unwrap();
@@ -358,12 +365,8 @@ async fn lifecycle_store_persists_descriptors_and_enforces_transitions() {
             node_id: "node-a".to_string(),
             region: "eu-west-1".to_string(),
             cell_id: "cell-a".to_string(),
-            libp2p_peer_id: "peer-a".to_string(),
-            receipt_signing_public_key_proto: libp2p::identity::Keypair::generate_ed25519()
-                .public()
-                .encode_protobuf(),
+            receipt_signing_public_key: test_receipt_signing_public_key(),
             public_api_addr: "http://127.0.0.1:50051".to_string(),
-            public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
             capabilities: vec![NodeCapability::Object, NodeCapability::Admin],
             capacity_json: "{}".to_string(),
         },
@@ -498,12 +501,8 @@ async fn lifecycle_read_model_replays_control_streams_as_source_of_truth() {
         node_id: "node-a".to_string(),
         region: "eu-west-1".to_string(),
         cell_id: "cell-a".to_string(),
-        libp2p_peer_id: "peer-a".to_string(),
-        receipt_signing_public_key_proto: libp2p::identity::Keypair::generate_ed25519()
-            .public()
-            .encode_protobuf(),
+        receipt_signing_public_key: test_receipt_signing_public_key(),
         public_api_addr: "http://127.0.0.1:50051".to_string(),
-        public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
         capabilities: vec![NodeCapability::Object, NodeCapability::Admin],
         capacity_json_hash: blake3::hash(b"{}").to_hex().to_string(),
         state: LifecycleState::Active,
@@ -577,12 +576,8 @@ async fn bootstrap_projection_is_visible_before_root_publication_begins() {
                 node_id: "node-a".to_string(),
                 region: "eu-west-1".to_string(),
                 cell_id: "cell-a".to_string(),
-                libp2p_peer_id: "peer-a".to_string(),
-                receipt_signing_public_key_proto: libp2p::identity::Keypair::generate_ed25519()
-                    .public()
-                    .encode_protobuf(),
+                receipt_signing_public_key: test_receipt_signing_public_key(),
                 public_api_addr: "http://127.0.0.1:50051".to_string(),
-                public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
                 capabilities: vec![NodeCapability::Metadata, NodeCapability::Object],
                 capacity_json: "{}".to_string(),
             }],
@@ -607,8 +602,8 @@ async fn canonical_topology_activation_is_portable_and_cannot_be_removed() {
     let source_temp = tempdir().unwrap();
     let source_storage = Storage::new_at(source_temp.path()).await.unwrap();
     let source_store = CoreStore::new(source_storage.clone()).await.unwrap();
-    let keypairs = (0..3)
-        .map(|_| libp2p::identity::Keypair::generate_ed25519())
+    let receipt_signing_public_keys = (0..3)
+        .map(|_| test_receipt_signing_public_key())
         .collect::<Vec<_>>();
     let cells = (0..3)
         .map(|index| RegisterCellDescriptor {
@@ -619,21 +614,21 @@ async fn canonical_topology_activation_is_portable_and_cannot_be_removed() {
             failure_domain: format!("rack-{index}"),
         })
         .collect::<Vec<_>>();
-    let nodes = keypairs
+    let nodes = receipt_signing_public_keys
         .iter()
         .enumerate()
-        .map(|(index, keypair)| RegisterNodeDescriptor {
-            mesh_id: "mesh-a".to_string(),
-            node_id: format!("node-{index}"),
-            region: "eu-west-1".to_string(),
-            cell_id: format!("cell-{index}"),
-            libp2p_peer_id: format!("peer-{index}"),
-            receipt_signing_public_key_proto: keypair.public().encode_protobuf(),
-            public_api_addr: format!("http://127.0.0.1:{}", 50_051 + index),
-            public_cluster_addrs: vec![format!("/ip4/127.0.0.1/udp/{}/quic-v1", 7_443 + index)],
-            capabilities: vec![NodeCapability::Metadata, NodeCapability::Object],
-            capacity_json: "{}".to_string(),
-        })
+        .map(
+            |(index, receipt_signing_public_key)| RegisterNodeDescriptor {
+                mesh_id: "mesh-a".to_string(),
+                node_id: format!("node-{index}"),
+                region: "eu-west-1".to_string(),
+                cell_id: format!("cell-{index}"),
+                receipt_signing_public_key: receipt_signing_public_key.clone(),
+                public_api_addr: format!("http://127.0.0.1:{}", 50_051 + index),
+                capabilities: vec![NodeCapability::Metadata, NodeCapability::Object],
+                capacity_json: "{}".to_string(),
+            },
+        )
         .collect::<Vec<_>>();
     let bootstrap = BootstrapMeshLifecycleProjection {
         regions: vec![CreateRegionDescriptor {
@@ -755,12 +750,8 @@ async fn register_test_node(storage: &Storage) -> NodeDescriptor {
             node_id: "node-a".to_string(),
             region: "eu-west-1".to_string(),
             cell_id: "cell-a".to_string(),
-            libp2p_peer_id: "peer-a".to_string(),
-            receipt_signing_public_key_proto: libp2p::identity::Keypair::generate_ed25519()
-                .public()
-                .encode_protobuf(),
+            receipt_signing_public_key: test_receipt_signing_public_key(),
             public_api_addr: "http://127.0.0.1:50051".to_string(),
-            public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
             capabilities: vec![NodeCapability::Object, NodeCapability::Admin],
             capacity_json: "{}".to_string(),
         },
@@ -821,12 +812,8 @@ async fn create_active_placement_model(
             node_id: "node-a".to_string(),
             region: "eu-west-1".to_string(),
             cell_id: "cell-a".to_string(),
-            libp2p_peer_id: "peer-a".to_string(),
-            receipt_signing_public_key_proto: libp2p::identity::Keypair::generate_ed25519()
-                .public()
-                .encode_protobuf(),
+            receipt_signing_public_key: test_receipt_signing_public_key(),
             public_api_addr: "http://127.0.0.1:50051".to_string(),
-            public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
             capabilities: vec![NodeCapability::Object, NodeCapability::Admin],
             capacity_json: "{}".to_string(),
         },

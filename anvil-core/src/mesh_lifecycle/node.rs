@@ -25,18 +25,16 @@ async fn register_node_inner(
     require_identifier(&input.node_id, "node id")?;
     require_identifier(&input.region, "region")?;
     require_identifier(&input.cell_id, "cell id")?;
-    require_nonempty(&input.libp2p_peer_id, "libp2p peer id")?;
-    if input.receipt_signing_public_key_proto.is_empty() {
+    if input.receipt_signing_public_key.is_empty() {
         return Err(LifecycleError::InvalidArgument(
-            "receipt signing public key protobuf must not be empty".to_string(),
+            "receipt signing public key must not be empty".to_string(),
         ));
     }
-    libp2p::identity::PublicKey::try_decode_protobuf(&input.receipt_signing_public_key_proto)
-        .map_err(|err| {
-            LifecycleError::InvalidArgument(format!(
-                "receipt signing public key protobuf is invalid: {err}"
-            ))
-        })?;
+    crate::node_signing::NodeVerifyingKey::from_bytes(&input.receipt_signing_public_key).map_err(
+        |err| {
+            LifecycleError::InvalidArgument(format!("receipt signing public key is invalid: {err}"))
+        },
+    )?;
     require_nonempty(&input.public_api_addr, "public api addr")?;
     if input.capabilities.is_empty() {
         return Err(LifecycleError::InvalidArgument(
@@ -73,10 +71,8 @@ async fn register_node_inner(
         node_id: input.node_id.clone(),
         region: input.region,
         cell_id: input.cell_id,
-        libp2p_peer_id: input.libp2p_peer_id,
-        receipt_signing_public_key_proto: input.receipt_signing_public_key_proto,
+        receipt_signing_public_key: input.receipt_signing_public_key,
         public_api_addr: input.public_api_addr,
-        public_cluster_addrs: input.public_cluster_addrs,
         capabilities: input.capabilities,
         capacity_json_hash,
         state: LifecycleState::Joining,
@@ -124,18 +120,16 @@ pub async fn put_node_in_transaction(
     require_identifier(&input.node_id, "node id")?;
     require_identifier(&input.region, "region")?;
     require_identifier(&input.cell_id, "cell id")?;
-    require_nonempty(&input.libp2p_peer_id, "libp2p peer id")?;
-    if input.receipt_signing_public_key_proto.is_empty() {
+    if input.receipt_signing_public_key.is_empty() {
         return Err(LifecycleError::InvalidArgument(
-            "receipt signing public key protobuf must not be empty".to_string(),
+            "receipt signing public key must not be empty".to_string(),
         ));
     }
-    libp2p::identity::PublicKey::try_decode_protobuf(&input.receipt_signing_public_key_proto)
-        .map_err(|err| {
-            LifecycleError::InvalidArgument(format!(
-                "receipt signing public key protobuf is invalid: {err}"
-            ))
-        })?;
+    crate::node_signing::NodeVerifyingKey::from_bytes(&input.receipt_signing_public_key).map_err(
+        |err| {
+            LifecycleError::InvalidArgument(format!("receipt signing public key is invalid: {err}"))
+        },
+    )?;
     require_nonempty(&input.public_api_addr, "public api addr")?;
     if input.capabilities.is_empty() {
         return Err(LifecycleError::InvalidArgument(
@@ -167,10 +161,8 @@ pub async fn put_node_in_transaction(
     let mut descriptor = if let Some(existing) = state.nodes.get(&input.node_id).cloned() {
         if existing.region != input.region
             || existing.cell_id != input.cell_id
-            || existing.libp2p_peer_id != input.libp2p_peer_id
-            || existing.receipt_signing_public_key_proto != input.receipt_signing_public_key_proto
+            || existing.receipt_signing_public_key != input.receipt_signing_public_key
             || existing.public_api_addr != input.public_api_addr
-            || existing.public_cluster_addrs != input.public_cluster_addrs
             || existing.capabilities != input.capabilities
             || existing.capacity_json_hash != capacity_json_hash
         {
@@ -188,10 +180,8 @@ pub async fn put_node_in_transaction(
             node_id: input.node_id.clone(),
             region: input.region,
             cell_id: input.cell_id,
-            libp2p_peer_id: input.libp2p_peer_id,
-            receipt_signing_public_key_proto: input.receipt_signing_public_key_proto,
+            receipt_signing_public_key: input.receipt_signing_public_key,
             public_api_addr: input.public_api_addr,
-            public_cluster_addrs: input.public_cluster_addrs,
             capabilities: input.capabilities,
             capacity_json_hash,
             state: LifecycleState::Joining,

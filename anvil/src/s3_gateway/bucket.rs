@@ -1432,14 +1432,12 @@ mod list_bucket_pagination_tests {
 }
 
 pub(super) async fn readiness_check(State(state): State<AppState>) -> Response {
-    let peers = state.cluster.read().await.len();
     let coremeta = state.core_store.coremeta_recovery_snapshot();
-    if peers >= 1 && coremeta.ready {
+    if coremeta.ready {
         (axum::http::StatusCode::OK, "READY").into_response()
     } else {
         let body = serde_json::json!({
             "status": "not_ready",
-            "peers": peers,
             "coremeta": {
                 "ready": coremeta.ready,
                 "distributed_required": coremeta.distributed_required,

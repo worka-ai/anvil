@@ -197,7 +197,7 @@ impl CoreStore {
             }
             self.register_node_receipt_signing_public_key(
                 &node.node_id,
-                &node.receipt_signing_public_key_proto,
+                &node.receipt_signing_public_key,
             )?;
             let placement = LocalShardPlacement {
                 is_local: node.node_id == self.node_identity.node_id,
@@ -600,7 +600,7 @@ impl CoreStore {
         if let Some(node) = nodes.into_iter().find(|node| node.node_id == node_id) {
             self.register_node_receipt_signing_public_key(
                 &node.node_id,
-                &node.receipt_signing_public_key_proto,
+                &node.receipt_signing_public_key,
             )?;
             Ok(Some(node.public_api_addr))
         } else {
@@ -653,7 +653,7 @@ impl CoreStore {
             fsync_sequence: receipt.fsync_sequence,
             written_at_unix_nanos: receipt.written_at_unix_nanos,
             signed_payload_hash: receipt.signed_payload_hash,
-            signature_algorithm: "ed25519-libp2p".to_string(),
+            signature_algorithm: "ed25519".to_string(),
             receipt_signature: receipt.signature,
         })
     }
@@ -728,7 +728,7 @@ fn validate_shard_receipt_binding(
         receipt.fsync_sequence,
         receipt.written_at_unix_nanos,
         &receipt.signed_payload_hash,
-        "ed25519-libp2p",
+        "ed25519",
         &receipt.signature,
         &expected_signed_payload_hash,
     )

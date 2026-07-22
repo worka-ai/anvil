@@ -501,7 +501,7 @@ mod tests {
             ..crate::config::Config::default()
         };
         let storage = crate::storage::Storage::new_at(temp.path()).await.unwrap();
-        let persistence = crate::persistence::Persistence::new(&config, None).unwrap();
+        let persistence = crate::persistence::Persistence::new(&config).unwrap();
         crate::system_realm::ensure_bootstrapped(
             &config,
             &persistence,

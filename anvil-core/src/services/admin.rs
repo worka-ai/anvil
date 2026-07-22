@@ -1410,10 +1410,8 @@ impl AdminService for AppState {
                 node_id: req.node_id,
                 region: req.region,
                 cell_id: req.cell_id,
-                libp2p_peer_id: req.libp2p_peer_id,
-                receipt_signing_public_key_proto: req.receipt_signing_public_key_proto,
+                receipt_signing_public_key: req.receipt_signing_public_key,
                 public_api_addr: req.public_api_addr,
-                public_cluster_addrs: req.public_cluster_addrs,
                 capabilities,
                 capacity_json: req.capacity_json,
             })
@@ -1449,18 +1447,9 @@ impl AdminService for AppState {
 
         // This RPC is used by the Docker topology bootstrap before lifecycle
         // projections and control streams are initialised. Build the descriptor
-        // from local runtime state instead of reading mesh lifecycle storage,
-        // otherwise early boot can recurse through CoreStore/control-stream
-        // bootstrap while the node is still trying to join the mesh.
-        let libp2p_peer_id = self
-            .cluster
-            .read()
-            .await
-            .iter()
-            .find_map(|(peer_id, info)| {
-                (info.grpc_addr == self.config.public_api_addr).then(|| peer_id.to_base58())
-            })
-            .ok_or_else(|| Status::unavailable("local cluster identity is not ready"))?;
+        // from local configuration and signing state instead of reading mesh
+        // lifecycle storage, otherwise early boot can recurse through CoreStore/
+        // control-stream bootstrap while the node is still trying to join the mesh.
         let now = Utc::now().to_rfc3339();
         let node = mesh_lifecycle::NodeDescriptor {
             schema: mesh_lifecycle::NODE_DESCRIPTOR_SCHEMA.to_string(),
@@ -1468,12 +1457,8 @@ impl AdminService for AppState {
             node_id: self.config.node_id.clone(),
             region: self.config.region.clone(),
             cell_id: self.config.cell_id.clone(),
-            libp2p_peer_id,
-            receipt_signing_public_key_proto: self
-                .core_store
-                .local_receipt_signing_public_key_proto(),
+            receipt_signing_public_key: self.core_store.local_receipt_signing_public_key(),
             public_api_addr: self.config.public_api_addr.clone(),
-            public_cluster_addrs: self.config.public_cluster_addrs.clone(),
             capabilities: vec![
                 CoreNodeCapability::Object,
                 CoreNodeCapability::Index,

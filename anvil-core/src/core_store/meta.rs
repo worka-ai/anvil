@@ -123,6 +123,7 @@ pub const TABLE_DIAGNOSTIC_ROW: u16 = 0x8c02;
 pub const TABLE_NODE_SIGNING_KEYPAIR_ROW: u16 = 0x8d01;
 pub const TABLE_PERSONALDB_SIGNING_KEY_ROW: u16 = 0x8d02;
 pub const TABLE_PERSONALDB_SIGNING_KEY_HEAD_ROW: u16 = 0x8d03;
+pub const TABLE_LOCAL_NODE_IDENTITY_ROW: u16 = 0x8d04;
 
 const CORE_META_VALUE_SCHEMA_VERSION: u32 = 1;
 pub(crate) const CORE_META_MAX_VALUE_BYTES: usize = 64 * 1024;
@@ -1432,6 +1433,7 @@ fn table_spec(table_id: u16) -> Result<CoreMetaTableSpec> {
         | TABLE_ROOT_CATALOG_CURRENT_ROW
         | TABLE_QUORUM_PROFILE_CURRENT_ROW
         | TABLE_NODE_SIGNING_KEYPAIR_ROW
+        | TABLE_LOCAL_NODE_IDENTITY_ROW
         | TABLE_PERSONALDB_SIGNING_KEY_ROW
         | TABLE_PERSONALDB_SIGNING_KEY_HEAD_ROW => CoreMetaTableSpec {
             cf: CF_MESH,
@@ -1781,6 +1783,7 @@ fn expected_schema_markers(table_id: u16) -> Option<&'static [&'static str]> {
         }
         TABLE_REPAIR_FINDING_HEAD_ROW => Some(&["anvil.repair.finding_head.v1"]),
         TABLE_REPAIR_FINDING_ID_ROW => Some(&["anvil.repair.finding_id.v1"]),
+        TABLE_LOCAL_NODE_IDENTITY_ROW => Some(&["anvil.coremeta.local_node_identity.v1"]),
         TABLE_TASK_CURRENT_ROW => Some(&["anvil.core.task_queue_row.v1"]),
         TABLE_CORE_FENCE_ROW => Some(&["anvil.control.current.v1", "anvil.core.fence.v1"]),
         TABLE_ROOT_FAILOVER_VOTE_ROW => Some(&["anvil.core.root_failover_vote.v1"]),

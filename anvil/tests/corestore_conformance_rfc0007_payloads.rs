@@ -236,7 +236,7 @@ fn non_corestore_direct_persistence_paths_are_scratch_or_operator_exports() {
     let snapshot_store = workspace_file("anvil-core/src/personaldb_snapshot_store.rs");
     let system_realm = workspace_file("anvil-core/src/system_realm.rs");
     let worker = workspace_file("anvil-core/src/worker.rs");
-    let cluster_identity = workspace_file("anvil-core/src/cluster_identity.rs");
+    let node_identity = workspace_file("anvil-core/src/node_identity.rs");
 
     assert_contains_all(
         "upload staging is Class C scratch",
@@ -314,16 +314,16 @@ fn non_corestore_direct_persistence_paths_are_scratch_or_operator_exports() {
         ],
     );
     assert_contains_all(
-        "cluster identity writes through CoreStore CoreMeta commit path",
-        &cluster_identity,
+        "node identity writes through CoreStore CoreMeta commit path",
+        &node_identity,
         &[
             "CoreStore::new(storage.clone())",
-            "commit_coremeta_batch_by_embedded_roots(&record.node_id, &[op])",
+            "commit_coremeta_root_groups(",
         ],
     );
     assert_contains_none(
-        "cluster identity direct committed write bypass",
-        &cluster_identity,
+        "node identity direct committed write bypass",
+        &node_identity,
         &["write_local_committed_batch", "meta.put("],
     );
 }

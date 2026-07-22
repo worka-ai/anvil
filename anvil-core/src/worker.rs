@@ -1,5 +1,4 @@
 use crate::auth::JwtManager;
-use crate::cluster::ClusterState;
 use crate::core_store::CoreStore;
 use crate::crypto::EncryptionKeyring;
 use crate::object_manager::ObjectManager;
@@ -188,7 +187,6 @@ struct IndexBuildPayload {
 pub async fn run(
     persistence: Persistence,
     core_store: CoreStore,
-    cluster_state: ClusterState,
     jwt_manager: Arc<JwtManager>,
     object_manager: ObjectManager,
     keyring: Arc<EncryptionKeyring>,
@@ -279,7 +277,6 @@ pub async fn run(
         for task in tasks {
             let p = persistence.clone();
             let core_store = core_store.clone();
-            let cs = cluster_state.clone();
             let jm = jwt_manager.clone();
             let om = object_manager.clone();
             let keyring = keyring.clone();
@@ -291,7 +288,7 @@ pub async fn run(
             tokio::spawn(async move {
                 let _permit = permit;
                 let result =
-                    execute_task_with_lease(&p, &core_store, &cs, &jm, &om, &task, &keyring).await;
+                    execute_task_with_lease(&p, &core_store, &jm, &om, &task, &keyring).await;
 
                 match result {
                     Err(failure) => {
@@ -490,7 +487,6 @@ struct TaskExecutionFailure {
 async fn execute_task_with_lease(
     persistence: &Persistence,
     core_store: &CoreStore,
-    _cluster_state: &ClusterState,
     _jwt_manager: &Arc<JwtManager>,
     object_manager: &ObjectManager,
     task: &Task,
@@ -1252,9 +1248,7 @@ mod tests {
     use super::*;
     use crate::{config::Config, storage::Storage};
     use chrono::Utc;
-    use std::collections::HashMap;
     use tempfile::tempdir;
-    use tokio::sync::RwLock;
 
     fn test_config(storage_path: &std::path::Path) -> Config {
         Config {
@@ -1317,7 +1311,7 @@ mod tests {
     async fn unleased_running_task_is_recovered_only_after_the_grace_period() {
         let temp = tempdir().unwrap();
         let config = test_config(temp.path());
-        let persistence = Persistence::new(&config, None).unwrap();
+        let persistence = Persistence::new(&config).unwrap();
 
         persistence
             .enqueue_task(TaskType::DeleteObject, json!({ "object_id": 1 }), 0)
@@ -1361,7 +1355,7 @@ mod tests {
     async fn running_task_is_recovered_only_after_its_lease_expires() {
         let temp = tempdir().unwrap();
         let config = test_config(temp.path());
-        let persistence = Persistence::new(&config, None).unwrap();
+        let persistence = Persistence::new(&config).unwrap();
 
         persistence
             .enqueue_task(TaskType::DeleteObject, json!({ "object_id": 1 }), 0)
@@ -1405,7 +1399,7 @@ mod tests {
     async fn object_metadata_compaction_task_seals_manifest() {
         let temp = tempdir().unwrap();
         let config = test_config(temp.path());
-        let persistence = Persistence::new(&config, None).unwrap();
+        let persistence = Persistence::new(&config).unwrap();
 
         persistence.create_region("local").await.unwrap();
         let bucket = persistence
@@ -1446,7 +1440,6 @@ mod tests {
         let core_store = crate::core_store::CoreStore::new(storage.clone())
             .await
             .unwrap();
-        let cluster_state: ClusterState = Arc::new(RwLock::new(HashMap::new()));
         let jwt_manager = Arc::new(JwtManager::new(config.jwt_secret.clone()));
         let object_manager = ObjectManager::new(
             persistence.clone(),
@@ -1461,7 +1454,6 @@ mod tests {
         execute_task_with_lease(
             &persistence,
             &core_store,
-            &cluster_state,
             &jwt_manager,
             &object_manager,
             &task,

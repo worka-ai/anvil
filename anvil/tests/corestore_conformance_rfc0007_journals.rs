@@ -1004,38 +1004,6 @@ fn rfc_0007_git_source_watch_payloads_are_deterministic_protobuf() {
 }
 
 #[test]
-fn rfc_0007_cluster_gossip_uses_deterministic_protobuf_control_messages() {
-    let source = production_source("anvil-core/src/cluster.rs");
-
-    assert_contains_all(
-        "cluster gossip deterministic protobuf control messages",
-        &source,
-        &[
-            "struct ClusterMessageProto",
-            "struct MetadataEventProto",
-            "fn encode_cluster_message",
-            "fn decode_cluster_message",
-            "fn encode_metadata_event",
-            "fn decode_metadata_event",
-            "encode_deterministic_proto(&ClusterMessageProto",
-            "decode_deterministic_proto::<ClusterMessageProto>",
-            "encode_deterministic_proto(&MetadataEventProto",
-            "decode_deterministic_proto::<MetadataEventProto>",
-        ],
-    );
-    assert_contains_none(
-        "cluster gossip JSON control message transport",
-        &source,
-        &[
-            "serde_json::to_vec(&message)",
-            "serde_json::to_vec(&event)",
-            "serde_json::from_slice::<ClusterMessage>",
-            "serde_json::from_slice::<MetadataEvent>",
-        ],
-    );
-}
-
-#[test]
 fn rfc_0007_mesh_control_payloads_are_protobuf_with_operator_json_only_at_boundary() {
     let control = production_source("anvil-core/src/mesh_control_stream.rs");
     let directory = production_source("anvil-core/src/mesh_directory/record_proto.rs");

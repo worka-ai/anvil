@@ -4,13 +4,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{Notify, OnceCell, mpsc::Sender};
+use tokio::sync::{Notify, OnceCell};
 
 use crate::{
     append_journal, authz_journal, authz_repair,
     bucket_journal::{self, BucketJournalMutation},
-    cache::MetadataCache,
-    cluster::MetadataEvent,
     config::Config,
     control_journal,
     core_store::{CoreObjectRef, CoreStore},
@@ -37,9 +35,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct Persistence {
     storage: Storage,
-    cache: MetadataCache,
     core_store: Arc<OnceCell<CoreStore>>,
-    event_publisher: Option<Sender<MetadataEvent>>,
     task_notify: Arc<Notify>,
     mesh_id: String,
     region: String,

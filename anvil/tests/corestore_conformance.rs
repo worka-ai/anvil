@@ -241,8 +241,6 @@ fn rfc_0006_local_storage_guard_prevents_authoritative_feature_file_writes() {
         "anvil-core/src/core_store/local_roots_layout.rs",
         // Storage owns transient upload staging only; object payloads are moved into CoreStore.
         "anvil-core/src/storage.rs",
-        // Node identity/keypair are operator bootstrap files; config rejects paths below storage.
-        "anvil-core/src/cluster_identity.rs",
         // System realm bootstrap writes the first-admin credential file for the operator once;
         // system realm state itself is still committed through CoreStore-authz paths.
         "anvil-core/src/system_realm.rs",

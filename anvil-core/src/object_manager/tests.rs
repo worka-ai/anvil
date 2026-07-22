@@ -64,7 +64,7 @@ async fn seeded_core_store_link() -> (TempDir, ObjectManager, Bucket, Object, Ob
     let config = test_config(&storage_path);
     let storage = Storage::new_at(&config.storage_path).await.unwrap();
     let core_store = CoreStore::new(storage.clone()).await.unwrap();
-    let persistence = Persistence::new(&config, None).unwrap();
+    let persistence = Persistence::new(&config).unwrap();
     system_realm::ensure_bootstrapped(
         &config,
         &persistence,
@@ -210,7 +210,7 @@ async fn seeded_object_manager(
     let config = test_config(&storage_path);
     let storage = Storage::new_at(&config.storage_path).await.unwrap();
     let core_store = CoreStore::new(storage.clone()).await.unwrap();
-    let persistence = Persistence::new(&config, None).unwrap();
+    let persistence = Persistence::new(&config).unwrap();
     system_realm::ensure_bootstrapped(
         &config,
         &persistence,

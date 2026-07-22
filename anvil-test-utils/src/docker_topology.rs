@@ -47,9 +47,7 @@ fn put_node_request(
         state: "active".to_string(),
         capacity_json: "{}".to_string(),
         options: None,
-        libp2p_peer_id: descriptor.libp2p_peer_id.clone(),
-        receipt_signing_public_key_proto: descriptor.receipt_signing_public_key_proto.clone(),
-        cluster_addrs: descriptor.public_cluster_addrs.clone(),
+        receipt_signing_public_key: descriptor.receipt_signing_public_key.clone(),
         capabilities: vec![
             "object".to_string(),
             "index".to_string(),

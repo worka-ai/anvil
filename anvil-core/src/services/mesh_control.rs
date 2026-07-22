@@ -79,10 +79,8 @@ impl MeshControlService for AppState {
                     node_id: node.node_id,
                     region: node.region_id,
                     cell_id: node.cell_id,
-                    libp2p_peer_id: node.libp2p_peer_id,
-                    receipt_signing_public_key_proto: node.receipt_signing_public_key_proto,
+                    receipt_signing_public_key: node.receipt_signing_public_key,
                     public_api_addr: node.advertise_addr,
-                    public_cluster_addrs: node.cluster_addrs,
                     capabilities,
                     capacity_json: node.capacity_json,
                 })
@@ -93,7 +91,7 @@ impl MeshControlService for AppState {
                 self.core_store
                     .register_node_receipt_signing_public_key(
                         &node.node_id,
-                        &node.receipt_signing_public_key_proto,
+                        &node.receipt_signing_public_key,
                     )
                     .map_err(mesh_status)?;
             }
@@ -254,12 +252,8 @@ impl MeshControlService for AppState {
                         node_id: req.node_id.clone(),
                         region: req.region_id.clone(),
                         cell_id: req.cell_id.clone(),
-                        libp2p_peer_id: req.libp2p_peer_id.clone(),
-                        receipt_signing_public_key_proto: req
-                            .receipt_signing_public_key_proto
-                            .clone(),
+                        receipt_signing_public_key: req.receipt_signing_public_key.clone(),
                         public_api_addr: req.advertise_addr.clone(),
-                        public_cluster_addrs: req.cluster_addrs.clone(),
                         capabilities,
                         capacity_json: req.capacity_json.clone(),
                     })
@@ -645,10 +639,8 @@ async fn put_node_in_transaction(
             node_id: req.node_id.clone(),
             region: req.region_id.clone(),
             cell_id: req.cell_id.clone(),
-            libp2p_peer_id: req.libp2p_peer_id.clone(),
-            receipt_signing_public_key_proto: req.receipt_signing_public_key_proto.clone(),
+            receipt_signing_public_key: req.receipt_signing_public_key.clone(),
             public_api_addr: req.advertise_addr.clone(),
-            public_cluster_addrs: req.cluster_addrs.clone(),
             capabilities,
             capacity_json: req.capacity_json.clone(),
         },
@@ -762,10 +754,8 @@ fn ensure_node_put_matches(
     let capacity_hash = capacity_json_hash(&req.capacity_json).map_err(mesh_status)?;
     if node.region != req.region_id
         || node.cell_id != req.cell_id
-        || node.libp2p_peer_id != req.libp2p_peer_id
-        || node.receipt_signing_public_key_proto != req.receipt_signing_public_key_proto
+        || node.receipt_signing_public_key != req.receipt_signing_public_key
         || node.public_api_addr != req.advertise_addr
-        || node.public_cluster_addrs != req.cluster_addrs
         || node.capabilities != capabilities
         || node.capacity_json_hash != capacity_hash
     {
@@ -1084,10 +1074,8 @@ async fn ensure_bootstrap_topology_matches(
         if actual.mesh_id != expected.mesh_id
             || actual.region != expected.region
             || actual.cell_id != expected.cell_id
-            || actual.libp2p_peer_id != expected.libp2p_peer_id
-            || actual.receipt_signing_public_key_proto != expected.receipt_signing_public_key_proto
+            || actual.receipt_signing_public_key != expected.receipt_signing_public_key
             || actual.public_api_addr != expected.public_api_addr
-            || actual.public_cluster_addrs != expected.public_cluster_addrs
             || actual.capabilities != expected.capabilities
             || actual.capacity_json_hash
                 != capacity_json_hash(&expected.capacity_json).map_err(mesh_status)?

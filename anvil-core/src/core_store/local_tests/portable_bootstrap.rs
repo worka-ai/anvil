@@ -217,10 +217,11 @@ async fn portable_bootstrap_preserves_root_verification_evidence() {
         load_node_receipt_signing_public_key(&source.meta, "local-control-node-1")
             .unwrap()
             .unwrap()
-            .encode_protobuf();
+            .to_bytes()
+            .to_vec();
     assert_ne!(
         source_bootstrap_key,
-        target.local_receipt_signing_public_key_proto(),
+        target.local_receipt_signing_public_key(),
         "the restart regression requires distinct source and joining-node identities"
     );
 
@@ -243,7 +244,8 @@ async fn portable_bootstrap_preserves_root_verification_evidence() {
         load_node_receipt_signing_public_key(&restarted.meta, "local-control-node-1",)
             .unwrap()
             .unwrap()
-            .encode_protobuf(),
+            .to_bytes()
+            .to_vec(),
         source_bootstrap_key,
         "startup must not replace portable bootstrap receipt identities"
     );
