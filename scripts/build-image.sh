@@ -8,20 +8,29 @@ case "${build_profile}" in
   release)
     cargo_profile_args=(--release)
     bin_profile_dir="release"
+    default_test_tools=0
     ;;
   ci)
     cargo_profile_args=(--profile ci)
     bin_profile_dir="ci"
+    default_test_tools=1
     ;;
   dev|debug)
     cargo_profile_args=()
     bin_profile_dir="debug"
+    default_test_tools=1
     ;;
   *)
     echo "unsupported ANVIL_BUILD_PROFILE=${build_profile}; expected release, ci, or dev" >&2
     exit 2
     ;;
 esac
+
+include_test_tools="${ANVIL_INCLUDE_TEST_TOOLS:-${default_test_tools}}"
+if [[ "${include_test_tools}" != "0" && "${include_test_tools}" != "1" ]]; then
+  echo "ANVIL_INCLUDE_TEST_TOOLS must be 0 or 1" >&2
+  exit 2
+fi
 
 case "${ANVIL_DOCKER_PLATFORM:-}" in
   "")
@@ -76,6 +85,9 @@ build_args=(
   -p anvil-server --bin anvil-server
   -p anvil-storage-cli --bin anvil --bin anvil-admin
 )
+if [[ "${include_test_tools}" == "1" ]]; then
+  build_args+=(--features anvil-server/root-publication-test-control)
+fi
 
 if [[ "$use_zig" == "1" ]]; then
   if ! command -v cargo-zigbuild >/dev/null 2>&1; then
@@ -115,6 +127,7 @@ trap 'rm -f "${iid_file}"' EXIT
 docker build \
   --platform "${platform}" \
   --build-arg "ANVIL_RUNTIME_BASE=${ANVIL_RUNTIME_BASE:-debian:bookworm-slim}" \
+  --build-arg "ANVIL_INCLUDE_TEST_TOOLS=${include_test_tools}" \
   --iidfile "${iid_file}" \
   -f anvil/Dockerfile.prebuilt \
   -t "${image}" \
