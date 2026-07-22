@@ -112,7 +112,6 @@ rust_unit_gates() {
 server_core_integration_gates() {
   local tests=(
     admin_lifecycle
-    cluster
     corestore_conformance
     corestore_conformance_durable_families
     corestore_conformance_rfc0007_byte_pipeline

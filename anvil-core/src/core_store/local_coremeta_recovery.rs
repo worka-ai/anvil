@@ -596,7 +596,7 @@ impl CoreStore {
         &self,
         peers: &[RecoveryPeer],
     ) -> Result<RootDirectoryDiscovery> {
-        let peer_ids = peers
+        let node_ids = peers
             .iter()
             .map(|peer| peer.node_id.clone())
             .collect::<BTreeSet<_>>();
@@ -608,13 +608,13 @@ impl CoreStore {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             state
                 .peer_cursors
-                .retain(|node_id, _| peer_ids.contains(node_id));
+                .retain(|node_id, _| node_ids.contains(node_id));
             state
                 .peers_with_complete_pass
-                .retain(|node_id| peer_ids.contains(node_id));
+                .retain(|node_id| node_ids.contains(node_id));
             state
                 .peer_entries
-                .retain(|node_id, _| peer_ids.contains(node_id));
+                .retain(|node_id, _| node_ids.contains(node_id));
             peers
                 .iter()
                 .cloned()
