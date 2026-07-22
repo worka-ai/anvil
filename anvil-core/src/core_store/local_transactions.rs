@@ -966,6 +966,29 @@ impl CoreStore {
         Ok(transaction)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn expire_explicit_transaction_for_tests(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+    ) -> Result<()> {
+        let (_guards, current, _preconditions) = self
+            .acquire_current_explicit_transaction_locks(transaction_id)
+            .await?;
+        if current.committed_by_principal != principal {
+            bail!("TransactionPrincipalMismatch");
+        }
+        if current.state != CoreTransactionState::Open {
+            bail!("TransactionNotOpen");
+        }
+        let expired = transaction_with_state(
+            current,
+            CoreTransactionState::Expired,
+            Some("TransactionExpired".to_string()),
+        )?;
+        self.write_transaction_unlocked(&expired).await
+    }
+
     pub fn root_key_hash_for_anchor(root_anchor_key: &str) -> String {
         root_key_hash(root_anchor_key)
     }
@@ -1066,8 +1089,14 @@ impl CoreStore {
             .read_transaction_unlocked(&batch.transaction_id)
             .await?
             .ok_or_else(|| anyhow!("TransactionNotFound"))?;
-        if transaction.state != CoreTransactionState::Open {
-            bail!("TransactionNotOpen");
+        match transaction.state {
+            CoreTransactionState::Open => {}
+            CoreTransactionState::Expired => bail!("TransactionExpired"),
+            CoreTransactionState::RolledBack | CoreTransactionState::Aborted => {
+                bail!("TransactionRolledBack")
+            }
+            CoreTransactionState::Committed => bail!("TransactionAlreadyCommitted"),
+            _ => bail!("TransactionNotOpen"),
         }
         if transaction.committed_by_principal != batch.committed_by_principal {
             bail!("TransactionPrincipalMismatch");
