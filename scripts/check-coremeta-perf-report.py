@@ -73,6 +73,7 @@ REQUIRED_CORRECTNESS_GATES = frozenset(
         "generation_inventory_snapshot_is_immutable",
         "deep_catch_up_cursor_progress_is_exact",
         "multi_page_generation_cursor_progress_is_exact",
+        "multi_page_generation_history_shape_is_exact",
         "multi_page_generation_uses_expected_page_count",
     }
 ) | frozenset(f"{name}_bounded_result" for name in REQUIRED_SCENARIOS)
@@ -134,6 +135,8 @@ PROFILE_FIELDS = frozenset(
         "multi_page_generation_warmup_operations",
         "multi_page_generation_samples",
         "multi_page_generation_rows",
+        "root_publication_history_rows_per_logical_mutation",
+        "root_publication_history_fixed_rows",
         "thresholds",
     }
 )
@@ -316,6 +319,11 @@ def validate_profile(profile: Any, label: str) -> dict[str, Any]:
 
 def scenario_contract(profile: dict[str, Any]) -> dict[str, tuple[int, int, int]]:
     mutation_rows = profile["warmup_operations"] + profile["mutation_samples"]
+    publication_history_rows = (
+        profile["multi_page_generation_rows"]
+        * profile["root_publication_history_rows_per_logical_mutation"]
+        + profile["root_publication_history_fixed_rows"]
+    )
     return {
         "point_get_small": (profile["small_rows"], profile["point_samples"], 1),
         "point_get_large": (profile["large_rows"], profile["point_samples"], 1),
@@ -393,7 +401,7 @@ def scenario_contract(profile: dict[str, Any]) -> dict[str, tuple[int, int, int]
         "generation_catch_up_multi_page_traversal": (
             profile["large_rows"],
             profile["multi_page_generation_samples"],
-            profile["multi_page_generation_rows"],
+            publication_history_rows,
         ),
     }
 
@@ -778,8 +786,23 @@ def build_gate_contracts(
         0.0,
         "checks",
     )
+    publication_history_rows = (
+        profile["multi_page_generation_rows"]
+        * profile["root_publication_history_rows_per_logical_mutation"]
+        + profile["root_publication_history_fixed_rows"]
+    )
+    add(
+        "multi_page_generation_history_shape_is_exact",
+        "correctness",
+        "history_mutations",
+        "==",
+        float(publication_history_rows),
+        float(publication_history_rows),
+        float(publication_history_rows),
+        "mutations",
+    )
     expected_pages = (
-        profile["multi_page_generation_rows"] + profile["history_page_size"] - 1
+        publication_history_rows + profile["history_page_size"] - 1
     ) // profile["history_page_size"]
     add(
         "multi_page_generation_uses_expected_page_count",
@@ -832,7 +855,7 @@ def build_gate_contracts(
         )
 
     traversal_work_limit = (
-        profile["multi_page_generation_rows"] * thresholds["history_work_per_item"]
+        publication_history_rows * thresholds["history_work_per_item"]
         + expected_pages * thresholds["history_fixed_work"]
     )
     add(

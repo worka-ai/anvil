@@ -72,6 +72,7 @@ CORRECTNESS_GATES = (
     "generation_inventory_snapshot_is_immutable",
     "deep_catch_up_cursor_progress_is_exact",
     "multi_page_generation_cursor_progress_is_exact",
+    "multi_page_generation_history_shape_is_exact",
     "multi_page_generation_uses_expected_page_count",
 ) + tuple(f"{name}_bounded_result" for name in SCENARIOS)
 LATENCY_GATES = (
@@ -116,6 +117,11 @@ BASE_MANIFEST = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
 
 def scenario_dimensions(profile: dict) -> dict[str, tuple[int, int, int]]:
     mutation_rows = profile["warmup_operations"] + profile["mutation_samples"]
+    publication_history_rows = (
+        profile["multi_page_generation_rows"]
+        * profile["root_publication_history_rows_per_logical_mutation"]
+        + profile["root_publication_history_fixed_rows"]
+    )
     return {
         "point_get_small": (profile["small_rows"], profile["point_samples"], 1),
         "point_get_large": (profile["large_rows"], profile["point_samples"], 1),
@@ -193,7 +199,7 @@ def scenario_dimensions(profile: dict) -> dict[str, tuple[int, int, int]]:
         "generation_catch_up_multi_page_traversal": (
             profile["large_rows"],
             profile["multi_page_generation_samples"],
-            profile["multi_page_generation_rows"],
+            publication_history_rows,
         ),
     }
 
@@ -339,6 +345,9 @@ class CoreMetaReportCheckerTests(unittest.TestCase):
         self.assertIn('&format!("{}_bounded_work", page.name)', source)
         self.assertIn('&format!("{}_bounded_work", publication.name)', source)
         self.assertIn('&format!("{}_bounded_work", history_page.name)', source)
+        self.assertIn("publication.expected_items_per_operation", source)
+        self.assertNotIn("history_assertions.publication_small_mutations", source)
+        self.assertNotIn("history_assertions.publication_large_mutations", source)
 
     def test_report_level_failure_is_rejected(self) -> None:
         report = valid_report()
@@ -447,6 +456,21 @@ class CoreMetaReportCheckerTests(unittest.TestCase):
         report["scenarios"][0]["item_count_mismatches"] = 1
         result = self.run_checker(report)
         self.assertNotEqual(result.returncode, 0)
+
+    def test_publication_history_amplification_is_enforced(self) -> None:
+        report = valid_report()
+        scenario = next(
+            item
+            for item in report["scenarios"]
+            if item["name"] == "generation_catch_up_multi_page_traversal"
+        )
+        scenario["expected_items_per_operation"] -= 1
+        scenario["returned_items"] = (
+            scenario["sample_count"] * scenario["expected_items_per_operation"]
+        )
+        result = self.run_checker(report)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("item bound does not match its profile", result.stderr)
 
     def test_manifest_profile_mismatch_is_rejected(self) -> None:
         report = valid_report()

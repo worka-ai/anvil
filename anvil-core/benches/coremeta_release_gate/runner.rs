@@ -32,9 +32,8 @@ struct HistoryGateAssertions {
     traversal_cursor_mismatches: u64,
     traversal_pages: usize,
     expected_traversal_pages: usize,
-    publication_small_mutations: usize,
-    publication_large_mutations: usize,
     multi_page_publication_mutations: usize,
+    expected_multi_page_publication_mutations: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,21 +173,7 @@ pub fn run(manifest: &GateManifest, profile: &ProfileSpec) -> Result<RunResult> 
     let large_root_anchor = publication_root_anchor_key("single-large");
     let small_root_hash = core_meta_root_key_hash(&small_root_anchor);
     let large_root_hash = core_meta_root_key_hash(&large_root_anchor);
-    let small_final_mutations = generation_mutation_count(
-        &publication_small_dataset.core_store,
-        &small_root_hash,
-        publication_generations,
-        profile.history_max_page_bytes,
-    )?;
-    let large_final_mutations = generation_mutation_count(
-        &dataset.core_store,
-        &large_root_hash,
-        publication_generations,
-        profile.history_max_page_bytes,
-    )?;
     let mut history_assertions = HistoryGateAssertions::default();
-    history_assertions.publication_small_mutations = small_final_mutations;
-    history_assertions.publication_large_mutations = large_final_mutations;
 
     let inventory_small_expected = publication_small_dataset
         .core_store
@@ -391,6 +376,8 @@ pub fn run(manifest: &GateManifest, profile: &ProfileSpec) -> Result<RunResult> 
         multi_page_generations,
         profile.history_max_page_bytes,
     )?;
+    let expected_multi_page_publication_mutations =
+        expected_publication_history_mutations(profile, profile.multi_page_generation_rows)?;
     let traversal_start = CoreMetaHistoryCursor {
         generation: multi_page_generations - 1,
         ordinal: previous_multi_page_mutations as u64 - 1,
@@ -409,8 +396,10 @@ pub fn run(manifest: &GateManifest, profile: &ProfileSpec) -> Result<RunResult> 
     history_assertions.traversal_cursor_mismatches = traversal_mismatches;
     history_assertions.traversal_pages = traversal.page_hashes.len();
     history_assertions.expected_traversal_pages =
-        multi_page_publication_mutations.div_ceil(profile.history_page_size);
+        expected_multi_page_publication_mutations.div_ceil(profile.history_page_size);
     history_assertions.multi_page_publication_mutations = multi_page_publication_mutations;
+    history_assertions.expected_multi_page_publication_mutations =
+        expected_multi_page_publication_mutations;
 
     set_perf_stats(PerfStatsLevel::Disable);
 
@@ -798,6 +787,16 @@ fn generation_mutation_count(
     }
     usize::try_from(descriptor.mutation_count)
         .context("CoreMeta generation mutation count exceeds usize")
+}
+
+fn expected_publication_history_mutations(
+    profile: &ProfileSpec,
+    logical_mutations: usize,
+) -> Result<usize> {
+    logical_mutations
+        .checked_mul(profile.root_publication_history_rows_per_logical_mutation)
+        .and_then(|rows| rows.checked_add(profile.root_publication_history_fixed_rows))
+        .context("CoreMeta expected publication history mutation count overflow")
 }
 
 fn history_page_expectation(
@@ -1515,21 +1514,9 @@ fn evaluate_gates(
         "ratio",
         "A page-spanning generation may add work per declared mutation, not per table row.",
     ));
-    for (publication, mutation_rows) in [
-        (
-            publication_small,
-            history_assertions.publication_small_mutations,
-        ),
-        (
-            publication_large,
-            history_assertions.publication_large_mutations,
-        ),
-        (
-            multi_page_generation,
-            history_assertions.multi_page_publication_mutations,
-        ),
-    ] {
-        let work_limit = mutation_rows as f64 * thresholds.root_publication_work_per_mutation
+    for publication in [publication_small, publication_large, multi_page_generation] {
+        let requested_mutations = publication.expected_items_per_operation as f64;
+        let work_limit = requested_mutations * thresholds.root_publication_work_per_mutation
             + thresholds.root_publication_fixed_work;
         gates.push(max_gate(
             &format!("{}_bounded_work", publication.name),
@@ -1539,7 +1526,7 @@ fn evaluate_gates(
             work_limit,
             work_limit,
             "count/op",
-            "Root publication work is capped by declared mutations plus fixed protocol overhead.",
+            "Root publication work is capped per requested logical mutation, including transaction evidence and R3/Q2 replication, plus fixed protocol overhead.",
         ));
     }
 
@@ -1569,6 +1556,15 @@ fn evaluate_gates(
         0.0,
         "checks",
         "Every page of one generation must advance without gaps, duplicates, or early completion.",
+    ));
+    gates.push(exact_gate(
+        "multi_page_generation_history_shape_is_exact",
+        "correctness",
+        "history_mutations",
+        history_assertions.multi_page_publication_mutations as f64,
+        history_assertions.expected_multi_page_publication_mutations as f64,
+        "mutations",
+        "Generation history must contain the protocol-defined canonical, transaction-update, header, and publication-manifest rows.",
     ));
     gates.push(exact_gate(
         "multi_page_generation_uses_expected_page_count",
@@ -1655,7 +1651,7 @@ fn evaluate_gates(
             "History-page work is capped by the requested page plus fixed seek and validation overhead.",
         ));
     }
-    let traversal_work_limit = history_assertions.multi_page_publication_mutations as f64
+    let traversal_work_limit = history_assertions.expected_multi_page_publication_mutations as f64
         * thresholds.history_work_per_item
         + history_assertions.expected_traversal_pages as f64 * thresholds.history_fixed_work;
     gates.push(max_gate(

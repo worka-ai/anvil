@@ -45,6 +45,8 @@ pub struct ProfileSpec {
     pub multi_page_generation_warmup_operations: usize,
     pub multi_page_generation_samples: usize,
     pub multi_page_generation_rows: usize,
+    pub root_publication_history_rows_per_logical_mutation: usize,
+    pub root_publication_history_fixed_rows: usize,
     pub thresholds: Thresholds,
 }
 
@@ -233,6 +235,13 @@ fn validate_profile(name: &str, profile: &ProfileSpec) -> Result<()> {
     {
         bail!(
             "{name}: multi-page generation settings need a warmup, at least 3 samples, more rows than both page bounds, and at most 4096 rows"
+        );
+    }
+    if !(1..=16).contains(&profile.root_publication_history_rows_per_logical_mutation)
+        || !(1..=64).contains(&profile.root_publication_history_fixed_rows)
+    {
+        bail!(
+            "{name}: root publication history amplification must use 1 to 16 rows per logical mutation and 1 to 64 fixed rows"
         );
     }
 

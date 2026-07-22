@@ -8750,6 +8750,16 @@ warm-up operations                    64            512
 point-read samples                 1,000         10,000
 page samples                         250          2,000
 durable-mutation samples              24            100
+root-publication warm-ups               2              8
+root-publication samples               20             50
+history-probe warm-ups                  4             16
+history-probe samples                  20            100
+history page size                       4              8
+multi-page publication warm-ups         1              1
+multi-page publication samples          3              5
+multi-page logical mutations          256          1,024
+history rows per logical mutation       2              2
+fixed history rows per publication      2              2
 ```
 
 The large collection is at least sixteen times the corresponding small
@@ -8771,6 +8781,16 @@ prefix_page_deep_large
 bounded_list_scaled_page_large
 durable_single_row
 transactional_head_read_and_batch
+atomic_root_publication_small_table
+atomic_root_publication_large_table
+atomic_root_publication_multi_page_generation
+generation_inventory_small_table
+generation_inventory_large_table
+generation_inventory_captured_after_growth
+generation_catch_up_early_large
+generation_catch_up_deep_small
+generation_catch_up_deep_large
+generation_catch_up_multi_page_traversal
 ```
 
 `transactional_head_read_and_batch` is the directly benchmarkable local
@@ -8810,9 +8830,36 @@ deep-page work, large / small                       <= 3.0
 deep-page work / early-page work                    <= 3.0
 scaled-page work / normal-page work                 <= (scaled_page_size / page_size) * 2.0
 each page's logical work per operation              <= page_size * 16 + 512
+single-root publication work, large / small          <= 4.0
+multi-page / single-row publication work             <= logical_mutations * 2.0
+root publication work per operation                  <= requested_logical_mutations * 768 + 32,768
+history inventory work, large / small                <= 4.0
+captured inventory after growth / before growth      <= 4.0
+deep catch-up work, large / small                    <= 4.0
+deep catch-up work / early catch-up work             <= 4.0
+whole-generation work / one-page work                <= expected_pages * 2.0
+history page work per operation                      <= history_page_size * 512 + 65,536
+whole-generation traversal work                      <= mutations * 512 + pages * 65,536
 returned or mutated items per operation             == declared bounded count
 aggregate measured read work                        >= 1
 ```
+
+Publication limits are expressed against the logical mutations requested by
+the caller, not the larger number of internal history rows produced by the
+implementation. The per-mutation budget includes required transaction evidence
+and R3/Q2 replication. Keeping the public input as the denominator makes the
+Rust gate and independent report verifier identical and prevents an
+implementation from weakening its own limit by emitting additional internal
+records. The independent table-size and scaling-ratio gates still reject work
+that grows with unrelated rows.
+
+For this benchmark's implicit transaction, every logical mutation produces one
+canonical row and one transaction-update row. The transaction header and root
+publication manifest add two fixed rows, so a generation containing `N`
+logical mutations must expose exactly `2N + 2` history mutations. Both the Rust
+runner and independent verifier derive traversal bounds from these checked-in
+protocol-amplification fields rather than trusting an implementation-reported
+count.
 
 The absolute latency limits are intentionally conservative fault detectors, not
 competitive service objectives. Page latency is normalized to a same-process
