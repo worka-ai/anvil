@@ -80,28 +80,18 @@ pub(crate) async fn read_multipart_frame_fences(
 }
 
 #[test]
-fn multipart_upload_indexes_share_one_embedded_post_generation() {
+fn multipart_upload_indexes_share_logical_revision_without_reserving_publication_generation() {
     let upload = test_upload(7, 1, 2, "shared-generation");
     let row = MultipartUploadCurrentRow {
         upload,
-        generation: 9,
-        transaction_id: "shared-generation-test".to_string(),
-        created_at_unix_nanos: 9,
+        logical_revision: 9,
     };
     let mut update = MultipartCurrentRowUpdate {
         upload_row: Some(row),
         ..Default::default()
     };
-    stage_active_count_update(
-        &mut update,
-        None,
-        1,
-        2,
-        MultipartMutationKind::CreateUpload,
-        "shared-generation-test",
-        9,
-    )
-    .unwrap();
+    stage_active_count_update(&mut update, None, 1, 2, MultipartMutationKind::CreateUpload)
+        .unwrap();
     let operations = multipart_current_row_operations(&update, "partition").unwrap();
     let payloads = operations
         .iter()
@@ -116,9 +106,18 @@ fn multipart_upload_indexes_share_one_embedded_post_generation() {
     let root_key_hash = core_meta_root_key_hash(&multipart_current_root_key(1, 2));
     assert!(payloads.iter().all(|payload| {
         core_meta_row_common_from_payload(payload)
-            .map(|common| common.root_key_hash == root_key_hash && common.root_generation == 9)
+            .map(|common| {
+                common.root_key_hash == root_key_hash
+                    && common.root_generation == MULTIPART_CURRENT_ROW_CANDIDATE_GENERATION
+            })
             .unwrap_or(false)
     }));
+    assert!(payloads[..3].iter().all(|payload| {
+        MultipartUploadCurrentRowProto::decode(payload.as_slice())
+            .map(|row| row.logical_revision == 9)
+            .unwrap_or(false)
+    }));
+    assert_ne!(MULTIPART_CURRENT_ROW_CANDIDATE_GENERATION, 9);
     assert!(payloads[..3].windows(2).all(|pair| pair[0] == pair[1]));
 }
 
@@ -226,20 +225,24 @@ async fn multipart_part_pages_seek_one_upload_and_bound_materialization() {
     // This same-table row has a mismatched physical key and would fail if the
     // page materialized another upload's part rows.
     let meta = CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
-    let unrelated_part = test_part(99, 1, "unrelated", 1, "unrelated");
-    let unrelated_row = MultipartPartCurrentRow {
+    let unrelated_part = MultipartPartCurrentRow {
         tenant_id: 1,
         bucket_id: 2,
-        part: unrelated_part,
-        generation: 1,
-        transaction_id: "unrelated-part".to_string(),
-        created_at_unix_nanos: 1,
+        part: test_part(98, 1, "unrelated", 1, "unrelated"),
+        logical_revision: 1,
     };
+    let mut malformed = MultipartPartCurrentRowProto::decode(
+        encode_part_current_row(&unrelated_part).unwrap().as_slice(),
+    )
+    .unwrap();
+    malformed.part = None;
+    let mut malformed_payload = Vec::new();
+    malformed.encode(&mut malformed_payload).unwrap();
     meta.put(
         CF_OBJECT_HEADS,
         TABLE_MULTIPART_PART_CURRENT_ROW,
         &multipart_part_row_key(1, 2, 98, 1).unwrap(),
-        &encode_part_current_row(&unrelated_row).unwrap(),
+        &malformed_payload,
     )
     .unwrap();
 
@@ -288,28 +291,40 @@ async fn active_upload_pages_seek_bucket_key_and_use_point_heads() {
 
     let mut terminal = test_upload(10, 1, 2, "docs/0");
     terminal.completed_at = Some(Utc::now());
-    let terminal_row = MultipartUploadCurrentRow {
-        upload: terminal.clone(),
-        generation: 2,
-        transaction_id: "terminal-active-index".to_string(),
-        created_at_unix_nanos: 2,
-    };
+    write_stale_active_index_for_test(&storage, &terminal)
+        .await
+        .unwrap();
     let meta = CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
-    meta.put(
-        CF_OBJECT_HEADS,
-        TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
-        &multipart_active_upload_key(2, &terminal.key, terminal.upload_id).unwrap(),
-        &encode_upload_current_row(&terminal_row).unwrap(),
-    )
-    .unwrap();
     // A malformed same-table row outside this bucket proves the source prefix
     // does not visit or materialize unrelated rows.
     let unrelated_id = uuid::Uuid::new_v4();
+    let unrelated_upload = MultipartUploadCurrentRow {
+        upload: MultipartUpload {
+            id: 99,
+            tenant_id: 1,
+            bucket_id: 99,
+            key: "broken".to_string(),
+            upload_id: unrelated_id,
+            created_at: Utc::now(),
+            completed_at: None,
+            aborted_at: None,
+        },
+        logical_revision: 1,
+    };
+    let mut malformed = MultipartUploadCurrentRowProto::decode(
+        encode_upload_current_row(&unrelated_upload)
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
+    malformed.upload = None;
+    let mut malformed_payload = Vec::new();
+    malformed.encode(&mut malformed_payload).unwrap();
     meta.put(
         CF_OBJECT_HEADS,
         TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
         &multipart_active_upload_key(99, "broken", unrelated_id).unwrap(),
-        b"malformed unrelated active index row",
+        &malformed_payload,
     )
     .unwrap();
 
@@ -562,82 +577,95 @@ async fn write_current_rows_for_test(
     upload: &MultipartUpload,
     parts: &[MultipartUploadPart],
 ) -> Result<()> {
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
-    let transaction_id = format!("multipart-current-rows-test:{}", uuid::Uuid::new_v4());
-    let upload_row = MultipartUploadCurrentRow {
-        upload: upload.clone(),
-        generation: 1,
-        transaction_id: transaction_id.clone(),
-        created_at_unix_nanos: current_unix_nanos()?,
-    };
-    let upload_payload = encode_upload_current_row(&upload_row)?;
-    meta.put(
-        CF_OBJECT_HEADS,
-        TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
-        &multipart_upload_row_key(upload.tenant_id, upload.bucket_id, upload.id)?,
-        &upload_payload,
+    let store = CoreStore::new(storage.clone()).await?;
+    let partition_id = hex::encode(multipart_metadata_partition_id(
+        upload.tenant_id,
+        upload.bucket_id,
+    ));
+    let update = multipart_current_row_update(
+        &store,
+        upload.tenant_id,
+        upload.bucket_id,
+        MultipartMutationKind::CreateUpload,
+        Some(upload),
+        None,
     )?;
-    meta.put(
-        CF_OBJECT_HEADS,
-        TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
-        &multipart_upload_id_head_key(upload.id)?,
-        &upload_payload,
-    )?;
-    if upload.completed_at.is_none() && upload.aborted_at.is_none() {
-        meta.put(
-            CF_OBJECT_HEADS,
-            TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
-            &multipart_active_upload_key(upload.bucket_id, &upload.key, upload.upload_id)?,
-            &upload_payload,
-        )?;
-        let active_count_key = multipart_active_count_key(upload.bucket_id)?;
-        let active_count = meta
-            .get(
-                CF_OBJECT_HEADS,
-                TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
-                &active_count_key,
-            )?
-            .as_deref()
-            .map(|payload| active_count_value(payload, upload.bucket_id))
-            .transpose()?
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("test multipart active count overflow"))?;
-        meta.put(
-            CF_OBJECT_HEADS,
-            TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
-            &active_count_key,
-            &encode_active_count_current_row(&MultipartActiveCountCurrentRow {
-                tenant_id: upload.tenant_id,
-                bucket_id: upload.bucket_id,
-                active_count,
-                generation: 1,
-                transaction_id: transaction_id.clone(),
-                created_at_unix_nanos: current_unix_nanos()?,
-            })?,
-        )?;
-    }
-    for part in parts {
-        let part_row = MultipartPartCurrentRow {
-            tenant_id: upload.tenant_id,
-            bucket_id: upload.bucket_id,
-            part: part.clone(),
-            generation: 1,
-            transaction_id: transaction_id.clone(),
-            created_at_unix_nanos: current_unix_nanos()?,
-        };
-        meta.put(
-            CF_OBJECT_HEADS,
-            TABLE_MULTIPART_PART_CURRENT_ROW,
-            &multipart_part_row_key(
+    let operations = multipart_current_row_operations(&update, &partition_id)?;
+    store
+        .commit_mutation_batch(CoreMutationBatch {
+            transaction_id: format!("multipart-current-test:{}", uuid::Uuid::new_v4()),
+            scope_partition: partition_id.clone(),
+            committed_by_principal: multipart_metadata_partition_principal(
                 upload.tenant_id,
                 upload.bucket_id,
-                part.upload_id,
-                part.part_number,
-            )?,
-            &encode_part_current_row(&part_row)?,
+            ),
+            root_publications: multipart_root_publications(
+                multipart_current_root_key(upload.tenant_id, upload.bucket_id),
+                partition_id.clone(),
+            ),
+            preconditions: update.preconditions,
+            operations,
+        })
+        .await?;
+    for part in parts {
+        let update = multipart_current_row_update(
+            &store,
+            upload.tenant_id,
+            upload.bucket_id,
+            MultipartMutationKind::UpsertPart,
+            None,
+            Some(part),
         )?;
+        let operations = multipart_current_row_operations(&update, &partition_id)?;
+        store
+            .commit_mutation_batch(CoreMutationBatch {
+                transaction_id: format!("multipart-current-test:{}", uuid::Uuid::new_v4()),
+                scope_partition: partition_id.clone(),
+                committed_by_principal: multipart_metadata_partition_principal(
+                    upload.tenant_id,
+                    upload.bucket_id,
+                ),
+                root_publications: multipart_root_publications(
+                    multipart_current_root_key(upload.tenant_id, upload.bucket_id),
+                    partition_id.clone(),
+                ),
+                preconditions: update.preconditions,
+                operations,
+            })
+            .await?;
     }
+    Ok(())
+}
+
+async fn write_stale_active_index_for_test(
+    storage: &Storage,
+    upload: &MultipartUpload,
+) -> Result<()> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let transaction_id = format!("terminal-active-index:{}", uuid::Uuid::new_v4());
+    let row = MultipartUploadCurrentRow {
+        upload: upload.clone(),
+        logical_revision: 1,
+    };
+    let payload = encode_upload_current_row(&row)?;
+    let tuple_key = multipart_active_upload_key(upload.bucket_id, &upload.key, upload.upload_id)?;
+    let op = CoreMetaBatchOp {
+        cf: CF_OBJECT_HEADS,
+        table_id: TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
+        tuple_key: &tuple_key,
+        common: None,
+        kind: CoreMetaBatchOpKind::Put(&payload),
+    };
+    store
+        .commit_coremeta_root_groups(
+            &transaction_id,
+            &[op],
+            &[CoreMetaRootPublication::new(
+                multipart_current_root_key(upload.tenant_id, upload.bucket_id),
+                WriterFamily::ObjectBlob,
+            )],
+        )
+        .await?;
     Ok(())
 }
 
@@ -659,6 +687,13 @@ async fn append_history_only_for_test(
             transaction_id: format!("multipart-history-only-test:{mutation_id}"),
             scope_partition: partition_id.clone(),
             committed_by_principal: multipart_metadata_partition_principal(tenant_id, bucket_id),
+            root_publications: vec![
+                CoreMutationRootPublication::new(
+                    partition_id.clone(),
+                    WriterFamily::CoreControl.as_str(),
+                )
+                .coordinator(),
+            ],
             preconditions: Vec::new(),
             operations: vec![CoreMutationOperation::StreamAppend {
                 partition_id,
