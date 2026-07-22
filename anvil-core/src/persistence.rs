@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{Mutex, Notify, OnceCell, mpsc::Sender};
+use tokio::sync::{Notify, OnceCell, mpsc::Sender};
 
 use crate::{
     append_journal, authz_journal, authz_repair,
@@ -20,11 +20,12 @@ use crate::{
     manifest_journal, mesh_control_stream, mesh_directory, metadata_journal, model_journal,
     multipart_journal, object_links,
     partition_fence::{
-        AcquireOwnership, ForceExpireOwnership, MAX_OWNERSHIP_LEASE_MS, OWNERSHIP_HELD,
-        OwnershipPrincipal, OwnershipResource, OwnershipResourceKind, PartitionOwnerStatus,
-        PartitionRecoveryAcquire, PartitionWritePermit, RenewOwnership, acquire_ownership,
-        acquire_partition_recovery, force_expire_ownership, force_expire_partition_owner_for_node,
-        list_active_ownership_fences_for_node, list_partition_owners_for_node,
+        AcquireOwnership, ForceExpireOwnership, MAX_OWNERSHIP_LEASE_MS,
+        MAX_PARTITION_FENCE_PAGE_SIZE, OWNERSHIP_HELD, OwnershipPrincipal, OwnershipResource,
+        OwnershipResourceKind, PartitionOwnerStatus, PartitionRecoveryAcquire,
+        PartitionWritePermit, RenewOwnership, acquire_ownership, acquire_partition_recovery,
+        force_expire_ownership, force_expire_partition_owner_for_node,
+        list_active_ownership_fences_for_node_page, list_partition_owners_for_node_page,
         partition_owner_is_force_expired, publish_partition_ready, read_ownership_fence,
         read_partition_owner, renew_ownership,
     },
@@ -40,11 +41,11 @@ pub struct Persistence {
     core_store: Arc<OnceCell<CoreStore>>,
     event_publisher: Option<Sender<MetadataEvent>>,
     task_notify: Arc<Notify>,
-    task_queue_write_lock: Arc<Mutex<()>>,
     mesh_id: String,
     region: String,
     cell_id: String,
     owner_node_id: String,
+    task_actor_instance_id: String,
     partition_owner_signing_key: Vec<u8>,
     embedding_providers: EmbeddingProviderRegistry,
     object_metadata_compaction_frame_threshold: u64,
@@ -499,6 +500,12 @@ pub struct TaskRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TaskPage {
+    pub tasks: Vec<TaskRecord>,
+    pub next_tuple_key: Option<Vec<u8>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TaskLeaseTarget {
     partition_family: String,
@@ -555,6 +562,9 @@ fn user_metadata_hash(user_meta: Option<&JsonValue>) -> String {
 }
 
 fn is_retryable_partition_fence_error(error: &anyhow::Error) -> bool {
+    if crate::core_store::is_retryable_mutation_conflict(error) {
+        return true;
+    }
     let message = error.to_string();
     message.contains("generation mismatch")
         || message.contains("target mismatch")
