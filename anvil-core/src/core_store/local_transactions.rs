@@ -40,6 +40,7 @@ impl CoreStore {
     async fn acquire_mutation_lock_keys(
         &self,
         lock_keys: &BTreeSet<(String, String)>,
+        publication_root_hashes: &BTreeSet<String>,
     ) -> Result<CoreStoreMutationLocks> {
         let mut locks = CoreStoreMutationLocks {
             _root_plan_guards: Vec::new(),
@@ -47,7 +48,7 @@ impl CoreStore {
         };
         for (kind, id) in lock_keys {
             let guard = self.acquire_named_lock(kind, id).await?;
-            if kind == "coremeta-root" {
+            if kind == "coremeta-root" && publication_root_hashes.contains(id) {
                 locks._root_plan_guards.push(guard);
             } else {
                 locks.mutable_guards.push(guard);
@@ -60,10 +61,17 @@ impl CoreStore {
         &self,
         batch: &CoreMutationBatch,
     ) -> Result<CoreStoreMutationLocks> {
+        let publication_root_hashes = batch
+            .root_publications
+            .iter()
+            .map(|publication| root_key_hash(&publication.root_anchor_key))
+            .collect::<BTreeSet<_>>();
         let mut acquired_keys = BTreeSet::new();
         for _ in 0..CORE_PROCESS_LOCK_RETRY_ATTEMPTS {
             let lock_keys = self.batch_lock_keys(batch)?;
-            let guards = self.acquire_mutation_lock_keys(&lock_keys).await?;
+            let guards = self
+                .acquire_mutation_lock_keys(&lock_keys, &publication_root_hashes)
+                .await?;
 
             // Deletions discover their root from the current row. Recompute while
             // row locks are held so a concurrent writer cannot make us miss a
@@ -182,7 +190,10 @@ impl CoreStore {
                 .read_transaction_preconditions_unlocked(transaction_id)
                 .await?;
             let lock_keys = self.explicit_transaction_lock_keys(&transaction, &preconditions)?;
-            let guards = self.acquire_mutation_lock_keys(&lock_keys).await?;
+            let publication_root_hashes = BTreeSet::from([transaction.root_key_hash.clone()]);
+            let guards = self
+                .acquire_mutation_lock_keys(&lock_keys, &publication_root_hashes)
+                .await?;
             let current = self
                 .read_transaction_unlocked(transaction_id)
                 .await?
