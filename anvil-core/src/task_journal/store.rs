@@ -8,16 +8,18 @@ use super::{
 };
 use crate::{
     core_store::{
-        CF_LEASES_FENCES, CoreMetaStore, CoreMutationBatch, CoreMutationOperation,
-        CoreMutationPrecondition, CoreStore, TABLE_TASK_CURRENT_ROW, core_meta_payload_digest,
-        core_meta_record_tuple_key, core_meta_root_key_hash,
+        CF_LEASES_FENCES, CoreMetaStore, CoreMutationBatch, CoreMutationBatchReceipt,
+        CoreMutationOperation, CoreMutationPrecondition, CoreMutationRootPublication, CoreStore,
+        CoreTransactionState, TABLE_TASK_CURRENT_ROW, core_meta_payload_digest,
+        core_meta_record_tuple_key,
     },
+    formats::writer::WriterFamily,
     persistence::{TaskPage, TaskRecord},
     storage::Storage,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_TASK_PAGE_ROWS: usize = 1_000;
 const MAX_QUEUE_CAS_ATTEMPTS: usize = 64;
@@ -56,6 +58,8 @@ impl QueueStore {
     }
 
     pub fn snapshot(&self, key: &[u8]) -> Result<RowSnapshot> {
+        // Mutation snapshots are exact write preconditions; commit must compare
+        // the physical canonical bytes even while another publication is staged.
         let payload = self
             .meta
             .get(CF_LEASES_FENCES, TABLE_TASK_CURRENT_ROW, key)?;
@@ -68,8 +72,20 @@ impl QueueStore {
         Ok(RowSnapshot { payload, decoded })
     }
 
-    pub fn read_task(&self, task_id: i64) -> Result<Option<TaskEntry>> {
-        let snapshot = self.snapshot(&current_key(task_id)?)?;
+    fn visible_snapshot(&self, core_store: &CoreStore, key: &[u8]) -> Result<RowSnapshot> {
+        let payload =
+            core_store.read_coremeta_row(CF_LEASES_FENCES, TABLE_TASK_CURRENT_ROW, key)?;
+        record_row_visits(1);
+        let decoded = payload
+            .as_deref()
+            .map(decode_queue_row)
+            .transpose()
+            .context("decode visible task queue point row")?;
+        Ok(RowSnapshot { payload, decoded })
+    }
+
+    pub fn read_task(&self, core_store: &CoreStore, task_id: i64) -> Result<Option<TaskEntry>> {
+        let snapshot = self.visible_snapshot(core_store, &current_key(task_id)?)?;
         match snapshot.decoded.map(|decoded| decoded.row) {
             None => Ok(None),
             Some(TaskQueueRow::Task(entry)) if entry.task.id == task_id => Ok(Some(entry)),
@@ -77,14 +93,18 @@ impl QueueStore {
         }
     }
 
-    pub fn first_due_task(&self, now: DateTime<Utc>) -> Result<Option<TaskEntry>> {
-        let Some(projection) = self.first_pending()? else {
+    pub fn first_due_task(
+        &self,
+        core_store: &CoreStore,
+        now: DateTime<Utc>,
+    ) -> Result<Option<TaskEntry>> {
+        let Some(projection) = self.first_pending(core_store)? else {
             return Ok(None);
         };
         if !projection.order.is_due(now)? {
             return Ok(None);
         }
-        let Some(entry) = self.read_task(projection.order.task_id)? else {
+        let Some(entry) = self.read_task(core_store, projection.order.task_id)? else {
             bail!("task pending projection references a missing task");
         };
         if TaskOrder::from_task(&entry.task)? != projection.order {
@@ -95,6 +115,7 @@ impl QueueStore {
 
     pub fn list_tasks_page(
         &self,
+        core_store: &CoreStore,
         after_tuple_key: Option<&[u8]>,
         page_size: usize,
     ) -> Result<TaskPage> {
@@ -105,7 +126,7 @@ impl QueueStore {
         if after_tuple_key.is_some_and(|cursor| !cursor.starts_with(&prefix)) {
             bail!("task page cursor is outside the task collection");
         }
-        let mut rows = self.meta.scan_prefix_page(
+        let mut rows = core_store.scan_coremeta_prefix_page(
             CF_LEASES_FENCES,
             TABLE_TASK_CURRENT_ROW,
             &prefix,
@@ -148,9 +169,9 @@ impl QueueStore {
         })
     }
 
-    fn first_pending(&self) -> Result<Option<PendingProjection>> {
+    fn first_pending(&self, core_store: &CoreStore) -> Result<Option<PendingProjection>> {
         let prefix = pending_prefix()?;
-        let rows = self.meta.scan_prefix_page(
+        let rows = core_store.scan_coremeta_prefix_page(
             CF_LEASES_FENCES,
             TABLE_TASK_CURRENT_ROW,
             &prefix,
@@ -179,6 +200,7 @@ pub(super) struct TaskMutation {
     transaction_id: String,
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
+    additional_preconditions: Vec<CoreMutationPrecondition>,
     initial: BTreeMap<Vec<u8>, RowSnapshot>,
     desired: BTreeMap<Vec<u8>, Option<TaskQueueRow>>,
     audit: Vec<TaskAuditEvent>,
@@ -195,6 +217,7 @@ impl TaskMutation {
             transaction_id: format!("task-queue:{}", uuid::Uuid::new_v4()),
             fence_token,
             partition_precondition,
+            additional_preconditions: Vec::new(),
             initial: BTreeMap::new(),
             desired: BTreeMap::new(),
             audit: Vec::new(),
@@ -237,6 +260,10 @@ impl TaskMutation {
         self.audit.push(event);
     }
 
+    pub fn add_precondition(&mut self, precondition: CoreMutationPrecondition) {
+        self.additional_preconditions.push(precondition);
+    }
+
     pub async fn commit(mut self) -> Result<()> {
         self.materialize_audit_rows()?;
         if self.desired.is_empty() {
@@ -249,12 +276,29 @@ impl TaskMutation {
         let created_at_unix_nanos = current_unix_nanos()?;
         let partition_id = hex::encode(task_queue_partition_id());
         let core_store = CoreStore::new(self.store.storage.clone()).await?;
-        let root_post_generations = self.root_post_generations(&core_store).await?;
+        let mutation_roots = self.mutation_roots()?;
+        let mut root_publications = vec![
+            CoreMutationRootPublication::new(
+                partition_id.clone(),
+                WriterFamily::CoreControl.as_str(),
+            )
+            .coordinator(),
+        ];
+        root_publications.extend(
+            mutation_roots
+                .iter()
+                .filter(|root| root.as_str() != partition_id.as_str())
+                .cloned()
+                .map(|root| {
+                    CoreMutationRootPublication::new(root, WriterFamily::CoreControl.as_str())
+                }),
+        );
         let mut preconditions = self
             .partition_precondition
             .take()
             .into_iter()
             .collect::<Vec<_>>();
+        preconditions.append(&mut self.additional_preconditions);
         let mut operations = Vec::new();
 
         for (key, desired) in &self.desired {
@@ -268,25 +312,12 @@ impl TaskMutation {
             preconditions.push(row_precondition(key, snapshot));
             match desired {
                 Some(row) => {
-                    let root_key = row_root_key(row);
-                    let generation =
-                        root_post_generations
-                            .get(&root_key)
-                            .copied()
-                            .ok_or_else(|| {
-                                anyhow!("task mutation lost the post generation for {root_key}")
-                            })?;
                     operations.push(CoreMutationOperation::CoreMetaPut {
                         partition_id: partition_id.clone(),
                         cf: CF_LEASES_FENCES.to_string(),
                         table_id: TABLE_TASK_CURRENT_ROW,
                         tuple_key: key.clone(),
-                        payload: encode_queue_row(
-                            row,
-                            &self.transaction_id,
-                            generation,
-                            created_at_unix_nanos,
-                        )?,
+                        payload: encode_queue_row(row, created_at_unix_nanos)?,
                     });
                 }
                 None => operations.push(CoreMutationOperation::CoreMetaDelete {
@@ -300,16 +331,17 @@ impl TaskMutation {
         if operations.is_empty() {
             return Ok(());
         }
-        core_store
+        let receipt = core_store
             .commit_mutation_batch(CoreMutationBatch {
                 transaction_id: self.transaction_id,
                 scope_partition: partition_id,
                 committed_by_principal: task_queue_partition_principal(),
+                root_publications,
                 preconditions,
                 operations,
             })
             .await?;
-        Ok(())
+        require_committed_task_mutation(&receipt)
     }
 
     fn materialize_audit_rows(&mut self) -> Result<()> {
@@ -333,8 +365,8 @@ impl TaskMutation {
         Ok(())
     }
 
-    async fn root_post_generations(&self, core_store: &CoreStore) -> Result<BTreeMap<String, u64>> {
-        let mut observed = BTreeMap::<String, Option<u64>>::new();
+    fn mutation_roots(&self) -> Result<BTreeSet<String>> {
+        let mut roots = BTreeSet::new();
         for (key, desired) in &self.desired {
             let snapshot = self
                 .initial
@@ -356,43 +388,9 @@ impl TaskMutation {
             let root = desired_root.or(initial_root).ok_or_else(|| {
                 anyhow!("task mutation cannot delete a row that was already absent")
             })?;
-            let entry = observed.entry(root.clone()).or_default();
-            if let Some(generation) = snapshot.decoded.as_ref().map(|row| row.generation) {
-                match *entry {
-                    Some(current) if current != generation => bail!(
-                        "task mutation observed multiple committed generations for root {root}"
-                    ),
-                    _ => *entry = Some(generation),
-                }
-            }
+            roots.insert(root);
         }
-
-        let mut post_generations = BTreeMap::new();
-        for (root_key, observed_generation) in observed {
-            let current_generation = match observed_generation {
-                Some(generation) => generation,
-                None => {
-                    let root_hash = core_meta_root_key_hash(&root_key);
-                    match core_store
-                        .read_internal_root_anchor_by_hash(&root_hash, 0)
-                        .await
-                    {
-                        Ok(root) => root.generation,
-                        Err(error) if is_missing_root(&error) => 0,
-                        Err(error) => {
-                            return Err(error).with_context(|| {
-                                format!("read task queue root generation for {root_key}")
-                            });
-                        }
-                    }
-                }
-            };
-            let post_generation = current_generation
-                .checked_add(1)
-                .ok_or_else(|| anyhow!("task queue root generation overflow for {root_key}"))?;
-            post_generations.insert(root_key, post_generation);
-        }
-        Ok(post_generations)
+        Ok(roots)
     }
 
     fn ensure_snapshot(&mut self, key: &[u8]) -> Result<()> {
@@ -401,6 +399,20 @@ impl TaskMutation {
         }
         Ok(())
     }
+}
+
+pub(super) fn require_committed_task_mutation(receipt: &CoreMutationBatchReceipt) -> Result<()> {
+    if receipt.state == CoreTransactionState::Committed {
+        return Ok(());
+    }
+    bail!(
+        "task queue mutation {} did not commit: {}",
+        receipt.transaction_id,
+        receipt
+            .finalisation_error
+            .as_deref()
+            .unwrap_or("unknown finalisation failure")
+    )
 }
 
 pub(super) fn is_queue_cas_conflict(error: &anyhow::Error) -> bool {
@@ -413,17 +425,10 @@ pub(super) fn is_queue_cas_conflict(error: &anyhow::Error) -> bool {
             && (message.contains("target mismatch")
                 || message.contains("must be absent")
                 || message.contains("must be present")
-                || message.contains("generation mismatch")))
+                || message.contains("generation mismatch")
+                || message.contains("payload hash mismatch")))
             || message.contains("CoreStore root CAS expected generation mismatch")
             || message.contains("CoreStore root CAS expected generation missing")
-    })
-}
-
-fn is_missing_root(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .to_string()
-            .contains("CoreStore root anchor not found")
     })
 }
 
@@ -471,12 +476,12 @@ pub(crate) fn task_row_visits_for_test() -> u64 {
 
 #[cfg(test)]
 pub(crate) async fn read_task_frame_fences_for_test(storage: &Storage) -> Result<Vec<u64>> {
-    let store = QueueStore::open(storage)?;
+    let store = CoreStore::new(storage.clone()).await?;
     let prefix = journal_prefix()?;
     let mut after = None;
     let mut fences = Vec::new();
     loop {
-        let rows = store.meta.scan_prefix_page(
+        let rows = store.scan_coremeta_prefix_page(
             CF_LEASES_FENCES,
             TABLE_TASK_CURRENT_ROW,
             &prefix,

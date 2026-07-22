@@ -8,10 +8,11 @@ use super::{
     store::{QueueStore, TaskMutation, is_queue_cas_conflict, max_queue_cas_attempts},
 };
 use crate::{
-    core_store::CoreMutationPrecondition,
+    core_store::{CoreMutationPrecondition, CoreStore},
     partition_fence::{PartitionWritePermit, partition_write_precondition},
     persistence::TaskRecord,
     storage::Storage,
+    task_lease::STALE_FENCE,
     tasks::{TaskStatus, TaskType},
 };
 use anyhow::{Result, anyhow, bail};
@@ -326,10 +327,13 @@ async fn claim_pending_tasks_inner(
         bail!("task claim limit exceeds {MAX_CLAIM_PAGE}");
     }
     let mut claimed = Vec::with_capacity(limit);
+    let core_store = CoreStore::new(storage.clone()).await?;
     while claimed.len() < limit {
         let mut completed_slot = false;
         for attempt in 0..max_queue_cas_attempts() {
-            let Some(candidate) = QueueStore::open(storage)?.first_due_task(Utc::now())? else {
+            let Some(candidate) =
+                QueueStore::open(storage)?.first_due_task(&core_store, Utc::now())?
+            else {
                 return Ok(claimed);
             };
             let mut mutation =
@@ -391,12 +395,14 @@ pub(crate) async fn list_tasks_page(
     after_tuple_key: Option<&[u8]>,
     page_size: usize,
 ) -> Result<crate::persistence::TaskPage> {
-    QueueStore::open(storage)?.list_tasks_page(after_tuple_key, page_size)
+    let core_store = CoreStore::new(storage.clone()).await?;
+    QueueStore::open(storage)?.list_tasks_page(&core_store, after_tuple_key, page_size)
 }
 
 pub(crate) async fn has_due_tasks(storage: &Storage) -> Result<bool> {
+    let core_store = CoreStore::new(storage.clone()).await?;
     Ok(QueueStore::open(storage)?
-        .first_due_task(Utc::now())?
+        .first_due_task(&core_store, Utc::now())?
         .is_some())
 }
 
@@ -406,7 +412,7 @@ pub(crate) async fn update_task_status(
     task_id: i64,
     status: TaskStatus,
 ) -> Result<()> {
-    update_task_status_inner(storage, task_id, status, 0, None).await
+    update_task_status_inner(storage, task_id, status, 0, None, None, None).await
 }
 
 pub(crate) async fn update_task_status_with_permit(
@@ -425,6 +431,32 @@ pub(crate) async fn update_task_status_with_permit(
         status,
         permit.fence_token,
         Some(partition_precondition),
+        None,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn update_task_status_with_execution_guard(
+    storage: &Storage,
+    task_id: i64,
+    expected_attempts: i32,
+    status: TaskStatus,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+    lease_precondition: CoreMutationPrecondition,
+) -> Result<()> {
+    require_task_queue_permit(permit)?;
+    let partition_precondition =
+        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    update_task_status_inner(
+        storage,
+        task_id,
+        status,
+        permit.fence_token,
+        Some(partition_precondition),
+        Some(lease_precondition),
+        Some(expected_attempts),
     )
     .await
 }
@@ -435,12 +467,18 @@ async fn update_task_status_inner(
     status: TaskStatus,
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
+    additional_precondition: Option<CoreMutationPrecondition>,
+    expected_running_attempts: Option<i32>,
 ) -> Result<()> {
     for attempt in 0..max_queue_cas_attempts() {
         let mut mutation = TaskMutation::new(storage, fence_token, partition_precondition.clone())?;
+        if let Some(precondition) = additional_precondition.clone() {
+            mutation.add_precondition(precondition);
+        }
         let Some(mut entry) = mutation.read_task(task_id)? else {
             return Ok(());
         };
+        require_running_attempt(&entry, expected_running_attempts)?;
         if entry.task.status == status {
             return Ok(());
         }
@@ -472,7 +510,7 @@ async fn update_task_status_inner(
 
 #[cfg(test)]
 pub(crate) async fn fail_task(storage: &Storage, task_id: i64, error: &str) -> Result<()> {
-    fail_task_inner(storage, task_id, error, 0, None).await
+    fail_task_inner(storage, task_id, error, 0, None, None, None).await
 }
 
 pub(crate) async fn fail_task_with_permit(
@@ -491,6 +529,32 @@ pub(crate) async fn fail_task_with_permit(
         error,
         permit.fence_token,
         Some(partition_precondition),
+        None,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn fail_task_with_execution_guard(
+    storage: &Storage,
+    task_id: i64,
+    expected_attempts: i32,
+    error: &str,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+    lease_precondition: CoreMutationPrecondition,
+) -> Result<()> {
+    require_task_queue_permit(permit)?;
+    let partition_precondition =
+        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    fail_task_inner(
+        storage,
+        task_id,
+        error,
+        permit.fence_token,
+        Some(partition_precondition),
+        Some(lease_precondition),
+        Some(expected_attempts),
     )
     .await
 }
@@ -501,12 +565,18 @@ async fn fail_task_inner(
     error: &str,
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
+    additional_precondition: Option<CoreMutationPrecondition>,
+    expected_running_attempts: Option<i32>,
 ) -> Result<()> {
     for attempt in 0..max_queue_cas_attempts() {
         let mut mutation = TaskMutation::new(storage, fence_token, partition_precondition.clone())?;
+        if let Some(precondition) = additional_precondition.clone() {
+            mutation.add_precondition(precondition);
+        }
         let Some(mut entry) = mutation.read_task(task_id)? else {
             return Ok(());
         };
+        require_running_attempt(&entry, expected_running_attempts)?;
         if entry.task.status == TaskStatus::Completed {
             return Ok(());
         }
@@ -567,6 +637,20 @@ async fn fail_task_inner(
         }
     }
     unreachable!("bounded task failure loop returns on its final attempt")
+}
+
+fn require_running_attempt(entry: &TaskEntry, expected_attempts: Option<i32>) -> Result<()> {
+    let Some(expected_attempts) = expected_attempts else {
+        return Ok(());
+    };
+    if entry.task.status != TaskStatus::Running || entry.task.attempts != expected_attempts {
+        bail!(
+            "{STALE_FENCE}: task execution attempt changed (expected attempts={expected_attempts}, actual status={:?}, actual attempts={})",
+            entry.task.status,
+            entry.task.attempts
+        );
+    }
+    Ok(())
 }
 
 fn complete_entry(
