@@ -49,6 +49,7 @@ pub(super) async fn create_fixture(cluster: &DockerTestCluster, label: &str) -> 
         options: None,
     });
     add_actor_bearer(&mut request, &actor);
+    request.set_timeout(DISTRIBUTED_WAIT);
     let bucket_id = client
         .create_bucket(request)
         .await
@@ -81,13 +82,43 @@ pub(super) async fn put_object_at(
     content: &[u8],
     identity: &MutationIdentity,
 ) -> Result<PutObjectResponse, Status> {
+    put_object_at_with_transaction(endpoint, fixture, object_key, content, identity, None).await
+}
+
+pub(super) async fn put_object_in_transaction_at(
+    endpoint: &str,
+    fixture: &DistributedFixture,
+    object_key: &str,
+    content: &[u8],
+    identity: &MutationIdentity,
+    transaction_id: &str,
+) -> Result<PutObjectResponse, Status> {
+    put_object_at_with_transaction(
+        endpoint,
+        fixture,
+        object_key,
+        content,
+        identity,
+        Some(transaction_id),
+    )
+    .await
+}
+
+async fn put_object_at_with_transaction(
+    endpoint: &str,
+    fixture: &DistributedFixture,
+    object_key: &str,
+    content: &[u8],
+    identity: &MutationIdentity,
+    transaction_id: Option<&str>,
+) -> Result<PutObjectResponse, Status> {
     let mut client = ObjectServiceClient::connect(endpoint.to_string())
         .await
         .map_err(|error| Status::unavailable(error.to_string()))?;
     let metadata = ObjectMetadata {
         bucket_name: fixture.bucket_name.clone(),
         object_key: object_key.to_string(),
-        mutation_context: Some(native_mutation_context(fixture, identity)),
+        mutation_context: Some(native_mutation_context(fixture, identity, transaction_id)),
         content_type: Some("application/octet-stream".to_string()),
         user_metadata_json: String::new(),
         storage_class: None,
@@ -104,6 +135,7 @@ pub(super) async fn put_object_at(
     }));
     let mut request = Request::new(tokio_stream::iter(frames));
     add_actor_bearer(&mut request, &fixture.actor);
+    request.set_timeout(DISTRIBUTED_WAIT);
     client
         .put_object(request)
         .await
@@ -139,6 +171,7 @@ pub(super) async fn get_object_at(
         consistency: Some(latest_consistency()),
     });
     add_actor_bearer(&mut request, &fixture.actor);
+    request.set_timeout(DISTRIBUTED_WAIT);
     let mut stream = client.get_object(request).await?.into_inner();
     let mut content = Vec::new();
     while let Some(frame) = stream.next().await {
@@ -168,6 +201,7 @@ pub(super) async fn list_object_versions_at(
         page_token: String::new(),
     });
     add_actor_bearer(&mut request, &fixture.actor);
+    request.set_timeout(DISTRIBUTED_WAIT);
     client
         .list_object_versions(request)
         .await
@@ -191,6 +225,7 @@ pub(super) fn assert_retryable_closed_failure(status: &Status, operation: &str) 
 fn native_mutation_context(
     fixture: &DistributedFixture,
     identity: &MutationIdentity,
+    transaction_id: Option<&str>,
 ) -> NativeMutationContext {
     NativeMutationContext {
         tenant_id: fixture.actor.tenant_id,
@@ -200,7 +235,7 @@ fn native_mutation_context(
         precondition: "none".to_string(),
         authz_zookie_optional: String::new(),
         idempotency_key: identity.idempotency_key.clone(),
-        transaction_id: None,
+        transaction_id: transaction_id.map(ToOwned::to_owned),
         saga_operation: None,
         saga_compensation_operation: None,
         write_visibility: None,
