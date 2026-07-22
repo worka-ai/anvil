@@ -1,10 +1,10 @@
 #![recursion_limit = "512"]
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::{Arc, Once, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use anvil::anvil_api::GetAccessTokenRequest;
@@ -23,6 +23,7 @@ use tracing_subscriber::{self, EnvFilter};
 
 mod coremeta_bootstrap;
 mod docker_cluster_control;
+mod docker_cluster_startup;
 mod docker_image;
 mod docker_observation;
 mod docker_process;
@@ -31,11 +32,14 @@ mod docker_topology;
 
 use coremeta_bootstrap::*;
 pub use docker_cluster_control::{DockerNetworkPartition, DockerPeer};
+pub use docker_cluster_startup::{
+    isolated_docker_test_cluster, isolated_docker_test_cluster_with_deferred_peer,
+};
 use docker_image::require_docker_image;
 pub use docker_observation::DockerObjectObservation;
 use docker_process::*;
 pub use docker_response_fault::GrpcLostResponseProxy;
-use docker_topology::ensure_docker_topology;
+use docker_topology::{ensure_docker_topology, prepare_docker_topology_with_deferred_peer};
 
 static INIT_LOGGER: Once = Once::new();
 static TEST_CLUSTER_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -127,13 +131,18 @@ async fn connect_docker_admin(addr: &str) -> AdminServiceClient<Channel> {
 async fn wait_for_docker_admin_ready(addr: &str, token: &str, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if let Ok(mut client) = AdminServiceClient::connect(addr.to_string()).await {
+        let attempt = tokio::time::timeout(Duration::from_secs(2), async {
+            let Ok(mut client) = AdminServiceClient::connect(addr.to_string()).await else {
+                return false;
+            };
             let mut request =
                 tonic::Request::new(anvil::anvil_api::GetLocalNodeDescriptorRequest {});
             add_docker_admin_bearer(&mut request, token);
-            if client.get_local_node_descriptor(request).await.is_ok() {
-                return true;
-            }
+            client.get_local_node_descriptor(request).await.is_ok()
+        })
+        .await;
+        if matches!(attempt, Ok(true)) {
+            return true;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -236,27 +245,6 @@ pub async fn shared_docker_test_cluster() -> SharedDockerTestCluster {
         cluster,
         _debug_throttle: debug_throttle,
     }
-}
-
-/// Create a Docker-backed cluster with a unique compose project and host ports.
-/// Use this only for tests that intentionally stop/restart nodes, need a unique
-/// region, or otherwise cannot share the long-lived Docker cluster safely.
-pub async fn isolated_docker_test_cluster(label: &str, region: &str) -> DockerTestCluster {
-    let label = compact_resource_label(label, 24);
-    let region = if region.trim().is_empty() {
-        docker_test_region()
-    } else {
-        region.to_string()
-    };
-    tokio::task::spawn_blocking(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build isolated Docker Anvil test-cluster runtime");
-        runtime.block_on(async move { DockerTestCluster::start_isolated(&label, &region).await })
-    })
-    .await
-    .expect("isolated Docker Anvil test cluster initialization panicked")
 }
 
 /// Shared default integration cluster for tests that only need normal Anvil
@@ -372,7 +360,10 @@ pub struct DockerTestCluster {
     pub public_region_host: String,
     admin_token: String,
     compose_env: Vec<(String, String)>,
+    deferred_topologies:
+        Mutex<std::collections::BTreeMap<u8, anvil::anvil_api::BootstrapMeshTopologyRequest>>,
     cleanup_on_drop: bool,
+    _cluster_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl DockerTestCluster {
@@ -403,15 +394,6 @@ impl DockerTestCluster {
             .map(|port| format!("http://127.0.0.1:{port}"))
             .collect::<Vec<_>>();
 
-        let wait_start = Instant::now();
-        for addr in &grpc_addrs {
-            assert!(
-                wait_for_http_ready(addr, Duration::from_secs(90)).await,
-                "Docker Anvil test endpoint did not become ready: {addr}"
-            );
-        }
-        emit_test_timing("docker_shared_cluster ports_ready", wait_start.elapsed());
-
         let admin_addrs = ports
             .admin_ports
             .iter()
@@ -432,6 +414,17 @@ impl DockerTestCluster {
         );
         ensure_docker_topology(&admin_addrs, &admin_token, &docker_test_region()).await;
 
+        // Distributed CoreMeta readiness depends on the lifecycle projection
+        // installed through the pre-readiness admin plane.
+        let wait_start = Instant::now();
+        for addr in &grpc_addrs {
+            assert!(
+                wait_for_http_ready(addr, Duration::from_secs(90)).await,
+                "Docker Anvil test endpoint did not become ready: {addr}"
+            );
+        }
+        emit_test_timing("docker_shared_cluster ports_ready", wait_start.elapsed());
+
         Self {
             project_name,
             compose_file,
@@ -441,11 +434,18 @@ impl DockerTestCluster {
             public_region_host: format!("{}.anvil-storage.test", docker_test_region()),
             admin_token,
             compose_env,
+            deferred_topologies: Mutex::new(std::collections::BTreeMap::new()),
             cleanup_on_drop: false,
+            _cluster_permit: None,
         }
     }
 
-    async fn start_isolated(label: &str, region: &str) -> Self {
+    async fn start_isolated(
+        label: &str,
+        region: &str,
+        deferred_ordinal: Option<u8>,
+        cluster_permit: OwnedSemaphorePermit,
+    ) -> Self {
         let _port_guard = docker_test_port_allocation_lock();
         let docker_image = require_docker_image();
         let compose_file = docker_compose_file();
@@ -469,6 +469,11 @@ impl DockerTestCluster {
                 port.to_string(),
             ));
         }
+        let mut startup_cleanup = DockerStartupCleanupGuard::new(
+            compose_file.clone(),
+            project_name.clone(),
+            compose_env.clone(),
+        );
         docker_compose_create_then_start(&compose_file, &project_name, &compose_env);
 
         let grpc_addrs = api_ports
@@ -479,15 +484,6 @@ impl DockerTestCluster {
             .iter()
             .map(|port| format!("http://127.0.0.1:{port}"))
             .collect::<Vec<_>>();
-        let wait_start = Instant::now();
-        for addr in &grpc_addrs {
-            assert!(
-                wait_for_http_ready(addr, Duration::from_secs(90)).await,
-                "isolated Docker Anvil test endpoint did not become ready: {addr}"
-            );
-        }
-        emit_test_timing("docker_isolated_cluster ports_ready", wait_start.elapsed());
-
         let admin_token = mint_docker_system_admin_token("docker-system-admin");
         let wait_start = Instant::now();
         for addr in &admin_addrs {
@@ -500,9 +496,41 @@ impl DockerTestCluster {
             "docker_isolated_cluster admin_ports_ready",
             wait_start.elapsed(),
         );
-        ensure_docker_topology(&admin_addrs, &admin_token, region).await;
+        let deferred_topology = if let Some(ordinal) = deferred_ordinal {
+            Some((
+                ordinal,
+                prepare_docker_topology_with_deferred_peer(
+                    &admin_addrs,
+                    &admin_token,
+                    region,
+                    ordinal,
+                )
+                .await,
+            ))
+        } else {
+            ensure_docker_topology(&admin_addrs, &admin_token, region).await;
+            None
+        };
 
-        Self {
+        // Distributed CoreMeta readiness depends on the lifecycle projection
+        // installed through the pre-readiness admin plane.
+        let wait_start = Instant::now();
+        for (index, addr) in grpc_addrs.iter().enumerate() {
+            if deferred_ordinal == Some(u8::try_from(index + 1).unwrap()) {
+                continue;
+            }
+            if !wait_for_http_ready(addr, Duration::from_secs(90)).await {
+                dump_docker_cluster_diagnostics(&compose_file, &project_name, &compose_env);
+                panic!(
+                    "isolated Docker Anvil peer {} endpoint did not become ready: {addr}",
+                    index + 1
+                );
+            }
+        }
+        emit_test_timing("docker_isolated_cluster ports_ready", wait_start.elapsed());
+
+        let deferred_topologies = deferred_topology.into_iter().collect();
+        let cluster = Self {
             project_name,
             compose_file,
             grpc_addrs,
@@ -511,8 +539,12 @@ impl DockerTestCluster {
             public_region_host: format!("{region}.anvil-storage.test"),
             admin_token,
             compose_env,
+            deferred_topologies: Mutex::new(deferred_topologies),
             cleanup_on_drop: true,
-        }
+            _cluster_permit: Some(cluster_permit),
+        };
+        startup_cleanup.disarm();
+        cluster
     }
 
     pub fn admin_token(&self) -> &str {
@@ -800,6 +832,21 @@ impl DockerTestCluster {
 impl Drop for DockerTestCluster {
     fn drop(&mut self) {
         if self.cleanup_on_drop {
+            let failed = std::thread::panicking();
+            if failed {
+                dump_docker_cluster_diagnostics(
+                    &self.compose_file,
+                    &self.project_name,
+                    &self.compose_env,
+                );
+            }
+            if failed && std::env::var_os("ANVIL_TEST_PRESERVE_FAILED_DOCKER_CLUSTER").is_some() {
+                eprintln!(
+                    "[anvil-test] preserving failed Docker project {}",
+                    self.project_name
+                );
+                return;
+            }
             docker_compose_with_env(
                 &self.compose_file,
                 &self.project_name,
@@ -1887,12 +1934,28 @@ async fn wait_for_http_ready(base_url: &str, timeout: Duration) -> bool {
     let start = Instant::now();
     let ready_url = format!("{}/ready", base_url.trim_end_matches('/'));
     while start.elapsed() < timeout {
-        if let Ok(response) = reqwest::get(&ready_url).await
+        if let Ok(Ok(response)) =
+            tokio::time::timeout(Duration::from_secs(2), reqwest::get(&ready_url)).await
             && response.status().is_success()
         {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    false
+}
+
+async fn wait_for_http_reachable(base_url: &str, timeout: Duration) -> bool {
+    let start = Instant::now();
+    let health_url = format!("{}/health", base_url.trim_end_matches('/'));
+    while start.elapsed() < timeout {
+        if matches!(
+            tokio::time::timeout(Duration::from_secs(2), reqwest::get(&health_url)).await,
+            Ok(Ok(_))
+        ) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     false
 }
@@ -1903,8 +1966,8 @@ async fn wait_for_all_http_ready(base_urls: &[String], timeout: Duration) -> boo
         let mut all_ready = true;
         for base_url in base_urls {
             let ready_url = format!("{}/ready", base_url.trim_end_matches('/'));
-            match reqwest::get(&ready_url).await {
-                Ok(response) if response.status().is_success() => {}
+            match tokio::time::timeout(Duration::from_secs(2), reqwest::get(&ready_url)).await {
+                Ok(Ok(response)) if response.status().is_success() => {}
                 _ => {
                     all_ready = false;
                     break;

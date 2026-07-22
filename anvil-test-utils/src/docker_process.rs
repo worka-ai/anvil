@@ -9,6 +9,45 @@ pub(super) struct DockerHostPorts {
     pub admin_ports: Vec<u16>,
 }
 
+pub(super) struct DockerStartupCleanupGuard {
+    compose_file: PathBuf,
+    project_name: String,
+    compose_env: Vec<(String, String)>,
+    armed: bool,
+}
+
+impl DockerStartupCleanupGuard {
+    pub(super) fn new(
+        compose_file: PathBuf,
+        project_name: String,
+        compose_env: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            compose_file,
+            project_name,
+            compose_env,
+            armed: true,
+        }
+    }
+
+    pub(super) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DockerStartupCleanupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            docker_compose_with_env(
+                &self.compose_file,
+                &self.project_name,
+                &["down", "-v", "--remove-orphans"],
+                &self.compose_env,
+            );
+        }
+    }
+}
+
 pub(super) fn docker_command_with_env(extra_env: &[(String, String)]) -> std::process::Command {
     let mut command = command_with_docker_env("docker");
     // Docker Desktop can deadlock concurrent container starts for the shared
@@ -367,39 +406,20 @@ pub(super) fn docker_project_needs_recreate(
     let expected_image_id = docker_image_id(expected_image);
     let mut seen_nodes = 0_u8;
     for node in 1..=docker_node_count() {
-        let service = docker_node_service(node);
-        let output = command_with_docker_env("docker")
-            .args([
-                "ps",
-                "-aq",
-                "--filter",
-                &format!("label=com.docker.compose.project={project_name}"),
-                "--filter",
-                &format!("label=com.docker.compose.service={service}"),
-            ])
-            .output()
-            .expect("failed to inspect Docker test project");
-        if !output.status.success() {
-            return true;
-        }
-        let ids = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter(|id| !id.is_empty())
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        match ids.as_slice() {
+        let node_ids = docker_service_container_ids(project_name, &docker_node_service(node));
+        match node_ids.as_slice() {
             [] => continue,
-            [id] => {
+            [node_id] => {
                 seen_nodes += 1;
-                if docker_container_image_id(id) != expected_image_id {
+                if docker_container_image_id(node_id) != expected_image_id {
                     return true;
                 }
                 if !docker_container_publishes_port(
-                    id,
+                    node_id,
                     "50051/tcp",
                     &docker_host_port_with_env(node, compose_env),
                 ) || !docker_container_publishes_port(
-                    id,
+                    node_id,
                     "50052/tcp",
                     &docker_host_admin_port_with_env(node, compose_env),
                 ) {
@@ -410,6 +430,28 @@ pub(super) fn docker_project_needs_recreate(
         }
     }
     seen_nodes != 0 && seen_nodes != docker_node_count()
+}
+
+fn docker_service_container_ids(project_name: &str, service: &str) -> Vec<String> {
+    let output = command_with_docker_env("docker")
+        .args([
+            "ps",
+            "-aq",
+            "--filter",
+            &format!("label=com.docker.compose.project={project_name}"),
+            "--filter",
+            &format!("label=com.docker.compose.service={service}"),
+        ])
+        .output()
+        .expect("failed to inspect Docker test project");
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 pub(super) fn docker_image_id(image: &str) -> Option<String> {
@@ -557,32 +599,6 @@ pub(super) fn docker_container_volume_name(
         .unwrap_or_else(|| panic!("Docker test node {node} has no volume at {destination}"))
 }
 
-pub(super) fn docker_recreate_node_with_empty_volume(
-    compose_file: &std::path::Path,
-    project_name: &str,
-    compose_env: &[(String, String)],
-    node: u8,
-) {
-    let service = docker_node_service(node);
-    let volume = docker_container_volume_name(project_name, node, "/var/lib/anvil");
-    docker_compose_with_env(
-        compose_file,
-        project_name,
-        &["rm", "--force", "--stop", &service],
-        compose_env,
-    );
-    docker_command_expect_success(
-        &["volume", "rm", &volume],
-        &format!("remove Docker test node {node} volume"),
-    );
-    docker_compose_with_env(
-        compose_file,
-        project_name,
-        &["create", "--no-deps", &service],
-        compose_env,
-    );
-}
-
 pub(super) fn docker_clear_node_block_shards(
     project_name: &str,
     compose_env: &[(String, String)],
@@ -609,12 +625,47 @@ pub(super) fn docker_clear_node_block_shards(
     );
 }
 
+pub(super) fn docker_remove_node_block_shards(
+    project_name: &str,
+    compose_env: &[(String, String)],
+    node: u8,
+    paths: &[String],
+) {
+    assert!(
+        !paths.is_empty(),
+        "remove Docker block shards requires at least one path"
+    );
+    let volume = docker_container_volume_name(project_name, node, "/var/lib/anvil");
+    let image = compose_env
+        .iter()
+        .find_map(|(key, value)| (key == "ANVIL_IMAGE").then_some(value.as_str()))
+        .expect("Docker test compose env includes ANVIL_IMAGE");
+    let mut args = vec![
+        "run".to_string(),
+        "--rm".to_string(),
+        "--entrypoint".to_string(),
+        "rm".to_string(),
+        "--volume".to_string(),
+        format!("{volume}:/var/lib/anvil"),
+        image.to_string(),
+        "-f".to_string(),
+        "--".to_string(),
+    ];
+    args.extend(paths.iter().cloned());
+    let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
+    docker_command_expect_success(
+        &borrowed,
+        &format!("remove exact Docker test node {node} block shards"),
+    );
+}
+
 pub(super) fn docker_compose_network_name(project_name: &str) -> String {
     let output = command_with_docker_env("docker")
         .args([
             "network",
             "ls",
-            "--quiet",
+            "--format",
+            "{{.Name}}",
             "--filter",
             &format!("label=com.docker.compose.project={project_name}"),
             "--filter",
@@ -640,89 +691,61 @@ pub(super) fn docker_compose_network_name(project_name: &str) -> String {
     network_ids.into_iter().next().unwrap()
 }
 
-pub(super) fn docker_create_bridge_network(network_name: &str, project_name: &str) {
-    if docker_network_exists(network_name) {
-        return;
-    }
-    docker_command_expect_success(
-        &[
-            "network",
-            "create",
-            "--driver",
-            "bridge",
-            "--label",
-            &format!("anvil.test.project={project_name}"),
-            network_name,
-        ],
-        &format!("create Docker partition network {network_name}"),
+pub(super) fn docker_network_container_ipv4(network: &str, container_id: &str) -> String {
+    let template = format!(
+        "{{{{with index .NetworkSettings.Networks \"{network}\"}}}}{{{{.IPAddress}}}}{{{{end}}}}"
     );
-}
-
-pub(super) fn docker_connect_network(network: &str, container_id: &str, alias: &str) {
-    if docker_network_contains_container(network, container_id) {
-        return;
-    }
-    docker_command_expect_success(
-        &[
-            "network",
-            "connect",
-            "--alias",
-            alias,
-            network,
-            container_id,
-        ],
-        &format!("connect {container_id} to Docker network {network}"),
-    );
-}
-
-pub(super) fn docker_disconnect_network(network: &str, container_id: &str) {
-    if !docker_network_contains_container(network, container_id) {
-        return;
-    }
-    docker_command_expect_success(
-        &["network", "disconnect", "--force", network, container_id],
-        &format!("disconnect {container_id} from Docker network {network}"),
-    );
-}
-
-pub(super) fn docker_remove_network(network: &str) {
-    if !docker_network_exists(network) {
-        return;
-    }
-    docker_command_expect_success(
-        &["network", "rm", network],
-        &format!("remove Docker network {network}"),
-    );
-}
-
-fn docker_network_exists(network: &str) -> bool {
-    command_with_docker_env("docker")
-        .args(["network", "inspect", network])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-fn docker_network_contains_container(network: &str, container_id: &str) -> bool {
-    if !docker_network_exists(network) {
-        return false;
-    }
     let output = command_with_docker_env("docker")
-        .args([
-            "network",
-            "inspect",
-            "--format",
-            "{{range $id, $_ := .Containers}}{{println $id}}{{end}}",
-            network,
-        ])
+        .args(["inspect", "--format", &template, container_id])
         .output()
-        .expect("inspect Docker network containers");
-    output.status.success()
-        && String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|member| member.starts_with(container_id) || container_id.starts_with(member))
+        .expect("inspect Docker peer network address");
+    assert!(
+        output.status.success(),
+        "inspect Docker peer address for {container_id} on {network}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let address = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    address
+        .parse::<std::net::Ipv4Addr>()
+        .unwrap_or_else(|error| panic!("invalid Docker peer IPv4 address {address:?}: {error}"));
+    address
+}
+
+pub(super) fn docker_set_unreachable_peer_routes(
+    container_id: &str,
+    peer_addresses: &[String],
+    blocked: bool,
+) {
+    let mut addresses = peer_addresses
+        .iter()
+        .map(|address| {
+            address
+                .parse::<std::net::Ipv4Addr>()
+                .unwrap_or_else(|error| {
+                    panic!("invalid Docker peer IPv4 address {address}: {error}")
+                })
+        })
+        .collect::<Vec<_>>();
+    addresses.sort_unstable();
+    addresses.dedup();
+    let script = addresses
+        .iter()
+        .map(|address| {
+            if blocked {
+                format!("ip route replace unreachable {address}/32")
+            } else {
+                format!("ip route del unreachable {address}/32 2>/dev/null || true")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    docker_command_expect_success(
+        &["exec", "--user", "0", container_id, "sh", "-ceu", &script],
+        &format!(
+            "{} Docker peer routes for {container_id}",
+            if blocked { "block" } else { "restore" }
+        ),
+    );
 }
 
 fn docker_command_expect_success(args: &[&str], operation: &str) {
