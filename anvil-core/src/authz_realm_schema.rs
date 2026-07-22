@@ -2,12 +2,13 @@ use crate::anvil_api::AuthzNamespaceSchema;
 use crate::authz_coremeta_payload::{decode_authz_payload_row, encode_authz_payload_row};
 use crate::authz_head::{self, AuthzHeadMutation, AuthzHeadSnapshot};
 use crate::core_store::{
-    CF_AUTHZ, CoreMetaStore, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation,
-    CoreMutationPrecondition, CoreStore, TABLE_AUTHZ_SCHEMA_ROW, core_meta_committed_row_common,
-    core_meta_payload_digest, core_meta_root_key_hash, core_meta_tuple_key,
-    decode_deterministic_proto, encode_deterministic_proto,
+    CF_AUTHZ, CoreMetaRecord, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation,
+    CoreMutationPrecondition, CoreMutationRootPublication, CoreStore, TABLE_AUTHZ_SCHEMA_ROW,
+    core_meta_committed_row_common, core_meta_payload_digest, core_meta_record_tuple_key,
+    core_meta_root_key_hash, core_meta_tuple_key, decode_deterministic_proto,
+    encode_deterministic_proto,
 };
-use crate::formats::hash32;
+use crate::formats::{hash32, writer::WriterFamily};
 use crate::persistence::AuthzSchemaBindingPrecondition;
 use crate::storage::Storage;
 use anyhow::{Result, anyhow};
@@ -18,6 +19,7 @@ const AUTHZ_SCHEMA_REVISION_ROW_KIND: &str = "schema_revision";
 const AUTHZ_SCHEMA_LATEST_ROW_KIND: &str = "schema_latest";
 const AUTHZ_SCHEMA_DIGEST_ROW_KIND: &str = "schema_digest";
 const AUTHZ_SCHEMA_BINDING_ROW_KIND: &str = "schema_binding";
+pub const AUTHZ_SCHEMA_PAGE_MAX: usize = 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredSchemaRef {
@@ -45,6 +47,18 @@ pub struct StoredAuthzSchemaBinding {
     pub written_by: String,
     pub reason: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredAuthzSchemaRevisionPage {
+    pub records: Vec<StoredAuthzSchemaRevision>,
+    pub next_tuple_key: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredAuthzSchemaBindingPage {
+    pub records: Vec<StoredAuthzSchemaBinding>,
+    pub next_tuple_key: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -186,7 +200,7 @@ pub async fn put_schema_revision(
         .as_ref()
         .map(|(record, _)| record.schema_ref.schema_revision.saturating_add(1))
         .unwrap_or(1);
-    let head_snapshot = authz_head::read(storage, tenant_id)?;
+    let head_snapshot = authz_head::read(storage, tenant_id).await?;
     let authz_revision = head_snapshot
         .head
         .committed_revision
@@ -298,7 +312,7 @@ pub async fn bind_schema(
         (Some(expected), Some(actual)) if expected == actual => {}
         _ => return Err(anyhow!("schema binding generation conflict")),
     }
-    let head_snapshot = authz_head::read(storage, tenant_id)?;
+    let head_snapshot = authz_head::read(storage, tenant_id).await?;
     let authz_revision = head_snapshot
         .head
         .committed_revision
@@ -347,11 +361,8 @@ pub async fn read_bound_schema_snapshot(
 ) -> Result<BoundAuthzSchemaSnapshot> {
     validate_realm_id(realm_id)?;
     let tuple_key = schema_binding_tuple_key(tenant_id, realm_id)?;
-    let Some(payload) = CoreMetaStore::open(storage.core_store_meta_path())?.get(
-        CF_AUTHZ,
-        TABLE_AUTHZ_SCHEMA_ROW,
-        &tuple_key,
-    )?
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(payload) = store.read_coremeta_row(CF_AUTHZ, TABLE_AUTHZ_SCHEMA_ROW, &tuple_key)?
     else {
         return Ok(BoundAuthzSchemaSnapshot {
             schema: None,
@@ -384,57 +395,103 @@ pub async fn read_bound_schema_snapshot(
     })
 }
 
-pub async fn list_schema_revisions(
+pub async fn page_schema_revisions(
     storage: &Storage,
     tenant_id: i64,
-) -> Result<Vec<StoredAuthzSchemaRevision>> {
+    after_tuple_key: Option<&[u8]>,
+    page_size: usize,
+) -> Result<StoredAuthzSchemaRevisionPage> {
     validate_storage_tenant(tenant_id)?;
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
+    let store = CoreStore::new(storage.clone()).await?;
     let prefix = core_meta_tuple_key(&[
         CoreMetaTuplePart::Utf8(AUTHZ_SCHEMA_REVISION_ROW_KIND),
         CoreMetaTuplePart::I64(tenant_id),
     ])?;
-    let mut records = Vec::new();
-    for row in meta.scan_prefix(CF_AUTHZ, TABLE_AUTHZ_SCHEMA_ROW, &prefix)? {
+    let (rows, next_tuple_key) =
+        scan_schema_rows_page(&store, &prefix, after_tuple_key, page_size)?;
+    let mut records = Vec::with_capacity(rows.len());
+    for row in rows {
         records.push(
             decode_schema_record_row::<StoredAuthzSchemaRevision>(storage, tenant_id, &row.payload)
                 .await?,
         );
     }
-    records.sort_by(|left, right| {
-        (
-            &left.schema_ref.schema_id,
-            left.schema_ref.schema_revision,
-            &left.schema_ref.schema_digest,
-        )
-            .cmp(&(
-                &right.schema_ref.schema_id,
-                right.schema_ref.schema_revision,
-                &right.schema_ref.schema_digest,
-            ))
-    });
-    Ok(records)
+    Ok(StoredAuthzSchemaRevisionPage {
+        records,
+        next_tuple_key,
+    })
 }
 
-pub async fn list_schema_bindings(
+pub async fn page_schema_bindings(
     storage: &Storage,
     tenant_id: i64,
-) -> Result<Vec<StoredAuthzSchemaBinding>> {
+    after_tuple_key: Option<&[u8]>,
+    page_size: usize,
+) -> Result<StoredAuthzSchemaBindingPage> {
     validate_storage_tenant(tenant_id)?;
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
+    let store = CoreStore::new(storage.clone()).await?;
     let prefix = core_meta_tuple_key(&[
         CoreMetaTuplePart::Utf8(AUTHZ_SCHEMA_BINDING_ROW_KIND),
         CoreMetaTuplePart::I64(tenant_id),
     ])?;
-    let mut records = Vec::new();
-    for row in meta.scan_prefix(CF_AUTHZ, TABLE_AUTHZ_SCHEMA_ROW, &prefix)? {
+    let (rows, next_tuple_key) =
+        scan_schema_rows_page(&store, &prefix, after_tuple_key, page_size)?;
+    let mut records = Vec::with_capacity(rows.len());
+    for row in rows {
         records.push(
             decode_schema_record_row::<StoredAuthzSchemaBinding>(storage, tenant_id, &row.payload)
                 .await?,
         );
     }
-    records.sort_by(|left, right| left.realm_id.cmp(&right.realm_id));
-    Ok(records)
+    Ok(StoredAuthzSchemaBindingPage {
+        records,
+        next_tuple_key,
+    })
+}
+
+fn scan_schema_rows_page(
+    store: &CoreStore,
+    prefix: &[u8],
+    after_tuple_key: Option<&[u8]>,
+    page_size: usize,
+) -> Result<(Vec<CoreMetaRecord>, Option<Vec<u8>>)> {
+    if !(1..=AUTHZ_SCHEMA_PAGE_MAX).contains(&page_size) {
+        return Err(anyhow!(
+            "authorization schema page size must be between 1 and {AUTHZ_SCHEMA_PAGE_MAX}"
+        ));
+    }
+    if after_tuple_key
+        .is_some_and(|cursor| cursor.len() <= prefix.len() || !cursor.starts_with(prefix))
+    {
+        return Err(anyhow!(
+            "authorization schema cursor is outside the tenant prefix"
+        ));
+    }
+    let mut rows = store.scan_coremeta_prefix_page(
+        CF_AUTHZ,
+        TABLE_AUTHZ_SCHEMA_ROW,
+        prefix,
+        after_tuple_key,
+        page_size + 1,
+    )?;
+    let has_more = rows.len() > page_size;
+    if has_more {
+        rows.truncate(page_size);
+    }
+    let next_tuple_key = if has_more {
+        Some(
+            core_meta_record_tuple_key(
+                &rows
+                    .last()
+                    .ok_or_else(|| anyhow!("authorization schema page is empty"))?
+                    .key,
+            )?
+            .to_vec(),
+        )
+    } else {
+        None
+    };
+    Ok((rows, next_tuple_key))
 }
 
 pub async fn read_bound_namespace_schema(
@@ -532,8 +589,9 @@ async fn write_schema_record(
         .await?
         .commit_mutation_batch(CoreMutationBatch {
             transaction_id,
-            scope_partition: partition_id,
+            scope_partition: partition_id.clone(),
             committed_by_principal: authz_head::transaction_principal(tenant_id),
+            root_publications: authz_schema_root_publications(&partition_id, tenant_id),
             preconditions: vec![
                 CoreMutationPrecondition::CoreMetaRow {
                     cf: CF_AUTHZ.to_string(),
@@ -609,6 +667,7 @@ async fn write_binding_record(
             transaction_id,
             scope_partition: partition_id.clone(),
             committed_by_principal: authz_head::transaction_principal(tenant_id),
+            root_publications: authz_schema_root_publications(&partition_id, tenant_id),
             preconditions: vec![
                 CoreMutationPrecondition::CoreMetaRow {
                     cf: CF_AUTHZ.to_string(),
@@ -624,6 +683,20 @@ async fn write_binding_record(
         })
         .await?;
     Ok(())
+}
+
+fn authz_schema_root_publications(
+    coordinator_root: &str,
+    tenant_id: i64,
+) -> Vec<CoreMutationRootPublication> {
+    vec![
+        CoreMutationRootPublication::new(coordinator_root, WriterFamily::CoreControl.as_str())
+            .coordinator(),
+        CoreMutationRootPublication::new(
+            authz_head::root_anchor_key(tenant_id),
+            WriterFamily::Authz.as_str(),
+        ),
+    ]
 }
 
 fn schema_revision_transaction_id(tenant_id: i64, record: &StoredAuthzSchemaRevision) -> String {
@@ -667,7 +740,8 @@ async fn find_schema_by_digest(
     schema_id: &str,
     digest: &str,
 ) -> Result<Option<StoredAuthzSchemaRevision>> {
-    let Some(payload) = CoreMetaStore::open(storage.core_store_meta_path())?.get(
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(payload) = store.read_coremeta_row(
         CF_AUTHZ,
         TABLE_AUTHZ_SCHEMA_ROW,
         &schema_digest_tuple_key(tenant_id, schema_id, digest)?,
@@ -698,12 +772,8 @@ async fn read_proto_row_snapshot<T: AuthzSchemaRecordCodec>(
     tenant_id: i64,
     tuple_key: Vec<u8>,
 ) -> Result<Option<(T, String)>> {
-    let Some(bytes) = CoreMetaStore::open(storage.core_store_meta_path())?.get(
-        CF_AUTHZ,
-        TABLE_AUTHZ_SCHEMA_ROW,
-        &tuple_key,
-    )?
-    else {
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(bytes) = store.read_coremeta_row(CF_AUTHZ, TABLE_AUTHZ_SCHEMA_ROW, &tuple_key)? else {
         return Ok(None);
     };
     let payload_hash = core_meta_payload_digest(TABLE_AUTHZ_SCHEMA_ROW, &bytes);
