@@ -65,7 +65,7 @@ async fn ready_object_metadata_permit(
 }
 
 #[tokio::test]
-async fn append_object_mutation_writes_direct_metadata_and_directory_records() {
+async fn append_object_mutation_writes_one_authoritative_metadata_record() {
     let temp = tempdir().unwrap();
     let storage = Storage::new_at(temp.path()).await.unwrap();
     let bucket = sample_bucket();
@@ -87,22 +87,14 @@ async fn append_object_mutation_writes_direct_metadata_and_directory_records() {
     let records = read_all_metadata_journal_records(&storage, &bucket)
         .await
         .unwrap();
-    assert_eq!(records.len(), 4);
+    assert_eq!(records.len(), 2);
     assert_eq!(
         records[0].record_kind,
         ObjectMetadataRecordKind::ObjectVersion
     );
     assert_eq!(
         records[1].record_kind,
-        ObjectMetadataRecordKind::DirectoryEntry
-    );
-    assert_eq!(
-        records[2].record_kind,
         ObjectMetadataRecordKind::DeleteMarker
-    );
-    assert_eq!(
-        records[3].record_kind,
-        ObjectMetadataRecordKind::DirectoryEntry
     );
     assert!(records.iter().all(|record| !record.payload.is_empty()));
 
@@ -142,18 +134,18 @@ async fn object_metadata_journal_reads_bounded_cursor_pages() {
 
     let core_store = CoreStore::new(storage.clone()).await.unwrap();
     let stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
-    let first = read_metadata_journal_records_page(&core_store, &stream_id, 0, 3)
+    let first = read_metadata_journal_records_page(&core_store, &stream_id, 0, 1)
         .await
         .unwrap();
-    assert_eq!(first.records.len(), 3);
-    assert_eq!(first.next_sequence, 3);
+    assert_eq!(first.records.len(), 1);
+    assert_eq!(first.next_sequence, 1);
     assert!(first.has_more);
     let second =
-        read_metadata_journal_records_page(&core_store, &stream_id, first.next_sequence, 3)
+        read_metadata_journal_records_page(&core_store, &stream_id, first.next_sequence, 1)
             .await
             .unwrap();
     assert_eq!(second.records.len(), 1);
-    assert_eq!(second.records[0].partition_sequence, 4);
+    assert_eq!(second.records[0].partition_sequence, 2);
     assert!(!second.has_more);
     assert!(
         read_metadata_journal_records_page(&core_store, &stream_id, 0, 0)
@@ -178,7 +170,7 @@ async fn object_metadata_source_checkpoint_uses_stream_metadata() {
     let first_cursor = object_metadata_source_cursor(&storage, &bucket, PARTITION_OWNER_KEY)
         .await
         .unwrap();
-    assert_eq!(first_cursor, 2);
+    assert_eq!(first_cursor, 1);
     let first_hash = object_metadata_source_checkpoint_hash(
         &storage,
         &bucket,
@@ -194,7 +186,7 @@ async fn object_metadata_source_checkpoint_uses_stream_metadata() {
     let second_cursor = object_metadata_source_cursor(&storage, &bucket, PARTITION_OWNER_KEY)
         .await
         .unwrap();
-    assert_eq!(second_cursor, 4);
+    assert_eq!(second_cursor, 2);
     let second_hash = object_metadata_source_checkpoint_hash(
         &storage,
         &bucket,
@@ -219,8 +211,8 @@ async fn object_metadata_source_checkpoint_uses_stream_metadata() {
     let stats = active_object_journal_stats(&storage, &bucket, PARTITION_OWNER_KEY)
         .await
         .unwrap();
-    assert_eq!(stats.last_sequence, 4);
-    assert_eq!(stats.uncompacted_frame_count, 4);
+    assert_eq!(stats.last_sequence, 2);
+    assert_eq!(stats.uncompacted_frame_count, 2);
     assert!(stats.uncompacted_encoded_bytes > 0);
 }
 
@@ -245,7 +237,7 @@ async fn object_metadata_write_permit_sets_frame_and_manifest_fence() {
     let records = read_all_metadata_journal_records(&storage, &bucket)
         .await
         .unwrap();
-    assert_eq!(records.len(), 2);
+    assert_eq!(records.len(), 1);
     assert!(
         records
             .iter()
@@ -262,7 +254,7 @@ async fn object_metadata_write_permit_sets_frame_and_manifest_fence() {
     )
     .await
     .unwrap();
-    assert_eq!(sealed.generation, 2);
+    assert_eq!(sealed.generation, 1);
     let manifest = read_latest_partition_manifest(&storage, &bucket, manifest_key)
         .await
         .unwrap()
@@ -571,10 +563,14 @@ async fn read_object_version_hides_explicitly_deleted_version_after_seal() {
     .unwrap();
     assert_eq!(before_delete.version_id, object.version_id);
 
+    let mut deletion = object.clone();
+    deletion.id = 2;
+    deletion.mutation_id = uuid::Uuid::new_v4();
+    deletion.deleted_at = Some(Utc::now());
     append_object_mutation(
         &storage,
         &bucket,
-        &object,
+        &deletion,
         ObjectJournalMutation::DeleteVersion,
     )
     .await
@@ -615,7 +611,7 @@ async fn seal_object_journal_segments_writes_metadata_and_directory_segments() {
     let sealed = seal_object_journal_segments(&storage, &bucket, signing_key)
         .await
         .unwrap();
-    assert_eq!(sealed.generation, 6);
+    assert_eq!(sealed.generation, 3);
     assert_eq!(sealed.metadata_record_count, 3);
     assert_eq!(sealed.directory_record_count, 2);
     assert_eq!(
@@ -736,6 +732,7 @@ async fn seal_object_journal_segments_writes_metadata_and_directory_segments() {
         object_metadata_segment_generation(ref_name).unwrap(),
         ref_name,
     )
+    .await
     .unwrap()
     .expect("metadata segment catalog row exists");
     catalog.core_object_ref_target = encode_core_object_ref_target(&object_ref).unwrap();

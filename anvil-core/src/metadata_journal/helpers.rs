@@ -4,6 +4,7 @@ use base64::Engine;
 
 const METADATA_JOURNAL_PAGE_ROWS: usize = 512;
 
+#[derive(Debug)]
 pub(super) struct MetadataJournalRecordPage {
     pub records: Vec<ObjectMetadataRecord>,
     pub next_sequence: u64,
@@ -21,13 +22,14 @@ pub(super) fn version_sorts_after_marker(
     Ok(created_at < marker_created_at || (created_at == marker_created_at && order < marker_order))
 }
 
-pub(super) async fn write_segment_file(
+pub(super) async fn stage_segment_file(
     storage: &Storage,
     bucket: &Bucket,
     generation: u64,
     family: FileFamily,
     header: SegmentHeader,
     records: &[SegmentRecord],
+    created_at_unix_nanos: u64,
 ) -> Result<WrittenSegment> {
     let body = encode_object_segment_body_table(family, records)?;
     let (first_record_hash, last_record_hash) = segment_record_hash_bounds(records);
@@ -80,6 +82,7 @@ pub(super) async fn write_segment_file(
         .write_format_build_output(WriterBuildOutput {
             logical_files: vec![built_segment.logical_file],
             core_meta_mutations: Vec::new(),
+            core_meta_root_publications: Vec::new(),
         })
         .await?;
     let object_ref = receipt
@@ -87,28 +90,33 @@ pub(super) async fn write_segment_file(
         .first()
         .cloned()
         .ok_or_else(|| anyhow!("CoreFormatWriter returned no object metadata object"))?;
-    write_writer_segment_catalog_record(
-        storage,
-        &WriterSegmentCatalogRecord {
-            family: OBJECT_METADATA_SEGMENT_CATALOG_FAMILY.to_string(),
-            scope: object_metadata_segment_scope(&ref_name)?,
-            segment_ref: ref_name.clone(),
-            core_object_ref_target: encode_core_object_ref_target(&object_ref)?,
-            segment_hash: file_hash.clone(),
-            segment_length: object_ref.logical_size,
-            generation,
-            source_cursor: generation,
-            created_at_unix_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-                as u64,
-        },
-    )
-    .await?;
+    let catalog_record = WriterSegmentCatalogRecord {
+        family: OBJECT_METADATA_SEGMENT_CATALOG_FAMILY.to_string(),
+        scope: object_metadata_segment_scope(&ref_name)?,
+        segment_ref: ref_name.clone(),
+        core_object_ref_target: encode_core_object_ref_target(&object_ref)?,
+        segment_hash: file_hash.clone(),
+        segment_length: object_ref.logical_size,
+        generation,
+        source_cursor: generation,
+        created_at_unix_nanos,
+    };
     Ok(WrittenSegment {
         family,
         ref_name,
         record_count: records.len() as u64,
         file_hash,
+        catalog_record,
     })
+}
+
+pub(super) async fn publish_segment_catalog(
+    storage: &Storage,
+    segment: &WrittenSegment,
+    additional_preconditions: &[CoreMutationPrecondition],
+) -> Result<()> {
+    write_writer_segment_catalog_record(storage, &segment.catalog_record, additional_preconditions)
+        .await
 }
 
 pub(super) fn encode_object_segment_body_table(
@@ -161,7 +169,7 @@ fn object_segment_tables(
         .collect()
 }
 
-pub(super) async fn write_partition_manifest(
+pub(super) async fn stage_partition_manifest(
     storage: &Storage,
     bucket: &Bucket,
     generation: u64,
@@ -169,8 +177,8 @@ pub(super) async fn write_partition_manifest(
     segments: &[WrittenSegment],
     manifest_signing_key: &[u8],
     fence_token: u64,
-    partition_precondition: Option<CoreMutationPrecondition>,
-) -> Result<(PartitionManifest, String)> {
+    published_at: String,
+) -> Result<StagedPartitionManifest> {
     if manifest_signing_key.is_empty() {
         return Err(anyhow!("partition manifest signing key must not be empty"));
     }
@@ -213,7 +221,7 @@ pub(super) async fn write_partition_manifest(
         segments: segment_refs,
         compacted_through_sequence: generation,
         last_record_hash,
-        published_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        published_at,
         manifest_hash: None,
         manifest_signature: None,
     };
@@ -257,46 +265,112 @@ pub(super) async fn write_partition_manifest(
         published_at: manifest.published_at.clone(),
     };
     let manifest_payload = encode_object_metadata_partition_manifest_row(bucket, &manifest_row)?;
-    let manifest_tuple_key = object_metadata_partition_manifest_row_key(bucket)?;
-    if let Some(precondition) = partition_precondition {
-        store
-            .commit_mutation_batch(CoreMutationBatch {
-                transaction_id: format!(
-                    "metadata-manifest:{}:{}:{}:{}",
-                    bucket.tenant_id, bucket.id, generation, manifest_hash
-                ),
-                scope_partition: manifest.partition_id.clone(),
-                committed_by_principal: object_metadata_partition_principal(bucket),
-                preconditions: vec![precondition],
-                operations: vec![CoreMutationOperation::CoreMetaPut {
-                    partition_id: manifest.partition_id.clone(),
-                    cf: CF_OBJECT_HEADS.to_string(),
-                    table_id: TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW,
-                    tuple_key: manifest_tuple_key,
-                    payload: manifest_payload,
-                }],
-            })
-            .await?;
-    } else {
-        // No extra CoreStore metadata mirror is published here. The manifest's current
-        // pointer is compact CoreMeta state in the object metadata manifest row.
-        store
-            .commit_coremeta_batch_by_embedded_roots(
-                &format!(
-                    "object-metadata-manifest:{}:{}:{}",
-                    bucket.tenant_id, bucket.id, generation
-                ),
-                &[CoreMetaBatchOp {
-                    cf: CF_OBJECT_HEADS,
-                    table_id: TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW,
-                    tuple_key: &manifest_tuple_key,
-                    common: None,
-                    kind: CoreMetaBatchOpKind::Put(&manifest_payload),
-                }],
-            )
-            .await?;
+    let manifest_root_anchor_key = format!(
+        "object-metadata-manifest/{}/{}",
+        bucket.tenant_id, bucket.id
+    );
+    Ok(StagedPartitionManifest {
+        manifest,
+        manifest_ref,
+        manifest_payload,
+        manifest_tuple_key: object_metadata_partition_manifest_row_key(bucket)?,
+        manifest_root_anchor_key,
+        transaction_id: format!(
+            "metadata-manifest:{}:{}:{}:{}",
+            bucket.tenant_id, bucket.id, generation, manifest_hash
+        ),
+    })
+}
+
+pub(super) async fn publish_partition_manifest(
+    storage: &Storage,
+    bucket: &Bucket,
+    staged: &StagedPartitionManifest,
+    additional_preconditions: &[CoreMutationPrecondition],
+) -> Result<()> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let current = store.read_coremeta_row(
+        CF_OBJECT_HEADS,
+        TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW,
+        &staged.manifest_tuple_key,
+    )?;
+    if let Some(current) = current.as_ref()
+        && decode_object_metadata_partition_manifest_row(bucket, current)?
+            == decode_object_metadata_partition_manifest_row(bucket, &staged.manifest_payload)?
+    {
+        return Ok(());
     }
-    Ok((manifest, manifest_ref))
+    let mut preconditions = Vec::with_capacity(additional_preconditions.len() + 1);
+    preconditions.push(CoreMutationPrecondition::CoreMetaRow {
+        cf: CF_OBJECT_HEADS.to_string(),
+        table_id: TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW,
+        tuple_key: staged.manifest_tuple_key.clone(),
+        expected_payload_hash: current.as_ref().map(|payload| {
+            core_meta_payload_digest(TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW, payload)
+        }),
+        require_absent: current.is_none(),
+        require_present: current.is_some(),
+    });
+    preconditions.extend_from_slice(additional_preconditions);
+    let transaction_id =
+        core_mutation_publication_attempt_id(&staged.transaction_id, &preconditions)?;
+    let receipt = store
+        .commit_mutation_batch(CoreMutationBatch {
+            transaction_id,
+            scope_partition: staged.manifest.partition_id.clone(),
+            committed_by_principal: object_metadata_partition_principal(bucket),
+            root_publications: object_metadata_manifest_root_publications(
+                &staged.manifest.partition_id,
+                &staged.manifest_root_anchor_key,
+            ),
+            preconditions,
+            operations: vec![CoreMutationOperation::CoreMetaPut {
+                partition_id: staged.manifest.partition_id.clone(),
+                cf: CF_OBJECT_HEADS.to_string(),
+                table_id: TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW,
+                tuple_key: staged.manifest_tuple_key.clone(),
+                payload: staged.manifest_payload.clone(),
+            }],
+        })
+        .await?;
+    if receipt.state != CoreTransactionState::Committed {
+        return Err(anyhow!(
+            "object metadata manifest publication {} did not commit: {}",
+            receipt.transaction_id,
+            receipt
+                .finalisation_error
+                .as_deref()
+                .unwrap_or("unknown finalisation failure")
+        ));
+    }
+    Ok(())
+}
+
+fn object_metadata_manifest_root_publications(
+    coordinator_root: &str,
+    data_root: &str,
+) -> Vec<crate::core_store::CoreMutationRootPublication> {
+    if coordinator_root == data_root {
+        return vec![crate::core_store::CoreMutationRootPublication {
+            root_anchor_key: data_root.to_string(),
+            writer_families: vec![
+                WriterFamily::CoreControl.as_str().to_string(),
+                WriterFamily::ObjectBlob.as_str().to_string(),
+            ],
+            transaction_coordinator: true,
+        }];
+    }
+    vec![
+        crate::core_store::CoreMutationRootPublication::new(
+            coordinator_root,
+            WriterFamily::CoreControl.as_str(),
+        )
+        .coordinator(),
+        crate::core_store::CoreMutationRootPublication::new(
+            data_root,
+            WriterFamily::ObjectBlob.as_str(),
+        ),
+    ]
 }
 
 pub fn decode_partition_manifest(
@@ -315,7 +389,7 @@ pub(crate) async fn read_latest_partition_manifest(
     bucket: &Bucket,
     manifest_signing_key: &[u8],
 ) -> Result<Option<PartitionManifest>> {
-    let Some(record) = read_object_metadata_partition_manifest_row(storage, bucket)? else {
+    let Some(record) = read_object_metadata_partition_manifest_row(storage, bucket).await? else {
         return Ok(None);
     };
     let store = CoreStore::new(storage.clone()).await?;
@@ -331,7 +405,9 @@ pub(crate) async fn read_latest_partition_manifest(
 }
 
 pub(super) async fn partition_manifest_exists(storage: &Storage, bucket: &Bucket) -> Result<bool> {
-    Ok(read_object_metadata_partition_manifest_row(storage, bucket)?.is_some())
+    Ok(read_object_metadata_partition_manifest_row(storage, bucket)
+        .await?
+        .is_some())
 }
 
 pub(super) async fn read_manifest_segment(
@@ -348,7 +424,8 @@ pub(super) async fn read_manifest_segment(
         &object_metadata_segment_scope(ref_name)?,
         object_metadata_segment_generation(ref_name)?,
         ref_name,
-    )?
+    )
+    .await?
     .ok_or_else(|| anyhow!("partition segment catalog row is missing"))?;
     let store = CoreStore::new(storage.clone()).await?;
     store
@@ -369,7 +446,8 @@ pub(super) async fn read_core_ref_uri_payload(storage: &Storage, ref_uri: &str) 
         &object_metadata_segment_scope(ref_name)?,
         object_metadata_segment_generation(ref_name)?,
         ref_name,
-    )?
+    )
+    .await?
     .ok_or_else(|| anyhow!("CoreStore writer segment catalog row is missing"))?;
     let store = CoreStore::new(storage.clone()).await?;
     store
@@ -624,6 +702,7 @@ pub async fn active_object_journal_stats(
     let mut tombstone_debt = 0_u64;
     let mut after_sequence = compacted_through_sequence;
     while after_sequence < last_sequence {
+        // The published head bounds this internal accounting scan; payload bytes are unnecessary.
         let page = core_store.raw_stream_record_metadata_range(
             &stream_id,
             after_sequence,
@@ -748,7 +827,10 @@ pub(super) async fn read_manifest_journal_ref_records(
             }
             records.push(record);
         }
-        if !page.has_more || page.next_sequence >= journal_ref.last_sequence {
+        if !page.has_more
+            || page.next_sequence >= journal_ref.last_sequence
+            || page.next_sequence <= after_sequence
+        {
             break;
         }
         after_sequence = page.next_sequence;
@@ -771,7 +853,7 @@ pub(super) async fn read_metadata_journal_records_from_store(
         )
         .await?;
         decoded.extend(page.records);
-        if !page.has_more {
+        if !page.has_more || page.next_sequence <= after_sequence {
             break;
         }
         after_sequence = page.next_sequence;
@@ -970,12 +1052,12 @@ pub(super) fn decode_object_metadata_partition_manifest_row(
     })
 }
 
-pub(super) fn read_object_metadata_partition_manifest_row(
+pub(super) async fn read_object_metadata_partition_manifest_row(
     storage: &Storage,
     bucket: &Bucket,
 ) -> Result<Option<ObjectMetadataPartitionManifestRow>> {
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
-    let Some(payload) = meta.get(
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(payload) = store.read_coremeta_row(
         CF_OBJECT_HEADS,
         TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW,
         &object_metadata_partition_manifest_row_key(bucket)?,
