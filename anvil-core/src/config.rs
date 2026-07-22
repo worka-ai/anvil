@@ -187,6 +187,15 @@ impl Config {
         me
     }
 
+    /// Whether this node participates in a multi-node CoreMeta topology.
+    ///
+    /// Distributed topology is installed through the administrative bootstrap
+    /// path before data-plane readiness. A node restart must not try to mutate
+    /// that topology while constructing its local application state.
+    pub fn requires_distributed_coremeta_recovery(&self) -> bool {
+        self.bootstrap_node_ids.len() > 1 || !self.bootstrap_addrs.is_empty()
+    }
+
     pub fn secret_keyring(&self) -> Result<crate::crypto::EncryptionKeyring> {
         let active_key_id = self.active_encryption_key_id();
         crate::crypto::EncryptionKeyring::from_hex_config(
@@ -226,11 +235,22 @@ impl Config {
 
     pub async fn with_persisted_identity(mut self) -> Result<Self> {
         let requested_node_id = (!self.node_id.trim().is_empty()).then_some(self.node_id.as_str());
-        let identity = crate::cluster_identity::load_or_create_cluster_identity_with_node_id(
-            &self.storage_path,
-            requested_node_id,
-        )
-        .await?;
+        let identity =
+            crate::cluster_identity::load_or_create_cluster_identity_with_core_store_configuration(
+                &self.storage_path,
+                requested_node_id,
+                self.core_pipeline_keyring()?,
+                crate::core_store::CoreStoreNodeIdentity {
+                    mesh_id: self.mesh_id.clone(),
+                    node_id: String::new(),
+                    region_id: self.region.clone(),
+                    cell_id: self.cell_id.clone(),
+                    public_api_addr: self.public_api_addr.clone(),
+                    internal_bearer_token: (!self.corestore_internal_bearer_token.is_empty())
+                        .then(|| self.corestore_internal_bearer_token.clone()),
+                },
+            )
+            .await?;
         self.node_id = identity.node_id;
 
         Ok(self)
@@ -295,6 +315,25 @@ mod tests {
     }
 
     #[test]
+    fn distributed_coremeta_is_derived_from_join_or_multi_node_configuration() {
+        assert!(!Config::default().requires_distributed_coremeta_recovery());
+        assert!(
+            Config {
+                bootstrap_node_ids: vec!["node-a".into(), "node-b".into()],
+                ..Config::default()
+            }
+            .requires_distributed_coremeta_recovery()
+        );
+        assert!(
+            Config {
+                bootstrap_addrs: vec!["/dns4/node-a/udp/7443/quic-v1".into()],
+                ..Config::default()
+            }
+            .requires_distributed_coremeta_recovery()
+        );
+    }
+
+    #[test]
     fn production_config_has_no_personaldb_signer_process_or_private_key_input() {
         let command = Config::command();
         let exposed_inputs = command
@@ -350,14 +389,17 @@ mod tests {
     async fn persisted_identity_is_coremeta_owned_and_reloads() {
         let temp = tempdir().unwrap();
         let storage_path = temp.path().join("storage");
+        let pipeline_key = "00".repeat(32);
         let config = Config {
             storage_path: storage_path.to_string_lossy().into_owned(),
+            anvil_secret_encryption_key: pipeline_key.clone(),
             ..Config::default()
         };
 
         let first = config.with_persisted_identity().await.unwrap();
         let restarted = Config {
             storage_path: storage_path.to_string_lossy().into_owned(),
+            anvil_secret_encryption_key: pipeline_key,
             ..Config::default()
         }
         .with_persisted_identity()
