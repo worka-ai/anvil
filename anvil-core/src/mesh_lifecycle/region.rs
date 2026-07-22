@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(test)]
 pub async fn create_region(
     storage: &Storage,
     input: CreateRegionDescriptor,
@@ -52,22 +53,26 @@ async fn create_region_inner(
     state
         .regions
         .insert(descriptor.region.clone(), descriptor.clone());
-    if let Some(authority) = authority {
-        append_lifecycle_control_mutation(
-            storage,
-            REGION_DESCRIPTOR_STREAM_FAMILY,
-            &lifecycle_control_partition(REGION_DESCRIPTOR_STREAM_FAMILY, &descriptor.region),
-            &descriptor.region,
-            "create",
-            None,
-            descriptor.generation,
-            &descriptor.mesh_id,
-            &descriptor,
-            authority,
-        )
-        .await?;
-    }
-    write_state(storage, &state).await?;
+    let control = authority
+        .map(|authority| {
+            topology_mutation::fenced_control_mutation(
+                REGION_DESCRIPTOR_STREAM_FAMILY,
+                descriptor.region.clone(),
+                "create",
+                None,
+                descriptor.generation,
+                &descriptor.mesh_id,
+                &descriptor,
+                authority,
+            )
+        })
+        .transpose()?;
+    topology_mutation::commit_topology_mutation(
+        storage,
+        record_proto::encode_region_projection_row(&descriptor)?,
+        control,
+    )
+    .await?;
     Ok(descriptor)
 }
 
@@ -86,6 +91,13 @@ pub async fn put_region_in_transaction(
     }
 
     let mut state = read_state_for_transaction(storage, transaction_id, principal).await?;
+    let transaction_timestamp =
+        lifecycle_transaction_timestamp(storage, transaction_id, principal).await?;
+    let existing_generation = state
+        .regions
+        .get(&input.region)
+        .map(|descriptor| descriptor.generation);
+    let existed = existing_generation.is_some();
     let mut descriptor = if let Some(existing) = state.regions.get(&input.region).cloned() {
         if !input.public_base_url.is_empty() && existing.public_base_url != input.public_base_url {
             return Err(LifecycleError::InvalidArgument(format!(
@@ -96,7 +108,7 @@ pub async fn put_region_in_transaction(
         existing
     } else {
         require_nonempty(&input.public_base_url, "public base url")?;
-        let now = timestamp_now();
+        let now = transaction_timestamp.clone();
         RegionDescriptor {
             schema: REGION_DESCRIPTOR_SCHEMA.to_string(),
             mesh_id: input.mesh_id,
@@ -125,16 +137,33 @@ pub async fn put_region_in_transaction(
         })?;
         ensure_region_drain_completion_is_supported(storage, &descriptor.region, target).await?;
         descriptor.state = target;
-        descriptor.updated_at = timestamp_now();
+        descriptor.updated_at = transaction_timestamp;
         descriptor.generation = descriptor.generation.saturating_add(1);
+    }
+
+    if existed && descriptor == state.regions[&input.region] {
+        return Ok(descriptor);
     }
 
     state
         .regions
         .insert(descriptor.region.clone(), descriptor.clone());
-    stage_lifecycle_projection_row_in_transaction(
+    let operation = if existed { "upsert" } else { "create" };
+    let expected_generation = existing_generation;
+    let control = topology_mutation::transactional_control_mutation(
+        REGION_DESCRIPTOR_STREAM_FAMILY,
+        descriptor.region.clone(),
+        operation,
+        expected_generation,
+        descriptor.generation,
+        &descriptor.mesh_id,
+        &descriptor,
+        principal,
+    )?;
+    topology_mutation::stage_topology_mutation_in_transaction(
         storage,
         record_proto::encode_region_projection_row(&descriptor)?,
+        control,
         transaction_id,
         principal,
     )
@@ -142,6 +171,7 @@ pub async fn put_region_in_transaction(
     Ok(descriptor)
 }
 
+#[cfg(test)]
 pub async fn transition_region(
     storage: &Storage,
     region: &str,
@@ -207,22 +237,26 @@ async fn transition_region_inner(
     descriptor.updated_at = timestamp_now();
     descriptor.generation = descriptor.generation.saturating_add(1);
     let out = descriptor.clone();
-    if let Some(authority) = authority {
-        append_lifecycle_control_mutation(
-            storage,
-            REGION_DESCRIPTOR_STREAM_FAMILY,
-            &lifecycle_control_partition(REGION_DESCRIPTOR_STREAM_FAMILY, &out.region),
-            &out.region,
-            "upsert",
-            Some(expected_generation),
-            out.generation,
-            &out.mesh_id,
-            &out,
-            authority,
-        )
-        .await?;
-    }
-    write_state(storage, &state).await?;
+    let control = authority
+        .map(|authority| {
+            topology_mutation::fenced_control_mutation(
+                REGION_DESCRIPTOR_STREAM_FAMILY,
+                out.region.clone(),
+                "upsert",
+                Some(expected_generation),
+                out.generation,
+                &out.mesh_id,
+                &out,
+                authority,
+            )
+        })
+        .transpose()?;
+    topology_mutation::commit_topology_mutation(
+        storage,
+        record_proto::encode_region_projection_row(&out)?,
+        control,
+    )
+    .await?;
     Ok(out)
 }
 
@@ -300,22 +334,26 @@ async fn activate_region_inner(
     descriptor.updated_at = timestamp_now();
     descriptor.generation = descriptor.generation.saturating_add(1);
     let out = descriptor.clone();
-    if let Some(authority) = authority {
-        append_lifecycle_control_mutation(
-            storage,
-            REGION_DESCRIPTOR_STREAM_FAMILY,
-            &lifecycle_control_partition(REGION_DESCRIPTOR_STREAM_FAMILY, &out.region),
-            &out.region,
-            "upsert",
-            Some(expected_generation),
-            out.generation,
-            &out.mesh_id,
-            &out,
-            authority,
-        )
-        .await?;
-    }
-    write_state(storage, &state).await?;
+    let control = authority
+        .map(|authority| {
+            topology_mutation::fenced_control_mutation(
+                REGION_DESCRIPTOR_STREAM_FAMILY,
+                out.region.clone(),
+                "upsert",
+                Some(expected_generation),
+                out.generation,
+                &out.mesh_id,
+                &out,
+                authority,
+            )
+        })
+        .transpose()?;
+    topology_mutation::commit_topology_mutation(
+        storage,
+        record_proto::encode_region_projection_row(&out)?,
+        control,
+    )
+    .await?;
     Ok(out)
 }
 

@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(test)]
 pub async fn register_node(
     storage: &Storage,
     input: RegisterNodeDescriptor,
@@ -88,24 +89,27 @@ async fn register_node_inner(
     state
         .nodes
         .insert(descriptor.node_id.clone(), descriptor.clone());
-    if let Some(authority) = authority {
-        let record_key =
-            node_record_key(&descriptor.region, &descriptor.cell_id, &descriptor.node_id)?;
-        append_lifecycle_control_mutation(
-            storage,
-            NODE_DESCRIPTOR_STREAM_FAMILY,
-            &lifecycle_control_partition(NODE_DESCRIPTOR_STREAM_FAMILY, &record_key),
-            &record_key,
-            "create",
-            None,
-            descriptor.generation,
-            &descriptor.mesh_id,
-            &descriptor,
-            authority,
-        )
-        .await?;
-    }
-    write_state(storage, &state).await?;
+    let record_key = node_record_key(&descriptor.region, &descriptor.cell_id, &descriptor.node_id)?;
+    let control = authority
+        .map(|authority| {
+            topology_mutation::fenced_control_mutation(
+                NODE_DESCRIPTOR_STREAM_FAMILY,
+                record_key,
+                "create",
+                None,
+                descriptor.generation,
+                &descriptor.mesh_id,
+                &descriptor,
+                authority,
+            )
+        })
+        .transpose()?;
+    topology_mutation::commit_topology_mutation(
+        storage,
+        record_proto::encode_node_projection_row(&descriptor)?,
+        control,
+    )
+    .await?;
     Ok(descriptor)
 }
 
@@ -141,6 +145,8 @@ pub async fn put_node_in_transaction(
     let capacity_json_hash = capacity_json_hash(&input.capacity_json)?;
 
     let mut state = read_state_for_transaction(storage, transaction_id, principal).await?;
+    let transaction_timestamp =
+        lifecycle_transaction_timestamp(storage, transaction_id, principal).await?;
     if !state.regions.contains_key(&input.region) {
         return Err(LifecycleError::NotFound {
             resource_kind: "region",
@@ -154,6 +160,10 @@ pub async fn put_node_in_transaction(
             resource_id: input.cell_id,
         });
     }
+    let existing_generation = state
+        .nodes
+        .get(&input.node_id)
+        .map(|descriptor| descriptor.generation);
     let mut descriptor = if let Some(existing) = state.nodes.get(&input.node_id).cloned() {
         if existing.region != input.region
             || existing.cell_id != input.cell_id
@@ -171,7 +181,7 @@ pub async fn put_node_in_transaction(
         }
         existing
     } else {
-        let now = timestamp_now();
+        let now = transaction_timestamp.clone();
         NodeDescriptor {
             schema: NODE_DESCRIPTOR_SCHEMA.to_string(),
             mesh_id: input.mesh_id,
@@ -209,16 +219,36 @@ pub async fn put_node_in_transaction(
         })?;
         descriptor.state = target;
         descriptor.drain = None;
-        descriptor.updated_at = timestamp_now();
+        descriptor.updated_at = transaction_timestamp;
         descriptor.generation = descriptor.generation.saturating_add(1);
+    }
+
+    if existing_generation.is_some() && descriptor == state.nodes[&input.node_id] {
+        return Ok(descriptor);
     }
 
     state
         .nodes
         .insert(descriptor.node_id.clone(), descriptor.clone());
-    stage_lifecycle_projection_row_in_transaction(
+    let record_key = node_record_key(&descriptor.region, &descriptor.cell_id, &descriptor.node_id)?;
+    let control = topology_mutation::transactional_control_mutation(
+        NODE_DESCRIPTOR_STREAM_FAMILY,
+        record_key,
+        if existing_generation.is_some() {
+            "upsert"
+        } else {
+            "create"
+        },
+        existing_generation,
+        descriptor.generation,
+        &descriptor.mesh_id,
+        &descriptor,
+        principal,
+    )?;
+    topology_mutation::stage_topology_mutation_in_transaction(
         storage,
         record_proto::encode_node_projection_row(&descriptor)?,
+        control,
         transaction_id,
         principal,
     )
@@ -226,6 +256,7 @@ pub async fn put_node_in_transaction(
     Ok(descriptor)
 }
 
+#[cfg(test)]
 pub async fn transition_node(
     storage: &Storage,
     node_id: &str,
@@ -301,23 +332,27 @@ async fn transition_node_inner(
     descriptor.updated_at = timestamp_now();
     descriptor.generation = descriptor.generation.saturating_add(1);
     let out = descriptor.clone();
-    if let Some(authority) = authority {
-        let record_key = node_record_key(&out.region, &out.cell_id, &out.node_id)?;
-        append_lifecycle_control_mutation(
-            storage,
-            NODE_DESCRIPTOR_STREAM_FAMILY,
-            &lifecycle_control_partition(NODE_DESCRIPTOR_STREAM_FAMILY, &record_key),
-            &record_key,
-            "upsert",
-            Some(expected_generation),
-            out.generation,
-            &out.mesh_id,
-            &out,
-            authority,
-        )
-        .await?;
-    }
-    write_state(storage, &state).await?;
+    let record_key = node_record_key(&out.region, &out.cell_id, &out.node_id)?;
+    let control = authority
+        .map(|authority| {
+            topology_mutation::fenced_control_mutation(
+                NODE_DESCRIPTOR_STREAM_FAMILY,
+                record_key,
+                "upsert",
+                Some(expected_generation),
+                out.generation,
+                &out.mesh_id,
+                &out,
+                authority,
+            )
+        })
+        .transpose()?;
+    topology_mutation::commit_topology_mutation(
+        storage,
+        record_proto::encode_node_projection_row(&out)?,
+        control,
+    )
+    .await?;
     Ok(out)
 }
 

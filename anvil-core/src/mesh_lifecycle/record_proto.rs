@@ -19,6 +19,8 @@ pub(super) const LIFECYCLE_PROJECTION_CELL_KIND: &str = "cell";
 pub(super) const LIFECYCLE_PROJECTION_NODE_KIND: &str = "node";
 pub(super) const LIFECYCLE_PROJECTION_HOST_ALIAS_KIND: &str = "host_alias";
 pub(super) const LIFECYCLE_PROJECTION_BUCKET_DRAIN_EXCEPTION_KIND: &str = "bucket_drain_exception";
+pub(super) const LIFECYCLE_PROJECTION_TOPOLOGY_ACTIVATION_KIND: &str = "topology_activation";
+pub(super) const LIFECYCLE_PROJECTION_TOPOLOGY_HEAD_KIND: &str = "topology_head";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct EncodedLifecycleProjectionRow {
@@ -33,6 +35,8 @@ pub(super) enum LifecycleProjectionDescriptor {
     Node(NodeDescriptor),
     HostAlias(HostAliasDescriptor),
     BucketDrainException(BucketDrainExceptionDescriptor),
+    TopologyActivation(CanonicalTopologyActivation),
+    TopologyHead(LifecycleTopologyHead),
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -47,6 +51,10 @@ struct MeshLifecycleStateProto {
     host_aliases: Vec<HostAliasDescriptorProto>,
     #[prost(message, repeated, tag = "5")]
     bucket_drain_exceptions: Vec<BucketDrainExceptionDescriptorProto>,
+    #[prost(message, optional, tag = "6")]
+    canonical_topology_activation: Option<CanonicalTopologyActivationProto>,
+    #[prost(message, optional, tag = "7")]
+    topology_head: Option<LifecycleTopologyHeadProto>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -207,6 +215,42 @@ struct BucketDrainExceptionDescriptorProto {
     generation: u64,
 }
 
+#[derive(Clone, PartialEq, Message)]
+struct CanonicalTopologyActivationProto {
+    #[prost(string, tag = "1")]
+    schema: String,
+    #[prost(string, tag = "2")]
+    mesh_id: String,
+    #[prost(uint64, tag = "3")]
+    pre_activation_topology_head_generation: u64,
+    #[prost(string, tag = "4")]
+    pre_activation_topology_head_hash: String,
+    #[prost(string, tag = "5")]
+    topology_hash: String,
+    #[prost(string, repeated, tag = "6")]
+    metadata_node_ids: Vec<String>,
+    #[prost(string, tag = "7")]
+    quorum_profile: String,
+    #[prost(uint64, tag = "8")]
+    activated_at_unix_nanos: u64,
+    #[prost(uint64, tag = "9")]
+    generation: u64,
+    #[prost(string, tag = "10")]
+    payload_hash: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct LifecycleTopologyHeadProto {
+    #[prost(string, tag = "1")]
+    schema: String,
+    #[prost(string, tag = "2")]
+    mesh_id: String,
+    #[prost(string, tag = "3")]
+    topology_hash: String,
+    #[prost(uint64, tag = "4")]
+    generation: u64,
+}
+
 pub(super) enum LifecycleControlDescriptor {
     Region(RegionDescriptor),
     Cell(CellDescriptor),
@@ -228,6 +272,11 @@ pub(super) fn encode_lifecycle_state(state: &MeshLifecycleState) -> LifecycleRes
             .values()
             .map(bucket_drain_exception_to_proto)
             .collect(),
+        canonical_topology_activation: state
+            .canonical_topology_activation
+            .as_ref()
+            .map(topology_activation_to_proto),
+        topology_head: state.topology_head.as_ref().map(topology_head_to_proto),
     }))
 }
 
@@ -280,6 +329,14 @@ pub(super) fn decode_lifecycle_state(bytes: &[u8]) -> LifecycleResult<MeshLifecy
             "bucket drain exception",
         )?;
     }
+    state.canonical_topology_activation = proto
+        .canonical_topology_activation
+        .map(topology_activation_from_proto)
+        .transpose()?;
+    state.topology_head = proto
+        .topology_head
+        .map(topology_head_from_proto)
+        .transpose()?;
     Ok(state)
 }
 
@@ -342,6 +399,30 @@ pub(super) fn encode_bucket_drain_exception_projection_row(
         record_key,
         descriptor.generation,
         encode_deterministic_proto(&bucket_drain_exception_to_proto(descriptor)),
+    )
+}
+
+pub(super) fn encode_topology_activation_projection_row(
+    activation: &CanonicalTopologyActivation,
+) -> LifecycleResult<EncodedLifecycleProjectionRow> {
+    topology_activation::validate_canonical_topology_activation(activation)?;
+    encode_projection_row(
+        LIFECYCLE_PROJECTION_TOPOLOGY_ACTIVATION_KIND,
+        activation.mesh_id.clone(),
+        activation.generation,
+        encode_deterministic_proto(&topology_activation_to_proto(activation)),
+    )
+}
+
+pub(super) fn encode_topology_head_projection_row(
+    head: &LifecycleTopologyHead,
+) -> LifecycleResult<EncodedLifecycleProjectionRow> {
+    validate_topology_head(head)?;
+    encode_projection_row(
+        LIFECYCLE_PROJECTION_TOPOLOGY_HEAD_KIND,
+        head.mesh_id.clone(),
+        head.generation,
+        encode_deterministic_proto(&topology_head_to_proto(head)),
     )
 }
 
@@ -437,6 +518,34 @@ pub(super) fn decode_lifecycle_projection_row(
                 descriptor,
             ))
         }
+        LIFECYCLE_PROJECTION_TOPOLOGY_ACTIVATION_KIND => {
+            let activation = topology_activation_from_proto(decode_deterministic(
+                &row.descriptor_payload_proto,
+                "canonical topology activation projection payload",
+            )?)?;
+            ensure_projection_row_scope(
+                &row,
+                LIFECYCLE_PROJECTION_TOPOLOGY_ACTIVATION_KIND,
+                &activation.mesh_id,
+                activation.generation,
+            )?;
+            Ok(LifecycleProjectionDescriptor::TopologyActivation(
+                activation,
+            ))
+        }
+        LIFECYCLE_PROJECTION_TOPOLOGY_HEAD_KIND => {
+            let head = topology_head_from_proto(decode_deterministic(
+                &row.descriptor_payload_proto,
+                "lifecycle topology head projection payload",
+            )?)?;
+            ensure_projection_row_scope(
+                &row,
+                LIFECYCLE_PROJECTION_TOPOLOGY_HEAD_KIND,
+                &head.mesh_id,
+                head.generation,
+            )?;
+            Ok(LifecycleProjectionDescriptor::TopologyHead(head))
+        }
         _ => Err(LifecycleError::InvalidArgument(format!(
             "unknown mesh lifecycle projection row kind {}",
             row.kind
@@ -450,10 +559,22 @@ fn encode_projection_row(
     generation: u64,
     descriptor_payload_proto: Vec<u8>,
 ) -> LifecycleResult<EncodedLifecycleProjectionRow> {
+    let root_anchor_key = if matches!(
+        kind,
+        LIFECYCLE_PROJECTION_REGION_KIND
+            | LIFECYCLE_PROJECTION_CELL_KIND
+            | LIFECYCLE_PROJECTION_NODE_KIND
+            | LIFECYCLE_PROJECTION_TOPOLOGY_ACTIVATION_KIND
+            | LIFECYCLE_PROJECTION_TOPOLOGY_HEAD_KIND
+    ) {
+        LIFECYCLE_TOPOLOGY_ROOT_ANCHOR_KEY.to_string()
+    } else {
+        format!("mesh/lifecycle/{kind}/{record_key}")
+    };
     let row = MeshLifecycleProjectionRowProto {
         common: Some(core_meta_committed_row_common(
             "mesh",
-            core_meta_root_key_hash(&format!("mesh/lifecycle/{kind}/{record_key}")),
+            core_meta_root_key_hash(&root_anchor_key),
             generation,
             format!("mesh-lifecycle:{kind}:{generation}"),
             0,
@@ -818,6 +939,82 @@ fn bucket_drain_exception_from_proto(
     require_identifier(&descriptor.region, "bucket drain exception region")?;
     require_nonempty(&descriptor.reason, "bucket drain exception reason")?;
     Ok(descriptor)
+}
+
+fn topology_activation_to_proto(
+    activation: &CanonicalTopologyActivation,
+) -> CanonicalTopologyActivationProto {
+    CanonicalTopologyActivationProto {
+        schema: activation.schema.clone(),
+        mesh_id: activation.mesh_id.clone(),
+        pre_activation_topology_head_generation: activation.pre_activation_topology_head_generation,
+        pre_activation_topology_head_hash: activation.pre_activation_topology_head_hash.clone(),
+        topology_hash: activation.topology_hash.clone(),
+        metadata_node_ids: activation.metadata_node_ids.clone(),
+        quorum_profile: activation.quorum_profile.clone(),
+        activated_at_unix_nanos: activation.activated_at_unix_nanos,
+        generation: activation.generation,
+        payload_hash: activation.payload_hash.clone(),
+    }
+}
+
+fn topology_activation_from_proto(
+    proto: CanonicalTopologyActivationProto,
+) -> LifecycleResult<CanonicalTopologyActivation> {
+    let activation = CanonicalTopologyActivation {
+        schema: proto.schema,
+        mesh_id: proto.mesh_id,
+        pre_activation_topology_head_generation: proto.pre_activation_topology_head_generation,
+        pre_activation_topology_head_hash: proto.pre_activation_topology_head_hash,
+        topology_hash: proto.topology_hash,
+        metadata_node_ids: proto.metadata_node_ids,
+        quorum_profile: proto.quorum_profile,
+        activated_at_unix_nanos: proto.activated_at_unix_nanos,
+        generation: proto.generation,
+        payload_hash: proto.payload_hash,
+    };
+    topology_activation::validate_canonical_topology_activation(&activation)?;
+    Ok(activation)
+}
+
+fn topology_head_to_proto(head: &LifecycleTopologyHead) -> LifecycleTopologyHeadProto {
+    LifecycleTopologyHeadProto {
+        schema: head.schema.clone(),
+        mesh_id: head.mesh_id.clone(),
+        topology_hash: head.topology_hash.clone(),
+        generation: head.generation,
+    }
+}
+
+fn topology_head_from_proto(
+    proto: LifecycleTopologyHeadProto,
+) -> LifecycleResult<LifecycleTopologyHead> {
+    let head = LifecycleTopologyHead {
+        schema: proto.schema,
+        mesh_id: proto.mesh_id,
+        topology_hash: proto.topology_hash,
+        generation: proto.generation,
+    };
+    validate_topology_head(&head)?;
+    Ok(head)
+}
+
+pub(super) fn validate_topology_head(head: &LifecycleTopologyHead) -> LifecycleResult<()> {
+    ensure_schema(
+        &head.schema,
+        LIFECYCLE_TOPOLOGY_HEAD_SCHEMA,
+        "lifecycle topology head",
+    )?;
+    require_identifier(&head.mesh_id, "lifecycle topology head mesh id")?;
+    if head.generation == 0 {
+        return Err(LifecycleError::InvalidArgument(
+            "lifecycle topology head generation must be nonzero".to_string(),
+        ));
+    }
+    topology_activation::validate_sha256_for_topology(
+        &head.topology_hash,
+        "lifecycle topology head hash",
+    )
 }
 
 fn decode_deterministic<M>(bytes: &[u8], context: &'static str) -> LifecycleResult<M>

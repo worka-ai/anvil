@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(test)]
 pub async fn register_cell(
     storage: &Storage,
     input: RegisterCellDescriptor,
@@ -54,23 +55,27 @@ async fn register_cell_inner(
         generation: 1,
     };
     state.cells.insert(key, descriptor.clone());
-    if let Some(authority) = authority {
-        let record_key = cell_record_key(&descriptor.region, &descriptor.cell_id)?;
-        append_lifecycle_control_mutation(
-            storage,
-            CELL_DESCRIPTOR_STREAM_FAMILY,
-            &lifecycle_control_partition(CELL_DESCRIPTOR_STREAM_FAMILY, &record_key),
-            &record_key,
-            "create",
-            None,
-            descriptor.generation,
-            &descriptor.mesh_id,
-            &descriptor,
-            authority,
-        )
-        .await?;
-    }
-    write_state(storage, &state).await?;
+    let record_key = cell_record_key(&descriptor.region, &descriptor.cell_id)?;
+    let control = authority
+        .map(|authority| {
+            topology_mutation::fenced_control_mutation(
+                CELL_DESCRIPTOR_STREAM_FAMILY,
+                record_key,
+                "create",
+                None,
+                descriptor.generation,
+                &descriptor.mesh_id,
+                &descriptor,
+                authority,
+            )
+        })
+        .transpose()?;
+    topology_mutation::commit_topology_mutation(
+        storage,
+        record_proto::encode_cell_projection_row(&descriptor)?,
+        control,
+    )
+    .await?;
     Ok(descriptor)
 }
 
@@ -87,6 +92,8 @@ pub async fn put_cell_in_transaction(
     require_identifier(&input.failure_domain, "cell failure domain")?;
 
     let mut state = read_state_for_transaction(storage, transaction_id, principal).await?;
+    let transaction_timestamp =
+        lifecycle_transaction_timestamp(storage, transaction_id, principal).await?;
     if !state.regions.contains_key(&input.region) {
         return Err(LifecycleError::NotFound {
             resource_kind: "region",
@@ -94,6 +101,10 @@ pub async fn put_cell_in_transaction(
         });
     }
     let key = cell_key(&input.region, &input.cell_id)?;
+    let existing_generation = state
+        .cells
+        .get(&key)
+        .map(|descriptor| descriptor.generation);
     let mut descriptor = if let Some(existing) = state.cells.get(&key).cloned() {
         if existing.failure_domain != input.failure_domain {
             return Err(LifecycleError::InvalidArgument(format!(
@@ -103,7 +114,7 @@ pub async fn put_cell_in_transaction(
         }
         existing
     } else {
-        let now = timestamp_now();
+        let now = transaction_timestamp.clone();
         CellDescriptor {
             schema: CELL_DESCRIPTOR_SCHEMA.to_string(),
             mesh_id: input.mesh_id,
@@ -130,15 +141,35 @@ pub async fn put_cell_in_transaction(
             }
         })?;
         descriptor.state = target;
-        descriptor.updated_at = timestamp_now();
+        descriptor.updated_at = transaction_timestamp;
         descriptor.generation = descriptor.generation.saturating_add(1);
+    }
+
+    if existing_generation.is_some() && descriptor == state.cells[&key] {
+        return Ok(descriptor);
     }
 
     let key = cell_key(&descriptor.region, &descriptor.cell_id)?;
     state.cells.insert(key, descriptor.clone());
-    stage_lifecycle_projection_row_in_transaction(
+    let record_key = cell_record_key(&descriptor.region, &descriptor.cell_id)?;
+    let control = topology_mutation::transactional_control_mutation(
+        CELL_DESCRIPTOR_STREAM_FAMILY,
+        record_key,
+        if existing_generation.is_some() {
+            "upsert"
+        } else {
+            "create"
+        },
+        existing_generation,
+        descriptor.generation,
+        &descriptor.mesh_id,
+        &descriptor,
+        principal,
+    )?;
+    topology_mutation::stage_topology_mutation_in_transaction(
         storage,
         record_proto::encode_cell_projection_row(&descriptor)?,
+        control,
         transaction_id,
         principal,
     )
@@ -146,6 +177,7 @@ pub async fn put_cell_in_transaction(
     Ok(descriptor)
 }
 
+#[cfg(test)]
 pub async fn transition_cell(
     storage: &Storage,
     region: &str,
@@ -205,23 +237,27 @@ async fn transition_cell_inner(
     descriptor.updated_at = timestamp_now();
     descriptor.generation = descriptor.generation.saturating_add(1);
     let out = descriptor.clone();
-    if let Some(authority) = authority {
-        let record_key = cell_record_key(&out.region, &out.cell_id)?;
-        append_lifecycle_control_mutation(
-            storage,
-            CELL_DESCRIPTOR_STREAM_FAMILY,
-            &lifecycle_control_partition(CELL_DESCRIPTOR_STREAM_FAMILY, &record_key),
-            &record_key,
-            "upsert",
-            Some(expected_generation),
-            out.generation,
-            &out.mesh_id,
-            &out,
-            authority,
-        )
-        .await?;
-    }
-    write_state(storage, &state).await?;
+    let record_key = cell_record_key(&out.region, &out.cell_id)?;
+    let control = authority
+        .map(|authority| {
+            topology_mutation::fenced_control_mutation(
+                CELL_DESCRIPTOR_STREAM_FAMILY,
+                record_key,
+                "upsert",
+                Some(expected_generation),
+                out.generation,
+                &out.mesh_id,
+                &out,
+                authority,
+            )
+        })
+        .transpose()?;
+    topology_mutation::commit_topology_mutation(
+        storage,
+        record_proto::encode_cell_projection_row(&out)?,
+        control,
+    )
+    .await?;
     Ok(out)
 }
 

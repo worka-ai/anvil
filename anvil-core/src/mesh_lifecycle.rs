@@ -1,17 +1,19 @@
 use crate::core_store::{
     CF_MESH, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-    CoreStore, CoreTransaction, CoreTransactionUpdate, TABLE_MESH_NODE_ROW,
-    TABLE_MESH_PARTITION_ROW, core_meta_payload_digest, core_meta_tuple_key,
+    CoreMutationRootPublication, CoreStore, CoreTransaction, CoreTransactionUpdate,
+    TABLE_MESH_NODE_ROW, TABLE_MESH_PARTITION_ROW, core_meta_payload_digest,
+    core_meta_record_tuple_key, core_meta_tuple_key,
 };
+use crate::formats::writer::WriterFamily;
 use crate::mesh_control_stream::{
     ControlMutationHeaderInput, ControlRecordDigest, ControlStreamFrame, ControlStreamSequence,
     read_control_checkpoint,
 };
-use crate::mesh_directory::{self, BucketLocatorStatus};
+use crate::mesh_directory::{self, BucketLocatorDescriptor, BucketLocatorStatus};
 use crate::partition_fence::{self, PartitionWritePermit};
 use crate::routing::{self, HostAliasDescriptor, HostAliasState, RoutingConfig};
 use crate::storage::Storage;
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -20,8 +22,11 @@ mod bootstrap;
 mod cell;
 mod host_alias;
 mod node;
+mod portable_snapshot;
 mod record_proto;
 mod region;
+mod topology_activation;
+mod topology_mutation;
 pub use bootstrap::{BootstrapMeshLifecycleProjection, install_bootstrap_lifecycle_projection};
 pub use cell::*;
 pub use host_alias::{
@@ -29,11 +34,18 @@ pub use host_alias::{
     transition_host_alias_in_transaction,
 };
 pub use node::*;
+pub(crate) use portable_snapshot::validate_portable_lifecycle_topology_snapshot;
 pub use region::*;
+pub(crate) use topology_activation::is_synthetic_control_node_id;
+pub use topology_activation::{
+    CANONICAL_METADATA_QUORUM_PROFILE, CANONICAL_TOPOLOGY_ACTIVATION_SCHEMA,
+    CanonicalTopologyActivation,
+};
 
 pub const REGION_DESCRIPTOR_SCHEMA: &str = "anvil.mesh.region.v1";
 pub const CELL_DESCRIPTOR_SCHEMA: &str = "anvil.mesh.cell.v1";
 pub const NODE_DESCRIPTOR_SCHEMA: &str = "anvil.mesh.node.v1";
+pub const LIFECYCLE_TOPOLOGY_HEAD_SCHEMA: &str = "anvil.mesh.lifecycle_topology_head.v1";
 pub const ACTIVATION_CHECKPOINT_SCHEMA: &str = "anvil.mesh.activation_checkpoint.v1";
 pub const BUCKET_DRAIN_EXCEPTION_SCHEMA: &str = "anvil.mesh.bucket_drain_exception.v1";
 pub const REGION_DESCRIPTOR_STREAM_FAMILY: &str = "region_descriptor";
@@ -41,6 +53,7 @@ pub const CELL_DESCRIPTOR_STREAM_FAMILY: &str = "cell_descriptor";
 pub const NODE_DESCRIPTOR_STREAM_FAMILY: &str = "node_descriptor";
 const CONTROL_MUTATION_SCHEMA: &str = "anvil.mesh.control_mutation.v1";
 const MESH_LIFECYCLE_PROJECTION_PARTITION_ID: &str = "mesh-lifecycle-projection";
+pub(crate) const LIFECYCLE_TOPOLOGY_ROOT_ANCHOR_KEY: &str = "mesh/lifecycle/topology";
 const LIFECYCLE_PROJECTION_PAGE_SIZE: usize = 256;
 const MAX_LIFECYCLE_PROJECTION_ROWS_PER_TABLE: usize = 8_192;
 
@@ -303,6 +316,14 @@ pub struct LifecycleControlWriteAuthority<'a> {
     pub signing_key: &'a [u8],
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LifecycleTopologyHead {
+    pub schema: String,
+    pub mesh_id: String,
+    pub topology_hash: String,
+    pub generation: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MeshLifecycleState {
     pub regions: BTreeMap<String, RegionDescriptor>,
@@ -312,6 +333,10 @@ pub struct MeshLifecycleState {
     pub host_aliases: BTreeMap<String, HostAliasDescriptor>,
     #[serde(default)]
     pub bucket_drain_exceptions: BTreeMap<String, BucketDrainExceptionDescriptor>,
+    #[serde(default)]
+    pub canonical_topology_activation: Option<CanonicalTopologyActivation>,
+    #[serde(default)]
+    pub topology_head: Option<LifecycleTopologyHead>,
 }
 
 pub async fn read_state(storage: &Storage) -> LifecycleResult<MeshLifecycleState> {
@@ -356,10 +381,45 @@ async fn read_state_for_transaction(
     Ok(state)
 }
 
+async fn lifecycle_transaction_timestamp(
+    storage: &Storage,
+    transaction_id: &str,
+    principal: &str,
+) -> LifecycleResult<String> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let transaction = store
+        .read_explicit_transaction_for_principal(transaction_id, principal)
+        .await?;
+    let seconds =
+        i64::try_from(transaction.created_at_unix_nanos / 1_000_000_000).map_err(|_| {
+            LifecycleError::InvalidArgument(
+                "lifecycle transaction timestamp exceeds the supported range".to_string(),
+            )
+        })?;
+    let nanos = (transaction.created_at_unix_nanos % 1_000_000_000) as u32;
+    let timestamp = DateTime::<Utc>::from_timestamp(seconds, nanos).ok_or_else(|| {
+        LifecycleError::InvalidArgument(
+            "lifecycle transaction timestamp exceeds the supported range".to_string(),
+        )
+    })?;
+    Ok(timestamp.to_rfc3339_opts(SecondsFormat::Millis, true))
+}
+
 async fn write_state(storage: &Storage, state: &MeshLifecycleState) -> LifecycleResult<()> {
     let store = CoreStore::new(storage.clone()).await?;
+    let existing_state = read_lifecycle_state_projection_with_core_store(&store)?;
+    let existing_activation = existing_state.canonical_topology_activation.as_ref();
+    ensure_canonical_topology_activation_is_preserved(
+        existing_activation,
+        state.canonical_topology_activation.as_ref(),
+    )?;
+    ensure_topology_head_is_preserved(
+        existing_state.topology_head.as_ref(),
+        state.topology_head.as_ref(),
+    )?;
     let rows = encode_lifecycle_projection_rows(state)?;
     let mut desired_keys = BTreeSet::new();
+    let mut data_roots = BTreeSet::new();
     let mut preconditions = Vec::with_capacity(rows.len());
     let mut operations = Vec::with_capacity(rows.len());
     for row in rows {
@@ -367,6 +427,13 @@ async fn write_state(storage: &Storage, state: &MeshLifecycleState) -> Lifecycle
         let tuple_key = lifecycle_projection_row_key(row.kind, &row.record_key)?;
         desired_keys.insert((table_id, tuple_key.clone()));
         let current = store.read_coremeta_row(CF_MESH, table_id, &tuple_key)?;
+        if current.as_deref() == Some(row.payload.as_slice()) {
+            continue;
+        }
+        data_roots.insert(lifecycle_projection_root_anchor_key(
+            row.kind,
+            &row.record_key,
+        ));
         preconditions.push(CoreMutationPrecondition::CoreMetaRow {
             cf: CF_MESH.to_string(),
             table_id,
@@ -394,6 +461,7 @@ async fn write_state(storage: &Storage, state: &MeshLifecycleState) -> Lifecycle
             if desired_keys.contains(&(table_id, tuple_key.clone())) {
                 continue;
             }
+            data_roots.insert(lifecycle_projection_root_anchor_key(kind, &record_key));
             preconditions.push(CoreMutationPrecondition::CoreMetaRow {
                 cf: CF_MESH.to_string(),
                 table_id,
@@ -413,11 +481,14 @@ async fn write_state(storage: &Storage, state: &MeshLifecycleState) -> Lifecycle
     if operations.is_empty() {
         return Ok(());
     }
+    let root_publications =
+        lifecycle_projection_root_publications(MESH_LIFECYCLE_PROJECTION_PARTITION_ID, data_roots);
     store
         .commit_mutation_batch(CoreMutationBatch {
             transaction_id: format!("mesh-lifecycle-projection:{}", uuid::Uuid::new_v4()),
             scope_partition: MESH_LIFECYCLE_PROJECTION_PARTITION_ID.to_string(),
             committed_by_principal: "mesh-lifecycle".to_string(),
+            root_publications,
             preconditions,
             operations,
         })
@@ -443,10 +514,50 @@ fn read_lifecycle_state_projection_with_core_store(
     Ok(state)
 }
 
+pub(crate) fn canonical_topology_activation_with_core_store(
+    store: &CoreStore,
+) -> LifecycleResult<Option<CanonicalTopologyActivation>> {
+    Ok(read_lifecycle_state_projection_with_core_store(store)?.canonical_topology_activation)
+}
+
+fn ensure_canonical_topology_activation_is_preserved(
+    existing: Option<&CanonicalTopologyActivation>,
+    candidate: Option<&CanonicalTopologyActivation>,
+) -> LifecycleResult<()> {
+    if let Some(existing) = existing
+        && candidate != Some(existing)
+    {
+        return Err(LifecycleError::InvalidArgument(
+            "canonical topology activation evidence cannot be replaced or removed".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_topology_head_is_preserved(
+    existing: Option<&LifecycleTopologyHead>,
+    candidate: Option<&LifecycleTopologyHead>,
+) -> LifecycleResult<()> {
+    if existing != candidate {
+        return Err(LifecycleError::InvalidArgument(
+            "generic lifecycle projection writes cannot replace, remove, or advance the topology head"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 async fn delete_lifecycle_state_projection(storage: &Storage) -> LifecycleResult<()> {
     let store = CoreStore::new(storage.clone()).await?;
+    if canonical_topology_activation_with_core_store(&store)?.is_some() {
+        return Err(LifecycleError::InvalidArgument(
+            "lifecycle test cleanup cannot remove canonical topology activation evidence"
+                .to_string(),
+        ));
+    }
     let prefix = lifecycle_projection_row_prefix()?;
+    let mut data_roots = BTreeSet::new();
     let mut preconditions = Vec::new();
     let mut operations = Vec::new();
     for table_id in [TABLE_MESH_PARTITION_ROW, TABLE_MESH_NODE_ROW] {
@@ -454,6 +565,7 @@ async fn delete_lifecycle_state_projection(storage: &Storage) -> LifecycleResult
             let projection = record_proto::decode_lifecycle_projection_row(&row.payload)?;
             let (kind, record_key) = lifecycle_projection_descriptor_key(&projection)?;
             let tuple_key = lifecycle_projection_row_key(kind, &record_key)?;
+            data_roots.insert(lifecycle_projection_root_anchor_key(kind, &record_key));
             preconditions.push(CoreMutationPrecondition::CoreMetaRow {
                 cf: CF_MESH.to_string(),
                 table_id,
@@ -473,11 +585,14 @@ async fn delete_lifecycle_state_projection(storage: &Storage) -> LifecycleResult
     if operations.is_empty() {
         return Ok(());
     }
+    let root_publications =
+        lifecycle_projection_root_publications(MESH_LIFECYCLE_PROJECTION_PARTITION_ID, data_roots);
     store
         .commit_mutation_batch(CoreMutationBatch {
             transaction_id: format!("mesh-lifecycle-projection-delete:{}", uuid::Uuid::new_v4()),
             scope_partition: MESH_LIFECYCLE_PROJECTION_PARTITION_ID.to_string(),
             committed_by_principal: "mesh-lifecycle-test".to_string(),
+            root_publications,
             preconditions,
             operations,
         })
@@ -491,7 +606,7 @@ fn scan_lifecycle_projection_rows(
     prefix: &[u8],
 ) -> LifecycleResult<Vec<crate::core_store::CoreMetaRecord>> {
     let mut rows = Vec::new();
-    let mut cursor = None;
+    let mut cursor: Option<Vec<u8>> = None;
     loop {
         let page = store.scan_coremeta_prefix_page(
             CF_MESH,
@@ -559,6 +674,14 @@ fn encode_lifecycle_projection_rows(
             descriptor,
         )?);
     }
+    if let Some(activation) = state.canonical_topology_activation.as_ref() {
+        rows.push(record_proto::encode_topology_activation_projection_row(
+            activation,
+        )?);
+    }
+    if let Some(head) = state.topology_head.as_ref() {
+        rows.push(record_proto::encode_topology_head_projection_row(head)?);
+    }
     Ok(rows)
 }
 
@@ -568,9 +691,9 @@ fn lifecycle_projection_table_id(kind: &str) -> LifecycleResult<u16> {
         record_proto::LIFECYCLE_PROJECTION_REGION_KIND
         | record_proto::LIFECYCLE_PROJECTION_CELL_KIND
         | record_proto::LIFECYCLE_PROJECTION_HOST_ALIAS_KIND
-        | record_proto::LIFECYCLE_PROJECTION_BUCKET_DRAIN_EXCEPTION_KIND => {
-            Ok(TABLE_MESH_PARTITION_ROW)
-        }
+        | record_proto::LIFECYCLE_PROJECTION_BUCKET_DRAIN_EXCEPTION_KIND
+        | record_proto::LIFECYCLE_PROJECTION_TOPOLOGY_ACTIVATION_KIND
+        | record_proto::LIFECYCLE_PROJECTION_TOPOLOGY_HEAD_KIND => Ok(TABLE_MESH_PARTITION_ROW),
         _ => Err(LifecycleError::InvalidArgument(format!(
             "unknown mesh lifecycle projection kind {kind}"
         ))),
@@ -593,6 +716,35 @@ fn lifecycle_projection_row_key(kind: &str, record_key: &str) -> LifecycleResult
         CoreMetaTuplePart::Utf8(kind),
         CoreMetaTuplePart::Utf8(record_key),
     ])?)
+}
+
+fn lifecycle_projection_root_anchor_key(kind: &str, record_key: &str) -> String {
+    format!("mesh/lifecycle/{kind}/{record_key}")
+}
+
+fn lifecycle_projection_root_publications(
+    coordinator_root: &str,
+    mut data_roots: BTreeSet<String>,
+) -> Vec<CoreMutationRootPublication> {
+    let coordinator_is_data_root = data_roots.remove(coordinator_root);
+    let coordinator = if coordinator_is_data_root {
+        CoreMutationRootPublication {
+            root_anchor_key: coordinator_root.to_string(),
+            writer_families: vec![
+                WriterFamily::CoreControl.as_str().to_string(),
+                WriterFamily::MeshControl.as_str().to_string(),
+            ],
+            transaction_coordinator: true,
+        }
+    } else {
+        CoreMutationRootPublication::new(coordinator_root, WriterFamily::CoreControl.as_str())
+            .coordinator()
+    };
+    std::iter::once(coordinator)
+        .chain(data_roots.into_iter().map(|root_anchor_key| {
+            CoreMutationRootPublication::new(root_anchor_key, WriterFamily::MeshControl.as_str())
+        }))
+        .collect()
 }
 
 async fn stage_lifecycle_projection_row_in_transaction(
@@ -715,6 +867,31 @@ fn apply_lifecycle_projection_row(
             );
             state.bucket_drain_exceptions.insert(key, descriptor);
         }
+        record_proto::LifecycleProjectionDescriptor::TopologyActivation(activation) => {
+            ensure_lifecycle_projection_table(
+                table_id,
+                record_proto::LIFECYCLE_PROJECTION_TOPOLOGY_ACTIVATION_KIND,
+            )?;
+            if let Some(existing) = state.canonical_topology_activation.as_ref()
+                && existing != &activation
+            {
+                return Err(LifecycleError::InvalidArgument(
+                    "canonical topology activation evidence is immutable".to_string(),
+                ));
+            }
+            state.canonical_topology_activation = Some(activation);
+        }
+        record_proto::LifecycleProjectionDescriptor::TopologyHead(head) => {
+            if let Some(existing) = state.topology_head.as_ref()
+                && existing.generation >= head.generation
+                && existing != &head
+            {
+                return Err(LifecycleError::InvalidArgument(
+                    "lifecycle topology head generation did not advance monotonically".to_string(),
+                ));
+            }
+            state.topology_head = Some(head);
+        }
     }
     Ok(())
 }
@@ -764,7 +941,9 @@ pub fn committed_topology_resources_from_transaction(
                 nodes.insert((descriptor.region, descriptor.cell_id, descriptor.node_id));
             }
             record_proto::LifecycleProjectionDescriptor::HostAlias(_)
-            | record_proto::LifecycleProjectionDescriptor::BucketDrainException(_) => {}
+            | record_proto::LifecycleProjectionDescriptor::BucketDrainException(_)
+            | record_proto::LifecycleProjectionDescriptor::TopologyActivation(_)
+            | record_proto::LifecycleProjectionDescriptor::TopologyHead(_) => {}
         }
     }
 
@@ -825,6 +1004,14 @@ fn lifecycle_projection_descriptor_key(
                 &descriptor.tenant_id,
                 &descriptor.bucket_name,
             ),
+        )),
+        record_proto::LifecycleProjectionDescriptor::TopologyActivation(activation) => Ok((
+            record_proto::LIFECYCLE_PROJECTION_TOPOLOGY_ACTIVATION_KIND,
+            activation.mesh_id.clone(),
+        )),
+        record_proto::LifecycleProjectionDescriptor::TopologyHead(head) => Ok((
+            record_proto::LIFECYCLE_PROJECTION_TOPOLOGY_HEAD_KIND,
+            head.mesh_id.clone(),
         )),
     }
 }
