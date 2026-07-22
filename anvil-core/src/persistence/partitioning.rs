@@ -38,6 +38,7 @@ fn is_partition_owner_cas_conflict(err: &anyhow::Error) -> bool {
 
 impl Persistence {
     pub fn new(config: &Config, event_publisher: Option<Sender<MetadataEvent>>) -> Result<Self> {
+        let owner_node_id = persistence_owner_node_id(config);
         Ok(Self {
             storage: Storage::new_at_sync(&config.storage_path)?,
             cache: MetadataCache::new(config),
@@ -47,7 +48,8 @@ impl Persistence {
             mesh_id: nonempty_or(&config.mesh_id, "default"),
             region: nonempty_or(&config.region, "default"),
             cell_id: nonempty_or(&config.cell_id, "default"),
-            owner_node_id: persistence_owner_node_id(config),
+            owner_node_id: owner_node_id.clone(),
+            task_actor_instance_id: format!("{owner_node_id}:{}", uuid::Uuid::new_v4()),
             partition_owner_signing_key: hex::decode(&config.anvil_secret_encryption_key)?,
             embedding_providers: EmbeddingProviderRegistry::from_config(config)?,
             object_metadata_compaction_frame_threshold: config
@@ -81,6 +83,10 @@ impl Persistence {
 
     pub(crate) fn partition_owner_signing_key(&self) -> &[u8] {
         &self.partition_owner_signing_key
+    }
+
+    pub(crate) fn storage(&self) -> &Storage {
+        &self.storage
     }
 
     pub(crate) fn owner_node_id(&self) -> &str {
@@ -261,8 +267,7 @@ impl Persistence {
                     MESH_ROUTING_PAGE_SIZE,
                 )
                 .await?;
-                if records.len().saturating_add(page.records.len())
-                    > MESH_ROUTING_ADMIN_RESULT_CAP
+                if records.len().saturating_add(page.records.len()) > MESH_ROUTING_ADMIN_RESULT_CAP
                 {
                     return Err(anyhow!(
                         "mesh routing admin result exceeds bounded cap of {MESH_ROUTING_ADMIN_RESULT_CAP} records"
@@ -529,9 +534,7 @@ impl Persistence {
                 MESH_ROUTING_PAGE_SIZE,
             )
             .await?;
-            if locators.len().saturating_add(page.locators.len())
-                > MESH_ROUTING_ADMIN_RESULT_CAP
-            {
+            if locators.len().saturating_add(page.locators.len()) > MESH_ROUTING_ADMIN_RESULT_CAP {
                 return Err(anyhow!(
                     "regional bucket locator result exceeds bounded cap of {MESH_ROUTING_ADMIN_RESULT_CAP} records"
                 ));
@@ -685,14 +688,40 @@ impl Persistence {
         let now_nanos = Utc::now()
             .timestamp_nanos_opt()
             .ok_or_else(|| anyhow!("partition owner timestamp overflow"))?;
-        if let Some(owner) = read_partition_owner(
+        let mut owner = read_partition_owner(
             &self.storage,
             partition_family,
             partition_id,
             &self.partition_owner_signing_key,
         )
-        .await?
+        .await?;
+        if let Some(current_owner) = owner.as_ref()
+            && current_owner.owner_node_id != self.owner_node_id
+            && !partition_owner_is_force_expired(current_owner)
         {
+            // The force-expiry mutation is coordinated through CoreStore. A
+            // different node can commit it only after root-register quorum has
+            // fenced the unreachable publisher; a healthy owner therefore
+            // remains authoritative and this request fails closed.
+            force_expire_partition_owner_for_node(
+                &self.storage,
+                partition_family,
+                partition_id,
+                &current_owner.owner_node_id,
+                now_nanos,
+                &self.partition_owner_signing_key,
+            )
+            .await?;
+            owner = read_partition_owner(
+                &self.storage,
+                partition_family,
+                partition_id,
+                &self.partition_owner_signing_key,
+            )
+            .await?;
+        }
+
+        if let Some(owner) = owner {
             if owner.owner_node_id != self.owner_node_id
                 && !partition_owner_is_force_expired(&owner)
             {
@@ -700,6 +729,17 @@ impl Persistence {
                     "{OWNERSHIP_HELD}: partition {partition_family}/{partition_id} is owned by active node {}",
                     owner.owner_node_id
                 );
+            }
+            if partition_owner_is_force_expired(&owner) {
+                return self
+                    .recover_partition_write_permit(
+                        partition_family,
+                        partition_id,
+                        owner.recovered_through_sequence,
+                        &owner.recovered_manifest_hash,
+                        now_nanos,
+                    )
+                    .await;
             }
             if owner.status == PartitionOwnerStatus::Ready {
                 return owner.write_permit().map_err(Into::into);
@@ -719,14 +759,32 @@ impl Persistence {
             return ready.write_permit().map_err(Into::into);
         }
 
+        self.recover_partition_write_permit(
+            partition_family,
+            partition_id,
+            0,
+            &hex::encode([0; 32]),
+            now_nanos,
+        )
+        .await
+    }
+
+    async fn recover_partition_write_permit(
+        &self,
+        partition_family: &str,
+        partition_id: &str,
+        recovered_through_sequence: u64,
+        recovered_manifest_hash: &str,
+        now_nanos: i64,
+    ) -> Result<PartitionWritePermit> {
         let recovering = acquire_partition_recovery(
             &self.storage,
             PartitionRecoveryAcquire {
                 partition_family: partition_family.to_string(),
                 partition_id: partition_id.to_string(),
                 owner_node_id: self.owner_node_id.clone(),
-                recovered_through_sequence: 0,
-                recovered_manifest_hash: hex::encode([0; 32]),
+                recovered_through_sequence,
+                recovered_manifest_hash: recovered_manifest_hash.to_string(),
                 now_nanos,
             },
             &self.partition_owner_signing_key,
@@ -741,8 +799,8 @@ impl Persistence {
             partition_id,
             &self.owner_node_id,
             recovering.fence_token,
-            0,
-            &hex::encode([0; 32]),
+            recovered_through_sequence,
+            recovered_manifest_hash,
             now_nanos.saturating_add(1),
             &self.partition_owner_signing_key,
         )
@@ -787,19 +845,6 @@ impl Persistence {
             node.state,
             partition_family
         ))
-    }
-
-    pub(super) async fn owned_write_permit(
-        &self,
-        resource_kind: OwnershipResourceKind,
-        resource_id: String,
-        partition_family: &str,
-        partition_id: String,
-    ) -> Result<PartitionWritePermit> {
-        self.ensure_ownership_fence(resource_kind, resource_id)
-            .await?;
-        self.global_write_permit(partition_family, partition_id)
-            .await
     }
 
     pub(crate) async fn ensure_ownership_fence(
@@ -913,8 +958,6 @@ impl Persistence {
         family: mesh_directory::RoutingRecordFamily,
         partition: &str,
     ) -> Result<PartitionWritePermit> {
-        self.ensure_mesh_control_ownership(family, partition)
-            .await?;
         self.global_write_permit(
             mesh_directory::CONTROL_PARTITION_FAMILY,
             mesh_directory::control_partition_id(family.stream_family(), partition),
@@ -927,79 +970,11 @@ impl Persistence {
         stream_family: &str,
         partition: &str,
     ) -> Result<PartitionWritePermit> {
-        self.ensure_mesh_control_stream_ownership(stream_family, partition)
-            .await?;
         self.global_write_permit(
             mesh_directory::CONTROL_PARTITION_FAMILY,
             mesh_directory::control_partition_id(stream_family, partition),
         )
         .await
-    }
-
-    pub(super) async fn ensure_mesh_control_ownership(
-        &self,
-        family: mesh_directory::RoutingRecordFamily,
-        partition: &str,
-    ) -> Result<()> {
-        self.ensure_mesh_control_stream_ownership(family.stream_family(), partition)
-            .await
-    }
-
-    pub(super) async fn ensure_mesh_control_stream_ownership(
-        &self,
-        stream_family: &str,
-        partition: &str,
-    ) -> Result<()> {
-        let resource = OwnershipResource {
-            resource_kind: OwnershipResourceKind::ControlPartition,
-            resource_id: format!("{stream_family}/{partition}"),
-        };
-        let owner = self.ownership_principal();
-        let now_nanos = Utc::now()
-            .timestamp_nanos_opt()
-            .ok_or_else(|| anyhow!("ownership timestamp overflow"))?;
-        let ttl_nanos = i64::try_from(MAX_OWNERSHIP_LEASE_MS)?.saturating_mul(1_000_000);
-
-        if let Some(record) = read_ownership_fence(
-            &self.storage,
-            owner.tenant_id,
-            &resource,
-            &self.partition_owner_signing_key,
-        )
-        .await?
-        {
-            if record.owner == owner && record.is_active_unexpired(now_nanos) {
-                renew_ownership(
-                    &self.storage,
-                    RenewOwnership {
-                        request_id: format!("mesh-control-renew-{}", resource.resource_id),
-                        resource: resource.clone(),
-                        owner: owner.clone(),
-                        current_fence: record.fence,
-                        now_nanos,
-                        ttl_nanos,
-                    },
-                    &self.partition_owner_signing_key,
-                )
-                .await?;
-                return Ok(());
-            }
-        }
-
-        acquire_ownership(
-            &self.storage,
-            AcquireOwnership {
-                request_id: format!("mesh-control-acquire-{}", resource.resource_id),
-                idempotency_key: format!("mesh-control-owner-{}", resource.resource_id),
-                resource,
-                owner,
-                now_nanos,
-                ttl_nanos,
-            },
-            &self.partition_owner_signing_key,
-        )
-        .await?;
-        Ok(())
     }
 
     pub(super) fn ownership_principal(&self) -> OwnershipPrincipal {
@@ -1016,13 +991,7 @@ impl Persistence {
 
     pub(super) async fn task_queue_write_permit(&self) -> Result<PartitionWritePermit> {
         let partition_id = hex::encode(task_journal::task_queue_partition_id());
-        self.owned_write_permit(
-            OwnershipResourceKind::TaskQueue,
-            format!("task_queue/{partition_id}"),
-            "task_queue",
-            partition_id,
-        )
-        .await
+        self.global_write_permit("task_queue", partition_id).await
     }
 
     pub(super) async fn model_write_permit(&self) -> Result<PartitionWritePermit> {
@@ -1043,24 +1012,14 @@ impl Persistence {
         tenant_id: i64,
     ) -> Result<PartitionWritePermit> {
         let partition_id = hex::encode(bucket_journal::tenant_bucket_partition_id(tenant_id));
-        self.owned_write_permit(
-            OwnershipResourceKind::BucketPrimary,
-            format!("tenant/{tenant_id}/bucket_metadata/{partition_id}"),
-            "bucket_metadata",
-            partition_id,
-        )
-        .await
+        self.global_write_permit("bucket_metadata", partition_id)
+            .await
     }
 
     pub(super) async fn bucket_global_write_permit(&self) -> Result<PartitionWritePermit> {
         let partition_id = hex::encode(bucket_journal::global_bucket_partition_id());
-        self.owned_write_permit(
-            OwnershipResourceKind::BucketPrimary,
-            format!("global/bucket_metadata/{partition_id}"),
-            "bucket_metadata",
-            partition_id,
-        )
-        .await
+        self.global_write_permit("bucket_metadata", partition_id)
+            .await
     }
 
     pub(super) async fn object_metadata_write_permit(
@@ -1071,13 +1030,8 @@ impl Persistence {
         let partition_id = hex::encode(metadata_journal::object_metadata_partition_id(
             tenant_id, bucket_id,
         ));
-        self.owned_write_permit(
-            OwnershipResourceKind::ObjectPartition,
-            format!("tenant/{tenant_id}/bucket/{bucket_id}/object_metadata/{partition_id}"),
-            "object_metadata",
-            partition_id,
-        )
-        .await
+        self.global_write_permit("object_metadata", partition_id)
+            .await
     }
 
     pub(super) async fn multipart_metadata_write_permit(
@@ -1088,13 +1042,8 @@ impl Persistence {
         let partition_id = hex::encode(multipart_journal::multipart_metadata_partition_id(
             tenant_id, bucket_id,
         ));
-        self.owned_write_permit(
-            OwnershipResourceKind::ObjectPartition,
-            format!("tenant/{tenant_id}/bucket/{bucket_id}/multipart_metadata/{partition_id}"),
-            "multipart_metadata",
-            partition_id,
-        )
-        .await
+        self.global_write_permit("multipart_metadata", partition_id)
+            .await
     }
 
     pub(super) async fn append_metadata_write_permit(
@@ -1105,13 +1054,8 @@ impl Persistence {
         let partition_id = hex::encode(append_journal::append_metadata_partition_id(
             tenant_id, bucket_id,
         ));
-        self.owned_write_permit(
-            OwnershipResourceKind::ObjectPartition,
-            format!("tenant/{tenant_id}/bucket/{bucket_id}/append_metadata/{partition_id}"),
-            "append_metadata",
-            partition_id,
-        )
-        .await
+        self.global_write_permit("append_metadata", partition_id)
+            .await
     }
 
     pub(super) async fn manifest_cas_write_permit(
@@ -1122,13 +1066,7 @@ impl Persistence {
         let partition_id = hex::encode(manifest_journal::manifest_cas_partition_id(
             tenant_id, bucket_id,
         ));
-        self.owned_write_permit(
-            OwnershipResourceKind::ObjectPartition,
-            format!("tenant/{tenant_id}/bucket/{bucket_id}/manifest_cas/{partition_id}"),
-            "manifest_cas",
-            partition_id,
-        )
-        .await
+        self.global_write_permit("manifest_cas", partition_id).await
     }
 
     pub(super) async fn authz_write_permit(&self, tenant_id: i64) -> Result<PartitionWritePermit> {
@@ -1161,13 +1099,8 @@ impl Persistence {
         let partition_id = hex::encode(index_journal::index_definition_partition_id(
             tenant_id, bucket_id,
         ));
-        self.owned_write_permit(
-            OwnershipResourceKind::IndexPartition,
-            format!("tenant/{tenant_id}/bucket/{bucket_id}/index_definition/{partition_id}"),
-            "index_definition",
-            partition_id,
-        )
-        .await
+        self.global_write_permit("index_definition", partition_id)
+            .await
     }
 
     pub(super) async fn index_diagnostic_write_permit(
@@ -1178,12 +1111,7 @@ impl Persistence {
         let partition_id = hex::encode(index_diagnostic_journal::index_diagnostic_partition_id(
             tenant_id, bucket_id,
         ));
-        self.owned_write_permit(
-            OwnershipResourceKind::IndexPartition,
-            format!("tenant/{tenant_id}/bucket/{bucket_id}/index_diagnostic/{partition_id}"),
-            "index_diagnostic",
-            partition_id,
-        )
-        .await
+        self.global_write_permit("index_diagnostic", partition_id)
+            .await
     }
 }
