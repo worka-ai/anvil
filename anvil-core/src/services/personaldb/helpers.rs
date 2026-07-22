@@ -430,6 +430,14 @@ mod limit_tests {
             tonic::Code::InvalidArgument
         );
     }
+
+    #[test]
+    fn authz_revision_lag_is_not_reported_as_an_internal_failure() {
+        let status = internal_status(anyhow::anyhow!(
+            "AuthzRevisionUnavailable: requested revision is not materialized"
+        ));
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    }
 }
 
 pub(super) fn split_u128(value: u128) -> (u64, u64) {
@@ -445,7 +453,12 @@ pub(super) fn now_rfc3339() -> String {
 }
 
 pub(super) fn internal_status(err: impl std::fmt::Display) -> Status {
-    Status::internal(format!("{err:#}"))
+    let message = format!("{err:#}");
+    if message.contains(AnvilErrorCode::AuthzRevisionUnavailable.as_str()) {
+        Status::failed_precondition(message)
+    } else {
+        Status::internal(message)
+    }
 }
 
 pub(super) fn personaldb_ownership_status(err: impl std::fmt::Display) -> Status {
