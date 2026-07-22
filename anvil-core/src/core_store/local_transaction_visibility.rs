@@ -424,19 +424,33 @@ impl CoreStore {
         transaction: &CoreTransaction,
         publication_generations: &BTreeMap<String, u64>,
     ) -> Result<()> {
-        let mut updates_by_stream = BTreeMap::<String, BTreeMap<u64, StreamRecord>>::new();
+        let mut unpublished_by_stream = BTreeMap::<String, BTreeMap<u64, StreamRecord>>::new();
         for update in &transaction.visible_updates {
             let Some(record) = publication_stream_record_from_update(transaction, update)? else {
                 continue;
             };
             let root_key_hash =
                 super::local_roots_layout::stream_coremeta_root_key_hash(&record.stream_id);
+            // Staging the coordinator can temporarily hide participant rows
+            // that recovery published earlier. Immutable root evidence still
+            // proves whether this exact stream effect is already durable.
+            if self
+                .validate_existing_stream_publication_unlocked(
+                    transaction,
+                    &record,
+                    &root_key_hash,
+                    publication_generations.get(&root_key_hash).copied(),
+                )
+                .await?
+            {
+                continue;
+            }
             if !publication_generations.contains_key(&root_key_hash) {
                 bail!(
                     "TransactionScopeMismatch: implicit stream publication does not declare canonical root {root_key_hash}"
                 );
             }
-            let previous = updates_by_stream
+            let previous = unpublished_by_stream
                 .entry(record.stream_id.clone())
                 .or_default()
                 .insert(record.sequence, record);
@@ -445,11 +459,17 @@ impl CoreStore {
             }
         }
 
-        for (stream_id, updates) in updates_by_stream {
-            let (mut previous_sequence, mut previous_event_hash) = self
-                .read_stream_head_from_meta(&stream_id)?
-                .map(|head| (head.last_sequence, head.last_event_hash))
-                .unwrap_or_else(|| (0, ZERO_HASH.to_string()));
+        for (stream_id, updates) in unpublished_by_stream {
+            let first = updates
+                .first_key_value()
+                .map(|(_, record)| record)
+                .ok_or_else(|| anyhow!("CoreStore unpublished stream update set is empty"))?;
+            let expected_previous_sequence = first
+                .sequence
+                .checked_sub(1)
+                .ok_or_else(|| anyhow!("CoreStore stream sequence must be nonzero"))?;
+            let mut previous_sequence = expected_previous_sequence;
+            let mut previous_event_hash = first.previous_event_hash.clone();
             for record in updates.into_values() {
                 verify_stream_record_after_head(
                     &stream_id,
@@ -463,6 +483,61 @@ impl CoreStore {
             }
         }
         Ok(())
+    }
+
+    async fn validate_existing_stream_publication_unlocked(
+        &self,
+        transaction: &CoreTransaction,
+        expected: &StreamRecord,
+        root_key_hash: &str,
+        active_publication_generation: Option<u64>,
+    ) -> Result<bool> {
+        let Some(payload) = self.meta.get(
+            CF_STREAM_RECORDS,
+            TABLE_STREAM_RECORD_INDEX_ROW,
+            &stream_record_key(&expected.stream_id, expected.sequence),
+        )?
+        else {
+            return Ok(false);
+        };
+        // Use a physical read here because the coordinator header currently
+        // being prepared can hide a previously published participant row.
+        let common = core_meta_row_common_from_payload(&payload)?;
+        if common.visibility_state_enum() != CoreMetaVisibilityState::Committed
+            || common.root_key_hash != root_key_hash
+            || common.root_generation == 0
+        {
+            return Ok(false);
+        }
+        if common.transaction_id != transaction.transaction_id {
+            bail!(
+                "TransactionScopeMismatch: materialised stream publication belongs to another transaction"
+            );
+        }
+        let published = self.root_generation_is_published(
+            root_key_hash,
+            common.root_generation,
+            &transaction.transaction_id,
+        )?;
+        if !published && active_publication_generation == Some(common.root_generation) {
+            return Ok(false);
+        }
+        if !published {
+            bail!(
+                "TransactionConflict: materialised stream publication has no durable generation evidence"
+            );
+        }
+        let actual = self
+            .stream_record_from_index_row(decode_stream_record_index_row(&payload)?)
+            .await?;
+        if actual != *expected {
+            bail!(
+                "TransactionConflict: stream {} sequence {} changed after the admitted mutation",
+                expected.stream_id,
+                expected.sequence
+            );
+        }
+        Ok(true)
     }
 
     async fn validate_explicit_transaction_coremeta_commits_unlocked(
@@ -584,13 +659,25 @@ impl CoreStore {
                     if &actual_hash != payload_hash {
                         bail!("TransactionConflict: staged CoreMeta payload hash mismatch");
                     }
+                    let cf = canonical_coremeta_cf_name(cf)?;
+                    let key = (cf.to_string(), *table_id, tuple_key.clone());
+                    if !coremeta_visible.contains_key(&key)
+                        && self.exact_coremeta_put_is_published_unlocked(
+                            transaction,
+                            cf,
+                            *table_id,
+                            tuple_key,
+                            payload,
+                        )?
+                    {
+                        coremeta_visible.insert(key, Some(payload.clone()));
+                        continue;
+                    }
                     validate_implicit_coremeta_put_common(
                         transaction,
                         payload,
                         publication_generations,
                     )?;
-                    let cf = canonical_coremeta_cf_name(cf)?;
-                    let key = (cf.to_string(), *table_id, tuple_key.clone());
                     let current_payload = match coremeta_visible.get(&key) {
                         Some(payload) => payload.clone(),
                         None => {
@@ -641,6 +728,35 @@ impl CoreStore {
             }
         }
         Ok(())
+    }
+
+    fn exact_coremeta_put_is_published_unlocked(
+        &self,
+        transaction: &CoreTransaction,
+        cf: &str,
+        table_id: u16,
+        tuple_key: &[u8],
+        expected_payload: &[u8],
+    ) -> Result<bool> {
+        let Some(actual_payload) = self.meta.get_named(cf, table_id, tuple_key)? else {
+            return Ok(false);
+        };
+        if actual_payload != expected_payload {
+            return Ok(false);
+        }
+        let common = core_meta_row_common_from_payload(expected_payload)?;
+        if common.visibility_state_enum() != CoreMetaVisibilityState::Committed
+            || common.root_key_hash.is_empty()
+            || common.root_generation == 0
+            || common.transaction_id != transaction.transaction_id
+        {
+            return Ok(false);
+        }
+        self.root_generation_is_published(
+            &common.root_key_hash,
+            common.root_generation,
+            &transaction.transaction_id,
+        )
     }
 
     pub(super) async fn commit_explicit_transaction_rows_and_coremeta_updates_unlocked(
