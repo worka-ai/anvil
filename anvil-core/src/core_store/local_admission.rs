@@ -25,6 +25,37 @@ impl CoreStore {
         payload: CorePendingMutationPayload<'_>,
         boundary_values: Vec<CoreBoundaryValue>,
     ) -> Result<CorePendingMutationRecord> {
+        let mutation_id_for_error = mutation_id.clone();
+        match self
+            .admit_core_mutation_outcome(
+                operation_family,
+                writer_family,
+                target,
+                mutation_id,
+                idempotency_key,
+                payload,
+                boundary_values,
+            )
+            .await?
+        {
+            CoreAdmissionOutcome::Pending(record) => Ok(record),
+            CoreAdmissionOutcome::Finalised(finalisation) => bail!(
+                "CoreStore mutation {mutation_id_for_error} has already been finalised in state {}",
+                finalisation.state
+            ),
+        }
+    }
+
+    pub(super) async fn admit_core_mutation_outcome(
+        &self,
+        operation_family: &str,
+        writer_family: &str,
+        target: CorePendingMutationTarget,
+        mutation_id: String,
+        idempotency_key: Option<String>,
+        payload: CorePendingMutationPayload<'_>,
+        boundary_values: Vec<CoreBoundaryValue>,
+    ) -> Result<CoreAdmissionOutcome> {
         let admission_started_at = Instant::now();
         let boundary_schema_generation = boundary_values
             .iter()
@@ -76,8 +107,10 @@ impl CoreStore {
             if result.is_ok() { "ok" } else { "error" },
             admission_started_at.elapsed(),
         );
-        let record = result?;
-        if let Some(bytes) = landed_source_bytes {
+        let outcome = result?;
+        if let (Some(bytes), CoreAdmissionOutcome::Pending(record)) =
+            (landed_source_bytes, &outcome)
+        {
             for landed in &record.landed_bytes {
                 let hash = strip_sha256_prefix(&landed.sha256)?.to_string();
                 let final_path = self.landed_bytes_path(&hash);
@@ -93,7 +126,7 @@ impl CoreStore {
             }
         }
         drop(landed_guard);
-        Ok(record)
+        Ok(outcome)
     }
 
     async fn land_core_bytes_unlocked(
@@ -744,21 +777,24 @@ impl CoreStore {
                         &record.writer_family,
                     )
                     .await;
-                if let Err(error) = materialisation {
-                    if super::local_root_publication_recovery::publication_terminal_reason(&error)
-                        == Some("PublicationSupersededByCommittedRoot")
-                    {
-                        return Ok(CorePendingMutationReplayOutcome {
-                            state: "superseded",
-                            result: None,
-                        });
+                match materialisation {
+                    Ok(object_ref) => Ok(CorePendingMutationReplayOutcome {
+                        state: "committed",
+                        result: Some(CorePendingMutationFinalisationResult::ObjectRef(object_ref)),
+                    }),
+                    Err(error) => {
+                        if super::local_root_publication_recovery::publication_terminal_reason(
+                            &error,
+                        ) == Some("PublicationSupersededByCommittedRoot")
+                        {
+                            return Ok(CorePendingMutationReplayOutcome {
+                                state: "superseded",
+                                result: None,
+                            });
+                        }
+                        Err(error)
                     }
-                    return Err(error);
                 }
-                Ok(CorePendingMutationReplayOutcome {
-                    state: "committed",
-                    result: None,
-                })
             }
             CorePendingMutationTarget::StreamAppend {
                 stream_id,

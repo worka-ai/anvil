@@ -35,7 +35,7 @@ impl CoreStore {
         landed_bytes: Vec<CorePendingLandedByte>,
         payload: &[u8],
         boundary_values: Vec<CoreBoundaryValue>,
-    ) -> Result<CorePendingMutationRecord> {
+    ) -> Result<CoreAdmissionOutcome> {
         if payload.len() > CORE_PENDING_MUTATION_MAX_INLINE_PAYLOAD_BYTES {
             bail!(
                 "CoreStore pending mutation payload exceeds {} bytes",
@@ -112,7 +112,7 @@ impl CoreStore {
                 write_started_at.elapsed(),
             );
             result?;
-            return Ok(prepared.record);
+            return Ok(CoreAdmissionOutcome::Pending(prepared.record));
         }
         bail!(
             "CoreStore admission shard {} remained contended after {} bounded publication attempts",
@@ -307,7 +307,7 @@ impl CoreStore {
         shard: &CoreAdmissionShard,
         requested: &CorePendingMutationRecord,
         request_hashes: &AdmissionRequestHashes,
-    ) -> Result<Option<CorePendingMutationRecord>> {
+    ) -> Result<Option<CoreAdmissionOutcome>> {
         if let Some(head) =
             self.read_admission_mutation_head(&shard.hash, &requested.mutation_id)?
         {
@@ -351,9 +351,28 @@ impl CoreStore {
         is_active: bool,
         expected_mutation_hash: Option<String>,
         expected_admission_hash: Option<String>,
-    ) -> Result<Option<CorePendingMutationRecord>> {
+    ) -> Result<Option<CoreAdmissionOutcome>> {
         if !is_active {
-            bail!("CoreStore pending mutation has already been finalised");
+            let key = CorePendingMutationKey {
+                admission_shard_hash: shard.hash.clone(),
+                node_id: self.node_identity.node_id.clone(),
+                mutation_epoch: self.admission_mutation_epoch,
+                mutation_sequence: sequence,
+            };
+            let index = self
+                .pending_mutation_finalisation_index_point(&key)?
+                .ok_or_else(|| anyhow!("CoreStore finalised admission head has no index row"))?;
+            let finalisation = self
+                .read_pending_mutation_finalisation_record(&key)?
+                .ok_or_else(|| anyhow!("CoreStore finalised admission head has no point record"))?;
+            if index.mutation_id != mutation_id
+                || finalisation.mutation_id != mutation_id
+                || index.state != finalisation.state
+                || index.result_hash != finalisation_result_hash(&finalisation.result)?
+            {
+                bail!("CoreStore finalised admission point state is inconsistent");
+            }
+            return Ok(Some(CoreAdmissionOutcome::Finalised(finalisation)));
         }
         let (existing, existing_payload, _) = self
             .read_pending_mutation_at(&shard.hash, sequence)?
@@ -374,7 +393,7 @@ impl CoreStore {
         }
         let hash_input = encode_pending_mutation_hash_input(&existing, &existing_payload)?;
         self.verify_local_admission_evidence(&existing, &hash_input)?;
-        Ok(Some(existing))
+        Ok(Some(CoreAdmissionOutcome::Pending(existing)))
     }
 
     pub(in crate::core_store::local) fn local_admission_evidence_bytes(

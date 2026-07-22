@@ -896,6 +896,7 @@ mod local_block_distribution;
 mod local_boundaries;
 #[path = "local_codec.rs"]
 mod local_codec;
+pub(crate) use local_codec::{decode_core_object_ref_target, encode_core_object_ref_target};
 #[path = "local_coremeta_history.rs"]
 pub(in crate::core_store) mod local_coremeta_history;
 #[path = "local_coremeta_quorum.rs"]

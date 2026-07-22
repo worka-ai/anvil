@@ -1,7 +1,10 @@
+use super::local::{decode_core_object_ref_target, encode_core_object_ref_target};
 use super::transaction_manifest_proto::{
     decode_manifest_locator_proto, encode_manifest_locator_proto,
 };
-use super::types::{CoreBoundaryValue, CoreCompressionDescriptor, CoreManifestLocator};
+use super::types::{
+    CoreBoundaryValue, CoreCompressionDescriptor, CoreManifestLocator, CoreObjectRef,
+};
 use super::{CoreMetaRowCommonProto, CoreMetaVisibilityState, core_meta_committed_row_common};
 use anyhow::{Context, Result, anyhow, bail};
 use prost::{Message, Oneof};
@@ -132,6 +135,13 @@ impl CorePendingMutationTarget {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) enum CorePendingMutationFinalisationResult {
     StreamStateLocator(CoreManifestLocator),
+    ObjectRef(CoreObjectRef),
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum CoreAdmissionOutcome {
+    Pending(CorePendingMutationRecord),
+    Finalised(CorePendingMutationFinalisationRecord),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -386,7 +396,7 @@ mod core_pending_mutation_target_proto {
 struct CorePendingMutationFinalisationResultProto {
     #[prost(
         oneof = "core_pending_mutation_finalisation_result_proto::Kind",
-        tags = "1"
+        tags = "1, 2"
     )]
     kind: Option<core_pending_mutation_finalisation_result_proto::Kind>,
 }
@@ -398,6 +408,8 @@ mod core_pending_mutation_finalisation_result_proto {
     pub(super) enum Kind {
         #[prost(bytes, tag = "1")]
         StreamStateLocator(Vec<u8>),
+        #[prost(string, tag = "2")]
+        ObjectRef(String),
     }
 }
 
@@ -1512,6 +1524,12 @@ fn result_to_proto(
                 .with_context(|| "encode CoreStore stream state locator")?;
             core_pending_mutation_finalisation_result_proto::Kind::StreamStateLocator(locator_bytes)
         }
+        CorePendingMutationFinalisationResult::ObjectRef(object_ref) => {
+            core_pending_mutation_finalisation_result_proto::Kind::ObjectRef(
+                encode_core_object_ref_target(object_ref)
+                    .with_context(|| "encode CoreStore finalised object ref")?,
+            )
+        }
     };
     Ok(CorePendingMutationFinalisationResultProto { kind: Some(kind) })
 }
@@ -1529,6 +1547,12 @@ fn result_from_proto(
             decode_manifest_locator_proto(&locator_bytes)
                 .with_context(|| "decode CoreStore stream state locator")?,
         ),
+        core_pending_mutation_finalisation_result_proto::Kind::ObjectRef(object_ref) => {
+            CorePendingMutationFinalisationResult::ObjectRef(
+                decode_core_object_ref_target(&object_ref)
+                    .with_context(|| "decode CoreStore finalised object ref")?,
+            )
+        }
     })
 }
 

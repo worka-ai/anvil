@@ -380,8 +380,8 @@ impl CoreStore {
         let stored_hash = format!("sha256:{}", sha256_hex(&input.bytes));
         let stored_len = input.bytes.len() as u64;
         let compression = none_compression_descriptor(&input.bytes);
-        let admission = self
-            .admit_core_mutation(
+        let admission = match self
+            .admit_core_mutation_outcome(
                 "object.put",
                 &request.writer_family,
                 CorePendingMutationTarget::ObjectPut {
@@ -408,7 +408,13 @@ impl CoreStore {
                     "admit CoreStore logical-file block mutation logical_file_id={} block_index={} mutation_id={}",
                     request.logical_file_id, block_index, input.mutation_id
                 )
-            })?;
+            })?
+        {
+            CoreAdmissionOutcome::Pending(admission) => admission,
+            CoreAdmissionOutcome::Finalised(finalisation) => {
+                return self.finalised_object_put_result(finalisation).await;
+            }
+        };
         let landed =
             admission.landed_bytes.first().cloned().ok_or_else(|| {
                 anyhow!("CoreStore put_blob admission did not produce landed bytes")
@@ -459,7 +465,13 @@ impl CoreStore {
                 return Err(error);
             }
         };
-        self.mark_pending_mutation_finalised_unlocked(&admission, "committed")
+        self.mark_pending_mutation_finalised_with_result_unlocked(
+            &admission,
+            "committed",
+            Some(CorePendingMutationFinalisationResult::ObjectRef(
+                object_ref.clone(),
+            )),
+        )
             .await
             .with_context(|| {
                 format!(
@@ -545,8 +557,8 @@ impl CoreStore {
         } else {
             canonical_logical_file_id(writer, 0, &input.logical_name, &hash32(&stored_bytes))
         };
-        let admission = self
-            .admit_core_mutation(
+        let admission = match self
+            .admit_core_mutation_outcome(
                 "object.put",
                 writer_family,
                 CorePendingMutationTarget::ObjectPut {
@@ -567,7 +579,13 @@ impl CoreStore {
                 CorePendingMutationPayload::Landed(&stored_bytes),
                 input.boundary_values,
             )
-            .await?;
+            .await?
+        {
+            CoreAdmissionOutcome::Pending(admission) => admission,
+            CoreAdmissionOutcome::Finalised(finalisation) => {
+                return self.finalised_object_put_result(finalisation).await;
+            }
+        };
         let landed =
             admission.landed_bytes.first().cloned().ok_or_else(|| {
                 anyhow!("CoreStore put_blob admission did not produce landed bytes")
@@ -615,9 +633,63 @@ impl CoreStore {
                 return Err(error);
             }
         };
-        self.mark_pending_mutation_finalised_unlocked(&admission, "committed")
-            .await?;
+        self.mark_pending_mutation_finalised_with_result_unlocked(
+            &admission,
+            "committed",
+            Some(CorePendingMutationFinalisationResult::ObjectRef(
+                object_ref.clone(),
+            )),
+        )
+        .await?;
         Ok(object_ref)
+    }
+
+    async fn finalised_object_put_result(
+        &self,
+        finalisation: CorePendingMutationFinalisationRecord,
+    ) -> Result<CoreObjectRef> {
+        if finalisation.state != "committed" || finalisation.operation_family != "object.put" {
+            bail!(
+                "CoreStore object mutation {} was finalised in state {}",
+                finalisation.mutation_id,
+                finalisation.state
+            );
+        }
+        let CorePendingMutationTarget::ObjectPut {
+            logical_name,
+            region_id,
+            erasure_profile_id,
+            encryption,
+            object_hash,
+            object_logical_size,
+            compression,
+            logical_offset,
+            ..
+        } = &finalisation.target
+        else {
+            bail!("CoreStore finalised object mutation has a non-object target");
+        };
+        let Some(CorePendingMutationFinalisationResult::ObjectRef(object_ref)) =
+            finalisation.result.as_ref()
+        else {
+            bail!("CoreStore committed object mutation has no object result");
+        };
+        let manifest = self.read_object_manifest(&object_ref).await?;
+        if manifest.mutation_id != finalisation.mutation_id
+            || manifest.logical_file_id != *logical_name
+            || manifest.region_id != *region_id
+            || manifest.writer_family != finalisation.writer_family
+            || manifest.object_hash != *object_hash
+            || manifest.logical_size != *object_logical_size
+            || manifest.logical_offset != *logical_offset
+            || manifest.encryption_algorithm != *encryption
+            || manifest.encoding.profile_id != *erasure_profile_id
+            || manifest.encoding.compression != *compression
+            || manifest.boundary_values != finalisation.boundary_values
+        {
+            bail!("CoreStore finalised object result does not match its admitted mutation");
+        }
+        Ok(object_ref.clone())
     }
 
     pub(crate) async fn put_inline_blob(
