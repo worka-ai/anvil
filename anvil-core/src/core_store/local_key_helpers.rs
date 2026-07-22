@@ -28,21 +28,34 @@ struct NodeReceiptSigningPublicKeyRowProto {
     updated_at_unix_nanos: u64,
 }
 
-pub(super) fn admission_record_key(sequence: u64) -> Vec<u8> {
-    meta_tuple_key(&[b"admission-record", &sequence.to_be_bytes()])
+pub(super) fn admission_record_key(admission_shard_hash: &str, sequence: u64) -> Vec<u8> {
+    meta_tuple_key(&[
+        b"admission-record",
+        admission_shard_hash.as_bytes(),
+        &sequence.to_be_bytes(),
+    ])
 }
 
-pub(super) fn admission_record_prefix() -> Vec<u8> {
+pub(super) fn all_admission_records_prefix() -> Vec<u8> {
     meta_tuple_key(&[b"admission-record"])
 }
 
-pub(super) fn admission_certificate_key(sequence: u64) -> Vec<u8> {
-    meta_tuple_key(&[b"admission-certificate", &sequence.to_be_bytes()])
+pub(super) fn admission_record_prefix(admission_shard_hash: &str) -> Vec<u8> {
+    meta_tuple_key(&[b"admission-record", admission_shard_hash.as_bytes()])
+}
+
+pub(super) fn admission_evidence_key(admission_shard_hash: &str, sequence: u64) -> Vec<u8> {
+    meta_tuple_key(&[
+        b"admission-evidence",
+        admission_shard_hash.as_bytes(),
+        &sequence.to_be_bytes(),
+    ])
 }
 
 pub(super) fn admission_finalisation_key(key: &CorePendingMutationKey) -> Vec<u8> {
     meta_tuple_key(&[
         b"admission-finalisation",
+        key.admission_shard_hash.as_bytes(),
         key.node_id.as_bytes(),
         &key.mutation_epoch.to_be_bytes(),
         &key.mutation_sequence.to_be_bytes(),
@@ -52,18 +65,69 @@ pub(super) fn admission_finalisation_key(key: &CorePendingMutationKey) -> Vec<u8
 pub(super) fn admission_finalisation_record_key(key: &CorePendingMutationKey) -> Vec<u8> {
     meta_tuple_key(&[
         b"admission-finalisation-record",
+        key.admission_shard_hash.as_bytes(),
         key.node_id.as_bytes(),
         &key.mutation_epoch.to_be_bytes(),
         &key.mutation_sequence.to_be_bytes(),
     ])
 }
 
-pub(super) fn admission_finalisation_prefix() -> Vec<u8> {
-    meta_tuple_key(&[b"admission-finalisation"])
+pub(super) fn admission_sequence_key(admission_shard_hash: &str) -> Vec<u8> {
+    meta_tuple_key(&[b"admission-sequence", admission_shard_hash.as_bytes()])
 }
 
-pub(super) fn admission_sequence_key() -> Vec<u8> {
-    meta_tuple_key(&[b"admission-sequence"])
+pub(super) fn admission_point_state_key(admission_shard_hash: &str) -> Vec<u8> {
+    meta_tuple_key(&[b"admission-point-state", admission_shard_hash.as_bytes()])
+}
+
+pub(super) fn admission_point_state_prefix() -> Vec<u8> {
+    meta_tuple_key(&[b"admission-point-state"])
+}
+
+pub(super) fn admission_mutation_head_key(
+    admission_shard_hash: &str,
+    mutation_id: &str,
+) -> Vec<u8> {
+    meta_tuple_key(&[
+        b"admission-mutation-head",
+        admission_shard_hash.as_bytes(),
+        mutation_id.as_bytes(),
+    ])
+}
+
+pub(super) fn admission_idempotency_head_key(
+    admission_shard_hash: &str,
+    idempotency_key_hash: &str,
+) -> Vec<u8> {
+    meta_tuple_key(&[
+        b"admission-idempotency-head",
+        admission_shard_hash.as_bytes(),
+        idempotency_key_hash.as_bytes(),
+    ])
+}
+
+pub(super) fn landed_byte_ref_key(admission_shard_hash: &str, landing_id: &str) -> Vec<u8> {
+    meta_tuple_key(&[
+        b"landed-byte",
+        admission_shard_hash.as_bytes(),
+        landing_id.as_bytes(),
+    ])
+}
+
+pub(super) fn landed_byte_ref_prefix() -> Vec<u8> {
+    meta_tuple_key(&[b"landed-byte"])
+}
+
+pub(super) fn landed_byte_head_key(admission_shard_hash: &str, sha256: &str) -> Vec<u8> {
+    meta_tuple_key(&[
+        b"landed-byte-head",
+        admission_shard_hash.as_bytes(),
+        sha256.as_bytes(),
+    ])
+}
+
+pub(super) fn landed_byte_head_prefix(admission_shard_hash: &str) -> Vec<u8> {
+    meta_tuple_key(&[b"landed-byte-head", admission_shard_hash.as_bytes()])
 }
 
 pub(super) fn object_manifest_meta_key(object_ref: &CoreObjectRef) -> Vec<u8> {
@@ -72,6 +136,10 @@ pub(super) fn object_manifest_meta_key(object_ref: &CoreObjectRef) -> Vec<u8> {
         object_ref.manifest_ref.as_bytes(),
         object_ref.encoding.block_id.as_bytes(),
     ])
+}
+
+pub(super) fn object_manifest_meta_prefix() -> Vec<u8> {
+    meta_tuple_key(&[b"object-manifest"])
 }
 
 pub(super) fn inline_payload_meta_key(object_ref: &CoreObjectRef) -> Vec<u8> {
@@ -100,6 +168,10 @@ pub(super) fn root_cache_hash_key(root_key_hash: &str) -> Vec<u8> {
     meta_tuple_key(&[b"root-anchor-hash", root_key_hash.as_bytes()])
 }
 
+pub(super) fn root_cache_hash_prefix() -> Vec<u8> {
+    meta_tuple_key(&[b"root-anchor-hash"])
+}
+
 pub(super) fn root_anchor_generation_key(root_key_hash: &str, generation: u64) -> Vec<u8> {
     meta_tuple_key(&[
         b"root-anchor-generation",
@@ -113,19 +185,39 @@ pub(super) fn root_anchor_generation_prefix(root_key_hash: &str) -> Vec<u8> {
 }
 
 pub(super) fn stream_head_key(stream_id: &str) -> Vec<u8> {
-    meta_tuple_key(&[b"stream-head", stream_id.as_bytes()])
+    meta_tuple_bytewise_key(b"stream-head", stream_id.as_bytes(), &[])
+}
+
+pub(super) fn stream_head_prefix(stream_prefix: &str) -> Vec<u8> {
+    meta_tuple_bytewise_key(b"stream-head", stream_prefix.as_bytes(), &[])
 }
 
 pub(super) fn stream_record_key(stream_id: &str, sequence: u64) -> Vec<u8> {
-    meta_tuple_key(&[
+    meta_tuple_bytewise_key(
         b"stream-record",
         stream_id.as_bytes(),
-        &sequence.to_be_bytes(),
-    ])
+        &[&sequence.to_be_bytes()],
+    )
 }
 
 pub(super) fn stream_record_prefix(stream_id: &str) -> Vec<u8> {
-    meta_tuple_key(&[b"stream-record", stream_id.as_bytes()])
+    meta_tuple_bytewise_key(b"stream-record", stream_id.as_bytes(), &[])
+}
+
+pub(super) fn pending_transaction_stream_key(
+    stream_id: &str,
+    transaction_id: &str,
+    ordinal: u64,
+) -> Vec<u8> {
+    meta_tuple_bytewise_key(
+        b"transaction-pending-stream",
+        stream_id.as_bytes(),
+        &[transaction_id.as_bytes(), &ordinal.to_be_bytes()],
+    )
+}
+
+pub(super) fn pending_transaction_stream_prefix(stream_prefix: &str) -> Vec<u8> {
+    meta_tuple_bytewise_key(b"transaction-pending-stream", stream_prefix.as_bytes(), &[])
 }
 
 pub(super) fn stream_idempotency_key(stream_id: &str, idempotency_key_hash: &str) -> Vec<u8> {
@@ -148,6 +240,7 @@ pub(super) fn load_or_create_node_signing_keypair(
     meta: &CoreMetaStore,
 ) -> Result<identity::Keypair> {
     let key = node_signing_keypair_key();
+    // Node identity is required before publication visibility can initialise.
     if let Some(bytes) = meta.get(CF_MESH, TABLE_NODE_SIGNING_KEYPAIR_ROW, &key)? {
         let row = decode_node_signing_keypair_row(&bytes)?;
         return identity::Keypair::from_protobuf_encoding(&row.keypair_protobuf)
@@ -184,19 +277,23 @@ pub(super) fn node_receipt_signing_public_key_hash(public_key_protobuf: &[u8]) -
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
+pub(super) fn node_admission_mutation_epoch(public_key_protobuf: &[u8]) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"anvil.corestore.admission_mutation_epoch.v1");
+    hasher.update([0]);
+    hasher.update(public_key_protobuf);
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(bytes).max(1)
+}
+
 pub(super) fn store_node_receipt_signing_public_key(
     meta: &CoreMetaStore,
     node_id: &str,
     public_key_protobuf: &[u8],
 ) -> Result<String> {
-    validate_logical_id(node_id, "node receipt signing public key node id")?;
-    let public_key = identity::PublicKey::try_decode_protobuf(public_key_protobuf)
-        .context("node receipt signing public key protobuf is invalid")?;
-    let canonical_public_key = public_key.encode_protobuf();
-    if canonical_public_key != public_key_protobuf {
-        bail!("node receipt signing public key protobuf is not canonical");
-    }
-    let public_key_hash = node_receipt_signing_public_key_hash(public_key_protobuf);
+    let public_key_hash = validate_node_receipt_signing_public_key(node_id, public_key_protobuf)?;
     let key = node_receipt_signing_public_key_key(node_id);
     if let Some(existing_bytes) = meta.get(CF_MESH, TABLE_NODE_SIGNING_KEYPAIR_ROW, &key)? {
         let existing = decode_node_receipt_signing_public_key_row(node_id, &existing_bytes)?;
@@ -205,20 +302,60 @@ pub(super) fn store_node_receipt_signing_public_key(
         {
             return Ok(public_key_hash);
         }
+        bail!("CoreStore receipt signing identity replacement rejected for node {node_id}");
     }
+    write_node_receipt_signing_public_key(meta, node_id, public_key_protobuf, &public_key_hash)?;
+    Ok(public_key_hash)
+}
+
+pub(super) fn seed_node_receipt_signing_public_key_if_absent(
+    meta: &CoreMetaStore,
+    node_id: &str,
+    public_key_protobuf: &[u8],
+) -> Result<String> {
+    let public_key_hash = validate_node_receipt_signing_public_key(node_id, public_key_protobuf)?;
+    let key = node_receipt_signing_public_key_key(node_id);
+    if let Some(existing_bytes) = meta.get(CF_MESH, TABLE_NODE_SIGNING_KEYPAIR_ROW, &key)? {
+        let existing = decode_node_receipt_signing_public_key_row(node_id, &existing_bytes)?;
+        return Ok(existing.public_key_hash);
+    }
+    write_node_receipt_signing_public_key(meta, node_id, public_key_protobuf, &public_key_hash)?;
+    Ok(public_key_hash)
+}
+
+fn validate_node_receipt_signing_public_key(
+    node_id: &str,
+    public_key_protobuf: &[u8],
+) -> Result<String> {
+    validate_logical_id(node_id, "node receipt signing public key node id")?;
+    let public_key = identity::PublicKey::try_decode_protobuf(public_key_protobuf)
+        .context("node receipt signing public key protobuf is invalid")?;
+    if public_key.encode_protobuf() != public_key_protobuf {
+        bail!("node receipt signing public key protobuf is not canonical");
+    }
+    Ok(node_receipt_signing_public_key_hash(public_key_protobuf))
+}
+
+fn write_node_receipt_signing_public_key(
+    meta: &CoreMetaStore,
+    node_id: &str,
+    public_key_protobuf: &[u8],
+    public_key_hash: &str,
+) -> Result<()> {
+    let key = node_receipt_signing_public_key_key(node_id);
     let updated_at_unix_nanos =
         u64::try_from(Utc::now().timestamp_nanos_opt().unwrap_or_default()).unwrap_or_default();
     let row = NodeReceiptSigningPublicKeyRowProto {
-        common: Some(core_meta_committed_row_common(
+        // Public receipt keys are generation-zero bootstrap evidence. Making
+        // them depend on a root whose receipts they are needed to verify would
+        // create a circular visibility dependency during cluster formation.
+        common: Some(core_meta_bootstrap_row_common(
             "system/corestore",
-            core_meta_root_key_hash(&format!("node-receipt-signing-public-key/{node_id}")),
-            1,
-            node_id.to_string(),
             updated_at_unix_nanos,
         )),
         node_id: node_id.to_string(),
         public_key_protobuf: public_key_protobuf.to_vec(),
-        public_key_hash: public_key_hash.clone(),
+        public_key_hash: public_key_hash.to_string(),
         updated_at_unix_nanos,
     };
     let bytes = encode_deterministic_proto(&row);
@@ -229,7 +366,7 @@ pub(super) fn store_node_receipt_signing_public_key(
         common: row.common.clone(),
         kind: CoreMetaBatchOpKind::Put(&bytes),
     }])?;
-    Ok(public_key_hash)
+    Ok(())
 }
 
 pub(super) fn load_node_receipt_signing_public_key(
@@ -237,6 +374,7 @@ pub(super) fn load_node_receipt_signing_public_key(
     node_id: &str,
 ) -> Result<Option<identity::PublicKey>> {
     validate_logical_id(node_id, "node receipt signing public key node id")?;
+    // Receipt verification keys bootstrap the visibility machinery they authenticate.
     let Some(bytes) = meta.get(
         CF_MESH,
         TABLE_NODE_SIGNING_KEYPAIR_ROW,
@@ -291,12 +429,11 @@ fn decode_node_receipt_signing_public_key_row(
     if common.realm_id != "system/corestore" {
         bail!("node receipt signing public key row realm mismatch");
     }
-    if common.root_key_hash
-        != core_meta_root_key_hash(&format!(
-            "node-receipt-signing-public-key/{expected_node_id}"
-        ))
+    if !common.root_key_hash.is_empty()
+        || common.root_generation != 0
+        || !common.transaction_id.is_empty()
     {
-        bail!("node receipt signing public key row root mismatch");
+        bail!("node receipt signing public key row must be generation-zero bootstrap evidence");
     }
     if common.visibility_state_enum() != CoreMetaVisibilityState::Committed {
         bail!("node receipt signing public key row is not committed");
@@ -319,6 +456,18 @@ pub(super) fn meta_tuple_key(parts: &[&[u8]]) -> Vec<u8> {
         .map(|part| CoreMetaTuplePart::Raw(part))
         .collect::<Vec<_>>();
     core_meta_tuple_key(&parts).expect("CoreStore raw metadata tuple must be valid")
+}
+
+fn meta_tuple_bytewise_key(namespace: &[u8], value: &[u8], suffix: &[&[u8]]) -> Vec<u8> {
+    let mut parts = Vec::with_capacity(1 + value.len() + suffix.len());
+    parts.push(CoreMetaTuplePart::Raw(namespace));
+    parts.extend(
+        value
+            .iter()
+            .map(|byte| CoreMetaTuplePart::Raw(std::slice::from_ref(byte))),
+    );
+    parts.extend(suffix.iter().map(|part| CoreMetaTuplePart::Raw(part)));
+    core_meta_tuple_key(&parts).expect("CoreStore bytewise metadata tuple must be valid")
 }
 
 pub(super) fn meta_tuple_utf8(parts: &[&str]) -> Vec<u8> {
