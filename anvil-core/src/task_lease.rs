@@ -2,11 +2,11 @@ use crate::{
     core_store::{
         CF_LEASES_FENCES, CoreMetaRowCommonProto, CoreMetaStore, CoreMetaTuplePart,
         CoreMetaVisibilityState, CoreMutationBatch, CoreMutationOperation,
-        CoreMutationPrecondition, CoreStore, TABLE_TASK_LEASE_ROW, core_meta_committed_row_common,
-        core_meta_payload_digest, core_meta_record_tuple_key, core_meta_root_key_hash,
-        core_meta_tuple_key,
+        CoreMutationPrecondition, CoreMutationRootPublication, CoreStore, TABLE_TASK_LEASE_ROW,
+        core_meta_committed_row_common, core_meta_payload_digest, core_meta_record_tuple_key,
+        core_meta_root_key_hash, core_meta_tuple_key,
     },
-    formats::hash32,
+    formats::{hash32, writer::WriterFamily},
     storage::Storage,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -41,11 +41,19 @@ pub struct TaskLeaseOwner {
 impl TaskLeaseOwner {
     pub fn node(owner_node_id: impl Into<String>) -> Self {
         let owner_node_id = owner_node_id.into();
+        Self::node_instance(owner_node_id.clone(), owner_node_id)
+    }
+
+    pub fn node_instance(
+        owner_node_id: impl Into<String>,
+        actor_instance_id: impl Into<String>,
+    ) -> Self {
+        let owner_node_id = owner_node_id.into();
         Self {
             tenant_id: 0,
             principal_kind: "node".to_string(),
             principal_id: owner_node_id.clone(),
-            actor_instance_id: owner_node_id.clone(),
+            actor_instance_id: actor_instance_id.into(),
             display_name: owner_node_id,
         }
     }
@@ -176,6 +184,28 @@ impl TaskLease {
         }
         Ok(())
     }
+
+    pub fn require_expected_version(
+        &self,
+        fence_token: u64,
+        root_generation: u64,
+        lease_epoch: u64,
+        expires_at_nanos: i64,
+        lease_hash: &str,
+    ) -> Result<()> {
+        if lease_hash.is_empty()
+            || self.fence_token != fence_token
+            || self.root_generation != root_generation
+            || self.lease_epoch != lease_epoch
+            || self.expires_at_nanos != expires_at_nanos
+            || self.lease_hash.as_deref() != Some(lease_hash)
+        {
+            return Err(anyhow!(
+                "{STALE_FENCE}: task lease version expectation does not match"
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,11 +230,9 @@ pub fn hash_task_lease(lease: &TaskLease) -> Result<String> {
     let mut unsigned = lease.clone();
     unsigned.lease_hash = None;
     unsigned.lease_signature = None;
-    Ok(hex::encode(hash32(&encode_task_lease_record(&unsigned)?)))
-}
-
-fn encode_task_lease_record(lease: &TaskLease) -> Result<Vec<u8>> {
-    Ok(task_lease_to_proto(lease).encode_to_vec())
+    Ok(hex::encode(hash32(
+        &task_lease_to_proto(&unsigned, None).encode_to_vec(),
+    )))
 }
 
 fn decode_task_lease_record(bytes: &[u8]) -> Result<TaskLease> {
@@ -215,9 +243,9 @@ fn decode_task_lease_record(bytes: &[u8]) -> Result<TaskLease> {
     task_lease_from_proto(proto)
 }
 
-fn task_lease_to_proto(lease: &TaskLease) -> TaskLeaseRecordProto {
+fn task_lease_to_proto(lease: &TaskLease, transaction_id: Option<&str>) -> TaskLeaseRecordProto {
     TaskLeaseRecordProto {
-        common: Some(task_lease_common(lease)),
+        common: transaction_id.map(|transaction_id| task_lease_common(lease, transaction_id)),
         format_version: u32::from(lease.format_version),
         task_id: lease.task_id.clone(),
         task_kind: lease.task_kind.clone(),
@@ -267,12 +295,12 @@ fn task_lease_from_proto(proto: TaskLeaseRecordProto) -> Result<TaskLease> {
     })
 }
 
-fn task_lease_common(lease: &TaskLease) -> CoreMetaRowCommonProto {
+fn task_lease_common(lease: &TaskLease, transaction_id: &str) -> CoreMetaRowCommonProto {
     core_meta_committed_row_common(
         format!("tenant/{}", lease.owner.tenant_id),
         task_lease_root_key_hash(lease.owner.tenant_id, &lease.task_id),
         lease.root_generation,
-        format!("{}/{}", lease.task_id, lease.root_generation),
+        transaction_id,
         u64::try_from(lease.updated_at_nanos).unwrap_or_default(),
     )
 }
@@ -294,7 +322,7 @@ fn validate_task_lease_common(
     if common.root_generation == 0 {
         return Err(anyhow!("task lease CoreMeta generation must be nonzero"));
     }
-    if common.transaction_id != format!("{}/{}", proto.task_id, common.root_generation) {
+    if !common.transaction_id.starts_with("task-lease:") {
         return Err(anyhow!("task lease CoreMeta transaction mismatch"));
     }
     if common.visibility_state_enum() != CoreMetaVisibilityState::Committed {
@@ -304,7 +332,11 @@ fn validate_task_lease_common(
 }
 
 fn task_lease_root_key_hash(tenant_id: i64, task_id: &str) -> String {
-    core_meta_root_key_hash(&format!("task-lease/tenant/{tenant_id}/task/{task_id}"))
+    core_meta_root_key_hash(&task_lease_root_anchor_key(tenant_id, task_id))
+}
+
+fn task_lease_root_anchor_key(tenant_id: i64, task_id: &str) -> String {
+    format!("task-lease/tenant/{tenant_id}/task/{task_id}")
 }
 
 async fn next_task_lease_root_generation(
@@ -382,10 +414,6 @@ pub async fn acquire_task_lease(
             Err(err) => return Err(err),
         };
         let existing_lease = existing.as_ref().map(|(_, lease)| lease);
-        let active_same_owner = existing_lease.is_some_and(|lease| {
-            lease.expires_at_nanos > request.now_nanos
-                && lease.owner.same_security_owner(&request.owner)
-        });
         if let Some(existing) = existing_lease
             && existing.expires_at_nanos > request.now_nanos
             && !existing.owner.same_security_owner(&request.owner)
@@ -395,15 +423,26 @@ pub async fn acquire_task_lease(
             ));
         }
 
-        let fence_token = if active_same_owner {
-            existing_lease.map(|lease| lease.fence_token).unwrap_or(1)
-        } else {
-            existing_lease
-                .map(|lease| lease.fence_token.saturating_add(1))
-                .unwrap_or(1)
-        };
+        // Every acquisition starts a new execution incarnation. Renewal is the
+        // only operation that preserves a fence; otherwise an older same-owner
+        // worker could continue publishing through a reacquired lease.
+        let fence_token = existing_lease
+            .map(|lease| {
+                lease
+                    .fence_token
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("task lease fence token overflow"))
+            })
+            .transpose()?
+            .unwrap_or(1);
         let lease_epoch = existing_lease
-            .map(|lease| lease.lease_epoch.saturating_add(1))
+            .map(|lease| {
+                lease
+                    .lease_epoch
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("task lease epoch overflow"))
+            })
+            .transpose()?
             .unwrap_or(1);
         let root_generation = next_task_lease_root_generation(
             storage,
@@ -429,7 +468,10 @@ pub async fn acquire_task_lease(
             checkpoint_cursor,
             lease_epoch,
             acquired_at_nanos: request.now_nanos,
-            expires_at_nanos: request.now_nanos.saturating_add(request.ttl_nanos),
+            expires_at_nanos: request
+                .now_nanos
+                .checked_add(request.ttl_nanos)
+                .ok_or_else(|| anyhow!("task lease expiry overflow"))?,
             updated_at_nanos: request.now_nanos,
             lease_hash: None,
             lease_signature: None,
@@ -446,31 +488,69 @@ pub async fn acquire_task_lease(
     ))
 }
 
+pub async fn check_task_lease(
+    storage: &Storage,
+    expected: &TaskLease,
+    now_nanos: i64,
+    signing_key: &[u8],
+) -> Result<TaskLease> {
+    let (_, lease) =
+        read_expected_task_lease_state(storage, expected, now_nanos, signing_key).await?;
+    Ok(lease)
+}
+
+pub async fn renew_task_lease(
+    storage: &Storage,
+    expected: &TaskLease,
+    now_nanos: i64,
+    ttl_nanos: i64,
+    signing_key: &[u8],
+) -> Result<TaskLease> {
+    if now_nanos < 0 {
+        return Err(anyhow!("task lease timestamp must be nonnegative"));
+    }
+    if ttl_nanos <= 0 {
+        return Err(anyhow!("task lease ttl must be positive"));
+    }
+
+    for _ in 0..LOCK_RETRY_ATTEMPTS {
+        let (row, mut lease) =
+            read_expected_task_lease_state(storage, expected, now_nanos, signing_key).await?;
+        lease.root_generation = lease
+            .root_generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("task lease root generation overflow"))?;
+        lease.lease_epoch = lease
+            .lease_epoch
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("task lease epoch overflow"))?;
+        lease.acquired_at_nanos = now_nanos;
+        lease.expires_at_nanos = now_nanos
+            .checked_add(ttl_nanos)
+            .ok_or_else(|| anyhow!("task lease expiry overflow"))?;
+        lease.updated_at_nanos = now_nanos;
+        lease = lease.seal(signing_key)?;
+        match write_task_lease_state(storage, &lease, Some(&row)).await {
+            Ok(()) => return Ok(lease),
+            Err(err) if is_core_ref_cas_conflict(&err) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(anyhow!(
+        "{LEASE_CAS_CONFLICT}: task lease renewal CAS retries exhausted"
+    ))
+}
+
 pub async fn checkpoint_task_lease(
     storage: &Storage,
-    task_id: &str,
-    owner: &TaskLeaseOwner,
-    fence_token: u64,
+    expected: &TaskLease,
     checkpoint_cursor: u128,
     now_nanos: i64,
     signing_key: &[u8],
 ) -> Result<TaskLease> {
     for _ in 0..LOCK_RETRY_ATTEMPTS {
-        let Some((row, mut lease)) =
-            read_task_lease_state(storage, owner.tenant_id, task_id, signing_key).await?
-        else {
-            return Err(anyhow!("task lease does not exist"));
-        };
-        lease.verify(signing_key)?;
-        if !lease.owner.same_security_owner(owner) {
-            return Err(anyhow!("{LEASE_OWNER_MISMATCH}: task lease owner mismatch"));
-        }
-        if lease.fence_token != fence_token {
-            return Err(anyhow!("{STALE_FENCE}: task lease fence token mismatch"));
-        }
-        if lease.expires_at_nanos <= now_nanos {
-            return Err(anyhow!("{LEASE_EXPIRED}: task lease expired"));
-        }
+        let (row, mut lease) =
+            read_expected_task_lease_state(storage, expected, now_nanos, signing_key).await?;
         if checkpoint_cursor < lease.checkpoint_cursor {
             return Err(anyhow!(
                 "{STALE_FENCE}: task lease checkpoint cannot move backwards"
@@ -499,29 +579,14 @@ pub async fn checkpoint_task_lease(
 
 pub async fn commit_task_lease(
     storage: &Storage,
-    task_id: &str,
-    owner: &TaskLeaseOwner,
-    fence_token: u64,
+    expected: &TaskLease,
     committed_cursor: u128,
     now_nanos: i64,
     signing_key: &[u8],
 ) -> Result<TaskLease> {
     for _ in 0..LOCK_RETRY_ATTEMPTS {
-        let Some((row, mut lease)) =
-            read_task_lease_state(storage, owner.tenant_id, task_id, signing_key).await?
-        else {
-            return Err(anyhow!("task lease does not exist"));
-        };
-        lease.verify(signing_key)?;
-        if !lease.owner.same_security_owner(owner) {
-            return Err(anyhow!("{LEASE_OWNER_MISMATCH}: task lease owner mismatch"));
-        }
-        if lease.fence_token != fence_token {
-            return Err(anyhow!("{STALE_FENCE}: task lease fence token mismatch"));
-        }
-        if lease.expires_at_nanos <= now_nanos {
-            return Err(anyhow!("{LEASE_EXPIRED}: task lease expired"));
-        }
+        let (row, mut lease) =
+            read_expected_task_lease_state(storage, expected, now_nanos, signing_key).await?;
         if committed_cursor < lease.checkpoint_cursor {
             return Err(anyhow!(
                 "{STALE_FENCE}: task lease commit cannot move backwards"
@@ -534,7 +599,14 @@ pub async fn commit_task_lease(
         lease.checkpoint_cursor = committed_cursor;
         lease.updated_at_nanos = now_nanos;
         let committed = lease.seal(signing_key)?;
-        match delete_task_lease_state(storage, owner.tenant_id, task_id, Some(&row)).await {
+        match delete_task_lease_state(
+            storage,
+            expected.owner.tenant_id,
+            &expected.task_id,
+            Some(&row),
+        )
+        .await
+        {
             Ok(_) => return Ok(committed),
             Err(err) if is_core_ref_cas_conflict(&err) => continue,
             Err(err) => return Err(err),
@@ -581,6 +653,56 @@ pub fn task_lease_precondition(
     })
 }
 
+pub async fn task_lease_exact_precondition(
+    storage: &Storage,
+    expected: &TaskLease,
+    signing_key: &[u8],
+) -> Result<CoreMutationPrecondition> {
+    expected.verify(signing_key)?;
+    let Some((payload, current)) = read_task_lease_state(
+        storage,
+        expected.owner.tenant_id,
+        &expected.task_id,
+        signing_key,
+    )
+    .await?
+    else {
+        return Err(anyhow!("{STALE_FENCE}: task lease does not exist"));
+    };
+    if current != *expected {
+        return Err(anyhow!("{STALE_FENCE}: task lease version changed"));
+    }
+    Ok(task_lease_row_precondition(
+        &task_lease_row_key(expected.owner.tenant_id, &expected.task_id)?,
+        Some(&payload),
+    ))
+}
+
+/// Returns the exact row-CAS precondition for an unexpired execution lease.
+///
+/// The caller must attach it to the same atomic mutation as the lease-protected
+/// completion effects; checking it separately does not fence that mutation.
+/// Commit admission must also compare `expected.expires_at_nanos` with its own
+/// commit-time clock so an unchanged but expired row cannot pass.
+pub async fn task_lease_fenced_precondition(
+    storage: &Storage,
+    expected: &TaskLease,
+    now_nanos: i64,
+    signing_key: &[u8],
+) -> Result<CoreMutationPrecondition> {
+    let (payload, _) =
+        read_expected_task_lease_state(storage, expected, now_nanos, signing_key).await?;
+    let row_key = task_lease_row_key(expected.owner.tenant_id, &expected.task_id)?;
+    Ok(CoreMutationPrecondition::CoreMetaLease {
+        cf: CF_LEASES_FENCES.to_string(),
+        table_id: TABLE_TASK_LEASE_ROW,
+        tuple_key: row_key,
+        expected_payload_hash: core_meta_payload_digest(TABLE_TASK_LEASE_ROW, &payload),
+        expires_at_unix_nanos: u64::try_from(expected.expires_at_nanos)
+            .context("task lease expiry is before the unix epoch")?,
+    })
+}
+
 pub async fn list_active_task_leases_for_node_page(
     storage: &Storage,
     owner_node_id: &str,
@@ -592,12 +714,12 @@ pub async fn list_active_task_leases_for_node_page(
     if !(1..=TASK_LEASE_LIST_PAGE_MAX).contains(&limit) {
         bail!("task lease page limit must be between 1 and {TASK_LEASE_LIST_PAGE_MAX}");
     }
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
+    let store = CoreStore::new(storage.clone()).await?;
     let prefix = task_lease_owner_prefix(owner_node_id)?;
     if after_tuple_key.is_some_and(|cursor| !cursor.starts_with(&prefix)) {
         bail!("task lease page cursor is outside the owner scope");
     }
-    let rows = meta.scan_prefix_page(
+    let rows = store.scan_coremeta_prefix_page(
         CF_LEASES_FENCES,
         TABLE_TASK_LEASE_ROW,
         &prefix,
@@ -725,6 +847,41 @@ fn sign_lease_hash(signing_key: &[u8], hash: &str, scope_parts: &[&str]) -> Resu
     Ok(base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
 }
 
+async fn read_expected_task_lease_state(
+    storage: &Storage,
+    expected: &TaskLease,
+    now_nanos: i64,
+    signing_key: &[u8],
+) -> Result<(Vec<u8>, TaskLease)> {
+    if now_nanos < 0 {
+        return Err(anyhow!("task lease timestamp must be nonnegative"));
+    }
+    expected.verify(signing_key)?;
+    let Some((row, lease)) = read_task_lease_state(
+        storage,
+        expected.owner.tenant_id,
+        &expected.task_id,
+        signing_key,
+    )
+    .await?
+    else {
+        return Err(anyhow!("{STALE_FENCE}: task lease does not exist"));
+    };
+    if !lease.owner.same_security_owner(&expected.owner) {
+        return Err(anyhow!("{LEASE_OWNER_MISMATCH}: task lease owner mismatch"));
+    }
+    if lease.fence_token != expected.fence_token {
+        return Err(anyhow!("{STALE_FENCE}: task lease fence token mismatch"));
+    }
+    if lease != *expected {
+        return Err(anyhow!("{STALE_FENCE}: task lease version changed"));
+    }
+    if lease.expires_at_nanos <= now_nanos {
+        return Err(anyhow!("{LEASE_EXPIRED}: task lease expired"));
+    }
+    Ok((row, lease))
+}
+
 async fn read_task_lease_state(
     storage: &Storage,
     tenant_id: i64,
@@ -732,8 +889,9 @@ async fn read_task_lease_state(
     signing_key: &[u8],
 ) -> Result<Option<(Vec<u8>, TaskLease)>> {
     let row_key = task_lease_row_key(tenant_id, task_id)?;
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
-    let Some(bytes) = meta.get(CF_LEASES_FENCES, TABLE_TASK_LEASE_ROW, &row_key)? else {
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(bytes) = store.read_coremeta_row(CF_LEASES_FENCES, TABLE_TASK_LEASE_ROW, &row_key)?
+    else {
         return Ok(None);
     };
     let lease = decode_task_lease_record(&bytes)?;
@@ -750,13 +908,13 @@ async fn write_task_lease_state(
     expected_row: Option<&Vec<u8>>,
 ) -> Result<()> {
     let row_key = task_lease_row_key(lease.owner.tenant_id, &lease.task_id)?;
-    let bytes = encode_task_lease_record(lease)?;
     let owner_key = task_lease_owner_key(lease)?;
     let previous = expected_row
         .map(|row| decode_task_lease_record(row))
         .transpose()?;
     let partition_id = task_lease_partition_id(lease.owner.tenant_id, &lease.task_id);
     let transaction_id = format!("task-lease:{}", uuid::Uuid::new_v4());
+    let bytes = task_lease_to_proto(lease, Some(&transaction_id)).encode_to_vec();
     let mut preconditions = vec![task_lease_row_precondition(&row_key, expected_row)];
     let mut operations = vec![CoreMutationOperation::CoreMetaPut {
         partition_id: partition_id.clone(),
@@ -791,16 +949,22 @@ async fn write_task_lease_state(
         tuple_key: owner_key,
         payload: bytes,
     });
-    CoreStore::new(storage.clone())
+    let root_publications = task_lease_root_publications(
+        task_lease_root_anchor_key(lease.owner.tenant_id, &lease.task_id),
+        partition_id.clone(),
+    );
+    let receipt = CoreStore::new(storage.clone())
         .await?
         .commit_mutation_batch(CoreMutationBatch {
             transaction_id,
             scope_partition: partition_id.clone(),
             committed_by_principal: task_lease_principal(&lease.owner),
+            root_publications,
             preconditions,
             operations,
         })
         .await?;
+    ensure_task_lease_mutation_committed(&receipt, "write")?;
     Ok(())
 }
 
@@ -842,17 +1006,40 @@ async fn delete_task_lease_state(
             tuple_key: owner_key,
         });
     }
-    CoreStore::new(storage.clone())
+    let root_publications = task_lease_root_publications(
+        task_lease_root_anchor_key(tenant_id, task_id),
+        partition_id.clone(),
+    );
+    let receipt = CoreStore::new(storage.clone())
         .await?
         .commit_mutation_batch(CoreMutationBatch {
             transaction_id: format!("task-lease-delete:{}", uuid::Uuid::new_v4()),
             scope_partition: partition_id.clone(),
             committed_by_principal: task_lease_principal(&owner),
+            root_publications,
             preconditions,
             operations,
         })
         .await?;
+    ensure_task_lease_mutation_committed(&receipt, "delete")?;
     Ok(())
+}
+
+fn ensure_task_lease_mutation_committed(
+    receipt: &crate::core_store::CoreMutationBatchReceipt,
+    operation: &str,
+) -> Result<()> {
+    if receipt.state == crate::core_store::CoreTransactionState::Committed {
+        return Ok(());
+    }
+    bail!(
+        "task lease {operation} mutation {} did not commit: {}",
+        receipt.transaction_id,
+        receipt
+            .finalisation_error
+            .as_deref()
+            .unwrap_or("unknown finalisation failure")
+    )
 }
 
 fn task_lease_row_precondition(
@@ -872,8 +1059,27 @@ fn task_lease_row_precondition(
 
 fn task_lease_partition_id(tenant_id: i64, task_id: &str) -> String {
     hex::encode(hash32(
-        format!("task-lease/tenant/{tenant_id}/task/{task_id}").as_bytes(),
+        task_lease_root_anchor_key(tenant_id, task_id).as_bytes(),
     ))
+}
+
+fn task_lease_root_publications(
+    data_root: String,
+    coordinator_root: String,
+) -> Vec<CoreMutationRootPublication> {
+    let coordinator = CoreMutationRootPublication::new(
+        coordinator_root.clone(),
+        WriterFamily::CoreControl.as_str(),
+    )
+    .coordinator();
+    if data_root == coordinator_root {
+        vec![coordinator]
+    } else {
+        vec![
+            coordinator,
+            CoreMutationRootPublication::new(data_root, WriterFamily::CoreControl.as_str()),
+        ]
+    }
 }
 
 fn task_lease_principal(_owner: &TaskLeaseOwner) -> String {
@@ -994,17 +1200,9 @@ mod tests {
             .unwrap()
             .expect("task lease owner projection");
         assert_eq!(owner_row, row);
-        let checkpointed = checkpoint_task_lease(
-            &storage,
-            "index-build-alpha",
-            &owner,
-            lease.fence_token,
-            99,
-            200,
-            KEY,
-        )
-        .await
-        .unwrap();
+        let checkpointed = checkpoint_task_lease(&storage, &lease, 99, 200, KEY)
+            .await
+            .unwrap();
         assert_eq!(checkpointed.checkpoint_cursor, 99);
         assert_eq!(
             read_task_lease(&storage, 0, "index-build-alpha", KEY)
@@ -1013,6 +1211,20 @@ mod tests {
                 .unwrap(),
             checkpointed
         );
+    }
+
+    #[tokio::test]
+    async fn task_lease_acquire_rejects_expiry_overflow() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let error = acquire_task_lease(
+            &storage,
+            acquire(TaskLeaseOwner::node("node-a"), i64::MAX - 1, 2),
+            KEY,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("task lease expiry overflow"));
     }
 
     #[tokio::test]
@@ -1025,43 +1237,29 @@ mod tests {
             .await
             .unwrap();
 
-        let wrong_owner = commit_task_lease(
-            &storage,
-            "index-build-alpha",
-            &other,
-            lease.fence_token,
-            10,
-            200,
-            KEY,
-        )
-        .await
-        .unwrap_err();
+        let mut wrong_owner_lease = lease.clone();
+        wrong_owner_lease.owner = other;
+        wrong_owner_lease.lease_hash = None;
+        wrong_owner_lease.lease_signature = None;
+        let wrong_owner_lease = wrong_owner_lease.seal(KEY).unwrap();
+        let wrong_owner = commit_task_lease(&storage, &wrong_owner_lease, 10, 200, KEY)
+            .await
+            .unwrap_err();
         assert!(wrong_owner.to_string().contains(LEASE_OWNER_MISMATCH));
 
-        let stale = commit_task_lease(
-            &storage,
-            "index-build-alpha",
-            &owner,
-            lease.fence_token + 1,
-            10,
-            200,
-            KEY,
-        )
-        .await
-        .unwrap_err();
+        let mut stale_lease = lease.clone();
+        stale_lease.fence_token += 1;
+        stale_lease.lease_hash = None;
+        stale_lease.lease_signature = None;
+        let stale_lease = stale_lease.seal(KEY).unwrap();
+        let stale = commit_task_lease(&storage, &stale_lease, 10, 200, KEY)
+            .await
+            .unwrap_err();
         assert!(stale.to_string().contains(STALE_FENCE));
 
-        let committed = commit_task_lease(
-            &storage,
-            "index-build-alpha",
-            &owner,
-            lease.fence_token,
-            12,
-            200,
-            KEY,
-        )
-        .await
-        .unwrap();
+        let committed = commit_task_lease(&storage, &lease, 12, 200, KEY)
+            .await
+            .unwrap();
         assert_eq!(committed.checkpoint_cursor, 12);
         assert_eq!(committed.root_generation, lease.root_generation + 1);
         assert!(
@@ -1115,24 +1313,16 @@ mod tests {
             }
         );
         assert!(
-            checkpoint_task_lease(
-                &storage,
-                "index-build-alpha",
-                &owner_a,
-                first.fence_token,
-                20,
-                750,
-                KEY,
-            )
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains(LEASE_OWNER_MISMATCH)
+            checkpoint_task_lease(&storage, &first, 20, 750, KEY,)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains(LEASE_OWNER_MISMATCH)
         );
     }
 
     #[tokio::test]
-    async fn same_owner_renews_without_changing_fence() {
+    async fn same_owner_reacquisition_starts_a_new_fenced_execution() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = TaskLeaseOwner::node("node-a");
@@ -1142,10 +1332,74 @@ mod tests {
         let renewed = acquire_task_lease(&storage, acquire(owner, 200, 500), KEY)
             .await
             .unwrap();
-        assert_eq!(renewed.fence_token, first.fence_token);
+        assert_eq!(renewed.fence_token, first.fence_token + 1);
         assert_eq!(renewed.lease_epoch, first.lease_epoch + 1);
         assert_eq!(renewed.root_generation, first.root_generation + 1);
         assert_eq!(renewed.expires_at_nanos, 700);
+        assert!(
+            checkpoint_task_lease(&storage, &first, 10, 250, KEY)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains(STALE_FENCE)
+        );
+        assert_eq!(
+            check_task_lease(&storage, &renewed, 250, KEY)
+                .await
+                .unwrap(),
+            renewed
+        );
+    }
+
+    #[tokio::test]
+    async fn checked_renewal_fences_old_versions_and_refuses_expired_leases() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let first = acquire_task_lease(
+            &storage,
+            acquire(TaskLeaseOwner::node("node-a"), 100, 500),
+            KEY,
+        )
+        .await
+        .unwrap();
+
+        let precondition = task_lease_fenced_precondition(&storage, &first, 150, KEY)
+            .await
+            .unwrap();
+        assert!(matches!(
+            precondition,
+            CoreMutationPrecondition::CoreMetaLease {
+                expires_at_unix_nanos: 600,
+                ..
+            }
+        ));
+
+        let renewed = renew_task_lease(&storage, &first, 200, 500, KEY)
+            .await
+            .unwrap();
+        assert_eq!(renewed.fence_token, first.fence_token);
+        assert_eq!(renewed.lease_epoch, first.lease_epoch + 1);
+        assert_eq!(renewed.expires_at_nanos, 700);
+        assert!(
+            check_task_lease(&storage, &first, 250, KEY)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains(STALE_FENCE)
+        );
+        assert_eq!(
+            check_task_lease(&storage, &renewed, 250, KEY)
+                .await
+                .unwrap(),
+            renewed
+        );
+        assert!(
+            renew_task_lease(&storage, &renewed, 700, 500, KEY)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains(LEASE_EXPIRED)
+        );
     }
 
     #[tokio::test]
@@ -1198,35 +1452,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_checkpoint_at_same_cursor_is_idempotent() {
+    async fn checkpoint_requires_the_exact_current_lease_version() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let owner = TaskLeaseOwner::node("node-a");
         let lease = acquire_task_lease(&storage, acquire(owner.clone(), 100, 500), KEY)
             .await
             .unwrap();
-        let first = checkpoint_task_lease(
-            &storage,
-            &lease.task_id,
-            &owner,
-            lease.fence_token,
-            99,
-            200,
-            KEY,
-        )
-        .await
-        .unwrap();
-        let second = checkpoint_task_lease(
-            &storage,
-            &lease.task_id,
-            &owner,
-            lease.fence_token,
-            99,
-            200,
-            KEY,
-        )
-        .await
-        .unwrap();
+        let first = checkpoint_task_lease(&storage, &lease, 99, 200, KEY)
+            .await
+            .unwrap();
+        let stale = checkpoint_task_lease(&storage, &lease, 99, 200, KEY)
+            .await
+            .unwrap_err();
+        assert!(stale.to_string().contains(STALE_FENCE));
+        let second = checkpoint_task_lease(&storage, &first, 99, 250, KEY)
+            .await
+            .unwrap();
         assert_eq!(first, second);
     }
 
@@ -1245,14 +1487,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let mut tampered = decode_task_lease_record(&row).unwrap();
-        tampered.checkpoint_cursor = 1234;
+        let mut tampered = TaskLeaseRecordProto::decode(row.as_slice()).unwrap();
+        tampered.checkpoint_cursor_be = 1234_u128.to_be_bytes().to_vec();
         let meta = CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
         meta.put(
             CF_LEASES_FENCES,
             TABLE_TASK_LEASE_ROW,
             &task_lease_row_key(0, "index-build-alpha").unwrap(),
-            &encode_task_lease_record(&tampered).unwrap(),
+            &tampered.encode_to_vec(),
         )
         .unwrap();
         assert!(
