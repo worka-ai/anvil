@@ -1710,7 +1710,7 @@ fn expected_schema_markers(table_id: u16) -> Option<&'static [&'static str]> {
         TABLE_EXPLICIT_TRANSACTION_ROW => Some(&[
             "anvil.core.transaction_header_row.v1",
             "anvil.core.transaction_staged_update_row.v1",
-            "anvil.core.transaction_precondition_row.v2",
+            "anvil.core.transaction_precondition_row.v3",
         ]),
         TABLE_PENDING_MUTATION_ROW => Some(&[
             "anvil.core.pending_mutation_row.v1",

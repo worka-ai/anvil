@@ -483,7 +483,7 @@ impl CoreStore {
         admission: &CorePendingMutationRecord,
         timing_name: &str,
     ) -> Result<CoreMutationBatchReceipt> {
-        self.finalise_admitted_mutation_batch_with_error(batch, admission, timing_name, None)
+        self.finalise_admitted_mutation_batch_with_error(batch, admission, timing_name, None, true)
             .await
     }
 
@@ -493,6 +493,7 @@ impl CoreStore {
         admission: &CorePendingMutationRecord,
         timing_name: &str,
         initial_error: Option<String>,
+        revalidate_preconditions: bool,
     ) -> Result<CoreMutationBatchReceipt> {
         let step_start = std::time::Instant::now();
         let mut prepared_coremeta_ops = Vec::new();
@@ -560,7 +561,11 @@ impl CoreStore {
         }
         let step_start = std::time::Instant::now();
         let transaction_ops = self
-            .transaction_rows_as_coremeta_ops_unlocked(&transaction, &batch.preconditions)
+            .transaction_rows_as_coremeta_ops_unlocked(
+                &transaction,
+                &batch.preconditions,
+                revalidate_preconditions && finalisation_error.is_none(),
+            )
             .await?;
         prepared_coremeta_ops.extend(transaction_ops);
         self.mark_pending_mutation_finalised_with_result_and_ops_unlocked(
@@ -677,6 +682,7 @@ impl CoreStore {
             .err()
             .map(|error| format!("{error:#}"))
         };
+        let revalidate_preconditions = !has_published_effect && precondition_error.is_none();
         operation_guards.release_mutable_guards();
         let result = self
             .finalise_admitted_mutation_batch_with_error(
@@ -684,6 +690,7 @@ impl CoreStore {
                 admission,
                 "recovery",
                 precondition_error,
+                revalidate_preconditions,
             )
             .await;
         drop(operation_guards);
@@ -710,6 +717,7 @@ impl CoreStore {
             admission,
             "terminal-recovery",
             Some(format!("{error:#}")),
+            false,
         )
         .await
     }

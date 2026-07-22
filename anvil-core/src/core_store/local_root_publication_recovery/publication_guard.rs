@@ -133,7 +133,12 @@ impl CoreStore {
                 }
             }
             for persisted in &context.preconditions {
-                self.insert_publication_precondition_lock_keys(&mut keys, &persisted.precondition)?;
+                if persisted.revalidate_at_publication {
+                    self.insert_publication_precondition_lock_keys(
+                        &mut keys,
+                        &persisted.precondition,
+                    )?;
+                }
             }
         }
         Ok(keys)
@@ -309,6 +314,9 @@ impl CoreStore {
             return self.terminal_publication_guard_failure(intent, "TransactionExpired");
         }
         for persisted in &context.preconditions {
+            if !persisted.revalidate_at_publication {
+                continue;
+            }
             if let CoreMutationPrecondition::CoreMetaLease {
                 expires_at_unix_nanos,
                 ..
@@ -369,7 +377,8 @@ fn publication_transaction_staging_matches(
     current_preconditions: &[super::super::local_tx_rows::CoreTransactionPreconditionRow],
     expected_preconditions: &[super::super::local_tx_rows::CoreTransactionPreconditionRow],
 ) -> bool {
-    current.transaction_id == expected.transaction_id
+    let exact_published_staging = current == expected;
+    let open_staging = current.transaction_id == expected.transaction_id
         && current.scope_partition == expected.scope_partition
         && current.state == CoreTransactionState::Open
         && current.preconditions_hash == expected.preconditions_hash
@@ -385,8 +394,8 @@ fn publication_transaction_staging_matches(
         && current.committed_root_generation.is_none()
         && current.purpose == expected.purpose
         && current.failure_evidence.is_none()
-        && current.outcome == "open"
-        && current_preconditions == expected_preconditions
+        && current.outcome == "open";
+    (open_staging || exact_published_staging) && current_preconditions == expected_preconditions
 }
 
 fn publication_transaction_is_completed_retry(

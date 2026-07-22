@@ -865,10 +865,12 @@ impl CoreStore {
             if persisted.visible_update_boundary > visible_update_count {
                 bail!("CoreStore transaction precondition boundary exceeds staged update count");
             }
-            by_boundary
-                .entry(persisted.visible_update_boundary)
-                .or_default()
-                .push(&persisted.precondition);
+            if persisted.revalidate_at_publication {
+                by_boundary
+                    .entry(persisted.visible_update_boundary)
+                    .or_default()
+                    .push(&persisted.precondition);
+            }
         }
 
         for (visible_update_boundary, boundary_preconditions) in by_boundary {

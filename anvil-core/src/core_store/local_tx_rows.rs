@@ -13,7 +13,7 @@ pub(super) use publication_guard::{
 const CORE_TRANSACTION_HEADER_ROW_SCHEMA: &str = "anvil.core.transaction_header_row.v1";
 const CORE_TRANSACTION_STAGED_UPDATE_ROW_SCHEMA: &str =
     "anvil.core.transaction_staged_update_row.v1";
-const CORE_TRANSACTION_PRECONDITION_ROW_SCHEMA: &str = "anvil.core.transaction_precondition_row.v2";
+const CORE_TRANSACTION_PRECONDITION_ROW_SCHEMA: &str = "anvil.core.transaction_precondition_row.v3";
 // Transaction rows may retain tiny CoreMeta payloads for recovery, but larger
 // staged payloads must stay in the CoreStore byte pipeline as locators.
 const CORE_TRANSACTION_STAGED_INLINE_PAYLOAD_BYTES: usize = 16 * 1024;
@@ -187,6 +187,8 @@ struct CoreTransactionPreconditionRowProto {
     precondition: Option<CoreMutationPreconditionRowProto>,
     #[prost(uint64, tag = "6")]
     visible_update_boundary: u64,
+    #[prost(bool, tag = "7")]
+    revalidate_at_publication: bool,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -326,6 +328,9 @@ pub(super) struct CoreTransactionPreconditionRow {
     ordinal: u64,
     pub(super) visible_update_boundary: u64,
     pub(super) precondition: CoreMutationPrecondition,
+    // Recovery retains the admitted precondition as audit evidence after an
+    // exact effect is durable, but must not evaluate the before-state again.
+    pub(super) revalidate_at_publication: bool,
 }
 
 pub(super) enum OwnedCoreMetaBatchOp {
@@ -376,7 +381,7 @@ impl CoreStore {
             transaction.state,
             CoreTransactionState::Open | CoreTransactionState::Prepared
         ) {
-            self.transaction_rows_as_coremeta_ops_unlocked(transaction, new_preconditions)
+            self.transaction_rows_as_coremeta_ops_unlocked(transaction, new_preconditions, true)
                 .await?
         } else {
             let mut preconditions = self
@@ -397,6 +402,7 @@ impl CoreStore {
                     ordinal,
                     visible_update_boundary,
                     precondition,
+                    revalidate_at_publication: true,
                 });
             }
             self.complete_transaction_rows_as_coremeta_ops_unlocked(transaction, &preconditions)
@@ -411,6 +417,7 @@ impl CoreStore {
         &self,
         transaction: &CoreTransaction,
         new_preconditions: &[CoreMutationPrecondition],
+        revalidate_at_publication: bool,
     ) -> Result<Vec<OwnedCoreMetaBatchOp>> {
         validate_transaction_root_scope(transaction)?;
         validate_logical_id(&transaction.transaction_id, "transaction id")?;
@@ -511,6 +518,7 @@ impl CoreStore {
                     ordinal,
                     existing_update_count,
                     precondition,
+                    revalidate_at_publication,
                 )?,
                 common: None,
             });
@@ -582,6 +590,7 @@ impl CoreStore {
                     ordinal,
                     precondition.visible_update_boundary,
                     &precondition.precondition,
+                    precondition.revalidate_at_publication,
                 )?,
                 common: None,
             });
@@ -1146,6 +1155,7 @@ fn encode_transaction_precondition_row(
     ordinal: u64,
     visible_update_boundary: u64,
     precondition: &CoreMutationPrecondition,
+    revalidate_at_publication: bool,
 ) -> Result<Vec<u8>> {
     validate_logical_id(&transaction.transaction_id, "transaction id")?;
     encode_message(CoreTransactionPreconditionRowProto {
@@ -1155,6 +1165,7 @@ fn encode_transaction_precondition_row(
         ordinal,
         precondition: Some(mutation_precondition_to_proto(precondition)?),
         visible_update_boundary,
+        revalidate_at_publication,
     })
 }
 
@@ -1180,6 +1191,7 @@ fn decode_transaction_precondition_row(
         precondition: mutation_precondition_from_proto(proto.precondition.ok_or_else(|| {
             anyhow!("CoreStore transaction precondition row is missing precondition")
         })?)?,
+        revalidate_at_publication: proto.revalidate_at_publication,
     })
 }
 
