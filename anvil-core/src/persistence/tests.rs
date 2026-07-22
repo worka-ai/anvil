@@ -210,6 +210,71 @@ async fn authz_tuple_write_enqueues_and_materializes_bounded_authorization_state
 }
 
 #[tokio::test]
+async fn authz_materialization_task_catches_up_a_grouped_revision_backlog() {
+    let temp = tempdir().unwrap();
+    let persistence = Persistence::new(&test_config(temp.path())).unwrap();
+    bind_persistence_test_authz_schema(&persistence, 42).await;
+
+    let first = persistence
+        .write_authz_tuple(
+            42,
+            "document",
+            "backlog-1",
+            "reader",
+            "user",
+            "alice",
+            "",
+            "add",
+            "test",
+            "seed authz materialization",
+        )
+        .await
+        .unwrap();
+
+    let mut latest = first;
+    for revision in 2..=8 {
+        latest = persistence
+            .write_authz_tuple(
+                42,
+                "document",
+                &format!("backlog-{revision}"),
+                "reader",
+                "user",
+                "alice",
+                "",
+                "add",
+                "test",
+                "extend authz materialization backlog",
+            )
+            .await
+            .unwrap();
+    }
+
+    let target_revision = latest.revision as u64;
+    let guard = claim_authz_materialization_guard(&persistence, 42, target_revision).await;
+    let outcome = persistence
+        .run_authz_materialization_task(42, target_revision, &guard)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.processed_revision, target_revision);
+    assert_eq!(outcome.source_rows_visited, 8);
+    for revision in 1..=target_revision {
+        assert!(
+            crate::authz_segment::existing_authz_tuple_segment_ref(
+                &persistence.storage,
+                42,
+                revision,
+            )
+            .await
+            .unwrap()
+            .is_some(),
+            "materialization task must publish every revision through {target_revision}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn authz_materialization_job_latency_with_retained_history_perf() {
     if std::env::var_os("ANVIL_RUN_AUTHZ_JOB_PERF").is_none() {
         return;

@@ -3,6 +3,7 @@ use crate::task_execution_guard::TaskExecutionGuard;
 use anyhow::Context;
 
 const AUTHZ_MATERIALIZATION_DERIVED_INDEX_KIND: &str = "userset";
+const AUTHZ_MATERIALIZATION_MAX_STEPS_PER_TASK: usize = 256;
 const REBALANCE_SHARD_PARTITION_FAMILY: &str = "object_shard_repair";
 
 fn task_queue_is_owned_elsewhere(error: &anyhow::Error) -> bool {
@@ -309,15 +310,38 @@ impl Persistence {
         let source_fence_token =
             authz_journal::latest_authz_journal_fence_token(&self.storage, tenant_id).await?;
 
-        let outcome = authz_journal::AuthzMaterializationOutcome::materialize_for_task_at_revision(
-            &self.storage,
-            tenant_id,
-            target_revision,
-            source_fence_token,
-            guard,
-            &source_partition_precondition,
-        )
-        .await?;
+        let mut steps = 0usize;
+        let mut source_rows_visited = 0usize;
+        let mut step_target =
+            if crate::authz_segment::latest_authz_tuple_segment_record(&self.storage, tenant_id)
+                .await?
+                .is_none()
+            {
+                1
+            } else {
+                target_revision
+            };
+        let outcome = loop {
+            let mut outcome =
+                authz_journal::AuthzMaterializationOutcome::materialize_for_task_at_revision(
+                    &self.storage,
+                    tenant_id,
+                    step_target,
+                    source_fence_token,
+                    guard,
+                    &source_partition_precondition,
+                )
+                .await?;
+            steps = steps.saturating_add(1);
+            source_rows_visited = source_rows_visited.saturating_add(outcome.source_rows_visited);
+            outcome.source_rows_visited = source_rows_visited;
+            if outcome.processed_revision >= target_revision
+                || steps >= AUTHZ_MATERIALIZATION_MAX_STEPS_PER_TASK
+            {
+                break outcome;
+            }
+            step_target = target_revision;
+        };
 
         let latest_after =
             authz_journal::latest_authz_tuple_revision(&self.storage, tenant_id).await?;
