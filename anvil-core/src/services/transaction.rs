@@ -481,6 +481,8 @@ mod tests {
     use tempfile::TempDir;
     use tokio::time::{Duration, sleep};
 
+    const TEST_TRANSACTION_TTL_MS: u64 = 3_600_000;
+
     #[derive(Clone, PartialEq, Message)]
     struct ExplicitTransactionStateRowProto {
         #[prost(message, optional, tag = "1")]
@@ -726,7 +728,7 @@ mod tests {
                 scope: Some(scope("tenant/1/root/rollback")),
                 preconditions: Vec::new(),
                 boundary_values: Vec::new(),
-                ttl_ms: 60_000,
+                ttl_ms: TEST_TRANSACTION_TTL_MS,
                 purpose: "service test rollback".to_string(),
             }))
             .await
@@ -801,7 +803,7 @@ mod tests {
                 scope: Some(scope(root)),
                 preconditions: Vec::new(),
                 boundary_values: Vec::new(),
-                ttl_ms: 60_000,
+                ttl_ms: TEST_TRANSACTION_TTL_MS,
                 purpose: "service test scope mismatch".to_string(),
             }))
             .await
@@ -872,7 +874,7 @@ mod tests {
                     scope: Some(scope(&root)),
                     preconditions: vec![precondition.clone()],
                     boundary_values: Vec::new(),
-                    ttl_ms: 60_000,
+                    ttl_ms: TEST_TRANSACTION_TTL_MS,
                     purpose: "service object mutation test".to_string(),
                 },
                 &claims,
@@ -958,7 +960,7 @@ mod tests {
                     scope: Some(scope(&root)),
                     preconditions: vec![rollback_precondition.clone()],
                     boundary_values: Vec::new(),
-                    ttl_ms: 60_000,
+                    ttl_ms: TEST_TRANSACTION_TTL_MS,
                     purpose: "service object rollback test".to_string(),
                 },
                 &claims,
@@ -1003,7 +1005,7 @@ mod tests {
                     scope: Some(scope(&root)),
                     preconditions: vec![successor_precondition.clone()],
                     boundary_values: Vec::new(),
-                    ttl_ms: 60_000,
+                    ttl_ms: TEST_TRANSACTION_TTL_MS,
                     purpose: "service object after rollback test".to_string(),
                 },
                 &claims,
@@ -1060,7 +1062,7 @@ mod tests {
                     scope: Some(scope(&root)),
                     preconditions: vec![open_precondition.clone()],
                     boundary_values: Vec::new(),
-                    ttl_ms: 60_000,
+                    ttl_ms: TEST_TRANSACTION_TTL_MS,
                     purpose: "service open predecessor test".to_string(),
                 },
                 &claims,
@@ -1090,7 +1092,7 @@ mod tests {
                     scope: Some(scope(&root)),
                     preconditions: vec![successor_precondition.clone()],
                     boundary_values: Vec::new(),
-                    ttl_ms: 60_000,
+                    ttl_ms: TEST_TRANSACTION_TTL_MS,
                     purpose: "service competing successor test".to_string(),
                 },
                 &claims,
@@ -1197,7 +1199,7 @@ mod tests {
                     scope: Some(scope(&root)),
                     preconditions: vec![predecessor_precondition.clone()],
                     boundary_values: Vec::new(),
-                    ttl_ms: 60_000,
+                    ttl_ms: TEST_TRANSACTION_TTL_MS,
                     purpose: "stage an abandoned predecessor".to_string(),
                 },
                 &claims,
@@ -1220,7 +1222,10 @@ mod tests {
         state.mutation_batch(predecessor_request).await.unwrap();
         state
             .core_store
-            .expire_explicit_transaction_for_tests(&predecessor.transaction_id, &claims.sub)
+            .expire_explicit_transaction_for_tests(
+                &predecessor.transaction_id,
+                &transaction_principal_from_claims(&claims),
+            )
             .await
             .unwrap();
 
@@ -1232,7 +1237,7 @@ mod tests {
                     scope: Some(scope(&root)),
                     preconditions: vec![successor_precondition.clone()],
                     boundary_values: Vec::new(),
-                    ttl_ms: 60_000,
+                    ttl_ms: TEST_TRANSACTION_TTL_MS,
                     purpose: "commit after an expired predecessor".to_string(),
                 },
                 &claims,
@@ -1292,7 +1297,7 @@ mod tests {
                 scope: Some(scope("tenant/1/root/principal-scope")),
                 preconditions: Vec::new(),
                 boundary_values: Vec::new(),
-                ttl_ms: 60_000,
+                ttl_ms: TEST_TRANSACTION_TTL_MS,
                 purpose: "service test principal scoping".to_string(),
             }))
             .await
@@ -1321,7 +1326,7 @@ mod tests {
                 scope: Some(scope(root)),
                 preconditions: Vec::new(),
                 boundary_values: Vec::new(),
-                ttl_ms: 60_000,
+                ttl_ms: TEST_TRANSACTION_TTL_MS,
                 purpose: "service test commit".to_string(),
             }))
             .await
