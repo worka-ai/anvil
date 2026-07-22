@@ -6,6 +6,8 @@ async fn core_store_node_signing_keypair_is_rocksdb_metadata_not_sidecar() {
     let storage = Storage::new_at(tmp.path()).await.unwrap();
     let first = CoreStore::new(storage.clone()).await.unwrap();
     let first_peer = first.node_signing_keypair.public().to_peer_id();
+    let first_admission_epoch = first.admission_mutation_epoch;
+    assert_ne!(first_admission_epoch, 0);
     assert!(
         !storage
             .core_store_root_path()
@@ -24,6 +26,40 @@ async fn core_store_node_signing_keypair_is_rocksdb_metadata_not_sidecar() {
         first_peer,
         restarted.node_signing_keypair.public().to_peer_id()
     );
+    assert_eq!(first_admission_epoch, restarted.admission_mutation_epoch);
+}
+
+#[tokio::test]
+async fn fresh_node_storage_has_a_distinct_admission_incarnation() {
+    let first_dir = tempfile::tempdir().unwrap();
+    let second_dir = tempfile::tempdir().unwrap();
+    let first = CoreStore::new(Storage::new_at(first_dir.path()).await.unwrap())
+        .await
+        .unwrap();
+    let second = CoreStore::new(Storage::new_at(second_dir.path()).await.unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(first.node_identity.node_id, second.node_identity.node_id);
+    assert_ne!(
+        first.admission_mutation_epoch, second.admission_mutation_epoch,
+        "a fresh local store must not reuse admission identities from an older node incarnation"
+    );
+
+    let admitted = first
+        .admit_core_mutation(
+            "test.identity",
+            WriterFamily::CoreControl.as_str(),
+            test_mutation_target(),
+            "node-scoped-admission".to_string(),
+            Some("node-scoped-admission".to_string()),
+            CorePendingMutationPayload::Inline(b"node-scoped-admission"),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admitted.node_id, first.node_identity.node_id);
+    assert_eq!(admitted.mutation_epoch, first.admission_mutation_epoch);
 }
 
 #[tokio::test]
@@ -59,6 +95,138 @@ async fn unchanged_receipt_signing_key_registration_is_a_storage_noop() {
         first, second,
         "registering an unchanged key must not rewrite its RocksDB row"
     );
+}
+
+#[tokio::test]
+async fn receipt_signing_identity_replacement_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let store = CoreStore::new(storage).await.unwrap();
+    let node_id = "receipt-node-immutable";
+    let first_public_key = identity::Keypair::generate_ed25519()
+        .public()
+        .encode_protobuf();
+    let replacement_public_key = identity::Keypair::generate_ed25519()
+        .public()
+        .encode_protobuf();
+
+    store
+        .register_node_receipt_signing_public_key(node_id, &first_public_key)
+        .unwrap();
+    let error = store
+        .register_node_receipt_signing_public_key(node_id, &replacement_public_key)
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("receipt signing identity replacement rejected")
+    );
+    assert_eq!(
+        load_node_receipt_signing_public_key(&store.meta, node_id)
+            .unwrap()
+            .unwrap()
+            .encode_protobuf(),
+        first_public_key,
+        "rejected registration must preserve the original verification identity"
+    );
+}
+
+#[tokio::test]
+async fn receipt_verification_reports_topology_unavailable_before_bootstrap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = CoreStore::new(Storage::new_at(tmp.path()).await.unwrap())
+        .await
+        .unwrap();
+    let remote = identity::Keypair::generate_ed25519();
+    let payload_hash = "sha256:bootstrap-race";
+    let signature = remote.sign(payload_hash.as_bytes()).unwrap();
+
+    let error = store
+        .verify_internal_core_receipt_signature("node-b", payload_hash, &signature)
+        .unwrap_err();
+
+    assert!(is_core_store_unavailable(&error));
+    assert!(
+        error
+            .to_string()
+            .contains("mesh topology is not ready to verify node node-b")
+    );
+}
+
+#[tokio::test]
+async fn receipt_verification_materialises_canonical_bootstrap_key_on_demand() {
+    use crate::mesh_lifecycle::{
+        BootstrapMeshLifecycleProjection, CreateRegionDescriptor, NodeCapability,
+        RegisterCellDescriptor, RegisterNodeDescriptor, install_bootstrap_lifecycle_projection,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let store = CoreStore::new(storage.clone()).await.unwrap();
+    let remote = identity::Keypair::generate_ed25519();
+    let remote_public_key = remote.public().encode_protobuf();
+
+    install_bootstrap_lifecycle_projection(
+        &storage,
+        &store,
+        BootstrapMeshLifecycleProjection {
+            regions: vec![CreateRegionDescriptor {
+                mesh_id: "mesh-a".to_string(),
+                region: "eu-west-1".to_string(),
+                public_base_url: "https://eu-west-1.anvil.test".to_string(),
+                virtual_host_suffix: "eu-west-1.anvil.test".to_string(),
+                placement_weight: 100,
+                default_cell: Some("cell-a".to_string()),
+            }],
+            cells: vec![RegisterCellDescriptor {
+                mesh_id: "mesh-a".to_string(),
+                region: "eu-west-1".to_string(),
+                cell_id: "cell-a".to_string(),
+                placement_weight: 100,
+                failure_domain: "rack-a".to_string(),
+            }],
+            nodes: vec![RegisterNodeDescriptor {
+                mesh_id: "mesh-a".to_string(),
+                node_id: "node-b".to_string(),
+                region: "eu-west-1".to_string(),
+                cell_id: "cell-a".to_string(),
+                libp2p_peer_id: "peer-node-b".to_string(),
+                receipt_signing_public_key_proto: remote_public_key,
+                public_api_addr: "http://127.0.0.1:50052".to_string(),
+                public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7444/quic-v1".to_string()],
+                capabilities: vec![NodeCapability::Metadata, NodeCapability::Object],
+                capacity_json: "{}".to_string(),
+            }],
+        },
+    )
+    .unwrap();
+
+    assert!(
+        load_node_receipt_signing_public_key(&store.meta, "node-b")
+            .unwrap()
+            .is_none(),
+        "bootstrap projection should remain the canonical source until first verification"
+    );
+
+    let payload_hash = "sha256:canonical-bootstrap-key";
+    let signature = remote.sign(payload_hash.as_bytes()).unwrap();
+    store
+        .verify_internal_core_receipt_signature("node-b", payload_hash, &signature)
+        .unwrap();
+
+    assert!(
+        load_node_receipt_signing_public_key(&store.meta, "node-b")
+            .unwrap()
+            .is_some(),
+        "successful verification should materialise the canonical lifecycle key"
+    );
+
+    let unknown = store
+        .verify_internal_core_receipt_signature("node-c", payload_hash, &signature)
+        .unwrap_err();
+    assert!(!is_core_store_unavailable(&unknown));
+    assert!(unknown.to_string().contains("unknown node node-c"));
 }
 
 #[tokio::test]
@@ -106,11 +274,18 @@ async fn coremeta_quorum_commits_independent_roots_as_one_group() {
             kind: CoreMetaBatchOpKind::Put(&second_payload),
         },
     ];
+    let publications = [
+        CoreMetaRootPublication::new("test/group/first", WriterFamily::CoreControl).coordinator(),
+        CoreMetaRootPublication::new("test/group/second", WriterFamily::CoreControl),
+    ];
 
-    let outcomes = store
-        .commit_coremeta_batch_by_embedded_roots("grouped-root-commit", &operations)
-        .await
-        .unwrap();
+    let outcomes = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        store.commit_coremeta_root_groups("grouped-root-commit", &operations, &publications),
+    )
+    .await
+    .expect("multi-root quorum publication must not retain speculative CAS locks")
+    .unwrap();
 
     assert_eq!(outcomes.len(), 2);
     assert_ne!(outcomes[0].root_key_hash, outcomes[1].root_key_hash);
@@ -137,7 +312,7 @@ async fn coremeta_quorum_commits_independent_roots_as_one_group() {
 }
 
 #[tokio::test]
-async fn coremeta_quorum_commits_successive_generations_of_one_root_in_order() {
+async fn coremeta_quorum_centrally_binds_one_generation_for_one_logical_mutation() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = Storage::new_at(tmp.path()).await.unwrap();
     let store = CoreStore::new(storage).await.unwrap();
@@ -182,20 +357,79 @@ async fn coremeta_quorum_commits_successive_generations_of_one_root_in_order() {
             kind: CoreMetaBatchOpKind::Put(&second_payload),
         },
     ];
+    let publications =
+        [
+            CoreMetaRootPublication::new("test/group/shared", WriterFamily::CoreControl)
+                .coordinator(),
+        ];
 
     let outcomes = store
-        .commit_coremeta_batch_by_embedded_roots("successive-root-commit", &operations)
+        .commit_coremeta_root_groups("successive-root-commit", &operations, &publications)
+        .await
+        .unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].post_root_generation, 1);
+    for tuple_key in [&first_key, &second_key] {
+        let payload = store
+            .read_coremeta_row(CF_INLINE_PAYLOADS, TABLE_INLINE_PAYLOAD_ROW, tuple_key)
+            .unwrap()
+            .expect("centrally bound row is visible");
+        let common = core_meta_row_common_from_payload(&payload).unwrap();
+        assert_eq!(common.root_key_hash, root_key_hash);
+        assert_eq!(common.root_generation, 1);
+        assert_eq!(common.transaction_id, "successive-root-commit");
+    }
+}
+
+#[tokio::test]
+async fn coremeta_quorum_batches_one_root_generation_into_one_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let store = CoreStore::new(storage).await.unwrap();
+    let root_key_hash = core_meta_root_key_hash("test/group/one-generation");
+    let first_key =
+        core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("one-generation-first")]).unwrap();
+    let second_key =
+        core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("one-generation-second")]).unwrap();
+    let common = core_meta_committed_row_common(
+        "test/group",
+        root_key_hash.clone(),
+        1,
+        "one-generation-commit",
+        1,
+    );
+    let first_payload = encode_core_meta_inline_payload_row(b"first", common.clone()).unwrap();
+    let second_payload = encode_core_meta_inline_payload_row(b"second", common).unwrap();
+    let operations = [
+        CoreMetaBatchOp {
+            cf: CF_INLINE_PAYLOADS,
+            table_id: TABLE_INLINE_PAYLOAD_ROW,
+            tuple_key: &first_key,
+            common: None,
+            kind: CoreMetaBatchOpKind::Put(&first_payload),
+        },
+        CoreMetaBatchOp {
+            cf: CF_INLINE_PAYLOADS,
+            table_id: TABLE_INLINE_PAYLOAD_ROW,
+            tuple_key: &second_key,
+            common: None,
+            kind: CoreMetaBatchOpKind::Put(&second_payload),
+        },
+    ];
+    let publications =
+        [
+            CoreMetaRootPublication::new("test/group/one-generation", WriterFamily::CoreControl)
+                .coordinator(),
+        ];
+
+    let outcomes = store
+        .commit_coremeta_root_groups("one-generation-commit", &operations, &publications)
         .await
         .unwrap();
 
-    assert_eq!(outcomes.len(), 2);
-    assert!(
-        outcomes
-            .iter()
-            .all(|outcome| outcome.root_key_hash == root_key_hash)
-    );
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].root_key_hash, root_key_hash);
     assert_eq!(outcomes[0].post_root_generation, 1);
-    assert_eq!(outcomes[1].post_root_generation, 2);
     assert!(
         store
             .meta
@@ -210,6 +444,123 @@ async fn coremeta_quorum_commits_successive_generations_of_one_root_in_order() {
             .unwrap()
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn direct_and_admitted_writers_publish_contiguous_root_generations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let store = CoreStore::new(storage).await.unwrap();
+    let root_anchor_key = "test/group/concurrent-plan";
+    let root_hash = core_meta_root_key_hash(root_anchor_key);
+    let direct_key = core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("concurrent-direct")]).unwrap();
+    let admitted_key =
+        core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("concurrent-admitted")]).unwrap();
+    let direct_payload = encode_core_meta_inline_payload_row(
+        b"direct",
+        core_meta_committed_row_common(
+            "test/group",
+            root_hash.clone(),
+            91,
+            "caller-placeholder",
+            1,
+        ),
+    )
+    .unwrap();
+    let admitted_payload = encode_core_meta_inline_payload_row(
+        b"admitted",
+        core_meta_committed_row_common(
+            "test/group",
+            root_hash.clone(),
+            47,
+            "caller-placeholder",
+            2,
+        ),
+    )
+    .unwrap();
+
+    let direct_store = store.clone();
+    let direct = async move {
+        let operations = [CoreMetaBatchOp {
+            cf: CF_INLINE_PAYLOADS,
+            table_id: TABLE_INLINE_PAYLOAD_ROW,
+            tuple_key: &direct_key,
+            common: None,
+            kind: CoreMetaBatchOpKind::Put(&direct_payload),
+        }];
+        direct_store
+            .commit_coremeta_root_groups(
+                "concurrent-direct-commit",
+                &operations,
+                &[
+                    CoreMetaRootPublication::new(root_anchor_key, WriterFamily::CoreControl)
+                        .coordinator(),
+                ],
+            )
+            .await
+            .map(|outcomes| (direct_key, outcomes))
+    };
+    let admitted_store = store.clone();
+    let admitted = async move {
+        admitted_store
+            .commit_mutation_batch(CoreMutationBatch {
+                transaction_id: "concurrent-admitted-commit".to_string(),
+                scope_partition: root_anchor_key.to_string(),
+                committed_by_principal: "principal:concurrent-writer".to_string(),
+                root_publications: vec![
+                    CoreMutationRootPublication::new(
+                        root_anchor_key,
+                        WriterFamily::CoreControl.as_str(),
+                    )
+                    .coordinator(),
+                ],
+                preconditions: Vec::new(),
+                operations: vec![CoreMutationOperation::CoreMetaPut {
+                    partition_id: root_anchor_key.to_string(),
+                    cf: CF_INLINE_PAYLOADS.to_string(),
+                    table_id: TABLE_INLINE_PAYLOAD_ROW,
+                    tuple_key: admitted_key.clone(),
+                    payload: admitted_payload,
+                }],
+            })
+            .await
+            .map(|receipt| (admitted_key, receipt))
+    };
+
+    let ((direct_key, direct_outcomes), (admitted_key, admitted_receipt)) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let (direct, admitted) = tokio::join!(direct, admitted);
+            (direct.unwrap(), admitted.unwrap())
+        })
+        .await
+        .expect("same-root writers must serialize without deadlocking");
+    assert_eq!(direct_outcomes.len(), 1);
+    assert_eq!(admitted_receipt.state, CoreTransactionState::Committed);
+
+    let anchor = store
+        .read_latest_root_anchor(root_anchor_key)
+        .await
+        .unwrap()
+        .expect("both root generations are published");
+    assert_eq!(anchor.root_generation, 2);
+    let mut published = [
+        (direct_key, "concurrent-direct-commit"),
+        (admitted_key, "concurrent-admitted-commit"),
+    ]
+    .into_iter()
+    .map(|(tuple_key, transaction_id)| {
+        let payload = store
+            .read_coremeta_row(CF_INLINE_PAYLOADS, TABLE_INLINE_PAYLOAD_ROW, &tuple_key)
+            .unwrap()
+            .expect("concurrent row is visible");
+        let common = core_meta_row_common_from_payload(&payload).unwrap();
+        assert_eq!(common.root_key_hash, root_hash);
+        assert_eq!(common.transaction_id, transaction_id);
+        common.root_generation
+    })
+    .collect::<Vec<_>>();
+    published.sort_unstable();
+    assert_eq!(published, vec![1, 2]);
 }
 
 #[tokio::test]
@@ -716,6 +1067,7 @@ async fn core_store_manifest_locator_reads_multiple_contiguous_blocks() {
                 ),
                 write.manifest.writer_generation,
                 index as u64,
+                logical_start,
                 &chunk_hash,
                 chunk_hash_hex,
                 chunk,
