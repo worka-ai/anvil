@@ -134,6 +134,7 @@ pub async fn write_registry_segment(
         .write_format_build_output(WriterBuildOutput {
             logical_files: vec![built_segment.logical_file],
             core_meta_mutations: Vec::new(),
+            core_meta_root_publications: Vec::new(),
         })
         .await?;
     let object_ref = receipt
@@ -159,6 +160,7 @@ pub async fn write_registry_segment(
             source_cursor: write.source_cursor,
             created_at_unix_nanos: unix_nanos_from_rfc3339(&header.created_at),
         },
+        &[],
     )
     .await?;
     Ok(ref_name)
@@ -180,7 +182,8 @@ pub async fn read_registry_segment(
         )?,
         parsed.generation,
         segment_ref,
-    )?
+    )
+    .await?
     .ok_or_else(|| anyhow!("registry segment catalog row is missing"))?;
     let store = CoreStore::new(storage.clone()).await?;
     let bytes = store
