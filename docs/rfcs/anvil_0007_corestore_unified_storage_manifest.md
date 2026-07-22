@@ -621,6 +621,7 @@ Initial CoreMeta table registry:
 | `0x8d01` | `cf_mesh` | `principal_or_node_id / key_id` | `NodeSigningKeyRow` | committed mesh root generation only |
 | `0x8d02` | `cf_mesh` | `system / personaldb-signing-key / key_id` | `PersonalDbSigningKeyRow` | current encrypted key record ordered by key id |
 | `0x8d03` | `cf_mesh` | `system / personaldb-signing-key` | `PersonalDbSigningKeyHeadRow` | current signing-key collection revision point lookup |
+| `0x8d04` | `cf_mesh` | `node-identity / local` | `LocalNodeIdentityRow` | node-private stable process identity; excluded from portable topology snapshots |
 | `0x8901` | `cf_leases_fences` | `realm / lease_id` | `LeaseFenceRow` | committed root generation only |
 | `0x8a01` | `cf_materialisation` | `node_id / materialisation_epoch` | `MaterialisationCursorRow` | local committed metadata |
 | `0x8a02` | `cf_materialisation` | `writer_family / scope_hash / generation` | `WriterSegmentRow` | immutable historical segment catalogue row |
@@ -1264,6 +1265,18 @@ message NodeSigningKeyRow {
   uint64 valid_from_revision = 6;
   uint64 revoked_at_revision = 7;
 }
+
+message LocalNodeIdentityRow {
+  CoreMetaRowCommon common = 1;
+  string schema = 2; // "anvil.coremeta.local_node_identity.v1"
+  string node_id = 3;
+}
+
+`LocalNodeIdentityRow` is process-private bootstrap state. It is read before
+portable root visibility is available, its `node_id` is immutable for the life
+of the storage root, and it MUST be excluded from every portable topology
+snapshot. Receipt-signing key material is stored independently; this row MUST
+NOT contain a transport keypair or transport-specific peer identity.
 
 message LeaseFenceRow {
   CoreMetaRowCommon common = 1;
@@ -2561,6 +2574,23 @@ node projection used to produce it. Every lifecycle mutation advances this head
 with an exact payload-hash CAS. The control-stream event, lifecycle projection,
 topology-head update, and any canonical activation record are one
 `CoreMutationBatch`; no part may become visible before the others.
+
+The committed lifecycle projection is the sole source of cluster membership.
+An implementation MUST NOT maintain a second membership plane through peer
+discovery, gossip, process-local peer sets, or transport observations. Each node
+descriptor contains the stable node id, authenticated gRPC endpoint, receipt
+signing public key, lifecycle state, failure-domain placement, and operation
+capabilities needed by the protocols in this document. A reachable endpoint does
+not make an uncommitted node a member, and a transport failure does not remove a
+committed member. Membership changes occur only through the lifecycle transaction
+above.
+
+Authenticated gRPC is the only inter-node data and control transport. Local
+transport success or failure is an observation used to retry or collect bounded
+failure evidence; it is never failover authority. Root-register Q2 decisions,
+committed topology epochs, and partition fences remain the only authority for
+ownership changes. Implementations MUST NOT expose or persist a transport-specific
+peer id, discovery address, or parallel cluster keypair in lifecycle state.
 
 The cluster enters canonical distributed mode when the committed topology first
 contains at least three active metadata-capable nodes satisfying the configured
@@ -6861,6 +6891,14 @@ node mTLS identity or an equivalent signed node credential. Every signed interna
 peer frame, including each command carried on a streaming RPC, MUST be authorised
 independently against current committed state before its payload is accepted or
 applied.
+
+The endpoint used for these services is resolved from the current committed node
+descriptor. Implementations MUST NOT fall back to a gossip-discovered endpoint or
+an independently maintained peer directory. Cross-node metadata caches are not a
+coherence mechanism: a cached value may be used only when its durable revision is
+part of the cache key and current committed state proves that revision remains
+valid. Otherwise the implementation performs an authoritative CoreMeta read or
+uses the bounded watch/recovery protocols defined here.
 
 The receiving node MUST fail closed unless all of these conjunctive checks pass:
 
