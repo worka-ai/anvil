@@ -22,6 +22,7 @@ impl CoreStore {
                     stream_id,
                     visible_sequence,
                     prepared_record_hash,
+                    ..
                 } => {
                     let Some(record) = self
                         .read_stream_record_from_meta(stream_id, *visible_sequence)
@@ -65,6 +66,8 @@ impl CoreStore {
                 }
             }
         }
+        // Finalisation verifies the exact physical write outcome. A
+        // publication-aware read could hide a malformed put or delete here.
         for ((cf, table_id, tuple_key), expected_hash) in expected_coremeta {
             match expected_hash {
                 Some(expected_hash) => {
