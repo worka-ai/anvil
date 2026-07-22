@@ -2,91 +2,7 @@ use super::*;
 use crate::index_coremeta;
 
 impl Persistence {
-    #[allow(clippy::too_many_arguments)]
-    pub async fn create_index_definition(
-        &self,
-        tenant_id: i64,
-        bucket_id: i64,
-        name: &str,
-        kind: &str,
-        selector: JsonValue,
-        extractor: JsonValue,
-        authorization_mode: &str,
-        build_policy: JsonValue,
-    ) -> Result<IndexDefinition> {
-        let now = Utc::now();
-        Ok(IndexDefinition {
-            id: index_journal::next_index_definition_id(&self.storage, tenant_id, bucket_id)
-                .await?,
-            tenant_id,
-            bucket_id,
-            name: name.to_string(),
-            kind: kind.to_string(),
-            selector,
-            extractor,
-            authorization_mode: authorization_mode.to_string(),
-            build_policy,
-            enabled: true,
-            version: 1,
-            created_at: now,
-            updated_at: now,
-        })
-    }
-
-    pub async fn update_index_definition(
-        &self,
-        tenant_id: i64,
-        bucket_id: i64,
-        name: &str,
-        selector: JsonValue,
-        extractor: JsonValue,
-        authorization_mode: &str,
-        build_policy: JsonValue,
-    ) -> Result<Option<IndexDefinition>> {
-        let Some(mut index) =
-            index_journal::read_current_index_definition(&self.storage, tenant_id, bucket_id, name)
-                .await?
-        else {
-            return Ok(None);
-        };
-        index.selector = selector;
-        index.extractor = extractor;
-        index.authorization_mode = authorization_mode.to_string();
-        index.build_policy = build_policy;
-        index.version += 1;
-        index.updated_at = Utc::now();
-        Ok(Some(index))
-    }
-
     pub async fn get_index_definition(
-        &self,
-        tenant_id: i64,
-        bucket_id: i64,
-        name: &str,
-    ) -> Result<Option<IndexDefinition>> {
-        index_journal::read_current_index_definition(&self.storage, tenant_id, bucket_id, name)
-            .await
-    }
-
-    pub async fn disable_index_definition(
-        &self,
-        tenant_id: i64,
-        bucket_id: i64,
-        name: &str,
-    ) -> Result<Option<IndexDefinition>> {
-        let Some(mut index) =
-            index_journal::read_current_index_definition(&self.storage, tenant_id, bucket_id, name)
-                .await?
-        else {
-            return Ok(None);
-        };
-        index.enabled = false;
-        index.version += 1;
-        index.updated_at = Utc::now();
-        Ok(Some(index))
-    }
-
-    pub async fn drop_index_definition(
         &self,
         tenant_id: i64,
         bucket_id: i64,
@@ -111,28 +27,8 @@ impl Persistence {
         .await
     }
 
-    pub async fn create_index_definition_event(
-        &self,
-        tenant_id: i64,
-        bucket_id: i64,
-        bucket_name: &str,
-        index: &IndexDefinition,
-        event_type: &str,
-    ) -> Result<IndexDefinitionEvent> {
-        self.create_index_definition_event_with_transaction(
-            tenant_id,
-            bucket_id,
-            bucket_name,
-            index,
-            event_type,
-            None,
-            None,
-        )
-        .await
-    }
-
     #[allow(clippy::too_many_arguments)]
-    pub async fn create_index_definition_event_with_transaction(
+    pub(super) async fn create_index_definition_event_with_transaction(
         &self,
         tenant_id: i64,
         bucket_id: i64,

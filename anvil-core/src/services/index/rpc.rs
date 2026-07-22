@@ -46,20 +46,37 @@ impl IndexService for AppState {
         let transaction_principal = transaction_id
             .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
 
-        let index = self
+        let mutation = crate::persistence::IndexDefinitionMutation::Create {
+            name: req.name,
+            kind: kind.to_string(),
+            selector,
+            extractor,
+            authorization_mode: req.authorization_mode,
+            build_policy,
+        };
+        let index = match self
             .persistence
-            .create_index_definition(
-                claims.tenant_id,
-                bucket.id,
-                &req.name,
-                kind,
-                selector,
-                extractor,
-                &req.authorization_mode,
-                build_policy,
+            .apply_index_definition_mutation(
+                &bucket,
+                &mutation,
+                transaction_id,
+                transaction_principal.as_deref(),
             )
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            crate::persistence::IndexDefinitionMutationOutcome::Published { index, event } => {
+                debug_assert_eq!(event.index_id, index.id);
+                index
+            }
+            crate::persistence::IndexDefinitionMutationOutcome::AlreadyExists => {
+                return Err(Status::already_exists("Index definition already exists"));
+            }
+            crate::persistence::IndexDefinitionMutationOutcome::NotFound
+            | crate::persistence::IndexDefinitionMutationOutcome::KindChanged => {
+                return Err(Status::internal("invalid create-index mutation outcome"));
+            }
+        };
         if transaction_id.is_none() {
             access_control::grant_index_defaults(
                 &self.persistence,
@@ -71,16 +88,6 @@ impl IndexService for AppState {
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        }
-        self.publish_index_definition_event_with_transaction(
-            &bucket,
-            &index,
-            "create",
-            transaction_id,
-            transaction_principal.as_deref(),
-        )
-        .await?;
-        if transaction_id.is_none() {
             self.persistence
                 .enqueue_index_build_for_index(&bucket, &index)
                 .await
@@ -130,28 +137,39 @@ impl IndexService for AppState {
             .ok_or_else(|| Status::not_found("Index definition not found"))?;
         validate_index_definition_shape(&existing.kind, &build_policy, &extractor, &self.config)?;
 
-        let index = self
+        let mutation = crate::persistence::IndexDefinitionMutation::Update {
+            name: req.name,
+            expected_kind: existing.kind,
+            selector,
+            extractor,
+            authorization_mode: req.authorization_mode,
+            build_policy,
+        };
+        let index = match self
             .persistence
-            .update_index_definition(
-                claims.tenant_id,
-                bucket.id,
-                &req.name,
-                selector,
-                extractor,
-                &req.authorization_mode,
-                build_policy,
+            .apply_index_definition_mutation(
+                &bucket,
+                &mutation,
+                transaction_id,
+                transaction_principal.as_deref(),
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Index definition not found"))?;
-        self.publish_index_definition_event_with_transaction(
-            &bucket,
-            &index,
-            "update",
-            transaction_id,
-            transaction_principal.as_deref(),
-        )
-        .await?;
+        {
+            crate::persistence::IndexDefinitionMutationOutcome::Published { index, event } => {
+                debug_assert_eq!(event.index_id, index.id);
+                index
+            }
+            crate::persistence::IndexDefinitionMutationOutcome::NotFound => {
+                return Err(Status::not_found("Index definition not found"));
+            }
+            crate::persistence::IndexDefinitionMutationOutcome::KindChanged => {
+                return Err(Status::aborted("Index definition changed during update"));
+            }
+            crate::persistence::IndexDefinitionMutationOutcome::AlreadyExists => {
+                return Err(Status::internal("invalid update-index mutation outcome"));
+            }
+        };
         if transaction_id.is_none() {
             self.persistence
                 .enqueue_index_build_for_index(&bucket, &index)
@@ -190,20 +208,30 @@ impl IndexService for AppState {
         let transaction_id = index_write_transaction_id(req.options.as_ref())?;
         let transaction_principal = transaction_id
             .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
-        let index = self
+        let mutation = crate::persistence::IndexDefinitionMutation::Disable { name: req.name };
+        let index = match self
             .persistence
-            .disable_index_definition(claims.tenant_id, bucket.id, &req.name)
+            .apply_index_definition_mutation(
+                &bucket,
+                &mutation,
+                transaction_id,
+                transaction_principal.as_deref(),
+            )
             .await
             .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Index definition not found"))?;
-        self.publish_index_definition_event_with_transaction(
-            &bucket,
-            &index,
-            "disable",
-            transaction_id,
-            transaction_principal.as_deref(),
-        )
-        .await?;
+        {
+            crate::persistence::IndexDefinitionMutationOutcome::Published { index, event } => {
+                debug_assert_eq!(event.index_id, index.id);
+                index
+            }
+            crate::persistence::IndexDefinitionMutationOutcome::NotFound => {
+                return Err(Status::not_found("Index definition not found"));
+            }
+            crate::persistence::IndexDefinitionMutationOutcome::AlreadyExists
+            | crate::persistence::IndexDefinitionMutationOutcome::KindChanged => {
+                return Err(Status::internal("invalid disable-index mutation outcome"));
+            }
+        };
 
         Ok(Response::new(IndexDefinitionResponse {
             index: Some(index_record(&bucket.name, index)?),
@@ -236,20 +264,29 @@ impl IndexService for AppState {
         let transaction_id = index_write_transaction_id(req.options.as_ref())?;
         let transaction_principal = transaction_id
             .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
-        let index = self
+        let mutation = crate::persistence::IndexDefinitionMutation::Drop { name: req.name };
+        match self
             .persistence
-            .drop_index_definition(claims.tenant_id, bucket.id, &req.name)
+            .apply_index_definition_mutation(
+                &bucket,
+                &mutation,
+                transaction_id,
+                transaction_principal.as_deref(),
+            )
             .await
             .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Index definition not found"))?;
-        self.publish_index_definition_event_with_transaction(
-            &bucket,
-            &index,
-            "drop",
-            transaction_id,
-            transaction_principal.as_deref(),
-        )
-        .await?;
+        {
+            crate::persistence::IndexDefinitionMutationOutcome::Published { index, event } => {
+                debug_assert_eq!(event.index_id, index.id);
+            }
+            crate::persistence::IndexDefinitionMutationOutcome::NotFound => {
+                return Err(Status::not_found("Index definition not found"));
+            }
+            crate::persistence::IndexDefinitionMutationOutcome::AlreadyExists
+            | crate::persistence::IndexDefinitionMutationOutcome::KindChanged => {
+                return Err(Status::internal("invalid drop-index mutation outcome"));
+            }
+        }
         Ok(Response::new(DropIndexResponse {}))
     }
 

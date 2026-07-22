@@ -612,6 +612,7 @@ fn canonical_json_bytes(value: &JsonValue) -> Vec<u8> {
 }
 
 mod helpers;
+mod index_definition_lifecycle;
 mod indexes;
 mod lifecycle;
 mod models;
@@ -622,6 +623,7 @@ mod tasks;
 mod tenancy;
 
 use helpers::*;
+pub use index_definition_lifecycle::{IndexDefinitionMutation, IndexDefinitionMutationOutcome};
 pub use objects::ObjectCreateOptions;
 
 #[cfg(test)]

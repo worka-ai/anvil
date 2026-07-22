@@ -119,6 +119,36 @@ fn collect_index_segments_for_test(
     records
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn create_index_definition_for_test(
+    persistence: &anvil::persistence::Persistence,
+    bucket: &anvil::persistence::Bucket,
+    name: &str,
+    kind: &str,
+    selector: serde_json::Value,
+    extractor: serde_json::Value,
+    authorization_mode: &str,
+    build_policy: serde_json::Value,
+) -> anvil::persistence::IndexDefinition {
+    let mutation = anvil::persistence::IndexDefinitionMutation::Create {
+        name: name.to_string(),
+        kind: kind.to_string(),
+        selector,
+        extractor,
+        authorization_mode: authorization_mode.to_string(),
+        build_policy,
+    };
+    let outcome = persistence
+        .apply_index_definition_mutation(bucket, &mutation, None, None)
+        .await
+        .unwrap();
+    let anvil::persistence::IndexDefinitionMutationOutcome::Published { index, .. } = outcome
+    else {
+        panic!("test index definition create should publish");
+    };
+    index
+}
+
 #[tokio::test]
 async fn test_full_text_index_builds_from_object_write_task() {
     let cluster = shared_default_test_cluster().await;
@@ -408,23 +438,17 @@ async fn test_full_text_index_build_uses_source_cursor_snapshot() {
         .create_bucket(tenant_id, &bucket_name, "test-region-1")
         .await
         .unwrap();
-    let index = persistence
-        .create_index_definition(
-            tenant_id,
-            bucket.id,
-            "body",
-            "full_text",
-            serde_json::json!({"prefix": "docs/"}),
-            serde_json::json!({"source": "object_body_utf8"}),
-            "index_only",
-            serde_json::json!({"positions": true}),
-        )
-        .await
-        .unwrap();
-    persistence
-        .create_index_definition_event(tenant_id, bucket.id, &bucket.name, &index, "create")
-        .await
-        .unwrap();
+    let index = create_index_definition_for_test(
+        persistence,
+        &bucket,
+        "body",
+        "full_text",
+        serde_json::json!({"prefix": "docs/"}),
+        serde_json::json!({"source": "object_body_utf8"}),
+        "index_only",
+        serde_json::json!({"positions": true}),
+    )
+    .await;
 
     put_index_object_bytes(
         &cluster,
@@ -602,23 +626,17 @@ async fn test_index_build_requires_current_rfc_ownership_fence() {
         .create_bucket(tenant_id, &bucket_name, "test-region-1")
         .await
         .unwrap();
-    let index = persistence
-        .create_index_definition(
-            tenant_id,
-            bucket.id,
-            "body",
-            "full_text",
-            serde_json::json!({"prefix": "docs/"}),
-            serde_json::json!({"source": "object_body_utf8"}),
-            "index_only",
-            serde_json::json!({"positions": true}),
-        )
-        .await
-        .unwrap();
-    persistence
-        .create_index_definition_event(tenant_id, bucket.id, &bucket.name, &index, "create")
-        .await
-        .unwrap();
+    let index = create_index_definition_for_test(
+        persistence,
+        &bucket,
+        "body",
+        "full_text",
+        serde_json::json!({"prefix": "docs/"}),
+        serde_json::json!({"source": "object_body_utf8"}),
+        "index_only",
+        serde_json::json!({"positions": true}),
+    )
+    .await;
     put_index_object_bytes(
         &cluster,
         tenant_id,
@@ -708,23 +726,17 @@ async fn test_index_enqueue_rebuilds_when_checkpoint_exists_but_proof_is_missing
         .create_bucket(tenant_id, &bucket_name, "test-region-1")
         .await
         .unwrap();
-    let index = persistence
-        .create_index_definition(
-            tenant_id,
-            bucket.id,
-            "body",
-            "full_text",
-            serde_json::json!({"prefix": "docs/"}),
-            serde_json::json!({"source": "object_body_utf8"}),
-            "index_only",
-            serde_json::json!({"positions": true}),
-        )
-        .await
-        .unwrap();
-    persistence
-        .create_index_definition_event(tenant_id, bucket.id, &bucket.name, &index, "create")
-        .await
-        .unwrap();
+    let index = create_index_definition_for_test(
+        persistence,
+        &bucket,
+        "body",
+        "full_text",
+        serde_json::json!({"prefix": "docs/"}),
+        serde_json::json!({"source": "object_body_utf8"}),
+        "index_only",
+        serde_json::json!({"positions": true}),
+    )
+    .await;
     put_index_object_bytes(
         &cluster,
         tenant_id,
@@ -860,23 +872,17 @@ async fn test_repair_rebuilds_missing_full_text_segment_from_base_journal() {
         .await
         .unwrap()
         .expect("object metadata compaction writes manifest segments");
-    let index = persistence
-        .create_index_definition(
-            tenant_id,
-            bucket.id,
-            "body",
-            "full_text",
-            serde_json::json!({"prefix": "docs/"}),
-            serde_json::json!({"source": "object_body_utf8"}),
-            "index_only",
-            serde_json::json!({"positions": true}),
-        )
-        .await
-        .unwrap();
-    persistence
-        .create_index_definition_event(tenant_id, bucket.id, &bucket.name, &index, "create")
-        .await
-        .unwrap();
+    let index = create_index_definition_for_test(
+        persistence,
+        &bucket,
+        "body",
+        "full_text",
+        serde_json::json!({"prefix": "docs/"}),
+        serde_json::json!({"source": "object_body_utf8"}),
+        "index_only",
+        serde_json::json!({"positions": true}),
+    )
+    .await;
     let signing_key = hex::decode(&cluster.states[0].config.anvil_secret_encryption_key).unwrap();
     let stats = anvil::metadata_journal::active_object_journal_stats(
         &cluster.states[0].storage,
@@ -1026,30 +1032,24 @@ async fn test_repair_rebuilds_missing_vector_segment_from_base_journal() {
         .await
         .unwrap()
         .expect("object metadata compaction writes manifest segments");
-    let index = persistence
-        .create_index_definition(
-            tenant_id,
-            bucket.id,
-            "embedding",
-            "vector",
-            serde_json::json!({"prefix": "vectors/"}),
-            serde_json::json!({}),
-            "index_only",
-            rfc_vector_policy(
-                "object_body_json_vector",
-                "caller_supplied",
-                "test-explicit-vector",
-                2,
-                "text",
-                "cosine",
-            ),
-        )
-        .await
-        .unwrap();
-    persistence
-        .create_index_definition_event(tenant_id, bucket.id, &bucket.name, &index, "create")
-        .await
-        .unwrap();
+    let index = create_index_definition_for_test(
+        persistence,
+        &bucket,
+        "embedding",
+        "vector",
+        serde_json::json!({"prefix": "vectors/"}),
+        serde_json::json!({}),
+        "index_only",
+        rfc_vector_policy(
+            "object_body_json_vector",
+            "caller_supplied",
+            "test-explicit-vector",
+            2,
+            "text",
+            "cosine",
+        ),
+    )
+    .await;
     let signing_key = hex::decode(&cluster.states[0].config.anvil_secret_encryption_key).unwrap();
     let stats = anvil::metadata_journal::active_object_journal_stats(
         &cluster.states[0].storage,
@@ -1171,23 +1171,17 @@ async fn test_index_build_followup_waits_for_running_build_and_catches_up_after_
         .create_bucket(tenant_id, &bucket_name, "test-region-1")
         .await
         .unwrap();
-    let index = persistence
-        .create_index_definition(
-            tenant_id,
-            bucket.id,
-            "body",
-            "full_text",
-            serde_json::json!({"prefix": "docs/"}),
-            serde_json::json!({"source": "object_body_utf8"}),
-            "index_only",
-            serde_json::json!({"positions": true}),
-        )
-        .await
-        .unwrap();
-    persistence
-        .create_index_definition_event(tenant_id, bucket.id, &bucket.name, &index, "create")
-        .await
-        .unwrap();
+    let index = create_index_definition_for_test(
+        persistence,
+        &bucket,
+        "body",
+        "full_text",
+        serde_json::json!({"prefix": "docs/"}),
+        serde_json::json!({"source": "object_body_utf8"}),
+        "index_only",
+        serde_json::json!({"positions": true}),
+    )
+    .await;
 
     put_index_object_bytes(
         &cluster,

@@ -1,6 +1,7 @@
 use super::*;
 mod fencing;
 mod helpers;
+mod index_definition_lifecycle;
 use crate::task_execution_guard::TaskExecutionGuard;
 use helpers::*;
 use serde_json::json;
@@ -314,28 +315,26 @@ async fn empty_bucket_index_build_materialises_an_empty_typed_json_segment() {
         .create_bucket(tenant.id, "empty-index-bucket", "test-region")
         .await
         .unwrap();
-    let index = persistence
-        .create_index_definition(
-            tenant.id,
-            bucket.id,
-            "pending-items",
-            "typed_json",
-            json!({"prefix": "items/"}),
-            json!({}),
-            "inherit_object",
-            json!({
-                "source_kind": "object_current",
-                "fields": [
-                    {"name": "state", "extractor": "/state", "required": true}
-                ]
-            }),
-        )
+    let mutation = IndexDefinitionMutation::Create {
+        name: "pending-items".to_string(),
+        kind: "typed_json".to_string(),
+        selector: json!({"prefix": "items/"}),
+        extractor: json!({}),
+        authorization_mode: "inherit_object".to_string(),
+        build_policy: json!({
+            "source_kind": "object_current",
+            "fields": [
+                {"name": "state", "extractor": "/state", "required": true}
+            ]
+        }),
+    };
+    let IndexDefinitionMutationOutcome::Published { index, .. } = persistence
+        .apply_index_definition_mutation(&bucket, &mutation, None, None)
         .await
-        .unwrap();
-    persistence
-        .create_index_definition_event(tenant.id, bucket.id, &bucket.name, &index, "create")
-        .await
-        .unwrap();
+        .unwrap()
+    else {
+        panic!("index definition create should publish");
+    };
 
     assert!(
         persistence
@@ -1103,23 +1102,21 @@ async fn persistence_replays_anvil_owned_state_after_fresh_instance_body() {
         .unwrap()
         .unwrap();
 
-    let index = persistence
-        .create_index_definition(
-            tenant.id,
-            bucket.id,
-            "body",
-            "full_text",
-            json!({"prefix": "project/"}),
-            json!({"field": "body"}),
-            "inherit",
-            json!({"mode": "watch"}),
-        )
+    let mutation = IndexDefinitionMutation::Create {
+        name: "body".to_string(),
+        kind: "full_text".to_string(),
+        selector: json!({"prefix": "project/"}),
+        extractor: json!({"field": "body"}),
+        authorization_mode: "inherit".to_string(),
+        build_policy: json!({"mode": "watch"}),
+    };
+    let IndexDefinitionMutationOutcome::Published { index, .. } = persistence
+        .apply_index_definition_mutation(&bucket, &mutation, None, None)
         .await
-        .unwrap();
-    persistence
-        .create_index_definition_event(tenant.id, bucket.id, &bucket.name, &index, "create")
-        .await
-        .unwrap();
+        .unwrap()
+    else {
+        panic!("index definition create should publish");
+    };
     persistence
         .create_index_diagnostic(
             tenant.id,

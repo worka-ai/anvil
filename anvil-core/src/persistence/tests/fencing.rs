@@ -79,23 +79,21 @@ async fn persistence_global_journal_writes_use_current_fence_tokens() {
             )
             .await
             .unwrap();
-        let index = persistence
-            .create_index_definition(
-                1,
-                bucket.id,
-                "body",
-                "full_text",
-                json!({"prefix": "objects/"}),
-                json!({"field": "body"}),
-                "inherit",
-                json!({"mode": "sync"}),
-            )
+        let mutation = IndexDefinitionMutation::Create {
+            name: "body".to_string(),
+            kind: "full_text".to_string(),
+            selector: json!({"prefix": "objects/"}),
+            extractor: json!({"field": "body"}),
+            authorization_mode: "inherit".to_string(),
+            build_policy: json!({"mode": "sync"}),
+        };
+        let IndexDefinitionMutationOutcome::Published { index, .. } = persistence
+            .apply_index_definition_mutation(&bucket, &mutation, None, None)
             .await
-            .unwrap();
-        persistence
-            .create_index_definition_event(1, bucket.id, &bucket.name, &index, "create")
-            .await
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("index definition create should publish");
+        };
         persistence
             .create_index_diagnostic(
                 1,
