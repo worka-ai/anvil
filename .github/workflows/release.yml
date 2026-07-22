@@ -27,7 +27,7 @@ env:
 jobs:
   release-context:
     name: Resolve immutable release context
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 10
     outputs:
       tag: ${{ steps.release.outputs.tag }}
@@ -94,7 +94,7 @@ jobs:
   build-image:
     name: Build release image (${{ matrix.platform }})
     needs: release-context
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 90
     env:
       ANVIL_BUILD_IMAGE: anvil:test-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -228,7 +228,7 @@ jobs:
   static-and-docs:
     name: Static gates and docs artifact
     needs: release-context
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 45
     steps:
       - name: Checkout repository
@@ -282,14 +282,14 @@ jobs:
   rust-unit:
     name: Rust unit and client tests
     needs: [release-context, build-image, static-and-docs]
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 120
     env:
       CARGO_BUILD_JOBS: "1"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       ANVIL_GATE_STEP_TIMEOUT_SECONDS: "5400"
-      ANVIL_RUST_TEST_THREADS: "4"
+      ANVIL_RUST_TEST_THREADS: "8"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -331,7 +331,7 @@ jobs:
   coremeta-performance:
     name: CoreMeta ordered-access release performance gate
     needs: [release-context, rust-unit]
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 180
     env:
       CARGO_BUILD_JOBS: "1"
@@ -387,13 +387,13 @@ jobs:
   server-core:
     name: Server core integration tests
     needs: [release-context, coremeta-performance]
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: "1"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-      ANVIL_RUST_TEST_THREADS: "4"
+      ANVIL_RUST_TEST_THREADS: "8"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -438,7 +438,7 @@ jobs:
   docker-integration:
     name: Docker integration tests (${{ matrix.group }})
     needs: [release-context, build-image, server-core]
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 120
     env:
       CARGO_BUILD_JOBS: "1"
@@ -509,7 +509,7 @@ jobs:
   publish:
     name: Publish release artifacts
     needs: [release-context, build-image, static-and-docs, rust-unit, coremeta-performance, server-core, docker-integration]
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 45
     environment:
       name: github-pages
