@@ -6,6 +6,7 @@ pub struct ObjectCreateOptions {
     pub exact_authz_revision: bool,
     pub enqueue_index_maintenance: bool,
     pub enqueue_metadata_compaction: bool,
+    pub(crate) journal_mutation: metadata_journal::ObjectJournalMutation,
 }
 
 impl ObjectCreateOptions {
@@ -15,6 +16,7 @@ impl ObjectCreateOptions {
             exact_authz_revision: false,
             enqueue_index_maintenance: false,
             enqueue_metadata_compaction: false,
+            journal_mutation: metadata_journal::ObjectJournalMutation::Put,
         }
     }
 
@@ -24,6 +26,14 @@ impl ObjectCreateOptions {
             exact_authz_revision: true,
             enqueue_index_maintenance: true,
             enqueue_metadata_compaction: true,
+            journal_mutation: metadata_journal::ObjectJournalMutation::Put,
+        }
+    }
+
+    pub(crate) fn copy() -> Self {
+        Self {
+            journal_mutation: metadata_journal::ObjectJournalMutation::Copy,
+            ..Self::strict()
         }
     }
 }
@@ -238,7 +248,7 @@ impl Persistence {
                     &self.storage,
                     &bucket,
                     &object,
-                    metadata_journal::ObjectJournalMutation::Put,
+                    options.journal_mutation,
                     &permit,
                     &self.partition_owner_signing_key,
                     Some(transaction_id),
@@ -251,7 +261,7 @@ impl Persistence {
                 &self.storage,
                 &bucket,
                 &object,
-                metadata_journal::ObjectJournalMutation::Put,
+                options.journal_mutation,
                 &permit,
                 &self.partition_owner_signing_key,
             ))
@@ -1115,22 +1125,9 @@ impl Persistence {
         &self,
         bucket_id: i64,
     ) -> Result<Option<metadata_journal::SealedObjectMetadataSegments>> {
-        let Some(bucket) =
-            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
-        else {
+        let Some(bucket) = self.pending_object_metadata_compaction(bucket_id).await? else {
             return Ok(None);
         };
-        let active_stats = metadata_journal::active_object_journal_stats(
-            &self.storage,
-            &bucket,
-            &self.partition_owner_signing_key,
-        )
-        .await?;
-        if active_stats.last_sequence == 0
-            || active_stats.last_sequence <= active_stats.compacted_through_sequence
-        {
-            return Ok(None);
-        }
         let permit = self
             .object_metadata_write_permit(bucket.tenant_id, bucket.id)
             .await?;
@@ -1143,6 +1140,47 @@ impl Persistence {
         )
         .await
         .map(Some)
+    }
+
+    pub(crate) async fn compact_object_metadata_for_task(
+        &self,
+        bucket_id: i64,
+        task_guard: &crate::task_execution_guard::TaskExecutionGuard,
+    ) -> Result<Option<metadata_journal::SealedObjectMetadataSegments>> {
+        let Some(bucket) = self.pending_object_metadata_compaction(bucket_id).await? else {
+            return Ok(None);
+        };
+        let permit = self
+            .object_metadata_write_permit(bucket.tenant_id, bucket.id)
+            .await?;
+        metadata_journal::seal_object_journal_segments_with_task_guard(
+            &self.storage,
+            &bucket,
+            &self.partition_owner_signing_key,
+            &permit,
+            &self.partition_owner_signing_key,
+            task_guard,
+        )
+        .await
+        .map(Some)
+    }
+
+    async fn pending_object_metadata_compaction(&self, bucket_id: i64) -> Result<Option<Bucket>> {
+        let Some(bucket) =
+            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        else {
+            return Ok(None);
+        };
+        let active_stats = metadata_journal::active_object_journal_stats(
+            &self.storage,
+            &bucket,
+            &self.partition_owner_signing_key,
+        )
+        .await?;
+        Ok(
+            (active_stats.last_sequence > active_stats.compacted_through_sequence)
+                .then_some(bucket),
+        )
     }
 
     pub(super) async fn enqueue_object_metadata_compaction_if_due(
