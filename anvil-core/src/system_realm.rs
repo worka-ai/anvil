@@ -1710,7 +1710,10 @@ mod tests {
         let err = crate::AppState::new(config, crate::test_support::personaldb_protocol_keyring())
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("system realm is missing"));
+        assert!(
+            format!("{err:#}").contains("system realm is missing"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[tokio::test]
