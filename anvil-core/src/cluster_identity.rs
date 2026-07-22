@@ -3,7 +3,8 @@ use libp2p::{PeerId, identity};
 use prost::Message;
 
 use crate::core_store::{
-    CF_MESH, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaStore, CoreMetaTuplePart, CoreStore,
+    CF_MESH, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaRootPublication, CoreMetaStore,
+    CoreMetaTuplePart, CorePipelineKeyring, CoreStore, CoreStoreNodeIdentity,
     TABLE_NODE_SIGNING_KEYPAIR_ROW, core_meta_committed_row_common, core_meta_root_key_hash,
     core_meta_tuple_key, decode_deterministic_proto, encode_deterministic_proto,
 };
@@ -43,9 +44,33 @@ pub async fn load_or_create_cluster_identity_with_node_id(
     storage_path: impl AsRef<std::path::Path>,
     requested_node_id: Option<&str>,
 ) -> Result<ClusterIdentity> {
+    load_or_create_cluster_identity_inner(storage_path, requested_node_id, None).await
+}
+
+pub(crate) async fn load_or_create_cluster_identity_with_core_store_configuration(
+    storage_path: impl AsRef<std::path::Path>,
+    requested_node_id: Option<&str>,
+    pipeline_keyring: CorePipelineKeyring,
+    node_identity: CoreStoreNodeIdentity,
+) -> Result<ClusterIdentity> {
+    load_or_create_cluster_identity_inner(
+        storage_path,
+        requested_node_id,
+        Some((pipeline_keyring, node_identity)),
+    )
+    .await
+}
+
+async fn load_or_create_cluster_identity_inner(
+    storage_path: impl AsRef<std::path::Path>,
+    requested_node_id: Option<&str>,
+    core_store_configuration: Option<(CorePipelineKeyring, CoreStoreNodeIdentity)>,
+) -> Result<ClusterIdentity> {
     let storage = Storage::new_at(storage_path).await?;
     let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
     let key = cluster_identity_key()?;
+    // Process identity is required before CoreStore can initialise publication
+    // verification, so this bootstrap read intentionally bypasses visibility.
     if let Some(bytes) = meta.get(CF_MESH, TABLE_NODE_SIGNING_KEYPAIR_ROW, &key)? {
         let identity = decode_cluster_identity(&bytes)?;
         if let Some(requested_node_id) = requested_node_id
@@ -83,10 +108,29 @@ pub async fn load_or_create_cluster_identity_with_node_id(
         common: record.common.clone(),
         kind: CoreMetaBatchOpKind::Put(&payload),
     };
-    CoreStore::new(storage.clone())
+    let core_store = if let Some((pipeline_keyring, mut node_identity)) = core_store_configuration {
+        node_identity.node_id.clone_from(&record.node_id);
+        CoreStore::new_with_pipeline_keyring_and_identity(
+            storage.clone(),
+            pipeline_keyring,
+            node_identity,
+            crate::core_store::CoreStoreStartupRecovery::Immediate,
+        )
         .await?
-        .commit_coremeta_batch_by_embedded_roots(&record.node_id, &[op])
+    } else {
+        CoreStore::new(storage.clone()).await?
+    };
+    core_store
+        .commit_coremeta_root_groups(
+            &record.node_id,
+            &[op],
+            &[CoreMetaRootPublication::new(
+                "mesh/cluster-identity/local",
+                crate::formats::writer::WriterFamily::MeshControl,
+            )],
+        )
         .await?;
+    // Verify the exact identity bytes persisted by the bootstrap write.
     let stored = meta
         .get(CF_MESH, TABLE_NODE_SIGNING_KEYPAIR_ROW, &key)?
         .context("CoreStore cluster identity row was not readable after write")?;
