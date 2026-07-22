@@ -182,14 +182,17 @@ async fn docker_lost_ack_retry_commits_once() {
     let identity = MutationIdentity::unique(object_key);
     let mut proxy = GrpcLostResponseProxy::start(&peer_one.grpc_addr).await;
 
-    let first = put_object_at(proxy.endpoint(), &fixture, object_key, content, &identity).await;
-    assert!(
-        first.is_err(),
-        "the lost-response proxy returned an acknowledgement"
-    );
+    let first_failure = put_object_at(proxy.endpoint(), &fixture, object_key, content, &identity)
+        .await
+        .expect_err("the lost-response proxy returned an acknowledgement");
     proxy
         .wait_until_response_dropped(Duration::from_secs(15))
-        .await;
+        .await
+        .unwrap_or_else(|proxy_error| {
+            panic!(
+                "lost-response proxy did not reach the response DATA boundary: {proxy_error}; client failure: {first_failure:?}"
+            )
+        });
 
     let retry = put_object_at(
         &peer_two.grpc_addr,
