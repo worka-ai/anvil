@@ -2,8 +2,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use blake3::Hasher;
 use prost::{Enumeration, Message};
 use rocksdb::{
-    ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options, ReadOptions, WriteBatch,
-    WriteOptions,
+    ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options, ReadOptions, Snapshot,
+    WriteBatch, WriteOptions,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -17,6 +17,7 @@ use super::transaction_manifest_proto::{
 use super::types::CoreManifestLocator;
 
 mod key;
+mod scans;
 pub use key::{CoreMetaTuplePart, core_meta_tuple_key};
 use key::{
     core_meta_key, decode_core_meta_table_id, decode_core_meta_tuple_key,
@@ -51,7 +52,9 @@ pub const TABLE_INLINE_MANIFEST_BODY_ROW: u16 = 0x8005;
 pub const TABLE_EXPLICIT_TRANSACTION_ROW: u16 = 0x8006;
 pub const TABLE_PENDING_MUTATION_ROW: u16 = 0x8007;
 pub const TABLE_NATIVE_IDEMPOTENCY_ROW: u16 = 0x8008;
-pub const TABLE_ADMISSION_COMMIT_CERTIFICATE_ROW: u16 = 0x8009;
+pub const TABLE_LOCAL_ADMISSION_EVIDENCE_ROW: u16 = 0x8009;
+pub const TABLE_TRANSACTION_MANIFEST_BODY_ROW: u16 = 0x800a;
+pub const TABLE_ROOT_PUBLICATION_INTENT_ROW: u16 = 0x800b;
 pub const TABLE_OBJECT_HEAD_ROW: u16 = 0x8101;
 pub const TABLE_OBJECT_VERSION_META_ROW: u16 = 0x8102;
 pub const TABLE_INLINE_PAYLOAD_ROW: u16 = 0x8103;
@@ -60,6 +63,7 @@ pub const TABLE_MULTIPART_UPLOAD_CURRENT_ROW: u16 = 0x8105;
 pub const TABLE_MULTIPART_PART_CURRENT_ROW: u16 = 0x8106;
 pub const TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW: u16 = 0x8107;
 pub const TABLE_OBJECT_WATCH_CURSOR_ROW: u16 = 0x8108;
+pub const TABLE_OBJECT_SHARD_REPAIR_ROW: u16 = 0x8109;
 pub const TABLE_STREAM_HEAD_ROW: u16 = 0x8201;
 pub const TABLE_STREAM_RECORD_INDEX_ROW: u16 = 0x8202;
 pub const TABLE_STREAM_IDEMPOTENCY_ROW: u16 = 0x8203;
@@ -106,6 +110,8 @@ pub const TABLE_PARTITION_OWNER_ROW: u16 = 0x8902;
 pub const TABLE_TASK_LEASE_ROW: u16 = 0x8903;
 pub const TABLE_TASK_CURRENT_ROW: u16 = 0x8904;
 pub const TABLE_CORE_FENCE_ROW: u16 = 0x8905;
+pub const TABLE_ROOT_FAILOVER_VOTE_ROW: u16 = 0x8906;
+pub const TABLE_ROOT_FAILOVER_CERTIFICATE_ROW: u16 = 0x8907;
 pub const TABLE_MATERIALISATION_CURSOR_ROW: u16 = 0x8a01;
 pub const TABLE_WRITER_SEGMENT_ROW: u16 = 0x8a02;
 pub const TABLE_WATCH_CHECKPOINT_ROW: u16 = 0x8a03;
@@ -129,9 +135,72 @@ pub(crate) const CORE_META_MAX_SCAN_PAGE_ROWS: usize = 4096;
 static META_DB_CACHE: LazyLock<StdMutex<BTreeMap<PathBuf, Weak<DB>>>> =
     LazyLock::new(|| StdMutex::new(BTreeMap::new()));
 
+#[cfg(feature = "coremeta-perf-gate")]
+static CORE_META_GET_PROBE: LazyLock<StdMutex<BTreeMap<(String, u16), u64>>> =
+    LazyLock::new(|| StdMutex::new(BTreeMap::new()));
+#[cfg(feature = "coremeta-perf-gate")]
+static CORE_META_GET_PROBE_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "coremeta-perf-gate")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreMetaGetProbeEntry {
+    pub column_family: String,
+    pub table_id: u16,
+    pub calls: u64,
+}
+
+#[cfg(feature = "coremeta-perf-gate")]
+pub fn reset_coremeta_get_probe() {
+    CORE_META_GET_PROBE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    CORE_META_GET_PROBE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "coremeta-perf-gate")]
+pub fn take_coremeta_get_probe() -> Vec<CoreMetaGetProbeEntry> {
+    CORE_META_GET_PROBE_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+    let mut counts = CORE_META_GET_PROBE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::mem::take(&mut *counts)
+        .into_iter()
+        .map(|((column_family, table_id), calls)| CoreMetaGetProbeEntry {
+            column_family,
+            table_id,
+            calls,
+        })
+        .collect()
+}
+
+#[cfg(feature = "coremeta-perf-gate")]
+fn record_coremeta_get_probe(column_family: &str, table_id: u16) {
+    if !CORE_META_GET_PROBE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut counts = CORE_META_GET_PROBE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let calls = counts
+        .entry((column_family.to_string(), table_id))
+        .or_default();
+    *calls = calls.saturating_add(1);
+}
+
 #[derive(Clone)]
 pub struct CoreMetaStore {
     db: Arc<DB>,
+}
+
+pub(crate) struct CoreMetaReadSnapshot<'a> {
+    store: &'a CoreMetaStore,
+    snapshot: Snapshot<'a>,
+}
+
+pub(crate) trait CoreMetaReader {
+    fn get(&self, cf: &'static str, table_id: u16, tuple_key: &[u8]) -> Result<Option<Vec<u8>>>;
 }
 
 impl std::fmt::Debug for CoreMetaStore {
@@ -169,16 +238,6 @@ pub struct CoreMetaEncodedRowsCursor {
 pub struct CoreMetaEncodedRowsPage {
     pub rows: Vec<CoreMetaEncodedOwnedRow>,
     pub next_cursor: Option<CoreMetaEncodedRowsCursor>,
-}
-
-#[derive(Debug, Clone)]
-pub struct CoreMetaInventoryRow {
-    pub cf: String,
-    pub core_meta_key: Vec<u8>,
-    pub row_hash: String,
-    pub root_key_hash: String,
-    pub root_generation: u64,
-    pub visibility_state: CoreMetaVisibilityState,
 }
 
 pub struct CoreMetaRecord {
@@ -501,6 +560,8 @@ impl CoreMetaStore {
         let cf = self.cf(cf_name)?;
         let started_at = Instant::now();
         let value = self.db.get_cf(&cf, key)?;
+        #[cfg(feature = "coremeta-perf-gate")]
+        record_coremeta_get_probe(cf_name, table_id);
         let bytes = key_bytes + value.as_ref().map(|value| value.len() as u64).unwrap_or(0);
         crate::perf::record_coremeta_duration(
             "get",
@@ -515,189 +576,11 @@ impl CoreMetaStore {
             .transpose()
     }
 
-    pub fn scan_prefix_page(
-        &self,
-        cf: &'static str,
-        table_id: u16,
-        tuple_prefix: &[u8],
-        after_tuple_key: Option<&[u8]>,
-        limit: usize,
-    ) -> Result<Vec<CoreMetaRecord>> {
-        validate_scan_limit(limit)?;
-        validate_meta_payload(cf, table_id, 0)?;
-        let prefix = core_meta_key(table_id, 0, tuple_prefix)?;
-        let upper_bound = exclusive_prefix_successor(&prefix)
-            .context("CoreMeta prefix has no finite exclusive upper bound")?;
-        let after_key = after_tuple_key
-            .map(|tuple_key| core_meta_key(table_id, 0, tuple_key))
-            .transpose()?;
-        if after_key
-            .as_ref()
-            .is_some_and(|after_key| !after_key.starts_with(&prefix))
-        {
-            bail!("CoreMeta page position is outside the requested prefix");
+    pub(crate) fn read_snapshot(&self) -> CoreMetaReadSnapshot<'_> {
+        CoreMetaReadSnapshot {
+            store: self,
+            snapshot: self.db.snapshot(),
         }
-
-        let start_key = after_key.as_ref().unwrap_or(&prefix);
-        let cf_name = cf;
-        let cf = self.cf(cf_name)?;
-        let mut read_options = ReadOptions::default();
-        read_options.set_iterate_lower_bound(start_key.clone());
-        read_options.set_iterate_upper_bound(upper_bound);
-        let iter = self.db.iterator_cf_opt(
-            &cf,
-            read_options,
-            IteratorMode::From(start_key, Direction::Forward),
-        );
-        let mut records = Vec::with_capacity(limit);
-        let mut scanned = 0_u64;
-        let mut bytes = 0_u64;
-        let started_at = Instant::now();
-        for item in iter {
-            let (key, value) = item?;
-            if !key.starts_with(&prefix) {
-                bail!("bounded CoreMeta prefix iterator returned an out-of-range key");
-            }
-            scanned = scanned.saturating_add(1);
-            bytes = bytes.saturating_add((key.len() + value.len()) as u64);
-            if after_key
-                .as_ref()
-                .is_some_and(|after_key| key.as_ref() <= after_key.as_slice())
-            {
-                continue;
-            }
-            let _ = decode_core_meta_tuple_key(&key)?;
-            records.push(CoreMetaRecord {
-                key: key.to_vec(),
-                payload: decode_envelope(cf_name, table_id, &value)?,
-            });
-            if records.len() == limit {
-                break;
-            }
-        }
-        crate::perf::record_coremeta_duration(
-            "scan_prefix_page",
-            cf_name,
-            table_id,
-            scanned,
-            bytes,
-            started_at.elapsed(),
-        );
-        Ok(records)
-    }
-
-    pub fn scan_range_inclusive(
-        &self,
-        cf: &'static str,
-        table_id: u16,
-        start_tuple_key: &[u8],
-        end_tuple_key: &[u8],
-        limit: usize,
-    ) -> Result<Vec<CoreMetaRecord>> {
-        validate_scan_limit(limit)?;
-        validate_meta_payload(cf, table_id, 0)?;
-        let start_key = core_meta_key(table_id, 0, start_tuple_key)?;
-        let end_key = core_meta_key(table_id, 0, end_tuple_key)?;
-        if start_key > end_key {
-            bail!("CoreMeta scan range start key exceeds end key");
-        }
-        let upper_bound = exclusive_prefix_successor(&end_key)
-            .context("CoreMeta range has no finite exclusive upper bound")?;
-        let cf_name = cf;
-        let cf = self.cf(cf_name)?;
-        let mut read_options = ReadOptions::default();
-        read_options.set_iterate_lower_bound(start_key.clone());
-        read_options.set_iterate_upper_bound(upper_bound);
-        let iter = self.db.iterator_cf_opt(
-            &cf,
-            read_options,
-            IteratorMode::From(&start_key, Direction::Forward),
-        );
-        let mut records = Vec::new();
-        let mut scanned = 0_u64;
-        let mut bytes = 0_u64;
-        let started_at = Instant::now();
-        for item in iter {
-            let (key, value) = item?;
-            if key.as_ref() > end_key.as_slice() {
-                break;
-            }
-            scanned = scanned.saturating_add(1);
-            bytes = bytes.saturating_add((key.len() + value.len()) as u64);
-            records.push(CoreMetaRecord {
-                key: key.to_vec(),
-                payload: decode_envelope(cf_name, table_id, &value)?,
-            });
-            if records.len() >= limit {
-                break;
-            }
-        }
-        crate::perf::record_coremeta_duration(
-            "scan_range",
-            cf_name,
-            table_id,
-            scanned,
-            bytes,
-            started_at.elapsed(),
-        );
-        Ok(records)
-    }
-
-    pub fn scan_range_reverse_inclusive(
-        &self,
-        cf: &'static str,
-        table_id: u16,
-        start_tuple_key: &[u8],
-        end_tuple_key: &[u8],
-        limit: usize,
-    ) -> Result<Vec<CoreMetaRecord>> {
-        validate_scan_limit(limit)?;
-        validate_meta_payload(cf, table_id, 0)?;
-        let start_key = core_meta_key(table_id, 0, start_tuple_key)?;
-        let end_key = core_meta_key(table_id, 0, end_tuple_key)?;
-        if start_key > end_key {
-            bail!("CoreMeta reverse scan range start key exceeds end key");
-        }
-        let upper_bound = exclusive_prefix_successor(&end_key)
-            .context("CoreMeta reverse range has no finite exclusive upper bound")?;
-        let cf_name = cf;
-        let cf = self.cf(cf_name)?;
-        let mut read_options = ReadOptions::default();
-        read_options.set_iterate_lower_bound(start_key.clone());
-        read_options.set_iterate_upper_bound(upper_bound);
-        let iter = self.db.iterator_cf_opt(
-            &cf,
-            read_options,
-            IteratorMode::From(&end_key, Direction::Reverse),
-        );
-        let mut records = Vec::new();
-        let mut scanned = 0_u64;
-        let mut bytes = 0_u64;
-        let started_at = Instant::now();
-        for item in iter {
-            let (key, value) = item?;
-            if key.as_ref() < start_key.as_slice() {
-                break;
-            }
-            scanned = scanned.saturating_add(1);
-            bytes = bytes.saturating_add((key.len() + value.len()) as u64);
-            records.push(CoreMetaRecord {
-                key: key.to_vec(),
-                payload: decode_envelope(cf_name, table_id, &value)?,
-            });
-            if records.len() >= limit {
-                break;
-            }
-        }
-        crate::perf::record_coremeta_duration(
-            "scan_range_reverse",
-            cf_name,
-            table_id,
-            scanned,
-            bytes,
-            started_at.elapsed(),
-        );
-        Ok(records)
     }
 
     pub fn write_batch(&self, ops: &[CoreMetaBatchOp<'_>]) -> Result<()> {
@@ -739,7 +622,7 @@ impl CoreMetaStore {
         Ok(())
     }
 
-    pub fn write_local_committed_batch(&self, ops: &[CoreMetaBatchOp<'_>]) -> Result<()> {
+    pub(crate) fn write_local_committed_batch(&self, ops: &[CoreMetaBatchOp<'_>]) -> Result<()> {
         let owned = self.encode_batch_ops(ops)?;
         let borrowed = owned
             .iter()
@@ -797,7 +680,56 @@ impl CoreMetaStore {
         Ok(rows)
     }
 
-    pub fn write_encoded_rows(&self, rows: &[CoreMetaEncodedRow<'_>]) -> Result<()> {
+    pub(crate) fn rebind_encoded_row_common(
+        &self,
+        row: &mut CoreMetaEncodedOwnedRow,
+        common: CoreMetaRowCommonProto,
+    ) -> Result<()> {
+        validate_coremeta_common_shape(&common)?;
+        if row.delete_marker {
+            if !row.value_envelope.is_empty() {
+                bail!("CoreMeta delete row must not carry a value envelope");
+            }
+        } else {
+            let table_id = decode_core_meta_table_id(&row.core_meta_key)?;
+            let (payload, _) = decode_envelope_with_common(&row.cf, table_id, &row.value_envelope)?;
+            let payload = replace_core_meta_row_common(&payload, &common)?;
+            row.value_envelope =
+                encode_envelope_with_common(&row.cf, table_id, &payload, common.clone())?;
+        }
+        row.root_key_hash = common.root_key_hash.clone();
+        row.root_generation = common.root_generation;
+        row.visibility_state = common.visibility_state_enum();
+        Ok(())
+    }
+
+    pub(crate) fn rebind_encoded_row_publication(
+        &self,
+        row: &mut CoreMetaEncodedOwnedRow,
+        root_generation: u64,
+        transaction_id: &str,
+    ) -> Result<()> {
+        if root_generation == 0 {
+            bail!("CoreMeta rooted row publication generation must be nonzero");
+        }
+        if row.delete_marker {
+            row.root_generation = root_generation;
+            return Ok(());
+        }
+        let table_id = decode_core_meta_table_id(&row.core_meta_key)?;
+        let (payload, mut common) =
+            decode_envelope_with_common(&row.cf, table_id, &row.value_envelope)?;
+        common.root_generation = root_generation;
+        common.transaction_id = transaction_id.to_string();
+        let payload = replace_core_meta_row_common(&payload, &common)?;
+        row.value_envelope =
+            encode_envelope_with_common(&row.cf, table_id, &payload, common.clone())?;
+        row.root_generation = root_generation;
+        row.visibility_state = common.visibility_state_enum();
+        Ok(())
+    }
+
+    pub(super) fn write_encoded_rows(&self, rows: &[CoreMetaEncodedRow<'_>]) -> Result<()> {
         let mut batch = WriteBatch::default();
         let mut bytes = 0_u64;
         for row in rows {
@@ -836,31 +768,68 @@ impl CoreMetaStore {
         Ok(())
     }
 
-    pub fn get_encoded_rows(
+    pub(crate) fn decode_encoded_owned_row(
+        row: &CoreMetaEncodedOwnedRow,
+    ) -> Result<(u16, Vec<u8>, Vec<u8>)> {
+        if row.delete_marker {
+            bail!("cannot decode a deleted CoreMeta row as snapshot state");
+        }
+        let table_id = decode_core_meta_table_id(&row.core_meta_key)?;
+        let tuple_key = decode_core_meta_tuple_key(&row.core_meta_key)?.to_vec();
+        let (payload, common) =
+            decode_envelope_with_common(&row.cf, table_id, &row.value_envelope)?;
+        let canonical = encode_envelope_with_common(&row.cf, table_id, &payload, common)?;
+        if canonical != row.value_envelope {
+            bail!("CoreMeta encoded snapshot row envelope is not canonical");
+        }
+        Ok((table_id, tuple_key, payload))
+    }
+
+    pub(crate) fn validate_and_own_encoded_rows(
         &self,
-        cf_name: &str,
-        keys: &[Vec<u8>],
+        rows: &[CoreMetaEncodedRow<'_>],
+        delete_common: Option<&CoreMetaRowCommonProto>,
     ) -> Result<Vec<CoreMetaEncodedOwnedRow>> {
-        let cf = self.cf(cf_name)?;
-        let mut rows = Vec::new();
-        for key in keys {
-            let table_id = decode_core_meta_table_id(key)?;
-            if let Some(value) = self.db.get_cf(&cf, key)? {
-                let (payload, common) = decode_envelope_with_common(cf_name, table_id, &value)?;
-                let canonical_envelope =
-                    encode_envelope_with_common(cf_name, table_id, &payload, common.clone())?;
-                rows.push(CoreMetaEncodedOwnedRow {
-                    cf: cf_name.to_string(),
-                    core_meta_key: key.clone(),
-                    value_envelope: canonical_envelope,
+        rows.iter()
+            .map(|row| {
+                let table_id = decode_core_meta_table_id(row.core_meta_key)?;
+                validate_meta_payload(row.cf, table_id, 0)?;
+                if row.delete_marker {
+                    if !row.value_envelope.is_empty() {
+                        bail!("CoreMeta delete row must not carry a value envelope");
+                    }
+                    let common = delete_common.ok_or_else(|| {
+                        anyhow!("CoreMeta delete row requires explicit common metadata")
+                    })?;
+                    validate_coremeta_common_shape(common)?;
+                    return Ok(CoreMetaEncodedOwnedRow {
+                        cf: row.cf.to_string(),
+                        core_meta_key: row.core_meta_key.to_vec(),
+                        value_envelope: Vec::new(),
+                        delete_marker: true,
+                        root_key_hash: common.root_key_hash.clone(),
+                        root_generation: common.root_generation,
+                        visibility_state: common.visibility_state_enum(),
+                    });
+                }
+                let (payload, common) =
+                    decode_envelope_with_common(row.cf, table_id, row.value_envelope)?;
+                let canonical =
+                    encode_envelope_with_common(row.cf, table_id, &payload, common.clone())?;
+                if canonical != row.value_envelope {
+                    bail!("CoreMeta encoded row is not canonical");
+                }
+                Ok(CoreMetaEncodedOwnedRow {
+                    cf: row.cf.to_string(),
+                    core_meta_key: row.core_meta_key.to_vec(),
+                    value_envelope: row.value_envelope.to_vec(),
                     delete_marker: false,
                     root_key_hash: common.root_key_hash.clone(),
                     root_generation: common.root_generation,
                     visibility_state: common.visibility_state_enum(),
-                });
-            }
-        }
-        Ok(rows)
+                })
+            })
+            .collect()
     }
 
     pub fn scan_encoded_rows_page(
@@ -955,118 +924,52 @@ impl CoreMetaStore {
         Ok(CoreMetaEncodedRowsPage { rows, next_cursor })
     }
 
-    pub fn scan_encoded_rows_for_root(
-        &self,
-        root_key_hash: &str,
-        after_generation: u64,
-        limit: usize,
-    ) -> Result<Vec<CoreMetaEncodedOwnedRow>> {
-        let mut rows = Vec::new();
-        let scan_limit = limit.max(1);
-        let started_at = Instant::now();
-        let mut scanned = 0_u64;
-        let mut bytes = 0_u64;
-
-        for cf_name in column_families() {
-            let cf = self.cf(cf_name)?;
-            let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
-            for item in iter {
-                let (key, value) = item?;
-                scanned = scanned.saturating_add(1);
-                bytes = bytes.saturating_add((key.len() + value.len()) as u64);
-                let table_id = decode_core_meta_table_id(&key)?;
-                let (payload, common) = decode_envelope_with_common(cf_name, table_id, &value)?;
-                if common.root_key_hash != root_key_hash {
-                    continue;
-                }
-                if common.root_generation <= after_generation {
-                    continue;
-                }
-                let canonical_envelope =
-                    encode_envelope_with_common(cf_name, table_id, &payload, common.clone())?;
-                rows.push(CoreMetaEncodedOwnedRow {
-                    cf: (*cf_name).to_string(),
-                    core_meta_key: key.to_vec(),
-                    value_envelope: canonical_envelope,
-                    delete_marker: false,
-                    root_key_hash: common.root_key_hash.clone(),
-                    root_generation: common.root_generation,
-                    visibility_state: common.visibility_state_enum(),
-                });
-                if rows.len() >= scan_limit {
-                    crate::perf::record_coremeta_duration(
-                        "scan_encoded_rows_for_root",
-                        "multi",
-                        0,
-                        scanned,
-                        bytes,
-                        started_at.elapsed(),
-                    );
-                    return Ok(rows);
-                }
-            }
-        }
-
-        crate::perf::record_coremeta_duration(
-            "scan_encoded_rows_for_root",
-            "multi",
-            0,
-            scanned,
-            bytes,
-            started_at.elapsed(),
-        );
-        Ok(rows)
-    }
-
-    pub fn inventory_rows_for_root(
-        &self,
-        root_key_hash: &str,
-        from_generation: u64,
-        to_generation: u64,
-        limit: usize,
-    ) -> Result<Vec<CoreMetaInventoryRow>> {
-        let mut rows = Vec::new();
-        let scan_limit = limit.max(1);
-        for cf_name in column_families() {
-            let cf = self.cf(cf_name)?;
-            for item in self.db.iterator_cf(&cf, IteratorMode::Start) {
-                let (key, value) = item?;
-                let table_id = decode_core_meta_table_id(&key)?;
-                let (payload, common) = decode_envelope_with_common(cf_name, table_id, &value)?;
-                if common.root_key_hash != root_key_hash {
-                    continue;
-                }
-                if common.root_generation < from_generation
-                    || common.root_generation > to_generation
-                {
-                    continue;
-                }
-                let canonical_envelope =
-                    encode_envelope_with_common(cf_name, table_id, &payload, common.clone())?;
-                rows.push(CoreMetaInventoryRow {
-                    cf: (*cf_name).to_string(),
-                    core_meta_key: key.to_vec(),
-                    row_hash: super::coremeta_quorum::core_meta_encoded_row_hash(
-                        cf_name,
-                        &key,
-                        &canonical_envelope,
-                    ),
-                    root_key_hash: common.root_key_hash.clone(),
-                    root_generation: common.root_generation,
-                    visibility_state: common.visibility_state_enum(),
-                });
-                if rows.len() >= scan_limit {
-                    return Ok(rows);
-                }
-            }
-        }
-        Ok(rows)
-    }
-
     fn cf(&self, name: &str) -> Result<&rocksdb::ColumnFamily> {
         self.db
             .cf_handle(name)
             .ok_or_else(|| anyhow!("missing CoreStore RocksDB column family {name}"))
+    }
+}
+
+impl CoreMetaReadSnapshot<'_> {
+    pub(crate) fn get(
+        &self,
+        cf: &'static str,
+        table_id: u16,
+        tuple_key: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        validate_meta_payload(cf, table_id, 0)?;
+        let key = core_meta_key(table_id, 0, tuple_key)?;
+        let key_bytes = key.len() as u64;
+        let column_family = self.store.cf(cf)?;
+        let started_at = Instant::now();
+        let value = self.snapshot.get_cf(&column_family, key)?;
+        #[cfg(feature = "coremeta-perf-gate")]
+        record_coremeta_get_probe(cf, table_id);
+        let bytes = key_bytes + value.as_ref().map(|value| value.len() as u64).unwrap_or(0);
+        crate::perf::record_coremeta_duration(
+            "snapshot_get",
+            cf,
+            table_id,
+            u64::from(value.is_some()),
+            bytes,
+            started_at.elapsed(),
+        );
+        value
+            .map(|value| decode_envelope(cf, table_id, &value))
+            .transpose()
+    }
+}
+
+impl CoreMetaReader for CoreMetaStore {
+    fn get(&self, cf: &'static str, table_id: u16, tuple_key: &[u8]) -> Result<Option<Vec<u8>>> {
+        CoreMetaStore::get(self, cf, table_id, tuple_key)
+    }
+}
+
+impl CoreMetaReader for CoreMetaReadSnapshot<'_> {
+    fn get(&self, cf: &'static str, table_id: u16, tuple_key: &[u8]) -> Result<Option<Vec<u8>>> {
+        CoreMetaReadSnapshot::get(self, cf, table_id, tuple_key)
     }
 }
 
@@ -1094,6 +997,10 @@ pub fn encode_core_meta_inline_payload_row(
 
 pub fn core_meta_record_tuple_key(encoded_key: &[u8]) -> Result<&[u8]> {
     decode_core_meta_tuple_key(encoded_key)
+}
+
+pub(crate) fn core_meta_record_table_id(encoded_key: &[u8]) -> Result<u16> {
+    decode_core_meta_table_id(encoded_key)
 }
 
 pub fn core_meta_committed_row_common(
@@ -1271,6 +1178,21 @@ fn local_committed_row_common() -> CoreMetaRowCommonProto {
     }
 }
 
+pub(super) fn core_meta_bootstrap_row_common(
+    realm_id: impl Into<String>,
+    created_at_unix_nanos: u64,
+) -> CoreMetaRowCommonProto {
+    CoreMetaRowCommonProto {
+        realm_id: realm_id.into(),
+        root_key_hash: String::new(),
+        root_generation: 0,
+        transaction_id: String::new(),
+        visibility_state: CoreMetaVisibilityState::Committed as i32,
+        created_at_unix_nanos,
+        payload_schema_version: CORE_META_VALUE_SCHEMA_VERSION,
+    }
+}
+
 fn decode_inline_payload_row(payload: &[u8]) -> Result<Vec<u8>> {
     let row = InlinePayloadRowProto::decode(payload)?;
     let mut canonical = Vec::new();
@@ -1299,6 +1221,76 @@ fn extract_row_common_from_payload(payload: &[u8]) -> Result<CoreMetaRowCommonPr
 
 pub(crate) fn core_meta_row_common_from_payload(payload: &[u8]) -> Result<CoreMetaRowCommonProto> {
     extract_row_common_from_payload(payload)
+}
+
+/// Replace the canonical field-one common envelope without decoding the
+/// feature-owned remainder of the row. Every CoreMeta row schema reserves
+/// field one for `CoreMetaRowCommonProto`, while the rest of the payload is
+/// owned by its writer family.
+pub(crate) fn replace_core_meta_row_common(
+    payload: &[u8],
+    common: &CoreMetaRowCommonProto,
+) -> Result<Vec<u8>> {
+    let mut offset = 0_usize;
+    let key = decode_proto_varint(payload, &mut offset)?;
+    if key != 0x0a {
+        bail!("CoreMeta row payload common field must be canonical field one");
+    }
+    let common_len = usize::try_from(decode_proto_varint(payload, &mut offset)?)
+        .context("CoreMeta row common field length exceeds addressable memory")?;
+    let common_end = offset
+        .checked_add(common_len)
+        .filter(|end| *end <= payload.len())
+        .ok_or_else(|| anyhow!("CoreMeta row payload common field is truncated"))?;
+
+    let mut encoded_common = Vec::new();
+    common.encode(&mut encoded_common)?;
+    let mut rebound = Vec::with_capacity(
+        1 + encoded_varint_len(encoded_common.len() as u64)
+            + encoded_common.len()
+            + payload.len().saturating_sub(common_end),
+    );
+    rebound.push(0x0a);
+    encode_proto_varint(encoded_common.len() as u64, &mut rebound);
+    rebound.extend_from_slice(&encoded_common);
+    rebound.extend_from_slice(&payload[common_end..]);
+
+    if extract_row_common_from_payload(&rebound)? != *common {
+        bail!("CoreMeta row common replacement did not round-trip");
+    }
+    Ok(rebound)
+}
+
+fn decode_proto_varint(bytes: &[u8], offset: &mut usize) -> Result<u64> {
+    let mut value = 0_u64;
+    for shift in (0..=63).step_by(7) {
+        let byte = *bytes
+            .get(*offset)
+            .ok_or_else(|| anyhow!("CoreMeta protobuf varint is truncated"))?;
+        *offset += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    bail!("CoreMeta protobuf varint exceeds u64")
+}
+
+fn encode_proto_varint(mut value: u64, output: &mut Vec<u8>) {
+    while value >= 0x80 {
+        output.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    output.push(value as u8);
+}
+
+fn encoded_varint_len(mut value: u64) -> usize {
+    let mut len = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
 }
 
 fn core_meta_inline_payload_hash(payload: &[u8]) -> String {
@@ -1346,10 +1338,18 @@ fn table_spec(table_id: u16) -> Result<CoreMetaTableSpec> {
         | TABLE_EXPLICIT_TRANSACTION_ROW
         | TABLE_PENDING_MUTATION_ROW
         | TABLE_NATIVE_IDEMPOTENCY_ROW
-        | TABLE_ADMISSION_COMMIT_CERTIFICATE_ROW => CoreMetaTableSpec {
-            cf: CF_TRANSACTIONS,
-            max_payload_bytes: CORE_META_MAX_VALUE_BYTES,
-        },
+        | TABLE_LOCAL_ADMISSION_EVIDENCE_ROW
+        | TABLE_TRANSACTION_MANIFEST_BODY_ROW
+        | TABLE_ROOT_PUBLICATION_INTENT_ROW
+        | super::local::local_coremeta_history::TABLE_COREMETA_GENERATION_DESCRIPTOR_ROW
+        | super::local::local_coremeta_history::TABLE_COREMETA_GENERATION_MUTATION_ROW
+        | super::local::local_coremeta_history::TABLE_COREMETA_GENERATION_ENVELOPE_CHUNK_ROW
+        | super::local::local_coremeta_history::TABLE_COREMETA_GENERATION_INSTALL_ROW => {
+            CoreMetaTableSpec {
+                cf: CF_TRANSACTIONS,
+                max_payload_bytes: CORE_META_MAX_VALUE_BYTES,
+            }
+        }
         TABLE_OBJECT_HEAD_ROW
         | TABLE_MANIFEST_CAS_CURRENT_ROW
         | TABLE_MULTIPART_UPLOAD_CURRENT_ROW
@@ -1358,7 +1358,9 @@ fn table_spec(table_id: u16) -> Result<CoreMetaTableSpec> {
             cf: CF_OBJECT_HEADS,
             max_payload_bytes: CORE_META_OBJECT_VERSION_MAX_PAYLOAD_BYTES,
         },
-        TABLE_OBJECT_VERSION_META_ROW | TABLE_OBJECT_WATCH_CURSOR_ROW => CoreMetaTableSpec {
+        TABLE_OBJECT_VERSION_META_ROW
+        | TABLE_OBJECT_WATCH_CURSOR_ROW
+        | TABLE_OBJECT_SHARD_REPAIR_ROW => CoreMetaTableSpec {
             cf: CF_OBJECT_VERSIONS,
             max_payload_bytes: CORE_META_OBJECT_VERSION_MAX_PAYLOAD_BYTES,
         },
@@ -1439,7 +1441,9 @@ fn table_spec(table_id: u16) -> Result<CoreMetaTableSpec> {
         | TABLE_PARTITION_OWNER_ROW
         | TABLE_TASK_LEASE_ROW
         | TABLE_TASK_CURRENT_ROW
-        | TABLE_CORE_FENCE_ROW => CoreMetaTableSpec {
+        | TABLE_CORE_FENCE_ROW
+        | TABLE_ROOT_FAILOVER_VOTE_ROW
+        | TABLE_ROOT_FAILOVER_CERTIFICATE_ROW => CoreMetaTableSpec {
             cf: CF_LEASES_FENCES,
             max_payload_bytes: CORE_META_MAX_VALUE_BYTES,
         },
@@ -1643,8 +1647,20 @@ fn validate_table_payload_schema(table_id: u16, payload: &[u8]) -> Result<()> {
         TABLE_TRANSACTION_COMMIT_EVIDENCE_ROW => {
             validate_coremeta_commit_evidence_row(payload)?;
         }
-        TABLE_ADMISSION_COMMIT_CERTIFICATE_ROW => {
-            super::pending_mutation::decode_admission_commit_certificate(payload)?;
+        TABLE_LOCAL_ADMISSION_EVIDENCE_ROW => {
+            super::pending_mutation::decode_local_admission_evidence(payload)?;
+        }
+        TABLE_TRANSACTION_MANIFEST_BODY_ROW => {
+            super::local::validate_transaction_manifest_body_row(payload)?;
+        }
+        TABLE_ROOT_PUBLICATION_INTENT_ROW => {
+            super::local::validate_root_publication_intent_row(payload)?;
+        }
+        super::local::local_coremeta_history::TABLE_COREMETA_GENERATION_DESCRIPTOR_ROW
+        | super::local::local_coremeta_history::TABLE_COREMETA_GENERATION_MUTATION_ROW
+        | super::local::local_coremeta_history::TABLE_COREMETA_GENERATION_ENVELOPE_CHUNK_ROW
+        | super::local::local_coremeta_history::TABLE_COREMETA_GENERATION_INSTALL_ROW => {
+            super::local::local_coremeta_history::validate_coremeta_history_row(table_id, payload)?;
         }
         _ => {}
     }
@@ -1670,16 +1686,35 @@ fn validate_table_schema_marker(table_id: u16, payload: &[u8]) -> Result<()> {
 fn expected_schema_markers(table_id: u16) -> Option<&'static [&'static str]> {
     match table_id {
         TABLE_INLINE_MANIFEST_BODY_ROW => Some(&["anvil.core.inline_manifest_body.v1"]),
+        TABLE_TRANSACTION_MANIFEST_BODY_ROW => Some(&["anvil.core.transaction_manifest_body.v1"]),
+        TABLE_ROOT_PUBLICATION_INTENT_ROW => Some(&[
+            "anvil.core.root_publication_intent.v2",
+            "anvil.core.root_publication_root.v1",
+            "anvil.core.root_publication_row.v1",
+            "anvil.core.root_publication_chunk.v1",
+        ]),
+        super::local::local_coremeta_history::TABLE_COREMETA_GENERATION_DESCRIPTOR_ROW => {
+            Some(&["anvil.coremeta.generation_descriptor.v1"])
+        }
+        super::local::local_coremeta_history::TABLE_COREMETA_GENERATION_MUTATION_ROW => {
+            Some(&["anvil.coremeta.generation_mutation.v1"])
+        }
+        super::local::local_coremeta_history::TABLE_COREMETA_GENERATION_ENVELOPE_CHUNK_ROW => {
+            Some(&["anvil.coremeta.generation_envelope_chunk.v1"])
+        }
+        super::local::local_coremeta_history::TABLE_COREMETA_GENERATION_INSTALL_ROW => {
+            Some(&["anvil.coremeta.generation_install.v1"])
+        }
         TABLE_EXPLICIT_TRANSACTION_ROW => Some(&[
             "anvil.core.transaction_header_row.v1",
             "anvil.core.transaction_staged_update_row.v1",
-            "anvil.core.transaction_precondition_row.v1",
+            "anvil.core.transaction_precondition_row.v2",
         ]),
         TABLE_PENDING_MUTATION_ROW => Some(&[
             "anvil.core.pending_mutation_row.v1",
             "anvil.core.pending_mutation_finalisation_index.v1",
         ]),
-        TABLE_ADMISSION_COMMIT_CERTIFICATE_ROW => Some(&["anvil.admission.commit_certificate.v1"]),
+        TABLE_LOCAL_ADMISSION_EVIDENCE_ROW => Some(&["anvil.admission.local_evidence.v1"]),
         TABLE_OBJECT_HEAD_ROW => Some(&["anvil.core.object_metadata.v1"]),
         TABLE_OBJECT_VERSION_META_ROW => Some(&[
             "anvil.core.object_manifest.v1",
@@ -1687,6 +1722,7 @@ fn expected_schema_markers(table_id: u16) -> Option<&'static [&'static str]> {
             "anvil.core.object_metadata_counter.v1",
         ]),
         TABLE_OBJECT_WATCH_CURSOR_ROW => Some(&["anvil.core.object_watch_cursor.v1"]),
+        TABLE_OBJECT_SHARD_REPAIR_ROW => Some(&["anvil.core.object_shard_repair.v1"]),
         TABLE_STREAM_HEAD_ROW => Some(&["anvil.core.stream_head.v1"]),
         TABLE_STREAM_RECORD_INDEX_ROW => Some(&[
             "anvil.core.watch_event.v1",
@@ -1714,7 +1750,7 @@ fn expected_schema_markers(table_id: u16) -> Option<&'static [&'static str]> {
             "anvil.authz.coremeta_payload_row.v1",
             "anvil.authz.derived_userset_index_row.v1",
         ]),
-        TABLE_AUTHZ_IDEMPOTENCY_RECEIPT_ROW => Some(&["anvil.authz.idempotency_receipt.v1"]),
+        TABLE_AUTHZ_IDEMPOTENCY_RECEIPT_ROW => Some(&["anvil.authz.idempotency_receipt.v2"]),
         TABLE_AUTHZ_HEAD_ROW => Some(&["anvil.authz.head.v1"]),
         TABLE_AUTHZ_TUPLE_OBJECT_CURRENT_ROW | TABLE_AUTHZ_TUPLE_SUBJECT_CURRENT_ROW => {
             Some(&["anvil.authz.coremeta_payload_row.v1"])
@@ -1747,6 +1783,8 @@ fn expected_schema_markers(table_id: u16) -> Option<&'static [&'static str]> {
         TABLE_REPAIR_FINDING_ID_ROW => Some(&["anvil.repair.finding_id.v1"]),
         TABLE_TASK_CURRENT_ROW => Some(&["anvil.core.task_queue_row.v1"]),
         TABLE_CORE_FENCE_ROW => Some(&["anvil.control.current.v1", "anvil.core.fence.v1"]),
+        TABLE_ROOT_FAILOVER_VOTE_ROW => Some(&["anvil.core.root_failover_vote.v1"]),
+        TABLE_ROOT_FAILOVER_CERTIFICATE_ROW => Some(&["anvil.core.root_failover_certificate.v1"]),
         TABLE_MATERIALISATION_CURSOR_ROW => Some(&[
             "anvil.core.materialisation_cursor.v1",
             "anvil.core.pending_mutation_finalisation.v1",
