@@ -126,27 +126,6 @@ fn run_anvil_expect_failure(config_dir: &TempDir, args: &[&str]) -> Output {
 
 async fn start_cluster_for_public_cli() -> (TestCluster, TempDir) {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    let region = cluster.states[0]
-        .persistence
-        .create_region_descriptor(anvil::mesh_lifecycle::CreateRegionDescriptor {
-            mesh_id: "default".to_string(),
-            region: "test-region-1".to_string(),
-            public_base_url: "https://test-region-1.anvil-storage.test".to_string(),
-            virtual_host_suffix: "test-region-1.anvil-storage.test".to_string(),
-            placement_weight: 100,
-            default_cell: None,
-        })
-        .await
-        .unwrap();
-    cluster.states[0]
-        .persistence
-        .transition_region_descriptor(
-            "test-region-1",
-            region.generation,
-            anvil::mesh_lifecycle::LifecycleState::Active,
-        )
-        .await
-        .unwrap();
     cluster.start_and_converge(Duration::from_secs(10)).await;
 
     let config_dir = tempdir().unwrap();
