@@ -181,7 +181,11 @@ async fn test_task_claim_marks_tasks_running_before_execution() {
         "running tasks must not be claimed again"
     );
 
-    let tasks = persistence.list_tasks().await.unwrap();
+    let tasks = persistence
+        .list_tasks_page(None, 1_000)
+        .await
+        .unwrap()
+        .tasks;
     let task = tasks.iter().find(|task| task.id == task_id).unwrap();
     assert_eq!(task.status, TaskStatus::Running);
 }

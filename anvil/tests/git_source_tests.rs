@@ -278,6 +278,7 @@ async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable(
             response.generation,
             &response.index_path,
         )
+        .await
         .unwrap()
         .is_some()
     );
@@ -301,6 +302,7 @@ async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable(
             response.generation,
             &response.index_path,
         )
+        .await
         .unwrap()
         .is_none()
     );
@@ -329,6 +331,7 @@ async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable(
             response.generation,
             &response.index_path,
         )
+        .await
         .unwrap()
         .is_some(),
         "git source query must rebuild a missing derived index catalog row from stored pack bytes"

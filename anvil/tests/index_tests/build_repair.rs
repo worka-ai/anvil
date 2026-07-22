@@ -496,7 +496,7 @@ async fn test_full_text_index_build_uses_source_cursor_snapshot() {
     );
 
     persistence
-        .build_index_task(
+        .rebuild_index_direct(
             tenant_id,
             bucket.id,
             index.id,
@@ -679,7 +679,7 @@ async fn test_index_build_requires_current_rfc_ownership_fence() {
     .unwrap();
 
     let err = persistence
-        .build_index_task(
+        .rebuild_index_direct(
             tenant_id,
             bucket.id,
             index.id,
@@ -756,7 +756,7 @@ async fn test_index_enqueue_rebuilds_when_checkpoint_exists_but_proof_is_missing
         .expect("initial index build task records source cursor");
 
     persistence
-        .build_index_task(
+        .rebuild_index_direct(
             tenant_id,
             bucket.id,
             index.id,
@@ -892,7 +892,7 @@ async fn test_repair_rebuilds_missing_full_text_segment_from_base_journal() {
     );
 
     persistence
-        .build_index_task(tenant_id, bucket.id, index.id, index.version, source_cursor)
+        .rebuild_index_direct(tenant_id, bucket.id, index.id, index.version, source_cursor)
         .await
         .unwrap()
         .expect("initial index build succeeds");
@@ -1065,7 +1065,7 @@ async fn test_repair_rebuilds_missing_vector_segment_from_base_journal() {
     );
 
     persistence
-        .build_index_task(tenant_id, bucket.id, index.id, index.version, source_cursor)
+        .rebuild_index_direct(tenant_id, bucket.id, index.id, index.version, source_cursor)
         .await
         .unwrap()
         .expect("initial vector index build succeeds");
@@ -1225,7 +1225,7 @@ async fn test_index_build_followup_waits_for_running_build_and_catches_up_after_
 
     let restarted = anvil::persistence::Persistence::new(&cluster.states[0].config, None).unwrap();
     restarted
-        .build_index_task(
+        .rebuild_index_direct(
             tenant_id,
             bucket.id,
             index.id,
@@ -1245,7 +1245,7 @@ async fn test_index_build_followup_waits_for_running_build_and_catches_up_after_
     let followup_cursor = followup[0].payload["source_cursor"].as_u64().unwrap();
     assert!(followup_cursor > first_cursor);
     restarted
-        .build_index_task(
+        .rebuild_index_direct(
             tenant_id,
             bucket.id,
             index.id,

@@ -609,7 +609,12 @@ async fn test_s3_writes_trigger_worker_metadata_compaction() {
     let completed_task = {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
         loop {
-            let tasks = cluster.states[0].persistence.list_tasks().await.unwrap();
+            let tasks = cluster.states[0]
+                .persistence
+                .list_tasks_page(None, 1_000)
+                .await
+                .unwrap()
+                .tasks;
             if let Some(task) = tasks.iter().find(|task| {
                 task.task_type == anvil_core::tasks::TaskType::ObjectMetadataCompaction
                     && task.payload == serde_json::json!({ "bucket_id": bucket_record.id })

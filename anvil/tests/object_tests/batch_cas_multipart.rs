@@ -228,6 +228,10 @@ async fn test_mutation_batch_rejects_stale_lease_fence_for_state_update() {
                 fence_token: lease.fence_token,
                 committed_cursor_low: 1,
                 committed_cursor_high: 0,
+                expected_root_generation: lease.root_generation,
+                expected_lease_epoch: lease.lease_epoch,
+                expected_expires_at_nanos: lease.expires_at_nanos,
+                expected_lease_hash: lease.lease_hash.clone(),
             },
             &token,
         ))
