@@ -52,7 +52,7 @@ run_cargo_test() {
 run_docker_cargo_test() {
   local name="$1"
   shift
-  local test_threads="${ANVIL_DOCKER_TEST_THREADS:-4}"
+  local test_threads="${ANVIL_DOCKER_TEST_THREADS:-1}"
   run_step "$name" cargo test --no-fail-fast "$@" -- --nocapture --test-threads="${test_threads}"
 }
 
@@ -70,8 +70,18 @@ reset_shared_docker_cluster() {
   for node in $(seq 1 "${node_count}"); do
     export "ANVIL_TEST_NODE${node}_TOKEN=release-gate-reset-token-${node}"
   done
-  rm -f "${TMPDIR:-/tmp}/anvil-test-cluster-locks/docker-shared-cluster.lock"
-  docker compose -p "${project}" -f "${compose_file}" down -v --remove-orphans || true
+  local state_dir="${TMPDIR:-/tmp}/anvil-test-cluster-locks"
+  local project_state="${project//[^a-zA-Z0-9_-]/-}"
+  docker compose -p "${project}" -f "${compose_file}" down -v --remove-orphans
+  rm -f "${state_dir}/${project_state}.ports"
+}
+
+cleanup_docker_gates() {
+  reset_shared_docker_cluster
+  local image="${ANVIL_IMAGE:-}"
+  if [[ -n "${image}" ]] && docker image inspect "${image}" >/dev/null 2>&1; then
+    docker image rm "${image}"
+  fi
 }
 
 static_gates() {
@@ -323,8 +333,18 @@ performance_quick_gates() {
 }
 
 performance_release_gates() {
-  run_step "CoreMeta ordered-access performance gate (release)" \
-    ./scripts/run-coremeta-perf-gate.sh release
+  local expected_commit="${ANVIL_EXPECTED_GIT_COMMIT:-}"
+  if [[ -n "${expected_commit}" ]]; then
+    if [[ ! "${expected_commit}" =~ ^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$ ]]; then
+      echo "ANVIL_EXPECTED_GIT_COMMIT must be a full Git object ID" >&2
+      return 2
+    fi
+    run_step "CoreMeta ordered-access performance gate (release)" \
+      env GITHUB_SHA="${expected_commit}" ./scripts/run-coremeta-perf-gate.sh release
+  else
+    run_step "CoreMeta ordered-access performance gate (release)" \
+      ./scripts/run-coremeta-perf-gate.sh release
+  fi
 }
 
 case "$group" in
@@ -365,9 +385,12 @@ case "$group" in
   docker-mesh)
     docker_mesh_gates
     ;;
+  docker-cleanup)
+    cleanup_docker_gates
+    ;;
   *)
     cat >&2 <<USAGE
-usage: $0 [all|static|rust|server-core|perf|perf-quick|perf-release|docker-auth|docker-storage|docker-index|docker-mesh]
+usage: $0 [all|static|rust|server-core|perf|perf-quick|perf-release|docker-auth|docker-storage|docker-index|docker-mesh|docker-cleanup]
 USAGE
     exit 2
     ;;
