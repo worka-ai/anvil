@@ -46,9 +46,6 @@ impl AppState {
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        if transaction_id.is_none() {
-            let _ = self.index_watch_tx.send(event.clone());
-        }
         Ok(event)
     }
 }

@@ -274,38 +274,70 @@ impl IndexService for AppState {
         let bucket = self
             .get_index_bucket(claims.tenant_id, &req.bucket_name)
             .await?;
-        let indexes = index_journal::read_current_index_definition_events(
+        let page_size = crate::services::collection_cursor::page_size(req.page.as_ref())?;
+        let revision = index_journal::current_index_definition_collection_revision(
             &self.storage,
             claims.tenant_id,
             bucket.id,
-            req.include_disabled,
         )
         .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .into_iter()
-        .map(|event| index_record_from_event(&event))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map_err(|error| Status::internal(error.to_string()))?;
         let include_disabled = req.include_disabled.to_string();
         let filters = [
             ("bucket_name", req.bucket_name.as_str()),
             ("include_disabled", include_disabled.as_str()),
         ];
         let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
-        let (indexes, page) = crate::services::collection_cursor::paginate(
-            indexes,
+        let revision_string = revision.to_string();
+        let binding = crate::services::collection_cursor::CollectionCursorBinding {
+            service_method: "anvil.IndexService/ListIndexes",
+            filters: &filters,
+            principal_scope: &principal_scope,
+            page_size,
+            revision: &revision_string,
+            sort: "name.asc",
+        };
+        let position = crate::services::collection_cursor::decode_page_token(
             req.page.as_ref(),
-            "anvil.IndexService/ListIndexes",
-            &filters,
-            &principal_scope,
-            "name.asc",
+            &binding,
             self.config.jwt_secret.as_bytes(),
-            |index| index.name.as_str(),
-            |index| index.version,
         )?;
+        let after_tuple_key =
+            crate::services::collection_cursor::decode_binary_position(position.as_deref())?;
+        let page = index_journal::page_current_index_definition_events(
+            &self.storage,
+            claims.tenant_id,
+            bucket.id,
+            req.include_disabled,
+            revision,
+            after_tuple_key.as_deref(),
+            page_size,
+        )
+        .await
+        .map_err(|error| Status::aborted(error.to_string()))?;
+        let next_page_token = page
+            .next_tuple_key
+            .as_deref()
+            .map(crate::services::collection_cursor::encode_binary_position)
+            .transpose()?
+            .map(|position| {
+                crate::services::collection_cursor::encode_next_page_token(
+                    &position,
+                    &binding,
+                    self.config.jwt_secret.as_bytes(),
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let indexes = page
+            .events
+            .into_iter()
+            .map(|event| index_record_from_event(&event))
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Response::new(ListIndexesResponse {
             indexes,
-            page: Some(page),
+            page: Some(PageResponse { next_page_token }),
         }))
     }
 
@@ -469,41 +501,34 @@ impl IndexService for AppState {
             .await?;
         let after_cursor = i64::try_from(req.after_cursor)
             .map_err(|_| Status::invalid_argument("after_cursor exceeds supported range"))?;
-        let snapshot = index_journal::read_index_definition_events(
-            &self.storage,
-            claims.tenant_id,
-            bucket.id,
-            after_cursor,
-            1000,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-        let mut live = self.index_watch_tx.subscribe();
+        let stream_id = index_journal::index_definition_stream_id(claims.tenant_id, bucket.id);
+        let mut live = self.storage.subscribe_stream(&stream_id);
+        let storage = self.storage.clone();
+        let tenant_id = claims.tenant_id;
+        let bucket_id = bucket.id;
 
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
             let mut last_cursor = after_cursor;
-            for event in snapshot {
-                last_cursor = last_cursor.max(event.id);
-                if tx
-                    .send(index_definition_event_response(&event))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-
             loop {
-                match live.recv().await {
-                    Ok(event) => {
-                        if event.tenant_id != claims.tenant_id
-                            || event.bucket_id != bucket.id
-                            || event.id <= last_cursor
-                        {
-                            continue;
+                loop {
+                    let page = match index_journal::read_index_definition_event_page(
+                        &storage,
+                        tenant_id,
+                        bucket_id,
+                        last_cursor,
+                        256,
+                    )
+                    .await
+                    {
+                        Ok(page) => page,
+                        Err(error) => {
+                            let _ = tx.send(Err(Status::internal(error.to_string()))).await;
+                            return;
                         }
-                        last_cursor = event.id;
+                    };
+                    let previous_cursor = last_cursor;
+                    for event in page.events {
                         if tx
                             .send(index_definition_event_response(&event))
                             .await
@@ -512,14 +537,14 @@ impl IndexService for AppState {
                             return;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let _ = tx
-                            .send(Err(Status::data_loss(
-                                "Index definition watch fell behind retained live event window",
-                            )))
-                            .await;
-                        return;
+                    last_cursor = page.next_cursor;
+                    if !page.has_more || last_cursor == previous_cursor {
+                        break;
                     }
+                }
+
+                match live.recv().await {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
@@ -568,78 +593,64 @@ impl IndexService for AppState {
             req.partition_id
         };
         let after_cursor = join_u128(req.after_cursor_low, req.after_cursor_high);
-        let snapshot = index_partition_watch::list_index_partition_watch_events(
-            &self.storage,
-            claims.tenant_id,
-            bucket.id,
-            &index_storage_id,
-            &partition_id,
-            after_cursor,
-            1000,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-
         let storage = self.storage.clone();
         let bucket_name = bucket.name.clone();
         let index_name = index.name.clone();
         let tenant_id = claims.tenant_id;
         let bucket_id = bucket.id;
+        let stream_id = index_partition_watch::index_partition_watch_stream_id_for_scope(
+            tenant_id,
+            bucket_id,
+            &index_storage_id,
+            &partition_id,
+        );
+        let mut live = self.storage.subscribe_stream(&stream_id);
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
             let mut last_cursor = after_cursor;
-            for event in snapshot {
-                last_cursor = last_cursor.max(event.cursor);
-                if tx
-                    .send(index_partition_event_response(
-                        &bucket_name,
-                        &index_name,
+            loop {
+                loop {
+                    let page = match index_partition_watch::list_index_partition_watch_event_page(
+                        &storage,
+                        tenant_id,
+                        bucket_id,
                         &index_storage_id,
                         &partition_id,
-                        event,
-                    ))
+                        last_cursor,
+                        256,
+                    )
                     .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-
-            let mut interval = tokio::time::interval(Duration::from_millis(500));
-            loop {
-                interval.tick().await;
-                let events = match index_partition_watch::list_index_partition_watch_events(
-                    &storage,
-                    tenant_id,
-                    bucket_id,
-                    &index_storage_id,
-                    &partition_id,
-                    last_cursor,
-                    1000,
-                )
-                .await
-                {
-                    Ok(events) => events,
-                    Err(error) => {
-                        let _ = tx.send(Err(Status::internal(error.to_string()))).await;
-                        return;
-                    }
-                };
-                for event in events {
-                    last_cursor = last_cursor.max(event.cursor);
-                    if tx
-                        .send(index_partition_event_response(
-                            &bucket_name,
-                            &index_name,
-                            &index_storage_id,
-                            &partition_id,
-                            event,
-                        ))
-                        .await
-                        .is_err()
                     {
-                        return;
+                        Ok(page) => page,
+                        Err(error) => {
+                            let _ = tx.send(Err(Status::internal(error.to_string()))).await;
+                            return;
+                        }
+                    };
+                    let previous_cursor = last_cursor;
+                    for event in page.events {
+                        if tx
+                            .send(index_partition_event_response(
+                                &bucket_name,
+                                &index_name,
+                                &index_storage_id,
+                                &partition_id,
+                                event,
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
+                    last_cursor = page.next_cursor;
+                    if !page.has_more || last_cursor == previous_cursor {
+                        break;
+                    }
+                }
+                match live.recv().await {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
         });
