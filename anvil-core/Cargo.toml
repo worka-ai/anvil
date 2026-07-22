@@ -23,10 +23,13 @@ path = "src/lib.rs"
 name = "coremeta_release_gate"
 path = "benches/coremeta_release_gate/main.rs"
 harness = false
+required-features = ["coremeta-perf-gate"]
 
 [features]
 #Declare an enterprise feature, doesn't activate any depdendencies so leave it with an empty array
 enterprise = []
+coremeta-perf-gate = []
+root-publication-test-control = []
 test-in-process-personaldb-signers = []
 gcp = ["dep:prost-types", "tonic/tls-ring"]
 routeguide = ["dep:async-stream", "dep:tokio-stream", "dep:rand"]
@@ -107,6 +110,7 @@ reed-solomon-erasure = "6.0.0"
 ahash = "0.8.12"
 futures ="0.3.31"
 fallible-streaming-iterator = "0.1"
+fs2 = "0.4"
 flate2 = "1"
 jsonwebtoken = "9.3.1"
 argon2 = "0.5.3"

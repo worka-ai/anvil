@@ -25,6 +25,7 @@ path = "src/main.rs"
 
 [features]
 enterprise = []
+root-publication-test-control = ["anvil-core/root-publication-test-control"]
 gcp = ["dep:prost-types", "tonic/tls-ring"]
 routeguide = ["dep:async-stream", "dep:tokio-stream", "dep:rand"]
 reflection = ["dep:tonic-reflection"]
