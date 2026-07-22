@@ -1758,7 +1758,7 @@ mod tests {
                 task_id: task_id.to_string(),
                 task_kind: "RebalanceShard".to_string(),
                 partition_family: "object_shard_repair".to_string(),
-                partition_id: format!("partition-{task_id}"),
+                partition_id: hex::encode(hash32(task_id.as_bytes())),
                 owner: TaskLeaseOwner::node("repair-test-node"),
                 source_cursor: 0,
                 now_nanos,
