@@ -303,7 +303,7 @@ jobs:
       ANVIL_DOCKER_TEST_PROJECT: anvil-ci-${{ matrix.group }}-${{ github.run_id }}-${{ github.run_attempt }}
       ANVIL_GATE_STEP_TIMEOUT_SECONDS: "5400"
     strategy:
-      fail-fast: false
+      fail-fast: true
       max-parallel: 1
       matrix:
         group: [docker-auth, docker-storage, docker-index, docker-mesh]

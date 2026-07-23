@@ -46,14 +46,14 @@ run_cargo_test() {
   local name="$1"
   shift
   local test_threads="${ANVIL_RUST_TEST_THREADS:-4}"
-  run_step "$name" cargo test --no-fail-fast "$@" -- --nocapture --test-threads="${test_threads}"
+  run_step "$name" cargo test "$@" -- --nocapture --test-threads="${test_threads}"
 }
 
 run_docker_cargo_test() {
   local name="$1"
   shift
   local test_threads="${ANVIL_DOCKER_TEST_THREADS:-1}"
-  run_step "$name" cargo test --no-fail-fast "$@" -- --nocapture --test-threads="${test_threads}"
+  run_step "$name" cargo test "$@" -- --nocapture --test-threads="${test_threads}"
 }
 
 require_image() {
