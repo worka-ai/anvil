@@ -1,7 +1,7 @@
 use super::*;
 use crate::core_store::{
-    CoreMutationRootPublication, CoreTransactionState, ObjectMetadataProjectionMutation,
-    core_meta_root_key_hash,
+    CoreMutationBatchAdditions, CoreMutationRootPublication, CoreTransactionState,
+    ObjectMetadataProjectionMutation, core_meta_root_key_hash,
 };
 use crate::formats::writer::WriterFamily;
 use crate::persistence::ObjectWatchEvent;
@@ -65,6 +65,274 @@ pub(crate) async fn append_object_mutation_with_permit_in_transaction(
         transaction_principal,
     )
     .await
+}
+
+pub(crate) async fn append_object_put_mutations_with_permit_in_transaction(
+    storage: &Storage,
+    bucket: &Bucket,
+    objects: &[Object],
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+    transaction_id: &str,
+    transaction_principal: &str,
+    additions: CoreMutationBatchAdditions,
+) -> Result<()> {
+    append_object_put_mutations_with_permit_inner(
+        storage,
+        bucket,
+        objects,
+        permit,
+        partition_owner_signing_key,
+        transaction_id,
+        Some(transaction_principal),
+        additions,
+    )
+    .await
+}
+
+pub(crate) async fn commit_object_put_mutations_with_permit(
+    storage: &Storage,
+    bucket: &Bucket,
+    objects: &[Object],
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+    transaction_id: &str,
+    additions: CoreMutationBatchAdditions,
+) -> Result<()> {
+    append_object_put_mutations_with_permit_inner(
+        storage,
+        bucket,
+        objects,
+        permit,
+        partition_owner_signing_key,
+        transaction_id,
+        None,
+        additions,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn append_object_put_mutations_with_permit_inner(
+    storage: &Storage,
+    bucket: &Bucket,
+    objects: &[Object],
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+    transaction_id: &str,
+    transaction_principal: Option<&str>,
+    mut additions: CoreMutationBatchAdditions,
+) -> Result<()> {
+    if objects.is_empty() {
+        return Ok(());
+    }
+    require_object_metadata_permit(bucket, permit)?;
+    let partition_precondition =
+        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let _mutation_guard = core_store
+        .acquire_object_metadata_mutation_lock(bucket)
+        .await?;
+    let scope_partition = hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id));
+    let explicit_transaction = match transaction_principal {
+        Some(transaction_principal) => {
+            let transaction = core_store
+                .read_explicit_transaction_for_principal(transaction_id, transaction_principal)
+                .await?;
+            if transaction.root_anchor_key != scope_partition {
+                bail!("object metadata explicit transaction scope mismatch");
+            }
+            Some(transaction)
+        }
+        None => None,
+    };
+    let committed_by_principal = explicit_transaction
+        .as_ref()
+        .map(|transaction| transaction.committed_by_principal.clone())
+        .unwrap_or_else(|| object_metadata_partition_principal(bucket));
+
+    let metadata_stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
+    let metadata_stream_precondition = core_store
+        .stream_head_precondition_visible_to_transaction(
+            &metadata_stream_id,
+            explicit_transaction.as_ref(),
+        )
+        .await?;
+    let watch_stream_id = watch_log::object_watch_stream_id(bucket.tenant_id, bucket.id);
+    let watch_stream_precondition = core_store
+        .stream_head_precondition_visible_to_transaction(
+            &watch_stream_id,
+            explicit_transaction.as_ref(),
+        )
+        .await?;
+    let first_watch_sequence = stream_precondition_next_sequence(&watch_stream_precondition)?;
+
+    let mut preconditions = vec![
+        partition_precondition,
+        metadata_stream_precondition,
+        watch_stream_precondition,
+    ];
+    let mut operations = Vec::with_capacity(objects.len() * 16);
+    for (index, object) in objects.iter().enumerate() {
+        let projection = core_store
+            .prepare_object_metadata_projection(
+                bucket,
+                object,
+                ObjectMetadataProjectionMutation::Upsert,
+                &scope_partition,
+                transaction_id,
+                explicit_transaction.as_ref(),
+            )
+            .await?;
+        let event = object_watch_event(bucket, object, ObjectJournalMutation::Put);
+        let sequence = first_watch_sequence
+            .checked_add(index as u64)
+            .ok_or_else(|| anyhow!("object watch stream sequence overflow"))?;
+        let watch = watch_log::prepare_object_watch_append_at_sequence(
+            bucket,
+            object,
+            &event,
+            &scope_partition,
+            &core_meta_root_key_hash(&scope_partition),
+            Some(projection.root_generation),
+            transaction_id,
+            sequence,
+            None,
+        )?;
+        preconditions.extend(watch.preconditions);
+        operations.push(CoreMutationOperation::StreamAppend {
+            partition_id: scope_partition.clone(),
+            stream_id: metadata_stream_id.clone(),
+            record_kind: ObjectJournalMutation::Put.object_record_kind().to_string(),
+            payload: encode_object_version_body(&object_version_body(
+                bucket,
+                object,
+                ObjectJournalMutation::Put,
+                permit.fence_token,
+            ))?,
+            idempotency_key: Some(format!("object-metadata:{}:put", object.mutation_id)),
+        });
+        operations.extend(watch.operations);
+        operations.extend(projection.operations);
+    }
+    preconditions.append(&mut additions.preconditions);
+    operations.append(&mut additions.operations);
+    let operations = coalesce_coremeta_operations_last_write_wins(operations);
+    let mut root_publications = vec![CoreMutationRootPublication {
+        root_anchor_key: scope_partition.clone(),
+        writer_families: vec![
+            WriterFamily::CoreControl.as_str().to_string(),
+            WriterFamily::ObjectBlob.as_str().to_string(),
+        ],
+        transaction_coordinator: true,
+    }];
+    for publication in additions.root_publications {
+        if publication.transaction_coordinator {
+            bail!("object metadata batch addition cannot replace the coordinator root");
+        }
+        if root_publications
+            .iter()
+            .any(|current| current.root_anchor_key == publication.root_anchor_key)
+        {
+            bail!("object metadata batch addition duplicates a root publication");
+        }
+        root_publications.push(publication);
+    }
+    let batch = CoreMutationBatch {
+        transaction_id: transaction_id.to_string(),
+        scope_partition,
+        committed_by_principal,
+        root_publications,
+        preconditions,
+        operations,
+    };
+    let receipt = if explicit_transaction.is_some() {
+        core_store.stage_explicit_transaction_batch(batch).await?
+    } else {
+        core_store.commit_mutation_batch(batch).await?
+    };
+    let expected_state = if explicit_transaction.is_some() {
+        CoreTransactionState::Open
+    } else {
+        CoreTransactionState::Committed
+    };
+    if receipt.state != expected_state {
+        bail!(
+            "object metadata mutation batch did not reach expected state {expected_state:?}: {}",
+            receipt
+                .finalisation_error
+                .as_deref()
+                .unwrap_or("unknown finalisation error")
+        );
+    }
+    require_stream_update(&receipt.visible_updates, &metadata_stream_id)?;
+    require_stream_update(&receipt.visible_updates, &watch_stream_id)?;
+    Ok(())
+}
+
+fn coalesce_coremeta_operations_last_write_wins(
+    operations: Vec<CoreMutationOperation>,
+) -> Vec<CoreMutationOperation> {
+    let mut last_coremeta_operation =
+        std::collections::BTreeMap::<(String, u16, Vec<u8>), usize>::new();
+    for (index, operation) in operations.iter().enumerate() {
+        let key = match operation {
+            CoreMutationOperation::CoreMetaPut {
+                cf,
+                table_id,
+                tuple_key,
+                ..
+            }
+            | CoreMutationOperation::CoreMetaDelete {
+                cf,
+                table_id,
+                tuple_key,
+                ..
+            } => Some((cf.clone(), *table_id, tuple_key.clone())),
+            CoreMutationOperation::StreamAppend { .. } => None,
+        };
+        if let Some(key) = key {
+            last_coremeta_operation.insert(key, index);
+        }
+    }
+
+    operations
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, operation)| {
+            let keep = match &operation {
+                CoreMutationOperation::CoreMetaPut {
+                    cf,
+                    table_id,
+                    tuple_key,
+                    ..
+                }
+                | CoreMutationOperation::CoreMetaDelete {
+                    cf,
+                    table_id,
+                    tuple_key,
+                    ..
+                } => last_coremeta_operation
+                    .get(&(cf.clone(), *table_id, tuple_key.clone()))
+                    .is_some_and(|last_index| *last_index == index),
+                CoreMutationOperation::StreamAppend { .. } => true,
+            };
+            keep.then_some(operation)
+        })
+        .collect()
+}
+
+fn stream_precondition_next_sequence(precondition: &CoreMutationPrecondition) -> Result<u64> {
+    let CoreMutationPrecondition::StreamHead {
+        expected_last_sequence,
+        ..
+    } = precondition
+    else {
+        bail!("object stream precondition has wrong kind");
+    };
+    expected_last_sequence
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("object stream sequence overflow"))
 }
 
 pub(super) async fn append_object_mutation_inner(

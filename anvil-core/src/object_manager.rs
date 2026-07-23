@@ -2,9 +2,9 @@ use crate::{
     access_control, auth, bucket_journal,
     core_store::{
         AppendStreamRecord as CoreAppendStreamRecord, AuthzScopeRef, CoreBoundarySchema,
-        CoreBoundarySource, CoreBoundaryValue, CoreByteRange, CoreManifestLocator, CoreObjectRef,
-        CorePrefetchPolicy, CoreStore, GetBlob, PutBlob, SealStreamSegment,
-        WriteLogicalFilePathRequest, WriteLogicalFileRequest,
+        CoreBoundarySource, CoreBoundaryValue, CoreByteRange, CoreManifestLocator,
+        CoreMutationPrecondition, CoreObjectRef, CorePrefetchPolicy, CoreStore, CoreTransaction,
+        GetBlob, PutBlob, SealStreamSegment, WriteLogicalFilePathRequest, WriteLogicalFileRequest,
         core_object_ref_from_logical_file_write, decode_core_object_ref_target,
         decode_manifest_locator_proto, encode_core_object_ref_target,
         encode_manifest_locator_proto,
@@ -38,7 +38,9 @@ use tonic::Status;
 use tonic::metadata::MetadataValue;
 use tracing::info;
 
+mod batch_write;
 mod write_visibility;
+pub(crate) use batch_write::ObjectBatchPut;
 pub use write_visibility::{
     AuthzMaterializationVisibility, AuthzRevisionVisibility, BoundaryExtractionVisibility,
     IndexMaintenanceVisibility, IndexPolicySnapshotVisibility, ObjectWriteOptions,
@@ -154,6 +156,11 @@ pub fn transaction_principal_from_claims(claims: &auth::Claims) -> String {
 pub struct ObjectHeadResult {
     pub object: Object,
     pub followed_link: Option<object_links::FollowedObjectLink>,
+}
+
+pub(crate) struct ObjectMutationPreconditionSnapshot {
+    pub(crate) object: Option<Object>,
+    pub(crate) precondition: CoreMutationPrecondition,
 }
 
 #[derive(Debug, Clone)]

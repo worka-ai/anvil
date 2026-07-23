@@ -11,7 +11,7 @@ use crate::{
     bucket_journal::{self, BucketJournalMutation},
     config::Config,
     control_journal,
-    core_store::{CoreObjectRef, CoreStore},
+    core_store::{CoreMutationBatchAdditions, CoreObjectRef, CoreStore},
     directory_repair,
     embedding_provider::EmbeddingProviderRegistry,
     hf_journal, index_builder, index_diagnostic_journal, index_journal, index_repair,
@@ -624,6 +624,7 @@ mod tenancy;
 
 use helpers::*;
 pub use index_definition_lifecycle::{IndexDefinitionMutation, IndexDefinitionMutationOutcome};
+pub(crate) use objects::ObjectBatchCreateInput;
 pub use objects::ObjectCreateOptions;
 
 #[cfg(test)]

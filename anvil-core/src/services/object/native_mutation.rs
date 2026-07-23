@@ -185,18 +185,41 @@ pub(super) async fn enforce_native_mutation_precondition(
     context: Option<&NativeMutationContext>,
     action: AnvilAction,
 ) -> Result<(), Status> {
+    prepare_native_mutation_precondition(
+        state,
+        claims,
+        bucket_name,
+        object_key,
+        context,
+        action,
+        None,
+    )
+    .await
+    .map(|_| ())
+}
+
+pub(super) async fn prepare_native_mutation_precondition(
+    state: &AppState,
+    claims: &auth::Claims,
+    bucket_name: &str,
+    object_key: &str,
+    context: Option<&NativeMutationContext>,
+    action: AnvilAction,
+    transaction: Option<&crate::core_store::CoreTransaction>,
+) -> Result<Option<crate::core_store::CoreMutationPrecondition>, Status> {
     let context =
         context.ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?;
     let precondition = parse_native_mutation_precondition(&context.precondition)?;
     if matches!(precondition, NativeMutationPrecondition::None) {
-        return Ok(());
+        return Ok(None);
     }
 
-    let current = state
+    let snapshot = state
         .object_manager
-        .current_object_for_mutation_precondition(claims, bucket_name, object_key, action)
+        .object_mutation_precondition_snapshot(claims, bucket_name, object_key, action, transaction)
         .await?;
-    let current = current
+    let current = snapshot
+        .object
         .as_ref()
         .filter(|object| object.deleted_at.is_none());
 
@@ -216,7 +239,7 @@ pub(super) async fn enforce_native_mutation_precondition(
             "Native mutation precondition failed",
         ));
     }
-    Ok(())
+    Ok(Some(snapshot.precondition))
 }
 
 pub(super) fn parse_native_mutation_precondition(

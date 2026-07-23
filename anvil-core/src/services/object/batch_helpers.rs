@@ -1,4 +1,5 @@
 use super::*;
+use crate::core_store::{CoreMutationPrecondition, CoreTransaction, CoreTransactionState};
 
 const MAX_MUTATION_BATCH_OPERATIONS: usize = 256;
 
@@ -7,58 +8,73 @@ pub(crate) async fn enforce_write_precondition(
     claims: &auth::Claims,
     precondition: Option<&WritePrecondition>,
 ) -> Result<(), Status> {
+    prepare_write_preconditions(state, claims, precondition, None)
+        .await
+        .map(|_| ())
+}
+
+pub(super) async fn prepare_write_preconditions(
+    state: &AppState,
+    claims: &auth::Claims,
+    precondition: Option<&WritePrecondition>,
+    transaction: Option<&CoreTransaction>,
+) -> Result<Vec<CoreMutationPrecondition>, Status> {
     let Some(precondition) = precondition else {
-        return Ok(());
+        return Ok(Vec::new());
     };
-    for object_precondition in &precondition.object_versions {
-        if object_precondition.bucket_name.trim().is_empty()
-            || object_precondition.object_key.trim().is_empty()
-        {
-            return Err(Status::invalid_argument(
-                "ObjectVersionPrecondition requires bucket_name and object_key",
-            ));
-        }
-        let expected_version_id =
-            parse_optional_version_id(object_precondition.expected_version_id.as_deref())?;
-        let head = state
-            .object_manager
-            .head_object(
-                Some(claims.clone()),
-                &object_precondition.bucket_name,
-                &object_precondition.object_key,
-                None,
-            )
-            .await;
-        match (
-            object_precondition.must_not_exist,
-            expected_version_id,
-            head,
-        ) {
-            (true, _, Ok(_)) => {
-                return Err(Status::failed_precondition(
-                    "ObjectVersionPreconditionFailed",
-                ));
-            }
-            (true, _, Err(status)) if status.code() == tonic::Code::NotFound => {}
-            (true, _, Err(status)) => return Err(status),
-            (false, Some(expected), Ok(object)) if object.version_id == expected => {}
-            (false, Some(_), Ok(_)) => {
-                return Err(Status::failed_precondition(
-                    "ObjectVersionPreconditionFailed",
-                ));
-            }
-            (false, Some(_), Err(status)) if status.code() == tonic::Code::NotFound => {
-                return Err(Status::failed_precondition(
-                    "ObjectVersionPreconditionFailed",
-                ));
-            }
-            (false, Some(_), Err(status)) => return Err(status),
-            (false, None, _) => {
+    let object_checks = precondition
+        .object_versions
+        .iter()
+        .map(|object_precondition| async move {
+            if object_precondition.bucket_name.trim().is_empty()
+                || object_precondition.object_key.trim().is_empty()
+            {
                 return Err(Status::invalid_argument(
-                    "ObjectVersionPrecondition requires expected_version_id or must_not_exist",
+                    "ObjectVersionPrecondition requires bucket_name and object_key",
                 ));
             }
-        }
+            let expected_version_id =
+                parse_optional_version_id(object_precondition.expected_version_id.as_deref())?;
+            let snapshot = state
+                .object_manager
+                .object_mutation_precondition_snapshot(
+                    claims,
+                    &object_precondition.bucket_name,
+                    &object_precondition.object_key,
+                    AnvilAction::ObjectRead,
+                    transaction,
+                )
+                .await;
+            match (
+                object_precondition.must_not_exist,
+                expected_version_id,
+                snapshot,
+            ) {
+                (true, _, Ok(snapshot)) if snapshot.object.is_none() => Ok(snapshot.precondition),
+                (true, _, Ok(_)) => Err(Status::failed_precondition(
+                    "ObjectVersionPreconditionFailed",
+                )),
+                (true, _, Err(status)) => Err(status),
+                (false, Some(expected), Ok(snapshot))
+                    if snapshot
+                        .object
+                        .as_ref()
+                        .is_some_and(|object| object.version_id == expected) =>
+                {
+                    Ok(snapshot.precondition)
+                }
+                (false, Some(_), Ok(_)) => Err(Status::failed_precondition(
+                    "ObjectVersionPreconditionFailed",
+                )),
+                (false, Some(_), Err(status)) => Err(status),
+                (false, None, _) => Err(Status::invalid_argument(
+                    "ObjectVersionPrecondition requires expected_version_id or must_not_exist",
+                )),
+            }
+        });
+    let mut durable_preconditions = Vec::with_capacity(precondition.object_versions.len() + 1);
+    for result in futures_util::future::join_all(object_checks).await {
+        durable_preconditions.push(result?);
     }
 
     if let Some(lease_fence) = precondition.lease_fence.as_ref() {
@@ -79,9 +95,46 @@ pub(crate) async fn enforce_write_precondition(
         if lease.expires_at_nanos <= current_time_nanos()? {
             return Err(Status::failed_precondition(task_lease::LEASE_EXPIRED));
         }
+        durable_preconditions.push(
+            state
+                .persistence
+                .named_task_lease_fenced_precondition(&lease, current_time_nanos()?)
+                .await
+                .map_err(lease_error_status)?,
+        );
     }
 
-    Ok(())
+    Ok(durable_preconditions)
+}
+
+pub(super) async fn mutation_precondition_transaction(
+    state: &AppState,
+    claims: &auth::Claims,
+    transaction_id: Option<&str>,
+) -> Result<Option<CoreTransaction>, Status> {
+    let Some(transaction_id) = transaction_id else {
+        return Ok(None);
+    };
+    let principal = crate::object_manager::transaction_principal_from_claims(claims);
+    let transaction = state
+        .core_store
+        .read_explicit_transaction_for_principal(transaction_id, &principal)
+        .await
+        .map_err(|error| {
+            transaction_core_store_status(&error.to_string())
+                .unwrap_or_else(|| Status::internal(error.to_string()))
+        })?;
+    match transaction.state {
+        CoreTransactionState::Open => Ok(Some(transaction)),
+        CoreTransactionState::Expired => Err(Status::failed_precondition("TransactionExpired")),
+        CoreTransactionState::RolledBack | CoreTransactionState::Aborted => {
+            Err(Status::failed_precondition("TransactionRolledBack"))
+        }
+        CoreTransactionState::Committed => {
+            Err(Status::failed_precondition("TransactionAlreadyCommitted"))
+        }
+        _ => Err(Status::failed_precondition("TransactionNotOpen")),
+    }
 }
 
 pub(super) fn validate_mutation_batch_operations(req: &MutationBatchRequest) -> Result<(), Status> {
@@ -214,11 +267,13 @@ pub(super) async fn validate_mutation_batch_authorization(
     Ok(())
 }
 
-pub(super) async fn enforce_mutation_batch_native_preconditions(
+pub(super) async fn prepare_mutation_batch_native_preconditions(
     state: &AppState,
     claims: &auth::Claims,
     req: &MutationBatchRequest,
-) -> Result<(), Status> {
+    transaction: Option<&CoreTransaction>,
+) -> Result<Vec<CoreMutationPrecondition>, Status> {
+    let mut preconditions = Vec::new();
     for operation in &req.operations {
         let Some(op) = operation.op.as_ref() else {
             continue;
@@ -242,17 +297,22 @@ pub(super) async fn enforce_mutation_batch_native_preconditions(
             mutation_batch_operation::Op::CheckpointTaskLease(_)
             | mutation_batch_operation::Op::CommitTaskLease(_) => continue,
         };
-        enforce_native_mutation_precondition(
+        if let Some(precondition) = prepare_native_mutation_precondition(
             state,
             claims,
             &req.bucket_name,
             object_key,
             req.mutation_context.as_ref(),
             action,
+            transaction,
         )
-        .await?;
+        .await?
+        {
+            preconditions.push(precondition);
+        }
     }
-    Ok(())
+    preconditions.dedup();
+    Ok(preconditions)
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]

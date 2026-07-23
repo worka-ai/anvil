@@ -86,6 +86,33 @@ pub(crate) async fn prepare_object_watch_append(
         .stream_head_precondition_visible_to_transaction(&stream_id, explicit_transaction)
         .await?;
     let sequence = next_sequence(&stream_precondition)?;
+    prepare_object_watch_append_at_sequence(
+        bucket,
+        object,
+        event,
+        scope_partition,
+        projection_root_key_hash,
+        projection_root_generation,
+        projection_transaction_id,
+        sequence,
+        Some(stream_precondition),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_object_watch_append_at_sequence(
+    bucket: &Bucket,
+    object: &Object,
+    event: &ObjectWatchEvent,
+    scope_partition: &str,
+    projection_root_key_hash: &str,
+    projection_root_generation: Option<u64>,
+    projection_transaction_id: &str,
+    sequence: u64,
+    stream_precondition: Option<CoreMutationPrecondition>,
+) -> Result<PreparedObjectWatchAppend> {
+    validate_event_scope(bucket, object, event)?;
+    let stream_id = object_watch_stream_id(bucket.tenant_id, bucket.id);
     let record = object_watch_record(bucket, object, event, sequence)?;
     let projection_common = object_watch_projection_common(
         event,
@@ -106,17 +133,16 @@ pub(crate) async fn prepare_object_watch_append(
         scope_partition,
         projection_common,
     )?);
+    let mut preconditions = stream_precondition.into_iter().collect::<Vec<_>>();
+    preconditions.push(projection::absent_precondition(
+        bucket.tenant_id,
+        bucket.id,
+        object.version_id,
+        object.mutation_id,
+    )?);
     Ok(PreparedObjectWatchAppend {
-        stream_id: stream_id.clone(),
-        preconditions: vec![
-            stream_precondition,
-            projection::absent_precondition(
-                bucket.tenant_id,
-                bucket.id,
-                object.version_id,
-                object.mutation_id,
-            )?,
-        ],
+        stream_id,
+        preconditions,
         operations,
     })
 }

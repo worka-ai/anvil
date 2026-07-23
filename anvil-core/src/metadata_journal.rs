@@ -1860,6 +1860,8 @@ pub(crate) use self::object_mutation::append_object_mutation;
 use self::object_mutation::append_object_mutation_inner;
 pub(crate) use self::object_mutation::{
     append_object_mutation_with_permit, append_object_mutation_with_permit_in_transaction,
+    append_object_put_mutations_with_permit_in_transaction,
+    commit_object_put_mutations_with_permit,
 };
 
 mod transaction_projection;

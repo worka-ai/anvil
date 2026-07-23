@@ -61,19 +61,34 @@ pub async fn materialize_committed_object_metadata_transaction(
             | ObjectJournalMutation::DeleteMarker => ObjectMetadataProjectionMutation::Upsert,
             ObjectJournalMutation::DeleteVersion => ObjectMetadataProjectionMutation::DeleteVersion,
         };
-        core_store
-            .materialize_object_metadata_ancillary_projections(
-                &bucket,
-                &object,
-                projection_mutation,
-            )
-            .await?;
         materialized.push(CommittedObjectMetadataProjection {
             bucket,
             object,
             event_type: mutation.watch_event_name(),
             is_delete_marker: mutation.is_delete_marker(),
+            ancillary_mutation: projection_mutation,
         });
+    }
+
+    if !materialized.is_empty() {
+        let projections = materialized
+            .iter()
+            .map(|projection| {
+                (
+                    &projection.bucket,
+                    &projection.object,
+                    projection.ancillary_mutation,
+                )
+            })
+            .collect::<Vec<_>>();
+        let ancillary_transaction_id =
+            format!("object-metadata-ancillary:{}", transaction.transaction_id);
+        core_store
+            .materialize_object_metadata_ancillary_projection_batch(
+                &ancillary_transaction_id,
+                &projections,
+            )
+            .await?;
     }
     Ok(materialized)
 }
@@ -92,4 +107,5 @@ pub struct CommittedObjectMetadataProjection {
     pub object: Object,
     pub event_type: &'static str,
     pub is_delete_marker: bool,
+    ancillary_mutation: ObjectMetadataProjectionMutation,
 }

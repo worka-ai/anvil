@@ -9,6 +9,22 @@ pub struct ObjectCreateOptions {
     pub(crate) journal_mutation: metadata_journal::ObjectJournalMutation,
 }
 
+pub(crate) struct ObjectBatchCreateInput {
+    pub key: String,
+    pub content_hash: String,
+    pub size: i64,
+    pub etag: String,
+    pub content_type: Option<String>,
+    pub user_meta: Option<JsonValue>,
+    pub shard_map: JsonValue,
+    pub storage_class: String,
+}
+
+pub(crate) struct PreparedObjectBatchCreate {
+    pub bucket: Bucket,
+    pub objects: Vec<Object>,
+}
+
 impl ObjectCreateOptions {
     pub fn deferred() -> Self {
         Self {
@@ -53,6 +69,194 @@ fn deferred_index_policy_snapshot_hash(tenant_id: i64, bucket_id: i64) -> String
 }
 
 impl Persistence {
+    pub(crate) async fn create_objects_with_storage_class_in_transaction(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        inputs: Vec<ObjectBatchCreateInput>,
+        transaction_id: &str,
+        transaction_principal: &str,
+        options: ObjectCreateOptions,
+        additions: CoreMutationBatchAdditions,
+    ) -> Result<Vec<Object>> {
+        let prepared = self
+            .prepare_objects_with_storage_class_in_transaction(
+                tenant_id,
+                bucket_id,
+                inputs,
+                transaction_id,
+                options,
+            )
+            .await?;
+        self.stage_prepared_objects_in_transaction(
+            prepared,
+            transaction_id,
+            transaction_principal,
+            additions,
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_objects_with_storage_class_in_transaction(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        inputs: Vec<ObjectBatchCreateInput>,
+        transaction_id: &str,
+        options: ObjectCreateOptions,
+    ) -> Result<PreparedObjectBatchCreate> {
+        self.prepare_objects_with_storage_class_inner(
+            tenant_id,
+            bucket_id,
+            inputs,
+            Some(transaction_id),
+            options,
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_objects_with_storage_class(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        inputs: Vec<ObjectBatchCreateInput>,
+        options: ObjectCreateOptions,
+    ) -> Result<PreparedObjectBatchCreate> {
+        self.prepare_objects_with_storage_class_inner(tenant_id, bucket_id, inputs, None, options)
+            .await
+    }
+
+    async fn prepare_objects_with_storage_class_inner(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        inputs: Vec<ObjectBatchCreateInput>,
+        transaction_id: Option<&str>,
+        options: ObjectCreateOptions,
+    ) -> Result<PreparedObjectBatchCreate> {
+        if inputs.is_empty() {
+            return Err(anyhow!("object batch must not be empty"));
+        }
+        let bucket = bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id)
+            .await?
+            .ok_or_else(|| anyhow!("bucket not found"))?;
+        if bucket.tenant_id != tenant_id {
+            return Err(anyhow!("bucket does not belong to tenant"));
+        }
+        let index_policy_snapshot = if options.exact_index_policy_snapshot {
+            self.active_index_policy_snapshot_hash(tenant_id, bucket_id)
+                .await?
+        } else {
+            deferred_index_policy_snapshot_hash(tenant_id, bucket_id)
+        };
+        let authz_revision = if options.exact_authz_revision {
+            self.latest_authz_revision(tenant_id).await?
+        } else {
+            0
+        };
+        let core_store = CoreStore::new(self.storage.clone()).await?;
+        let first_object_id = core_store
+            .next_object_metadata_id_in_transaction(&bucket, transaction_id)
+            .await?;
+        let mut objects = Vec::with_capacity(inputs.len());
+        for (index, input) in inputs.into_iter().enumerate() {
+            let offset = i64::try_from(index).map_err(|_| anyhow!("object batch exceeds i64"))?;
+            let id = first_object_id
+                .checked_add(offset)
+                .ok_or_else(|| anyhow!("object id overflow"))?;
+            let version_id = uuid::Uuid::new_v4();
+            let mutation_id = uuid::Uuid::new_v4();
+            let user_metadata_hash = user_metadata_hash(input.user_meta.as_ref());
+            let record_hash = object_version_record_hash(ObjectVersionRecordHashInput {
+                tenant_id,
+                bucket_id,
+                key: &input.key,
+                version_id,
+                mutation_id,
+                content_hash: &input.content_hash,
+                size: input.size,
+                etag: &input.etag,
+                content_type: input.content_type.as_deref(),
+                storage_class: Some(&input.storage_class),
+                user_metadata_hash: &user_metadata_hash,
+                index_policy_snapshot: &index_policy_snapshot,
+                authz_revision,
+                delete_marker: false,
+            });
+            objects.push(Object {
+                id,
+                tenant_id,
+                bucket_id,
+                key: input.key,
+                kind: object_links::ObjectEntryKind::Blob,
+                content_hash: input.content_hash,
+                size: input.size,
+                etag: input.etag,
+                content_type: input.content_type,
+                version_id,
+                mutation_id,
+                index_policy_snapshot: index_policy_snapshot.clone(),
+                user_metadata_hash,
+                authz_revision,
+                record_hash,
+                created_at: Utc::now(),
+                deleted_at: None,
+                storage_class: Some(input.storage_class),
+                user_meta: input.user_meta,
+                shard_map: Some(input.shard_map),
+                checksum: None,
+                link: None,
+            });
+        }
+        Ok(PreparedObjectBatchCreate { bucket, objects })
+    }
+
+    pub(crate) async fn commit_prepared_objects(
+        &self,
+        prepared: PreparedObjectBatchCreate,
+        transaction_id: &str,
+        additions: CoreMutationBatchAdditions,
+    ) -> Result<Vec<Object>> {
+        let permit = self
+            .object_metadata_write_permit(prepared.bucket.tenant_id, prepared.bucket.id)
+            .await?;
+        metadata_journal::commit_object_put_mutations_with_permit(
+            &self.storage,
+            &prepared.bucket,
+            &prepared.objects,
+            &permit,
+            &self.partition_owner_signing_key,
+            transaction_id,
+            additions,
+        )
+        .await?;
+        Ok(prepared.objects)
+    }
+
+    pub(crate) async fn stage_prepared_objects_in_transaction(
+        &self,
+        prepared: PreparedObjectBatchCreate,
+        transaction_id: &str,
+        transaction_principal: &str,
+        additions: CoreMutationBatchAdditions,
+    ) -> Result<Vec<Object>> {
+        let permit = self
+            .object_metadata_write_permit(prepared.bucket.tenant_id, prepared.bucket.id)
+            .await?;
+        metadata_journal::append_object_put_mutations_with_permit_in_transaction(
+            &self.storage,
+            &prepared.bucket,
+            &prepared.objects,
+            &permit,
+            &self.partition_owner_signing_key,
+            transaction_id,
+            transaction_principal,
+            additions,
+        )
+        .await?;
+        Ok(prepared.objects)
+    }
+
     pub async fn create_object(
         &self,
         tenant_id: i64,

@@ -458,6 +458,20 @@ impl Persistence {
         .await
     }
 
+    pub(crate) async fn named_task_lease_fenced_precondition(
+        &self,
+        lease: &task_lease::TaskLease,
+        now_nanos: i64,
+    ) -> Result<crate::core_store::CoreMutationPrecondition> {
+        task_lease::task_lease_fenced_precondition(
+            &self.storage,
+            lease,
+            now_nanos,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
     pub async fn read_expected_named_task_lease(
         &self,
         authenticated_owner: &task_lease::TaskLeaseOwner,

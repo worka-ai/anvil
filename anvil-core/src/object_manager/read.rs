@@ -1138,6 +1138,38 @@ impl ObjectManager {
             .map_err(|e| Status::internal(e.to_string()))
     }
 
+    pub(crate) async fn object_mutation_precondition_snapshot(
+        &self,
+        claims: &auth::Claims,
+        bucket_name: &str,
+        object_key: &str,
+        action: AnvilAction,
+        explicit_transaction: Option<&CoreTransaction>,
+    ) -> Result<ObjectMutationPreconditionSnapshot, Status> {
+        // Reuse the public mutation authorization path, then capture the exact
+        // metadata row that must remain unchanged until transaction publication.
+        self.current_object_for_mutation_precondition(claims, bucket_name, object_key, action)
+            .await?;
+        let bucket = self
+            .get_tenant_bucket(claims.tenant_id, bucket_name)
+            .await?;
+        let transaction = explicit_transaction.filter(|transaction| {
+            transaction.root_anchor_key
+                == hex::encode(crate::metadata_journal::object_metadata_partition_id(
+                    bucket.tenant_id,
+                    bucket.id,
+                ))
+        });
+        let snapshot = self
+            .core_store
+            .object_metadata_precondition_snapshot(&bucket, object_key, transaction)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(ObjectMutationPreconditionSnapshot {
+            object: snapshot.object,
+            precondition: snapshot.precondition,
+        })
+    }
+
     pub async fn copy_object(
         &self,
         claims: auth::Claims,
