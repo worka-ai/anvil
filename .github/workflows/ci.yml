@@ -288,7 +288,10 @@ jobs:
 
   docker-integration:
     name: Docker integration tests (${{ matrix.group }})
-    needs: [build-image, server-core]
+    # Docker/distributed validation only consumes the test image. Keep it on an
+    # independent lane so it can run alongside Rust, performance, and
+    # server-core validation instead of waiting for that entire chain.
+    needs: build-image
     runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 120
     env:
