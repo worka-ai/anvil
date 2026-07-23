@@ -612,6 +612,7 @@ async fn performance_native_api_smoke() {
                         transaction_id: unique_test_name("perf-coremeta"),
                         scope_partition: "perf".to_string(),
                         committed_by_principal: "perf-principal".to_string(),
+                        root_publications: vec![],
                         preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
                             cf: CF_INLINE_PAYLOADS.to_string(),
                             table_id: TABLE_INLINE_PAYLOAD_ROW,
@@ -663,6 +664,7 @@ async fn performance_native_api_smoke() {
                         transaction_id: unique_test_name("perf-batch"),
                         scope_partition: "perf".to_string(),
                         committed_by_principal: "perf-principal".to_string(),
+                        root_publications: vec![],
                         preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
                             cf: CF_INLINE_PAYLOADS.to_string(),
                             table_id: TABLE_INLINE_PAYLOAD_ROW,
