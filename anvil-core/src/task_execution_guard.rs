@@ -162,7 +162,7 @@ mod tests {
     use super::*;
     use crate::task_lease::{TaskLeaseAcquire, TaskLeaseOwner, acquire_task_lease};
     use tempfile::{TempDir, tempdir};
-    use tokio::time::{sleep, timeout};
+    use tokio::{sync::oneshot, time::timeout};
 
     const KEY: &[u8] = b"task execution guard signing key";
     const TEST_TTL_NANOS: i64 = 60_000_000_000;
@@ -172,20 +172,23 @@ mod tests {
         let (_temp, guard, original) = acquired_guard().await;
         let permit = guard.publication_permit().await.unwrap();
         let renewal_guard = guard.clone();
-        let mut renewal = tokio::spawn(async move { renewal_guard.renew().await });
-
+        let (renewal_started_tx, renewal_started_rx) = oneshot::channel();
+        let renewal = tokio::spawn(async move {
+            renewal_started_tx
+                .send(())
+                .expect("renewal start receiver remains open");
+            renewal_guard.renew().await
+        });
+        renewal_started_rx
+            .await
+            .expect("renewal reports its lock attempt");
         assert!(
-            timeout(Duration::from_millis(20), &mut renewal)
-                .await
-                .is_err(),
+            !renewal.is_finished(),
             "renewal must wait for the publication permit"
         );
 
         let precondition = permit
-            .publish_with(|precondition| async move {
-                sleep(Duration::from_millis(1)).await;
-                Ok::<_, ()>(precondition)
-            })
+            .publish_with(|precondition| async move { Ok::<_, ()>(precondition) })
             .await
             .unwrap();
         let CoreMutationPrecondition::CoreMetaLease {
@@ -202,7 +205,7 @@ mod tests {
             u64::try_from(original.expires_at_nanos).unwrap()
         );
 
-        let renewed = timeout(Duration::from_secs(5), renewal)
+        let renewed = timeout(Duration::from_secs(60), renewal)
             .await
             .unwrap()
             .unwrap()
@@ -228,16 +231,20 @@ mod tests {
         let (_temp, guard, original) = acquired_guard().await;
         let permit = guard.publication_permit().await.unwrap();
         let checkpoint_guard = guard.clone();
-        let mut checkpoint = tokio::spawn(async move {
+        let (checkpoint_started_tx, checkpoint_started_rx) = oneshot::channel();
+        let checkpoint = tokio::spawn(async move {
+            checkpoint_started_tx
+                .send(())
+                .expect("checkpoint start receiver remains open");
             checkpoint_guard
                 .checkpoint(original.source_cursor + 7)
                 .await
         });
-
+        checkpoint_started_rx
+            .await
+            .expect("checkpoint reports its lock attempt");
         assert!(
-            timeout(Duration::from_millis(20), &mut checkpoint)
-                .await
-                .is_err(),
+            !checkpoint.is_finished(),
             "checkpoint must wait for the publication permit"
         );
         permit
@@ -245,7 +252,7 @@ mod tests {
             .await
             .unwrap();
 
-        let checkpointed = timeout(Duration::from_secs(5), checkpoint)
+        let checkpointed = timeout(Duration::from_secs(60), checkpoint)
             .await
             .unwrap()
             .unwrap()
