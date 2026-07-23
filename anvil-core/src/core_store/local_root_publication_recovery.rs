@@ -883,9 +883,20 @@ impl CoreStore {
         // reject a value which the register has already committed.
         let (publication_guards, guard_context) =
             self.acquire_publication_intent_locks(intent).await?;
-        let current_intent = self
-            .read_root_publication_intent(&intent.transaction_id)?
-            .ok_or_else(|| anyhow!("CoreMeta publication intent disappeared before commit"))?;
+        let Some(current_intent) = self.read_root_publication_intent(&intent.transaction_id)?
+        else {
+            // A foreground retry can finish and clear the intent while a
+            // recovery worker waits for the same publication locks. Treat
+            // disappearance as success only when every durable root proves
+            // that this exact transaction committed.
+            if self
+                .completed_publication_matches_intent(intent, &outcomes)
+                .await?
+            {
+                return Ok(outcomes);
+            }
+            bail!("CoreMeta publication intent disappeared before commit");
+        };
         if !publication_intent_retry_matches(&current_intent, intent)?
             || current_intent.state != intent.state
             || current_intent.terminal_reason != intent.terminal_reason

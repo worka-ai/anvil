@@ -595,6 +595,15 @@ async fn exact_retry_reuses_persisted_generation_after_root_has_advanced() {
             .is_none()
     );
 
+    // A recovery worker may have read the recorded intent before the
+    // foreground publisher completed, then acquire the root lock after the
+    // foreground path has cleared it. Durable completion makes that replay a
+    // successful no-op rather than a recovery-readiness failure.
+    store
+        .resume_root_publication_intent_for_recovery(durable_intent.clone())
+        .await
+        .unwrap();
+
     // Model a lost cleanup acknowledgement: the durable plan is visible to a
     // late exact retry even though the root already reached that generation.
     store
