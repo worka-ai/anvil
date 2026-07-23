@@ -263,13 +263,23 @@ async fn proxy_native_put(
             "native proxy idempotency identity does not match its routing header",
         ));
     }
-    let response = crate::services::object::execute_native_put(
-        state,
-        original_claims,
-        metadata,
-        stream.map(native_proxy_data_chunk),
-    )
-    .await?;
+    // A routed write is already detached from its original client connection.
+    // Give the durable mutation its own task boundary as well: this keeps the
+    // large authorization/storage future chain off the proxy RPC stack and
+    // lets an admitted idempotent mutation finish if the forwarding peer loses
+    // its response connection.
+    let state = state.clone();
+    let response = tokio::spawn(async move {
+        crate::services::object::execute_native_put(
+            &state,
+            original_claims,
+            metadata,
+            stream.map(native_proxy_data_chunk),
+        )
+        .await
+    })
+    .await
+    .map_err(|error| Status::internal(format!("native proxy task failed: {error}")))??;
     unary_proxy_response(header.request_id, 200, true, Vec::new(), Some(response))
 }
 
