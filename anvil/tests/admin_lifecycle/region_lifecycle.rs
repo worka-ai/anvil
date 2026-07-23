@@ -430,7 +430,10 @@ async fn admin_region_drain_applies_bucket_dispositions_and_exceptions() {
                 node_id: local_node_id.clone(),
                 region: "eu-west-1".to_string(),
                 cell_id: "cell-a".to_string(),
-                receipt_signing_public_key: test_receipt_signing_public_key(),
+                receipt_signing_public_key: node
+                    .state
+                    .core_store
+                    .local_receipt_signing_public_key(),
                 public_api_addr: "http://127.0.0.1:50051".to_string(),
                 capabilities: vec![1, 6],
                 capacity_json: "{}".to_string(),

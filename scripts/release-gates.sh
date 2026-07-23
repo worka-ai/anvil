@@ -112,8 +112,14 @@ rust_unit_gates() {
 }
 
 server_core_integration_gates() {
+  # Each admin lifecycle test starts an isolated server and durable metadata
+  # store. Running those fixtures concurrently causes severe RocksDB and
+  # background-worker contention, making the suite slower rather than faster.
+  run_step "server integration admin_lifecycle" \
+    cargo test --no-fail-fast -p anvil-server --test admin_lifecycle \
+    -- --nocapture --test-threads=1
+
   local tests=(
-    admin_lifecycle
     corestore_conformance
     corestore_conformance_durable_families
     corestore_conformance_rfc0007_byte_pipeline
