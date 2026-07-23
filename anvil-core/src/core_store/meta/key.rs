@@ -324,6 +324,56 @@ mod tests {
     }
 
     #[test]
+    fn raw_nul_bytes_round_trip_through_the_canonical_escape_encoding() {
+        let values = [
+            vec![0],
+            vec![0, 0],
+            vec![b'a', 0, b'b'],
+            vec![0, 0xff, 0],
+            (0..=u8::MAX).collect::<Vec<_>>(),
+        ];
+
+        for value in values {
+            let encoded = core_meta_tuple_key(&[CoreMetaTuplePart::Raw(value.as_slice())]).unwrap();
+            let (decoded, next_offset) = decode_escaped_value(&encoded, 1).unwrap();
+
+            assert_eq!(decoded, value);
+            assert_eq!(next_offset, encoded.len());
+            validate_core_meta_tuple_key(&encoded).unwrap();
+        }
+    }
+
+    #[test]
+    fn raw_nul_bytes_preserve_complete_tuple_prefixes() {
+        let prefix = core_meta_tuple_key(&[CoreMetaTuplePart::Raw(b"tenant\0bucket")]).unwrap();
+        let descendant = core_meta_tuple_key(&[
+            CoreMetaTuplePart::Raw(b"tenant\0bucket"),
+            CoreMetaTuplePart::U64(42),
+        ])
+        .unwrap();
+
+        assert!(descendant.starts_with(&prefix));
+    }
+
+    #[test]
+    fn length_delimited_tuple_shape_is_not_canonical_escape_encoding() {
+        let value = b"tenant\0bucket";
+        let mut length_delimited = Vec::new();
+        length_delimited.extend_from_slice(&1_u16.to_le_bytes());
+        length_delimited.push(KIND_RAW);
+        length_delimited.push(0);
+        length_delimited.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        length_delimited.extend_from_slice(value);
+
+        let error = validate_core_meta_tuple_key(&length_delimited).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("variable part has an invalid NUL escape")
+        );
+    }
+
+    #[test]
     fn signed_and_unsigned_integer_encodings_preserve_order() {
         let signed = [i64::MIN, -9, -1, 0, 1, 9, i64::MAX];
         let signed_keys =

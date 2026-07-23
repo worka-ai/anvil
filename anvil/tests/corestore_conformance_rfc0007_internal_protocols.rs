@@ -126,6 +126,7 @@ fn native_gateway_stream_registry_boundary_and_mesh_services_are_declared() {
 fn internal_block_coremeta_and_root_services_are_registered_without_string_dispatch() {
     let services = workspace_file("anvil-core/src/services/mod.rs");
     let internal = workspace_file("anvil-core/src/services/corestore_internal.rs");
+    let internal_auth = workspace_file("anvil-core/src/services/internal_proxy.rs");
 
     assert_contains_all(
         "registered CoreStore internal services",
@@ -151,14 +152,18 @@ fn internal_block_coremeta_and_root_services_are_registered_without_string_dispa
             "impl AntiEntropyInternal for AppState",
             "impl CrossRegionProxyInternal for AppState",
             "put_internal_shard(CoreInternalPutShard",
-            "coremeta_commit_evidence_encoded_row(",
-            "write_coremeta_encoded_rows(&rows)",
-            "catch_up_coremeta_rows(",
-            "compare_and_swap_internal_root_anchor(",
+            "coremeta_commit_evidence_encoded_row_at(",
+            "write_coremeta_encoded_rows(&borrowed)",
+            "catch_up_coremeta_generation_history(",
+            "compare_and_swap_internal_root_anchor_from_register_quorum(",
             "validate_commit_evidence_with_verifier(",
             "ensure_internal_node_request",
-            "system realm manage_nodes relation required",
         ],
+    );
+    assert_contains_all(
+        "CoreStore internal service authorisation",
+        &internal_auth,
+        &["system realm manage_nodes relation required"],
     );
     assert_contains_none(
         "CoreStore internal service placeholders",
@@ -237,7 +242,7 @@ fn root_register_persists_through_coremeta_not_sidecar_files() {
             "TABLE_ROOT_CACHE_ROW",
             "root_anchor_generation_key",
             "root_cache_key",
-            "commit_coremeta_batch_by_embedded_roots",
+            "commit_coremeta_root_groups",
         ],
     );
     assert_contains_none(
