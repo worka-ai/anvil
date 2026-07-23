@@ -47,6 +47,10 @@ async fn spawn_admin_node() -> AdminNode {
         storage_path: storage_path.to_string_lossy().into_owned(),
         personaldb_snapshot_entry_threshold: 1024,
         personaldb_snapshot_payload_bytes_threshold: 64 * 1024 * 1024,
+        // These tests exercise synchronous administrative lifecycle APIs.
+        // Background task execution is covered separately and would leave
+        // detached workers competing across the nodes created by this binary.
+        run_background_worker: false,
         ..anvil::config::Config::default()
     };
 
