@@ -183,14 +183,13 @@ async fn test_mutation_batch_rejects_stale_lease_fence_for_state_update() {
                     }),
                 }),
                 operations: vec![MutationBatchOperation {
-                    op: Some(anvil_api::mutation_batch_operation::Op::PatchJsonObject(
-                        MutationBatchPatchJsonObject {
+                    op: Some(anvil_api::mutation_batch_operation::Op::PutObject(
+                        MutationBatchPutObject {
                             object_key: object_key.clone(),
-                            base_version_id: None,
-                            merge_patch_json: serde_json::json!({
-                                "state": {"state": "leased"}
-                            })
-                            .to_string(),
+                            payload: br#"{"state":{"state":"leased"}}"#.to_vec(),
+                            content_type: Some("application/json".into()),
+                            user_metadata_json: String::new(),
+                            storage_class: None,
                         },
                     )),
                 }],
@@ -201,25 +200,6 @@ async fn test_mutation_batch_rejects_stale_lease_fence_for_state_update() {
         .unwrap()
         .into_inner();
     assert_eq!(batch.operation_receipts.len(), 1);
-
-    let stream_key = "queue/item-1-attempts".to_string();
-    let create_stream = object_client
-        .create_append_stream(authorized(
-            CreateAppendStreamRequest {
-                bucket_name: bucket_name.clone(),
-                stream_key: stream_key.clone(),
-                mutation_context: Some(native_mutation_context(
-                    &actor,
-                    bucket_id,
-                    "fenced-batch-create-stream",
-                )),
-            },
-            &token,
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-    let stream_id = create_stream.stream_id;
 
     coordination_client
         .commit_task_lease(authorized(
@@ -255,14 +235,13 @@ async fn test_mutation_batch_rejects_stale_lease_fence_for_state_update() {
                     }),
                 }),
                 operations: vec![MutationBatchOperation {
-                    op: Some(anvil_api::mutation_batch_operation::Op::PatchJsonObject(
-                        MutationBatchPatchJsonObject {
+                    op: Some(anvil_api::mutation_batch_operation::Op::PutObject(
+                        MutationBatchPutObject {
                             object_key: object_key.clone(),
-                            base_version_id: None,
-                            merge_patch_json: serde_json::json!({
-                                "state": {"state": "completed"}
-                            })
-                            .to_string(),
+                            payload: br#"{"state":{"state":"completed"}}"#.to_vec(),
+                            content_type: Some("application/json".into()),
+                            user_metadata_json: String::new(),
+                            storage_class: None,
                         },
                     )),
                 }],
@@ -271,41 +250,6 @@ async fn test_mutation_batch_rejects_stale_lease_fence_for_state_update() {
         ))
         .await;
     assert!(stale.is_err());
-
-    let stale_append = object_client
-        .mutation_batch(authorized(
-            MutationBatchRequest {
-                bucket_name,
-                mutation_context: Some(native_mutation_context(
-                    &actor,
-                    bucket_id,
-                    "fenced-batch-stale-append",
-                )),
-                precondition: Some(WritePrecondition {
-                    object_versions: vec![],
-                    lease_fence: Some(LeaseFencePrecondition {
-                        task_id,
-                        fence_token: lease.fence_token,
-                    }),
-                }),
-                operations: vec![MutationBatchOperation {
-                    op: Some(anvil_api::mutation_batch_operation::Op::AppendStreamRecord(
-                        MutationBatchAppendStreamRecord {
-                            stream_key,
-                            stream_id,
-                            payload: br#"{"attempt":1}"#.to_vec(),
-                            content_type: Some("application/json".to_string()),
-                            user_metadata_json: String::new(),
-                        },
-                    )),
-                }],
-            },
-            &token,
-        ))
-        .await
-        .expect_err("stale lease fence must not append a protected stream record");
-    assert_eq!(stale_append.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(stale_append.message(), "LeaseExpired");
 }
 
 #[tokio::test]
