@@ -30,7 +30,7 @@ impl RootPublicationIntent {
             .collect()
     }
 
-    fn transaction_deadline_elapsed(&self) -> Result<bool> {
+    pub(super) fn transaction_deadline_elapsed(&self) -> Result<bool> {
         let Some(guard) = self.guard.as_ref() else {
             return Ok(false);
         };
@@ -66,11 +66,27 @@ impl CoreStore {
         let current = self
             .read_root_publication_intent(&intent.transaction_id)?
             .ok_or_else(|| anyhow!("CoreMeta publication intent disappeared before expiry"))?;
-        current.ensure_pending()?;
+        if !publication_intent_retry_matches(&current, intent)?
+            || current.state != intent.state
+            || current.terminal_reason != intent.terminal_reason
+        {
+            bail!("CoreMeta publication intent changed during expiry handling");
+        }
         if !current.transaction_deadline_elapsed()? {
             bail!("CoreMeta publication intent deadline changed during expiry handling");
         }
-        self.mark_root_publication_intent_terminal(&current, "TransactionExpired")?;
+        self.ensure_publication_intent_active_locked(&current)
+    }
+
+    pub(super) fn ensure_publication_intent_active_locked(
+        &self,
+        intent: &RootPublicationIntent,
+    ) -> Result<()> {
+        intent.ensure_pending()?;
+        if !intent.transaction_deadline_elapsed()? {
+            return Ok(());
+        }
+        self.mark_root_publication_intent_terminal(intent, "TransactionExpired")?;
         Err(publication_terminal_error("TransactionExpired"))
     }
 

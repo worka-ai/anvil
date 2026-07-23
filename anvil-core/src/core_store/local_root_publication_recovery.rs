@@ -865,22 +865,6 @@ impl CoreStore {
     ) -> Result<Vec<CoreMetaQuorumCommitOutcome>> {
         intent.ensure_pending()?;
         let outcomes = self.root_publication_outcomes(intent)?;
-        if self
-            .completed_publication_matches_intent(intent, &outcomes)
-            .await?
-        {
-            let delete_rows = self.root_publication_intent_delete_rows(intent)?;
-            self.write_coremeta_encoded_rows(&borrow_encoded_rows(&delete_rows))?;
-            return Ok(outcomes);
-        }
-        if self
-            .materialize_locally_committed_publication_intent(intent, &outcomes)
-            .await?
-        {
-            return Ok(outcomes);
-        }
-
-        self.ensure_publication_intent_active(intent).await?;
         #[cfg(test)]
         super::local_root_publication_test_control::pause_before_coordinator(
             &intent.transaction_id,
@@ -908,7 +892,24 @@ impl CoreStore {
         {
             bail!("CoreMeta publication intent changed before commit");
         }
+        if self
+            .completed_publication_matches_intent(&current_intent, &outcomes)
+            .await?
+        {
+            let delete_rows = self.root_publication_intent_delete_rows(&current_intent)?;
+            self.write_coremeta_encoded_rows(&borrow_encoded_rows(&delete_rows))?;
+            return Ok(outcomes);
+        }
+        if self
+            .materialize_locally_committed_publication_intent(&current_intent, &outcomes)
+            .await?
+        {
+            return Ok(outcomes);
+        }
+        self.ensure_publication_intent_active_locked(&current_intent)?;
         self.validate_publication_guards_at_linearization(&current_intent, guard_context.as_ref())
+            .await?;
+        self.validate_publication_predecessors_at_linearization(&current_intent)
             .await?;
 
         let anchors = self.publication_anchors(&current_intent, &outcomes)?;
@@ -1122,14 +1123,12 @@ impl CoreStore {
         intent: &RootPublicationIntent,
         outcomes: &[CoreMetaQuorumCommitOutcome],
     ) -> Result<bool> {
-        let anchors = self.publication_anchors(intent, outcomes)?;
         let coordinator_index = effective_coordinator_index(intent)?;
-        let coordinator = &anchors[coordinator_index];
+        let coordinator_root = &intent.roots[coordinator_index];
+        let coordinator_root_hash = coordinator_root.publication.descriptor.root_key_hash();
+        let coordinator_generation = coordinator_root.publication.post_root_generation;
         let Some(inspection) = self
-            .inspect_root_register_generation(
-                &coordinator.root_key_hash,
-                coordinator.root_generation,
-            )
+            .inspect_root_register_generation(&coordinator_root_hash, coordinator_generation)
             .await?
         else {
             return Ok(false);
@@ -1138,6 +1137,28 @@ impl CoreStore {
         if inspection.shard_indexes.len() < profile.prepare_quorum {
             return Ok(false);
         }
+        let committed = decode_root_anchor_record(&inspection.root_anchor_record)?;
+        validate_root_anchor_record(&committed)?;
+        if committed.root_key_hash != coordinator_root_hash
+            || committed.root_generation != coordinator_generation
+        {
+            bail!("committed local root-register quorum escaped its requested scope");
+        }
+        if publication_transaction_id(&committed)? != intent.transaction_id {
+            return self.terminal_publication_guard_failure(
+                intent,
+                &format!(
+                    "PublicationRootChanged: physical generation {} for root {} belongs to another transaction",
+                    coordinator_generation, coordinator_root_hash
+                ),
+            );
+        }
+
+        // Only derive owner terms after physical Q2 has proved that this exact
+        // intent owns the generation. A stale, uncommitted intent must never
+        // reconstruct an anchor against a newer local head.
+        let anchors = self.publication_anchors(intent, outcomes)?;
+        let coordinator = &anchors[coordinator_index];
         let coordinator_record = encode_root_anchor_record(coordinator)?;
         if inspection.root_anchor_record != coordinator_record
             || inspection.root_anchor_hash != hash_root_anchor_record(coordinator)?
@@ -1153,6 +1174,47 @@ impl CoreStore {
         self.materialize_committed_publication_intent(intent, &anchors)
             .await?;
         Ok(true)
+    }
+
+    async fn validate_publication_predecessors_at_linearization(
+        &self,
+        intent: &RootPublicationIntent,
+    ) -> Result<()> {
+        for root in &intent.roots {
+            let current = self
+                .read_latest_root_anchor(&root.publication.descriptor.root_anchor_key)
+                .await?;
+            let actual_generation = current.as_ref().map_or(0, |anchor| anchor.root_generation);
+            let actual_hash = current
+                .as_ref()
+                .map(hash_root_anchor_record)
+                .transpose()?
+                .unwrap_or_else(|| ZERO_HASH.to_string());
+            if actual_generation < root.expected_root_generation {
+                bail!(
+                    "CoreMeta publication predecessor is not locally visible: root={} expected_generation={} actual_generation={}",
+                    root.publication.descriptor.root_key_hash(),
+                    root.expected_root_generation,
+                    actual_generation
+                );
+            }
+            if actual_generation != root.expected_root_generation
+                || actual_hash != root.publication.previous_root_hash
+            {
+                return self.terminal_publication_guard_failure(
+                    intent,
+                    &format!(
+                        "PublicationRootChanged: root={} expected_generation={} actual_generation={} expected_hash={} actual_hash={}",
+                        root.publication.descriptor.root_key_hash(),
+                        root.expected_root_generation,
+                        actual_generation,
+                        root.publication.previous_root_hash,
+                        actual_hash
+                    ),
+                );
+            }
+        }
+        Ok(())
     }
 
     async fn materialize_committed_publication_intent(
@@ -1267,128 +1329,48 @@ impl CoreStore {
             {
                 continue;
             }
-            if !intent.all_outcomes_recorded() {
-                let coordinator = &intent.roots[effective_coordinator_index(&intent)?];
-                let root_key_hash = coordinator.publication.descriptor.root_key_hash();
-                let generation = coordinator.publication.post_root_generation;
-                match self
-                    .resolve_root_register_generation(
-                        peers,
-                        None,
-                        &root_key_hash,
-                        generation,
-                    )
-                    .await?
-                {
-                    super::local_coremeta_recovery::RootRegisterGenerationResolution::Committed {
-                        anchor_record,
-                    } => {
-                        let committed = decode_root_anchor_record(&anchor_record)?;
-                        let committed_transaction_id = publication_transaction_id(&committed)?;
-                        self.catch_up_committed_publication(peers, &anchor_record)
-                            .await?;
-                        if committed_transaction_id == intent.transaction_id {
-                            if self
-                                .read_root_publication_intent(&intent.transaction_id)?
-                                .is_some()
-                            {
-                                bail!(
-                                    "CoreMeta committed publication catch-up did not clear its publisher intent"
-                                );
-                            }
-                        } else {
-                            self.mark_superseded_publication_if_still_current(&intent)?;
-                        }
-                    }
-                    super::local_coremeta_recovery::RootRegisterGenerationResolution::DefinitivelyAbsent => {
-                        self.resume_root_publication_intent_for_recovery(intent)
-                            .await?;
-                    }
-                    super::local_coremeta_recovery::RootRegisterGenerationResolution::Indeterminate => {
-                        unresolved.insert(transaction_id);
-                    }
-                }
-                continue;
-            }
-
-            let outcomes = self.root_publication_outcomes(&intent)?;
-            if self
-                .completed_publication_matches_intent(&intent, &outcomes)
-                .await?
-            {
-                let delete_rows = self.root_publication_intent_delete_rows(&intent)?;
-                self.write_coremeta_encoded_rows(&borrow_encoded_rows(&delete_rows))?;
-                continue;
-            }
-            let anchors = self.publication_anchors(&intent, &outcomes)?;
-            let coordinator = &anchors[effective_coordinator_index(&intent)?];
-            let coordinator_record = encode_root_anchor_record(coordinator)?;
+            let coordinator = &intent.roots[effective_coordinator_index(&intent)?];
+            let root_key_hash = coordinator.publication.descriptor.root_key_hash();
+            let generation = coordinator.publication.post_root_generation;
             match self
-                .resolve_root_register_quorum(
+                .resolve_root_register_generation(
                     peers,
                     None,
-                    &coordinator.root_key_hash,
-                    coordinator.root_generation,
-                    &coordinator_record,
+                    &root_key_hash,
+                    generation,
                 )
                 .await?
             {
-                super::local_coremeta_recovery::RootRegisterQuorumResolution::Committed => {
-                    self.repair_committed_publication_intent(&intent, &anchors, &outcomes)
-                        .await?;
-                }
-                super::local_coremeta_recovery::RootRegisterQuorumResolution::CommittedConflict {
+                super::local_coremeta_recovery::RootRegisterGenerationResolution::Committed {
                     anchor_record,
                 } => {
-                    // A different anchor has already won the physical Q2 CAS
-                    // for this exact generation. This publisher's pending rows
-                    // can no longer become visible, so retaining the intent as
-                    // recoverable would permanently hold the node unready.
+                    let committed = decode_root_anchor_record(&anchor_record)?;
+                    let committed_transaction_id = publication_transaction_id(&committed)?;
                     self.catch_up_committed_publication(peers, &anchor_record)
                         .await?;
-                    self.mark_superseded_publication_if_still_current(&intent)?;
+                    if committed_transaction_id == intent.transaction_id {
+                        if self
+                            .read_root_publication_intent(&intent.transaction_id)?
+                            .is_some()
+                        {
+                            bail!(
+                                "CoreMeta committed publication catch-up did not clear its publisher intent"
+                            );
+                        }
+                    } else {
+                        self.mark_superseded_publication_if_still_current(&intent)?;
+                    }
                 }
-                super::local_coremeta_recovery::RootRegisterQuorumResolution::DefinitivelyAbsent => {
+                super::local_coremeta_recovery::RootRegisterGenerationResolution::DefinitivelyAbsent => {
                     self.resume_root_publication_intent_for_recovery(intent)
                         .await?;
                 }
-                super::local_coremeta_recovery::RootRegisterQuorumResolution::Indeterminate => {
+                super::local_coremeta_recovery::RootRegisterGenerationResolution::Indeterminate => {
                     unresolved.insert(transaction_id);
                 }
             }
         }
         Ok(unresolved)
-    }
-
-    /// Completes the replica CAS after root-register Q2 was durable but the
-    /// original publisher did not receive enough responses to finish the
-    /// publication. Replaying the exact prepare and CAS bytes is idempotent and
-    /// restores a committed participant-root cache quorum for peer recovery.
-    async fn repair_committed_publication_intent(
-        &self,
-        intent: &RootPublicationIntent,
-        anchors: &[CoreRootAnchorRecord],
-        outcomes: &[CoreMetaQuorumCommitOutcome],
-    ) -> Result<()> {
-        let coordinator_index = effective_coordinator_index(intent)?;
-        let participant_evidence = root_publication_evidence(anchors, outcomes)?;
-        self.publish_root_anchor_generation_with_participants(
-            &anchors[coordinator_index],
-            &participant_evidence,
-            Some(intent),
-        )
-        .await?;
-
-        for root in &intent.roots {
-            if !self.root_generation_is_published(
-                &root.publication.descriptor.root_key_hash(),
-                root.publication.post_root_generation,
-                &intent.transaction_id,
-            )? {
-                bail!("CoreMeta committed publication repair left a participant unpublished");
-            }
-        }
-        Ok(())
     }
 
     pub(super) async fn compare_and_swap_publication_group_locally(

@@ -24,7 +24,7 @@ pub(super) fn publication_terminal_error(reason: impl Into<String>) -> anyhow::E
 }
 
 impl CoreStore {
-    pub(super) async fn resume_root_publication_intent_for_recovery(
+    pub(in crate::core_store::local) async fn resume_root_publication_intent_for_recovery(
         &self,
         intent: RootPublicationIntent,
     ) -> Result<()> {

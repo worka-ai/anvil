@@ -1,4 +1,6 @@
-use super::super::local_root_publication_recovery::root_publication_evidence;
+use super::super::local_root_publication_recovery::{
+    RootPublicationIntentState, publication_transaction_id, root_publication_evidence,
+};
 use super::super::local_root_publication_test_control::pause_publication;
 use super::*;
 use crate::core_store::{
@@ -203,6 +205,75 @@ async fn persisted_publication_summary_rejects_a_changed_commit_plan() {
         .validate_persisted_root_publication_intent_summary(&changed)
         .unwrap_err();
     assert!(error.to_string().contains("intent header changed"));
+}
+
+#[tokio::test]
+async fn stale_recovery_intent_terminalizes_after_another_transaction_wins_its_generation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = CoreStore::new(Storage::new_at(tmp.path()).await.unwrap())
+        .await
+        .unwrap();
+    let root = "publication/stale-recovery-generation";
+    let key = publication_key("stale-recovery-generation");
+    let initial_transaction_id = "publication-stale-recovery-v1";
+    let stale_transaction_id = "publication-stale-recovery-stale-v2";
+    let winner_transaction_id = "publication-stale-recovery-winner-v2";
+    let initial = publication_payload(root, 1, initial_transaction_id, "initial");
+    publish_initial_value(&store, root, initial_transaction_id, &key, &initial).await;
+
+    let stale_payload = publication_payload(root, 2, stale_transaction_id, "stale");
+    let stale_intent = stage_single_put_intent(
+        &store,
+        root,
+        stale_transaction_id,
+        &store.node_identity.node_id,
+        &key,
+        &stale_payload,
+    )
+    .await;
+    store
+        .persist_root_publication_intent(&stale_intent)
+        .unwrap();
+
+    let winner_payload = publication_payload(root, 2, winner_transaction_id, "winner");
+    publish_initial_value(&store, root, winner_transaction_id, &key, &winner_payload).await;
+
+    store
+        .resume_root_publication_intent_for_recovery(stale_intent)
+        .await
+        .unwrap();
+    let terminal = store
+        .read_root_publication_intent(stale_transaction_id)
+        .unwrap()
+        .expect("stale publication intent remains as durable terminal evidence");
+    assert_eq!(terminal.state, RootPublicationIntentState::Terminal);
+    assert!(
+        terminal
+            .terminal_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("PublicationRootChanged"))
+    );
+    assert_eq!(
+        store
+            .read_coremeta_row(CF_OBSERVABILITY, TABLE_DIAGNOSTIC_ROW, &key)
+            .unwrap(),
+        Some(winner_payload)
+    );
+    let head = store
+        .read_latest_root_anchor(root)
+        .await
+        .unwrap()
+        .expect("winner root head");
+    assert_eq!(head.root_generation, 2);
+    assert_eq!(
+        publication_transaction_id(&head).unwrap(),
+        winner_transaction_id
+    );
+
+    store
+        .resume_root_publication_intent_for_recovery(terminal)
+        .await
+        .unwrap();
 }
 
 fn signed_prepare_receipt(
