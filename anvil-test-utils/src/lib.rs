@@ -998,6 +998,13 @@ pub async fn get_access_token_for_test(
                     {
                         last_error = Some(status.to_string());
                     }
+                    Err(status) if status.code() == tonic::Code::Unavailable => {
+                        // A newly started distributed peer can accept gRPC
+                        // connections before CoreMeta recovery admits public
+                        // reads. Treat that explicit retryable response like
+                        // the connection races handled by this helper.
+                        last_error = Some(status.to_string());
+                    }
                     Err(status) => panic!("get access token failed: {status:?}"),
                 }
             }
