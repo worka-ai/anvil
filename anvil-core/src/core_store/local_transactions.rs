@@ -1406,6 +1406,42 @@ impl CoreStore {
         .await
     }
 
+    pub(crate) async fn stage_mutation_additions_in_transaction(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+        additions: CoreMutationBatchAdditions,
+    ) -> Result<CoreMutationBatchReceipt> {
+        validate_logical_id(transaction_id, "transaction id")?;
+        validate_logical_id(principal, "transaction principal")?;
+        if additions.operations.is_empty() {
+            bail!("CoreStore transaction additions must include an operation");
+        }
+        if !additions.root_publications.is_empty() {
+            bail!("explicit transaction additions cannot introduce publication roots");
+        }
+        let transaction = self
+            .read_explicit_transaction_for_principal(transaction_id, principal)
+            .await?;
+        validate_transaction_root_scope(&transaction)?;
+        let scope_partition = transaction.scope_partition.clone();
+        self.stage_explicit_transaction_batch(CoreMutationBatch {
+            transaction_id: transaction_id.to_string(),
+            scope_partition: scope_partition.clone(),
+            committed_by_principal: principal.to_string(),
+            root_publications: vec![
+                CoreMutationRootPublication::new(
+                    scope_partition,
+                    WriterFamily::CoreControl.as_str(),
+                )
+                .coordinator(),
+            ],
+            preconditions: additions.preconditions,
+            operations: additions.operations,
+        })
+        .await
+    }
+
     pub async fn stage_coremeta_delete_in_transaction(
         &self,
         transaction_id: &str,

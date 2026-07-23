@@ -930,7 +930,8 @@ mod local_mutation_preparation;
 mod local_object_metadata;
 pub(crate) use local_object_metadata::{
     CurrentObjectMetadataPage, ObjectMetadataMutationGuard, ObjectMetadataPageCursor,
-    ObjectMetadataProjectionMutation, ObjectVersionsMetadataPage, PreparedObjectMetadataProjection,
+    ObjectMetadataPreconditionSnapshot, ObjectMetadataProjectionMutation,
+    ObjectVersionsMetadataPage, PreparedObjectMetadataProjection,
 };
 #[path = "local_pending_finalisation.rs"]
 mod local_pending_finalisation;

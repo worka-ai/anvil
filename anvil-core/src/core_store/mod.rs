@@ -47,8 +47,8 @@ pub(crate) use local::root_register_cohort_hash;
 pub(crate) use local::shard_inventory_response;
 pub(crate) use local::{
     CoreMetaPeerRoute, CoreMetaPeerTarget, CoreMetaWriteRoute, CurrentObjectMetadataPage,
-    ObjectMetadataMutationGuard, ObjectMetadataPageCursor, ObjectMetadataProjectionMutation,
-    ObjectVersionsMetadataPage, PreparedObjectMetadataProjection,
+    ObjectMetadataMutationGuard, ObjectMetadataPageCursor, ObjectMetadataPreconditionSnapshot,
+    ObjectMetadataProjectionMutation, ObjectVersionsMetadataPage, PreparedObjectMetadataProjection,
     core_mutation_publication_attempt_id,
 };
 pub use local::{

@@ -878,6 +878,13 @@ pub struct CoreMutationBatch {
     pub operations: Vec<CoreMutationOperation>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreMutationBatchAdditions {
+    pub root_publications: Vec<CoreMutationRootPublication>,
+    pub preconditions: Vec<CoreMutationPrecondition>,
+    pub operations: Vec<CoreMutationOperation>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CoreMutationRootPublication {
     pub root_anchor_key: String,

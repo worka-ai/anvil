@@ -9,6 +9,13 @@ use crate::formats::{
 };
 use futures_util::{StreamExt, stream::FuturesUnordered};
 
+struct PreparedInlineBlob {
+    object_ref: CoreObjectRef,
+    mutation_id: String,
+    operations: Vec<OwnedCoreMetaBatchOp>,
+    publication: CoreMetaRootPublication,
+}
+
 fn core_store_instance_registry_key(storage: &Storage) -> PathBuf {
     storage.core_store_root_path()
 }
@@ -314,6 +321,52 @@ impl CoreStore {
             storage_class.inline_payload_policy,
         )
         .await
+    }
+
+    pub async fn put_blobs_with_storage_classes(
+        &self,
+        inputs: Vec<(PutBlob, Option<String>)>,
+    ) -> Result<Vec<CoreObjectRef>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let all_inline = inputs.iter().all(|(input, storage_class_id)| {
+            self.select_storage_class(storage_class_id.as_deref())
+                .is_ok_and(|storage_class| {
+                    let policy = &storage_class.inline_payload_policy;
+                    policy.enabled
+                        && input.bytes.len() <= policy.effective_raw_payload_cap_bytes() as usize
+                })
+        });
+        let payloads_are_unique = inputs
+            .iter()
+            .map(|(input, _)| sha256_hex(&input.bytes))
+            .collect::<BTreeSet<_>>()
+            .len()
+            == inputs.len();
+
+        if all_inline && payloads_are_unique {
+            let mut prepared = Vec::with_capacity(inputs.len());
+            for (input, storage_class_id) in inputs {
+                let storage_class = self.select_storage_class(storage_class_id.as_deref())?;
+                prepared.push(self.prepare_inline_blob(
+                    input,
+                    WriterFamily::ObjectBlob.as_str(),
+                    storage_class.inline_payload_policy.clone(),
+                )?);
+            }
+            return self.commit_prepared_inline_blobs(prepared).await;
+        }
+
+        let mut objects = Vec::with_capacity(inputs.len());
+        for (input, storage_class_id) in inputs {
+            objects.push(
+                self.put_blob_with_storage_class(input, storage_class_id.as_deref())
+                    .await?,
+            );
+        }
+        Ok(objects)
     }
 
     pub(crate) async fn put_format_blob(
@@ -698,6 +751,26 @@ impl CoreStore {
         writer_family: &str,
         inline_policy: CoreInlinePayloadPolicy,
     ) -> Result<CoreObjectRef> {
+        let prepared = self.prepare_inline_blob(input, writer_family, inline_policy)?;
+        let mutation_id = prepared.mutation_id.clone();
+        let operations = borrow_owned_coremeta_batch_ops(&prepared.operations);
+        self.commit_coremeta_root_groups(
+            &mutation_id,
+            &operations,
+            std::slice::from_ref(&prepared.publication),
+        )
+        .await?;
+        self.read_inline_blob(&prepared.object_ref)?;
+        record_corestore_trace_event("byte_pipeline.inline_payload", "ok");
+        Ok(prepared.object_ref)
+    }
+
+    fn prepare_inline_blob(
+        &self,
+        input: PutBlob,
+        writer_family: &str,
+        inline_policy: CoreInlinePayloadPolicy,
+    ) -> Result<PreparedInlineBlob> {
         inline_policy.validate()?;
         let raw_cap =
             (inline_policy.max_raw_payload_bytes as usize).min(CORE_META_MAX_INLINE_PAYLOAD_BYTES);
@@ -778,33 +851,58 @@ impl CoreStore {
             );
         }
         let manifest_payload = encode_object_manifest_record(&manifest)?;
-        self.commit_coremeta_root_groups(
-            &manifest.mutation_id,
-            &[
-                CoreMetaBatchOp {
+        Ok(PreparedInlineBlob {
+            object_ref,
+            mutation_id: manifest.mutation_id,
+            operations: vec![
+                OwnedCoreMetaBatchOp::Put {
                     cf: CF_INLINE_PAYLOADS,
                     table_id: TABLE_INLINE_PAYLOAD_ROW,
-                    tuple_key: &inline_key,
+                    tuple_key: inline_key,
                     common: Some(common),
-                    kind: CoreMetaBatchOpKind::Put(&inline_payload),
+                    payload: inline_payload,
                 },
-                CoreMetaBatchOp {
+                OwnedCoreMetaBatchOp::Put {
                     cf: CF_OBJECT_VERSIONS,
                     table_id: TABLE_OBJECT_VERSION_META_ROW,
-                    tuple_key: &manifest_key,
+                    tuple_key: manifest_key,
                     common: None,
-                    kind: CoreMetaBatchOpKind::Put(&manifest_payload),
+                    payload: manifest_payload,
                 },
             ],
-            &[CoreMetaRootPublication::new(
-                root_anchor_key,
-                WriterFamily::ObjectBlob,
-            )],
-        )
-        .await?;
-        self.read_inline_blob(&object_ref)?;
-        record_corestore_trace_event("byte_pipeline.inline_payload", "ok");
-        Ok(object_ref)
+            publication: CoreMetaRootPublication::new(root_anchor_key, WriterFamily::ObjectBlob),
+        })
+    }
+
+    async fn commit_prepared_inline_blobs(
+        &self,
+        prepared: Vec<PreparedInlineBlob>,
+    ) -> Result<Vec<CoreObjectRef>> {
+        let mut transaction_hasher = blake3::Hasher::new();
+        let mut operations = Vec::with_capacity(prepared.len() * 2);
+        let mut publications = Vec::with_capacity(prepared.len());
+        let mut object_refs = Vec::with_capacity(prepared.len());
+        for blob in prepared {
+            transaction_hasher.update(blob.mutation_id.as_bytes());
+            operations.extend(blob.operations);
+            publications.push(blob.publication);
+            object_refs.push(blob.object_ref);
+        }
+        if publications.len() > 1 {
+            publications[0].transaction_coordinator = true;
+        }
+        let transaction_id = format!(
+            "inline-blob-batch:{}",
+            transaction_hasher.finalize().to_hex()
+        );
+        let operations = borrow_owned_coremeta_batch_ops(&operations);
+        self.commit_coremeta_root_groups(&transaction_id, &operations, &publications)
+            .await?;
+        for object_ref in &object_refs {
+            self.read_inline_blob(object_ref)?;
+        }
+        record_corestore_trace_event("byte_pipeline.inline_payload_batch", "ok");
+        Ok(object_refs)
     }
 
     pub(super) async fn materialise_object_blob_bytes(
