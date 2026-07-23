@@ -90,11 +90,11 @@ fn delete_index_segment_coremeta_row(
     }
 }
 
-fn collect_index_segments_for_test(
+async fn collect_index_segments_for_test(
     storage: &anvil::storage::Storage,
     index_id: &str,
 ) -> Vec<anvil::index_coremeta::IndexSegmentCoreMetaRecord> {
-    let mut cursor = None;
+    let mut cursor: Option<Vec<u8>> = None;
     let mut records = Vec::new();
     loop {
         let page = anvil::index_coremeta::page_index_segment_coremeta_records(
@@ -103,15 +103,17 @@ fn collect_index_segments_for_test(
             cursor.as_deref(),
             256,
         )
+        .await
         .unwrap();
         records.extend(page.records);
         let Some(next_cursor) = page.next_tuple_key else {
             break;
         };
         assert!(
-            cursor
-                .as_ref()
-                .is_none_or(|current| current.as_slice() < next_cursor.as_slice()),
+            match cursor {
+                None => true,
+                Some(current) => current.as_slice() < next_cursor.as_slice(),
+            },
             "index segment page cursor must advance"
         );
         cursor = Some(next_cursor);
@@ -914,6 +916,7 @@ async fn test_repair_rebuilds_missing_full_text_segment_from_base_journal() {
     .expect("proof exists before deleting segment");
     assert!(!proof.segment_hashes.is_empty());
     for segment in collect_index_segments_for_test(&cluster.states[0].storage, &index_storage_id)
+        .await
         .into_iter()
         .filter(|record| record.index_kind == "full_text")
     {
@@ -1080,6 +1083,7 @@ async fn test_repair_rebuilds_missing_vector_segment_from_base_journal() {
     .expect("proof exists before deleting segment");
     assert!(!proof.segment_hashes.is_empty());
     for segment in collect_index_segments_for_test(&cluster.states[0].storage, &index_storage_id)
+        .await
         .into_iter()
         .filter(|record| record.index_kind == "vector")
     {

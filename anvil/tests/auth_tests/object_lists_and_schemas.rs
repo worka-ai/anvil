@@ -217,7 +217,6 @@ async fn test_authz_namespace_watch_streams_snapshot_and_new_events() {
     append_authz_namespace_watch_record(
         &cluster.states[0].storage,
         1,
-        1,
         [1; 16],
         namespace_watch_payload(10),
     )
@@ -257,7 +256,6 @@ async fn test_authz_namespace_watch_streams_snapshot_and_new_events() {
     append_authz_namespace_watch_record(
         &cluster.states[0].storage,
         1,
-        2,
         [2; 16],
         namespace_watch_payload(11),
     )
@@ -804,9 +802,9 @@ async fn test_authz_derived_lag_watch_streams_snapshot_and_new_events() {
     append_authz_derived_lag_watch_record(
         &cluster.states[0].storage,
         1,
-        1,
         [1; 16],
         derived_lag_watch_payload(90, 100, 1),
+        &[],
     )
     .await
     .unwrap();
@@ -846,9 +844,9 @@ async fn test_authz_derived_lag_watch_streams_snapshot_and_new_events() {
     append_authz_derived_lag_watch_record(
         &cluster.states[0].storage,
         1,
-        2,
         [2; 16],
         derived_lag_watch_payload(100, 100, 2),
+        &[],
     )
     .await
     .unwrap();

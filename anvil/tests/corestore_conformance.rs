@@ -1172,6 +1172,7 @@ async fn rfc_0006_corestore_transactions_gate_coremeta_stream_and_watch_visibili
             transaction_id: "txn-rfc0006-visible".to_string(),
             scope_partition: "tenant:t/bucket:b".to_string(),
             committed_by_principal: "principal:rfc0006".to_string(),
+            root_publications: vec![],
             preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
                 cf: CF_INLINE_PAYLOADS.to_string(),
                 table_id: TABLE_INLINE_PAYLOAD_ROW,
@@ -1259,6 +1260,7 @@ async fn rfc_0006_corestore_transactions_gate_coremeta_stream_and_watch_visibili
             transaction_id: "txn-rfc0006-failed".to_string(),
             scope_partition: "tenant:t/bucket:b".to_string(),
             committed_by_principal: "principal:rfc0006".to_string(),
+            root_publications: vec![],
             preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
                 cf: CF_INLINE_PAYLOADS.to_string(),
                 table_id: TABLE_INLINE_PAYLOAD_ROW,
@@ -1752,6 +1754,7 @@ async fn rfc_0006_fenced_mutations_use_authenticated_principal_not_request_owner
             transaction_id: "txn-rfc0006-wrong-principal".to_string(),
             scope_partition: "tenant:t/bucket:b".to_string(),
             committed_by_principal: "principal:impersonator".to_string(),
+            root_publications: vec![],
             preconditions: vec![CoreMutationPrecondition::Fence {
                 fence_name: "tenant:t/bucket:b/object:secure".to_string(),
                 fence_token: fence.fence_token,
@@ -1787,6 +1790,7 @@ async fn rfc_0006_fenced_mutations_use_authenticated_principal_not_request_owner
             transaction_id: "txn-rfc0006-right-principal".to_string(),
             scope_partition: "tenant:t/bucket:b".to_string(),
             committed_by_principal: "principal:legitimate-worker".to_string(),
+            root_publications: vec![],
             preconditions: vec![CoreMutationPrecondition::Fence {
                 fence_name: "tenant:t/bucket:b/object:secure".to_string(),
                 fence_token: fence.fence_token,
