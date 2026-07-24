@@ -46,14 +46,14 @@ run_cargo_test() {
   local name="$1"
   shift
   local test_threads="${ANVIL_RUST_TEST_THREADS:-4}"
-  run_step "$name" cargo test --no-fail-fast "$@" -- --nocapture --test-threads="${test_threads}"
+  run_step "$name" cargo test "$@" -- --nocapture --test-threads="${test_threads}"
 }
 
 run_docker_cargo_test() {
   local name="$1"
   shift
-  local test_threads="${ANVIL_DOCKER_TEST_THREADS:-4}"
-  run_step "$name" cargo test --no-fail-fast "$@" -- --nocapture --test-threads="${test_threads}"
+  local test_threads="${ANVIL_DOCKER_TEST_THREADS:-1}"
+  run_step "$name" cargo test "$@" -- --nocapture --test-threads="${test_threads}"
 }
 
 require_image() {
@@ -70,14 +70,25 @@ reset_shared_docker_cluster() {
   for node in $(seq 1 "${node_count}"); do
     export "ANVIL_TEST_NODE${node}_TOKEN=release-gate-reset-token-${node}"
   done
-  rm -f "${TMPDIR:-/tmp}/anvil-test-cluster-locks/docker-shared-cluster.lock"
-  docker compose -p "${project}" -f "${compose_file}" down -v --remove-orphans || true
+  local state_dir="${TMPDIR:-/tmp}/anvil-test-cluster-locks"
+  local project_state="${project//[^a-zA-Z0-9_-]/-}"
+  docker compose -p "${project}" -f "${compose_file}" down -v --remove-orphans
+  rm -f "${state_dir}/${project_state}.ports"
+}
+
+cleanup_docker_gates() {
+  reset_shared_docker_cluster
+  local image="${ANVIL_IMAGE:-}"
+  if [[ -n "${image}" ]] && docker image inspect "${image}" >/dev/null 2>&1; then
+    docker image rm "${image}"
+  fi
 }
 
 static_gates() {
   run_step "no external database gate" ./scripts/check-no-external-db.sh
   run_step "no public unfenced journal writes gate" ./scripts/check-no-public-unfenced-journal-writes.sh
   run_step "documentation hardening gate" ./scripts/check-docs-hardening.sh
+  run_step "CoreMeta performance evidence checker tests" python3 ./scripts/test-coremeta-perf-report.py
   run_step "release notes gate" ./scripts/test-release-notes.sh
   run_step "fission docs check" fission site check --project-dir documentation --release
   run_step "fission docs build" fission site build --project-dir documentation --release
@@ -85,23 +96,24 @@ static_gates() {
 }
 
 rust_unit_gates() {
-  run_cargo_test "core library tests" -p anvil-storage-core --lib --bins
-  run_cargo_test "server library and binary tests" -p anvil-server --lib --bins
-  run_cargo_test "public CLI binary/unit tests" -p anvil-storage-cli --bins
+  # Exercise the public command contract before the long-running core suite so
+  # CLI/docs drift fails quickly instead of consuming most of the CI timeout.
   run_cargo_test "public CLI non-Docker integration tests" -p anvil-storage-cli \
     --test binary_names \
     --test confy_test \
     --test public_command_surface
+  run_cargo_test "public CLI binary/unit tests" -p anvil-storage-cli --bins
   run_cargo_test "Rust client package tests" -p anvil-storage --lib --tests
   run_cargo_test "test utils package tests" -p anvil-storage-test-utils --lib
   run_cargo_test "CoreStore model package tests" -p anvil-corestore-model --lib --tests
   run_cargo_test "documentation package tests" -p anvil-documentation --lib --bins
+  run_cargo_test "core library tests" -p anvil-storage-core --lib --bins
+  run_cargo_test "server library and binary tests" -p anvil-server --lib --bins
 }
 
 server_core_integration_gates() {
   local tests=(
     admin_lifecycle
-    cluster
     corestore_conformance
     corestore_conformance_durable_families
     corestore_conformance_rfc0007_byte_pipeline
@@ -306,14 +318,49 @@ docker_index_gates() {
 docker_mesh_gates() {
   require_image
   reset_shared_docker_cluster
-  local tests=(
-    distributed_tests
-    docker_cluster_test
-    grpc
+  # Each distributed scenario owns an isolated six-node cluster. Keep the
+  # modules in separate test processes so the step timeout applies to useful
+  # units of work rather than the cumulative startup and fault-injection time
+  # of every scenario in the binary.
+  local distributed_modules=(
+    faults
+    metadata
+    objects
+    publication_recovery
   )
-  for test_name in "${tests[@]}"; do
-    run_docker_cargo_test "Docker mesh integration ${test_name}" -p anvil-server --test "${test_name}"
+  local module
+  for module in "${distributed_modules[@]}"; do
+    run_docker_cargo_test "Docker mesh integration distributed_tests ${module}" \
+      -p anvil-server --test distributed_tests "${module}::"
   done
+  # The remaining binaries share the named Docker cluster. Recreate it between
+  # binaries so fault/restart state from one contract cannot leak into another.
+  reset_shared_docker_cluster
+  run_docker_cargo_test "Docker mesh integration docker_cluster_test" \
+    -p anvil-server --test docker_cluster_test
+  reset_shared_docker_cluster
+  run_docker_cargo_test "Docker mesh integration grpc" \
+    -p anvil-server --test grpc
+}
+
+performance_quick_gates() {
+  run_step "CoreMeta ordered-access performance gate (quick)" \
+    ./scripts/run-coremeta-perf-gate.sh quick
+}
+
+performance_release_gates() {
+  local expected_commit="${ANVIL_EXPECTED_GIT_COMMIT:-}"
+  if [[ -n "${expected_commit}" ]]; then
+    if [[ ! "${expected_commit}" =~ ^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$ ]]; then
+      echo "ANVIL_EXPECTED_GIT_COMMIT must be a full Git object ID" >&2
+      return 2
+    fi
+    run_step "CoreMeta ordered-access performance gate (release)" \
+      env GITHUB_SHA="${expected_commit}" ./scripts/run-coremeta-perf-gate.sh release
+  else
+    run_step "CoreMeta ordered-access performance gate (release)" \
+      ./scripts/run-coremeta-perf-gate.sh release
+  fi
 }
 
 case "$group" in
@@ -321,6 +368,7 @@ case "$group" in
     static_gates
     rust_unit_gates
     server_core_integration_gates
+    performance_quick_gates
     docker_auth_gates
     docker_storage_gates
     docker_index_gates
@@ -335,6 +383,12 @@ case "$group" in
   server-core)
     server_core_integration_gates
     ;;
+  perf|perf-quick)
+    performance_quick_gates
+    ;;
+  perf-release)
+    performance_release_gates
+    ;;
   docker-auth)
     docker_auth_gates
     ;;
@@ -347,9 +401,12 @@ case "$group" in
   docker-mesh)
     docker_mesh_gates
     ;;
+  docker-cleanup)
+    cleanup_docker_gates
+    ;;
   *)
     cat >&2 <<USAGE
-usage: $0 [all|static|rust|server-core|docker-auth|docker-storage|docker-index|docker-mesh]
+usage: $0 [all|static|rust|server-core|perf|perf-quick|perf-release|docker-auth|docker-storage|docker-index|docker-mesh|docker-cleanup]
 USAGE
     exit 2
     ;;
