@@ -735,8 +735,8 @@ fn record_authz_materialization_deferred(tenant_id: i64, revision: i64, record_c
 
 pub(crate) use materialization::{
     AuthzMaterializationOutcome, materialize_authz_derived_state_at_revision,
-    materialize_authz_tuple_segment, materialize_authz_tuple_segment_at_revision,
-    rebuild_authz_materialization_at_revision,
+    materialize_authz_derived_state_through_revision, materialize_authz_tuple_segment,
+    materialize_authz_tuple_segment_at_revision, rebuild_authz_materialization_at_revision,
 };
 
 pub async fn latest_authz_revision(storage: &Storage, tenant_id: i64) -> Result<i64> {

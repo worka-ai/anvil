@@ -544,7 +544,7 @@ async fn test_authz_tuple_rejects_invalid_caveat_hash_before_writing() {
 async fn test_authz_permission_resolves_nested_usersets() {
     let cluster = shared_docker_test_cluster().await;
     let actor = create_docker_storage_test_actor(&cluster, "authz-nested-usersets").await;
-    grant_docker_authz_realm(&cluster, &actor, "default").await;
+    let schema_revision = prepare_docker_default_authz_realm(&cluster, &actor).await;
 
     let token = actor.token.clone();
     let mut auth_client = AuthServiceClient::connect(actor.grpc_addr.clone())
@@ -660,7 +660,7 @@ async fn test_authz_permission_resolves_nested_usersets() {
         .await
         .unwrap()
         .into_inner();
-    for expected_revision in 1..=4 {
+    for expected_revision in (schema_revision + 1)..=(schema_revision + 4) {
         let event = tokio::time::timeout(Duration::from_secs(5), lag_stream.next())
             .await
             .unwrap()

@@ -101,7 +101,12 @@ fn stable_jitter_ms(node_id: &str, attempt: u32, max_jitter_ms: u64) -> u64 {
 fn classify_worker_claim_error(error: &anyhow::Error) -> WorkerClaimError {
     if error_chain_contains(
         error,
-        &[OWNERSHIP_HELD, OWNERSHIP_OWNER_MISMATCH, LEASE_HELD],
+        &[
+            OWNERSHIP_HELD,
+            OWNERSHIP_OWNER_MISMATCH,
+            LEASE_HELD,
+            "partition owner row exists but is not committed-visible",
+        ],
     ) {
         return WorkerClaimError::OwnershipContention;
     }
@@ -1266,6 +1271,11 @@ mod tests {
     #[test]
     fn worker_claim_error_classification_treats_queue_ownership_as_contention() {
         let error = anyhow!("{OWNERSHIP_HELD}: partition task_queue is owned by active node");
+        assert_eq!(
+            classify_worker_claim_error(&error),
+            WorkerClaimError::OwnershipContention
+        );
+        let error = anyhow!("partition owner row exists but is not committed-visible");
         assert_eq!(
             classify_worker_claim_error(&error),
             WorkerClaimError::OwnershipContention

@@ -666,6 +666,24 @@ impl Persistence {
         Ok(record)
     }
 
+    pub(crate) async fn materialize_authz_through_revision(
+        &self,
+        tenant_id: i64,
+        revision: i64,
+    ) -> Result<authz_journal::AuthzMaterializationOutcome> {
+        let target_revision = u64::try_from(revision)
+            .map_err(|_| anyhow!("authorization revision must be nonnegative"))?;
+        let source_fence_token =
+            authz_journal::latest_authz_journal_fence_token(&self.storage, tenant_id).await?;
+        authz_journal::materialize_authz_derived_state_through_revision(
+            &self.storage,
+            tenant_id,
+            target_revision,
+            source_fence_token,
+        )
+        .await
+    }
+
     pub async fn write_authz_tuple_batch(
         &self,
         tenant_id: i64,

@@ -121,6 +121,44 @@ pub(crate) async fn materialize_authz_derived_state_at_revision(
     .await
 }
 
+pub(crate) async fn materialize_authz_derived_state_through_revision(
+    storage: &Storage,
+    tenant_id: i64,
+    target_revision: u64,
+    source_fence_token: u64,
+) -> Result<AuthzMaterializationOutcome> {
+    let mut previous_revision = None;
+    let mut step_target = if authz_segment::latest_authz_tuple_segment_record(storage, tenant_id)
+        .await?
+        .is_none()
+    {
+        1
+    } else {
+        target_revision
+    };
+
+    loop {
+        let outcome = materialize_authz_state_at_revision(
+            storage,
+            tenant_id,
+            step_target,
+            source_fence_token,
+            AuthzPublication::Direct,
+        )
+        .await?;
+        if outcome.processed_revision >= target_revision {
+            return Ok(outcome);
+        }
+        if previous_revision == Some(outcome.processed_revision) {
+            bail!(
+                "authorization materialization made no progress before revision {target_revision}"
+            );
+        }
+        previous_revision = Some(outcome.processed_revision);
+        step_target = target_revision;
+    }
+}
+
 impl AuthzMaterializationOutcome {
     pub(crate) async fn materialize_for_task_at_revision(
         storage: &Storage,

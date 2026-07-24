@@ -936,7 +936,7 @@ pub async fn write_delegated_action_tuple(
     let relation =
         delegated_relation_for_action(storage, tenant_id, action.clone(), resource).await?;
     let assignment_relation = delegated_assignment_relation(&action, &relation);
-    persistence
+    let record = persistence
         .write_authz_tuple(
             SYSTEM_STORAGE_TENANT_ID,
             &relation.namespace,
@@ -949,6 +949,10 @@ pub async fn write_delegated_action_tuple(
             written_by,
             reason,
         )
+        .await
+        .map_err(authz_tuple_write_status)?;
+    persistence
+        .materialize_authz_through_revision(SYSTEM_STORAGE_TENANT_ID, record.revision)
         .await
         .map_err(authz_tuple_write_status)?;
     Ok(())
@@ -992,8 +996,17 @@ pub async fn write_delegated_action_tuple_batch(
         });
     }
 
-    persistence
+    let records = persistence
         .write_authz_tuple_batch(SYSTEM_STORAGE_TENANT_ID, mutations, written_by)
+        .await
+        .map_err(authz_tuple_write_status)?;
+    let revision = records
+        .iter()
+        .map(|record| record.revision)
+        .max()
+        .ok_or_else(|| Status::internal("application policy batch produced no records"))?;
+    persistence
+        .materialize_authz_through_revision(SYSTEM_STORAGE_TENANT_ID, revision)
         .await
         .map_err(authz_tuple_write_status)?;
     Ok(())
