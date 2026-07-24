@@ -1,6 +1,9 @@
 #![recursion_limit = "256"]
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -12,6 +15,37 @@ fn workspace_root() -> PathBuf {
 fn workspace_file(path: &str) -> String {
     fs::read_to_string(workspace_root().join(path))
         .unwrap_or_else(|err| panic!("read {path}: {err}"))
+}
+
+fn collect_rust_files(directory: &Path, files: &mut Vec<PathBuf>) {
+    let mut entries = fs::read_dir(directory)
+        .unwrap_or_else(|err| panic!("read directory {}: {err}", directory.display()))
+        .map(|entry| entry.expect("read Rust module directory entry").path())
+        .collect::<Vec<_>>();
+    entries.sort();
+
+    for path in entries {
+        if path.is_dir() {
+            collect_rust_files(&path, files);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            files.push(path);
+        }
+    }
+}
+
+fn workspace_rust_module(root_file: &str, module_directory: &str) -> String {
+    let root = workspace_root();
+    let mut files = vec![root.join(root_file)];
+    collect_rust_files(&root.join(module_directory), &mut files);
+
+    files
+        .into_iter()
+        .map(|path| {
+            fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("read Rust module {}: {err}", path.display()))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn assert_contains_all(label: &str, source: &str, terms: &[&str]) {
@@ -125,7 +159,10 @@ fn native_gateway_stream_registry_boundary_and_mesh_services_are_declared() {
 #[test]
 fn internal_block_coremeta_and_root_services_are_registered_without_string_dispatch() {
     let services = workspace_file("anvil-core/src/services/mod.rs");
-    let internal = workspace_file("anvil-core/src/services/corestore_internal.rs");
+    let internal = workspace_rust_module(
+        "anvil-core/src/services/corestore_internal.rs",
+        "anvil-core/src/services/corestore_internal",
+    );
     let internal_auth = workspace_file("anvil-core/src/services/internal_proxy.rs");
 
     assert_contains_all(
