@@ -4244,6 +4244,7 @@ message RootPrepareReceipt {
   uint64 fsync_sequence = 8;
   string signed_payload_hash = 9;
   bytes signature = 10;
+  uint64 placement_epoch = 11;
 }
 
 message CoreMetaRootPublicationEvidence {
@@ -4267,6 +4268,7 @@ message CompareAndSwapRootRequest {
   repeated CoreMetaRootPublicationEvidence participant_commit_evidence = 11;
   repeated string register_cohort_node_ids = 12;
   string register_cohort_hash = 13;
+  uint64 placement_epoch = 14;
 }
 
 message RootAnchorWrite {

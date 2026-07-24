@@ -1,6 +1,90 @@
 use super::*;
 
+const REQUESTED_PUBLICATION_CATCH_UP_LIMIT: usize = 32;
+
 impl CoreStore {
+    /// Records a supervised repair target before an incoming publication
+    /// request performs any await. The request can then be cancelled by its
+    /// publisher without cancelling the recovery work on this replica.
+    pub(crate) fn incoming_root_publication_is_ready(
+        &self,
+        root_key_hash: &str,
+        expected_generation: u64,
+    ) -> Result<bool> {
+        validate_hash(
+            root_key_hash,
+            "incoming root-publication catch-up root key hash",
+        )?;
+        if expected_generation == 0 {
+            return Ok(true);
+        }
+
+        let local_generation = self.coremeta_recovery_published_generation(root_key_hash)?;
+        if local_generation >= expected_generation {
+            return Ok(true);
+        }
+
+        self.request_coremeta_root_repair(root_key_hash, expected_generation);
+        Ok(false)
+    }
+
+    pub(super) async fn recover_requested_root_generations(
+        &self,
+        peers: &[RecoveryPeer],
+    ) -> Result<usize> {
+        let targets = self.coremeta_root_repair_targets();
+        let mut operations = 0usize;
+        for (root_key_hash, target_generation) in targets {
+            let mut local_generation =
+                self.coremeta_recovery_published_generation(&root_key_hash)?;
+            while local_generation < target_generation
+                && operations < REQUESTED_PUBLICATION_CATCH_UP_LIMIT
+            {
+                let next_generation = local_generation.saturating_add(1);
+                let committed_anchor = self
+                    .fetch_committed_register_anchor(peers, &root_key_hash, next_generation)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "resolve committed root-register repair generation: root={root_key_hash} generation={next_generation}"
+                        )
+                    })?;
+                if let Err(error) = self
+                    .catch_up_committed_publication(peers, &committed_anchor)
+                    .await
+                {
+                    let matching_generation = self
+                        .read_committed_root_anchor_generation(&root_key_hash, next_generation)
+                        .await?
+                        .map(|anchor| encode_root_anchor_record(&anchor))
+                        .transpose()?
+                        .is_some_and(|record| record == committed_anchor);
+                    if !matching_generation {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "install committed root-register repair generation: root={root_key_hash} generation={next_generation}"
+                            )
+                        });
+                    }
+                }
+                let advanced_generation =
+                    self.coremeta_recovery_published_generation(&root_key_hash)?;
+                if advanced_generation <= local_generation {
+                    bail!(
+                        "CoreMeta requested root repair made no progress: root={root_key_hash} local={local_generation} target={target_generation}"
+                    );
+                }
+                local_generation = advanced_generation;
+                operations = operations.saturating_add(1);
+            }
+            self.complete_coremeta_root_repair(&root_key_hash, local_generation);
+            if operations >= REQUESTED_PUBLICATION_CATCH_UP_LIMIT {
+                break;
+            }
+        }
+        Ok(operations)
+    }
+
     /// Installs the publication which already owns the physical Q2 decision for
     /// an exact coordinator generation. Foreground optimistic conflicts use
     /// this bounded path so their caller can retry against the winning state

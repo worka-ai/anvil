@@ -561,7 +561,7 @@ impl CoreStore {
         }
         if current.root_generation.saturating_add(1) != new_anchor.root_generation {
             if current.root_generation < new_anchor.root_generation
-                && self.startup_recovery_deferred()
+                && self.coremeta_distributed_recovery_required()
             {
                 // This register replica missed one or more committed
                 // generations. It must stop serving the public plane until

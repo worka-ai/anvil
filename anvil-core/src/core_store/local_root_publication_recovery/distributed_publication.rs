@@ -2,6 +2,138 @@ use super::super::local_coremeta_history::CoreMetaGenerationInstallOutcome;
 use super::*;
 
 impl CoreStore {
+    pub(in crate::core_store::local) async fn materialize_own_committed_publication(
+        &self,
+        peers: &[super::super::local_coremeta_recovery::RecoveryPeer],
+        intent: &RootPublicationIntent,
+        committed_coordinator_record: &[u8],
+    ) -> Result<()> {
+        let outcomes = self.root_publication_outcomes(intent)?;
+        let committed_anchors = self
+            .committed_anchors_for_local_intent(
+                peers,
+                intent,
+                &outcomes,
+                committed_coordinator_record,
+            )
+            .await?;
+
+        let Some(current_intent) = self.read_root_publication_intent(&intent.transaction_id)?
+        else {
+            if self
+                .completed_publication_matches_intent(intent, &outcomes)
+                .await?
+            {
+                return Ok(());
+            }
+            bail!("committed CoreMeta publication intent disappeared before materialization");
+        };
+        if !publication_intent_retry_matches(&current_intent, intent)?
+            || current_intent.state != intent.state
+            || current_intent.terminal_reason != intent.terminal_reason
+        {
+            bail!("CoreMeta publication intent changed before committed materialization");
+        }
+
+        let current_outcomes = self.root_publication_outcomes(&current_intent)?;
+        let current_anchors = self.validate_committed_anchors_for_intent(
+            &current_intent,
+            &current_outcomes,
+            &committed_anchors,
+            committed_coordinator_record,
+        )?;
+        self.materialize_committed_publication_intent(&current_intent, &current_anchors)
+            .await?;
+        Ok(())
+    }
+
+    async fn committed_anchors_for_local_intent(
+        &self,
+        peers: &[super::super::local_coremeta_recovery::RecoveryPeer],
+        intent: &RootPublicationIntent,
+        outcomes: &[CoreMetaQuorumCommitOutcome],
+        committed_coordinator_record: &[u8],
+    ) -> Result<BTreeMap<String, CoreRootAnchorRecord>> {
+        let coordinator = decode_root_anchor_record(committed_coordinator_record)?;
+        validate_root_anchor_record(&coordinator)?;
+        let coordinator_index = effective_coordinator_index(intent)?;
+        let coordinator_root = &intent.roots[coordinator_index];
+        let coordinator_hash = coordinator_root.publication.descriptor.root_key_hash();
+        if coordinator.root_key_hash != coordinator_hash
+            || coordinator.root_generation != coordinator_root.publication.post_root_generation
+            || publication_transaction_id(&coordinator)? != intent.transaction_id
+        {
+            bail!("committed root-register anchor does not match its local publisher intent");
+        }
+
+        let mut committed = BTreeMap::from([(coordinator_hash, coordinator)]);
+        for root in &intent.roots {
+            let root_key_hash = root.publication.descriptor.root_key_hash();
+            if committed.contains_key(&root_key_hash) {
+                continue;
+            }
+            let anchor_record = self
+                .fetch_committed_cache_anchor(
+                    peers,
+                    &root_key_hash,
+                    root.publication.post_root_generation,
+                )
+                .await?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "committed CoreMeta publication participant has no root-cache quorum: root={} generation={}",
+                        root_key_hash,
+                        root.publication.post_root_generation
+                    )
+                })?;
+            committed.insert(root_key_hash, decode_root_anchor_record(&anchor_record)?);
+        }
+
+        self.validate_committed_anchors_for_intent(
+            intent,
+            outcomes,
+            &committed,
+            committed_coordinator_record,
+        )?;
+        Ok(committed)
+    }
+
+    fn validate_committed_anchors_for_intent(
+        &self,
+        intent: &RootPublicationIntent,
+        outcomes: &[CoreMetaQuorumCommitOutcome],
+        committed: &BTreeMap<String, CoreRootAnchorRecord>,
+        committed_coordinator_record: &[u8],
+    ) -> Result<Vec<CoreRootAnchorRecord>> {
+        if committed.len() != intent.roots.len() {
+            bail!("committed CoreMeta publication participant cardinality mismatch");
+        }
+        let outcomes = outcomes
+            .iter()
+            .map(|outcome| (outcome.root_key_hash.as_str(), outcome))
+            .collect::<BTreeMap<_, _>>();
+        let anchors = intent
+            .roots
+            .iter()
+            .map(|root| {
+                let root_key_hash = root.publication.descriptor.root_key_hash();
+                let outcome = outcomes
+                    .get(root_key_hash.as_str())
+                    .ok_or_else(|| anyhow!("committed CoreMeta publication outcome is missing"))?;
+                let anchor = committed.get(&root_key_hash).ok_or_else(|| {
+                    anyhow!("committed CoreMeta publication participant is missing")
+                })?;
+                let anchor_record = encode_root_anchor_record(anchor)?;
+                self.recovered_committed_anchor(root, outcome, intent, &anchor_record)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let coordinator_index = effective_coordinator_index(intent)?;
+        if encode_root_anchor_record(&anchors[coordinator_index])? != committed_coordinator_record {
+            bail!("committed root-register anchor changed its local publisher intent");
+        }
+        Ok(anchors)
+    }
+
     pub(in crate::core_store::local) fn coremeta_recovery_intent_root_hashes(
         &self,
     ) -> Result<BTreeSet<String>> {
@@ -37,6 +169,14 @@ impl CoreStore {
         committed_anchors: &BTreeMap<(String, u64), Vec<u8>>,
     ) -> Result<()> {
         let bundle = decode_coremeta_recovery_publication_bundle(publication_bundle)?;
+        let publication_lock_keys = bundle
+            .scopes
+            .iter()
+            .map(|(root_key_hash, _)| ("root-publication".to_string(), root_key_hash.clone()))
+            .collect::<BTreeSet<_>>();
+        let _publication_guards = self
+            .acquire_sorted_lock_keys(&publication_lock_keys)
+            .await?;
         let committed_certificates =
             self.recovery_committed_certificate_hashes(&bundle, committed_anchors)?;
         let mut generations = Vec::with_capacity(bundle.scopes.len());
@@ -134,7 +274,24 @@ impl CoreStore {
                 self.recovered_committed_anchor(root, outcome, &intent, bytes)
             })
             .collect::<Result<Vec<_>>>()?;
-        let evidence = root_publication_evidence(&anchors, &outcomes)?;
+        let evidence = root_publication_evidence(&anchors, &outcomes).with_context(|| {
+            let scopes = outcomes
+                .iter()
+                .map(|outcome| {
+                    format!(
+                        "{}@{}:{}",
+                        outcome.root_key_hash,
+                        outcome.post_root_generation,
+                        outcome.metadata_replica_node_ids.join(",")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(";");
+            format!(
+                "validate recovered CoreMeta publication evidence: transaction={} scopes={scopes}",
+                bundle.transaction_id
+            )
+        })?;
         let participant_records = self
             .install_recovered_root_publication_commit_evidence(
                 &bundle.publisher_node_id,

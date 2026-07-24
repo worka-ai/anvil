@@ -809,6 +809,7 @@ fn validate_root_prepare_receipts(
     new_root_anchor_record: &[u8],
     register_cohort_node_ids: &[String],
     register_cohort_hash: &str,
+    placement_epoch: u64,
     receipts: &[RootPrepareReceipt],
 ) -> Result<(), Status> {
     if receipts.len() < core_store::CORE_META_DEFAULT_QUORUM {
@@ -819,6 +820,7 @@ fn validate_root_prepare_receipts(
     let new_root_hash = format!("sha256:{}", core_store::sha256_hex(new_root_anchor_record));
     let post_generation = expected_generation.saturating_add(1);
     if register_cohort_node_ids.len() != 3
+        || placement_epoch == 0
         || register_cohort_hash
             != core_store::root_register_cohort_hash(
                 root_key_hash,
@@ -840,6 +842,7 @@ fn validate_root_prepare_receipts(
             || receipt.post_generation != post_generation
             || receipt.new_root_hash != new_root_hash
             || receipt.register_cohort_hash != register_cohort_hash
+            || receipt.placement_epoch != placement_epoch
             || receipt.fsync_sequence == 0
             || register_cohort_node_ids
                 .get(shard_index)
@@ -1244,6 +1247,20 @@ impl RootRegisterInternal for AppState {
                 "root partition owner fence mismatch",
             ));
         }
+        if source_node_id != new_anchor.publisher_node_id {
+            return Err(Status::failed_precondition(
+                "root publication source is not the declared owner",
+            ));
+        }
+        if !self
+            .core_store
+            .incoming_root_publication_is_ready(&req.root_key_hash, req.expected_generation)
+            .map_err(internal_status)?
+        {
+            return Err(Status::unavailable(
+                "root-register replica catch-up has been queued",
+            ));
+        }
         self.core_store
             .validate_root_owner_publication(&source_node_id, &new_anchor)
             .map_err(internal_status)?;
@@ -1321,6 +1338,26 @@ impl RootRegisterInternal for AppState {
                 "root partition owner fence mismatch",
             ));
         }
+        if source_node_id != new_anchor.publisher_node_id {
+            return Err(Status::failed_precondition(
+                "root publication source is not the declared owner",
+            ));
+        }
+        if !self
+            .core_store
+            .incoming_root_publication_is_ready(&req.root_key_hash, req.expected_generation)
+            .map_err(internal_status)?
+        {
+            // Unlike prepare, a CAS request carries evidence for the post
+            // generation. Once Q2 commits elsewhere, supervised recovery can
+            // therefore advance through the generation this replica rejected,
+            // rather than remaining permanently one publication behind.
+            self.core_store
+                .request_coremeta_root_repair(&req.root_key_hash, new_anchor.root_generation);
+            return Err(Status::unavailable(
+                "root-register replica catch-up has been queued",
+            ));
+        }
         self.core_store
             .validate_root_owner_publication(&source_node_id, &new_anchor)
             .map_err(internal_status)?;
@@ -1382,8 +1419,20 @@ impl RootRegisterInternal for AppState {
             &req.new_root_anchor_record,
             &req.register_cohort_node_ids,
             &req.register_cohort_hash,
+            req.placement_epoch,
             &req.prepare_receipts,
         )?;
+        self.core_store
+            .ensure_local_committed_root_register_shard(
+                &new_anchor,
+                &req.new_root_anchor_record,
+                req.expected_generation,
+                &req.register_cohort_node_ids,
+                &req.register_cohort_hash,
+                req.placement_epoch,
+            )
+            .await
+            .map_err(internal_status)?;
         let participant_anchor_records = if req.participant_commit_evidence.is_empty() {
             self.core_store
                 .persist_coremeta_commit_evidence_at(

@@ -115,6 +115,35 @@ impl CoreStore {
                         bail!("CoreMeta recovery source has a different publication bundle");
                     }
                 }
+                let required_evidence = self
+                    .default_coremeta_quorum_profile()?
+                    .certificate_persist_quorum;
+                if descriptor.certificate_persist_evidence.len() < required_evidence {
+                    let replica_node_ids = descriptor
+                        .certificate_persist_evidence
+                        .iter()
+                        .filter_map(|evidence| {
+                            decode_deterministic_proto::<
+                                crate::anvil_api::CoreMetaCertificatePersistReceipt,
+                            >(
+                                &evidence.evidence,
+                                "CoreMeta recovery certificate persistence receipt",
+                            )
+                            .ok()
+                            .map(|receipt| receipt.replica_node_id)
+                        })
+                        .collect::<Vec<_>>();
+                    tracing::warn!(
+                        source_node_id = %source.peer.node_id,
+                        root_key_hash,
+                        generation,
+                        transaction_id = %descriptor.transaction_id,
+                        evidence_count = descriptor.certificate_persist_evidence.len(),
+                        required_evidence,
+                        replica_node_ids = %replica_node_ids.join(","),
+                        "CoreMeta recovery source returned a generation without certificate persistence quorum"
+                    );
+                }
                 let bundle =
                     decode_coremeta_recovery_publication_bundle(&descriptor.publication_bundle)?;
                 if bundle.transaction_id != descriptor.transaction_id

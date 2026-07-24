@@ -1340,6 +1340,23 @@ impl CoreStore {
             {
                 continue;
             }
+            // Foreground publication holds this same lock set from its final
+            // mutable checks through local materialization. Waiting here
+            // prevents recovery from observing physical Q2 while participant
+            // root-cache writes are still in flight.
+            let (publication_guards, _) = self.acquire_publication_intent_locks(&intent).await?;
+            let Some(current_intent) = self.read_root_publication_intent(&transaction_id)? else {
+                drop(publication_guards);
+                continue;
+            };
+            if !publication_intent_retry_matches(&current_intent, &intent)?
+                || current_intent.state != intent.state
+                || current_intent.terminal_reason != intent.terminal_reason
+            {
+                drop(publication_guards);
+                bail!("CoreMeta publication intent changed during distributed recovery");
+            }
+            let intent = current_intent;
             let coordinator = &intent.roots[effective_coordinator_index(&intent)?];
             let root_key_hash = coordinator.publication.descriptor.root_key_hash();
             let generation = coordinator.publication.post_root_generation;
@@ -1357,8 +1374,18 @@ impl CoreStore {
                 } => {
                     let committed = decode_root_anchor_record(&anchor_record)?;
                     let committed_transaction_id = publication_transaction_id(&committed)?;
-                    self.catch_up_committed_publication(peers, &anchor_record)
+                    if committed_transaction_id == intent.transaction_id {
+                        self.materialize_own_committed_publication(
+                            peers,
+                            &intent,
+                            &anchor_record,
+                        )
                         .await?;
+                    } else {
+                        drop(publication_guards);
+                        self.catch_up_committed_publication(peers, &anchor_record)
+                            .await?;
+                    }
                     if committed_transaction_id == intent.transaction_id {
                         if self
                             .read_root_publication_intent(&intent.transaction_id)?
@@ -1373,10 +1400,12 @@ impl CoreStore {
                     }
                 }
                 super::local_coremeta_recovery::RootRegisterGenerationResolution::DefinitivelyAbsent => {
+                    drop(publication_guards);
                     self.resume_root_publication_intent_for_recovery(intent)
                         .await?;
                 }
                 super::local_coremeta_recovery::RootRegisterGenerationResolution::Indeterminate => {
+                    drop(publication_guards);
                     unresolved.insert(transaction_id);
                 }
             }

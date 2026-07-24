@@ -22,6 +22,8 @@ use tonic::metadata::MetadataValue;
 mod generation_fetch;
 #[path = "local_coremeta_recovery/publication_catch_up.rs"]
 mod publication_catch_up;
+#[path = "local_coremeta_recovery/readiness.rs"]
+mod readiness;
 #[path = "local_coremeta_recovery/register_quarantine.rs"]
 mod register_quarantine;
 #[path = "local_coremeta_recovery/register_quorum.rs"]
@@ -29,6 +31,8 @@ mod register_quorum;
 #[path = "local_coremeta_recovery/topology_settlement.rs"]
 mod topology_settlement;
 
+pub(in crate::core_store::local) use readiness::validate_recovery_publication_anchor;
+use readiness::*;
 pub(in crate::core_store::local) use register_quorum::{
     RootRegisterGenerationResolution, RootRegisterQuorumResolution,
 };
@@ -82,9 +86,13 @@ impl Default for CoreMetaRecoverySnapshot {
 #[derive(Debug)]
 pub(super) struct CoreMetaRecoveryState {
     started: AtomicBool,
+    distributed_required: AtomicBool,
     startup_admitted: AtomicBool,
     ready: AtomicBool,
+    readiness_epoch: AtomicU64,
     completed_rounds: AtomicU64,
+    wake: Notify,
+    requested_generations: StdMutex<BTreeMap<String, u64>>,
     snapshot: StdMutex<CoreMetaRecoverySnapshot>,
     root_directory: StdMutex<RootDirectoryScanState>,
     canonical_settlement: StdMutex<topology_settlement::CanonicalSettlementScanState>,
@@ -94,9 +102,13 @@ impl Default for CoreMetaRecoveryState {
     fn default() -> Self {
         Self {
             started: AtomicBool::new(false),
+            distributed_required: AtomicBool::new(false),
             startup_admitted: AtomicBool::new(true),
             ready: AtomicBool::new(true),
+            readiness_epoch: AtomicU64::new(0),
             completed_rounds: AtomicU64::new(0),
+            wake: Notify::new(),
+            requested_generations: StdMutex::new(BTreeMap::new()),
             snapshot: StdMutex::new(CoreMetaRecoverySnapshot::default()),
             root_directory: StdMutex::new(RootDirectoryScanState::default()),
             canonical_settlement: StdMutex::new(
@@ -110,25 +122,36 @@ impl Default for CoreMetaRecoveryState {
 struct RootDirectoryScanState {
     peer_cursors: BTreeMap<String, String>,
     peers_with_complete_pass: BTreeSet<String>,
+    /// Last complete, internally consistent directory snapshot per peer.
     peer_entries: BTreeMap<String, BTreeMap<String, RootDirectoryEntry>>,
+    /// Entries accumulated for the next pass. A partial page sequence must not
+    /// replace the last complete snapshot or revoke steady-state readiness.
+    pending_peer_entries: BTreeMap<String, BTreeMap<String, RootDirectoryEntry>>,
 }
 
 impl RootDirectoryScanState {
     fn record_page(&mut self, node_id: &str, after: &str, page: &RootDirectoryPage) {
         if after.is_empty() {
-            self.peers_with_complete_pass.remove(node_id);
-            self.peer_entries
+            self.pending_peer_entries
                 .entry(node_id.to_string())
                 .or_default()
                 .clear();
         }
-        let peer_entries = self.peer_entries.entry(node_id.to_string()).or_default();
+        let peer_entries = self
+            .pending_peer_entries
+            .entry(node_id.to_string())
+            .or_default();
         for entry in &page.entries {
             peer_entries.insert(entry.root_key_hash.clone(), entry.clone());
         }
         if page.directory_complete {
             self.peer_cursors.remove(node_id);
             self.peers_with_complete_pass.insert(node_id.to_string());
+            let completed = self
+                .pending_peer_entries
+                .remove(node_id)
+                .unwrap_or_default();
+            self.peer_entries.insert(node_id.to_string(), completed);
         } else {
             self.peer_cursors
                 .insert(node_id.to_string(), page.next_root_key_hash.clone());
@@ -164,6 +187,7 @@ struct RootAnchorQuorumCandidate {
 
 #[derive(Debug, Default)]
 struct RecoveryRound {
+    readiness_epoch: u64,
     reachable_peers: BTreeSet<String>,
     known_roots: BTreeSet<String>,
     remote_heads: BTreeMap<String, BTreeMap<String, RootDirectoryEntry>>,
@@ -202,6 +226,12 @@ impl CoreStore {
         self.coremeta_recovery.ready.load(Ordering::Acquire)
     }
 
+    pub(in crate::core_store::local) fn coremeta_distributed_recovery_required(&self) -> bool {
+        self.coremeta_recovery
+            .distributed_required
+            .load(Ordering::Acquire)
+    }
+
     pub async fn wait_for_coremeta_recovery_ready(&self) {
         while !self.coremeta_recovery_ready() {
             tokio::time::sleep(RECOVERY_READINESS_POLL_INTERVAL).await;
@@ -217,6 +247,18 @@ impl CoreStore {
     }
 
     fn set_coremeta_recovery_required(&self, distributed_required: bool) {
+        let mut requested_generations = self
+            .coremeta_recovery
+            .requested_generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        requested_generations.clear();
+        self.coremeta_recovery
+            .readiness_epoch
+            .fetch_add(1, Ordering::AcqRel);
+        self.coremeta_recovery
+            .distributed_required
+            .store(distributed_required, Ordering::Release);
         self.coremeta_recovery
             .ready
             .store(!distributed_required, Ordering::Release);
@@ -232,6 +274,8 @@ impl CoreStore {
         snapshot.distributed_required = distributed_required;
         snapshot.in_progress = distributed_required;
         snapshot.last_error = None;
+        drop(snapshot);
+        drop(requested_generations);
     }
 
     async fn run_coremeta_recovery_loop(self) {
@@ -245,24 +289,26 @@ impl CoreStore {
                         .startup_admitted
                         .load(Ordering::Acquire);
                     let ready = if admitted {
-                        recovery_round_is_serviceable(&round)
+                        recovery_round_preserves_admitted_readiness(&round)
                     } else {
                         recovery_round_is_ready(&round)
                     };
+                    let ready = self.finish_coremeta_recovery_round(&round, ready, None);
                     if ready {
                         self.coremeta_recovery
                             .startup_admitted
                             .store(true, Ordering::Release);
                     }
-                    self.finish_coremeta_recovery_round(&round, ready, None);
                     if ready {
                         backoff = RECOVERY_INITIAL_BACKOFF;
-                        tokio::time::sleep(RECOVERY_STEADY_INTERVAL).await;
+                        self.wait_for_coremeta_recovery_wake(RECOVERY_STEADY_INTERVAL)
+                            .await;
                     } else if round.durable_progress {
                         backoff = RECOVERY_INITIAL_BACKOFF;
-                        tokio::time::sleep(RECOVERY_INITIAL_BACKOFF).await;
+                        self.wait_for_coremeta_recovery_wake(RECOVERY_INITIAL_BACKOFF)
+                            .await;
                     } else {
-                        tokio::time::sleep(backoff).await;
+                        self.wait_for_coremeta_recovery_wake(backoff).await;
                         backoff = next_recovery_backoff(backoff);
                     }
                 }
@@ -279,7 +325,8 @@ impl CoreStore {
                         );
                         self.finish_stale_recovery_publication_retry(format!("{error:#}"));
                         backoff = RECOVERY_INITIAL_BACKOFF;
-                        tokio::time::sleep(RECOVERY_INITIAL_BACKOFF).await;
+                        self.wait_for_coremeta_recovery_wake(RECOVERY_INITIAL_BACKOFF)
+                            .await;
                         continue;
                     }
                     tracing::warn!(
@@ -292,18 +339,30 @@ impl CoreStore {
                         false,
                         Some(format!("{error:#}")),
                     );
-                    tokio::time::sleep(backoff).await;
+                    self.wait_for_coremeta_recovery_wake(backoff).await;
                     backoff = next_recovery_backoff(backoff);
                 }
             }
         }
     }
 
+    async fn wait_for_coremeta_recovery_wake(&self, delay: Duration) {
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = self.coremeta_recovery.wake.notified() => {}
+        }
+    }
+
     async fn reconcile_coremeta_once(&self) -> Result<RecoveryRound> {
+        let readiness_epoch = self.begin_coremeta_recovery_round();
         let all_peers = self.coremeta_recovery_peers()?;
         if all_peers.is_empty() {
             bail!("CoreMeta recovery has no reachable equal-peer candidates");
         }
+        let requested_repair_operations = self
+            .recover_requested_root_generations(&all_peers)
+            .await
+            .context("recover requested root-register generations")?;
         let unresolved_publication_intents = self
             .recover_distributed_root_publication_intents(&all_peers)
             .await
@@ -319,12 +378,15 @@ impl CoreStore {
             .filter(|peer| directory.reachable_peers.contains(&peer.node_id))
             .collect::<Vec<_>>();
         let mut round = RecoveryRound {
+            readiness_epoch,
             known_roots: self.coremeta_recovery_root_hashes()?,
             reachable_peers: directory.reachable_peers,
             remote_heads: directory.heads_by_root,
             root_directory_complete: directory.complete,
             unresolved_publication_intents,
             pending_mutations_complete,
+            durable_progress: requested_repair_operations > 0,
+            operations: requested_repair_operations,
             ..RecoveryRound::default()
         };
         let remote_roots = round.remote_heads.keys().cloned().collect::<Vec<_>>();
@@ -342,8 +404,23 @@ impl CoreStore {
                 if round.operations >= RECOVERY_MAX_OPERATIONS_PER_ROUND {
                     break;
                 }
-                let local_generation =
+                let mut local_generation =
                     self.coremeta_recovery_published_generation(&root_key_hash)?;
+                if remote_root_needs_inventory(
+                    local_generation,
+                    round.remote_heads.get(&root_key_hash),
+                ) {
+                    // A foreground publisher exposes the remote register/cache
+                    // quorum before it installs the same generation locally.
+                    // Wait for that publication's linearization guard and
+                    // re-read before treating the node as genuinely stale.
+                    local_generation = {
+                        let _publication_guard = self
+                            .acquire_named_lock("root-publication", &root_key_hash)
+                            .await?;
+                        self.coremeta_recovery_published_generation(&root_key_hash)?
+                    };
+                }
                 if !remote_root_needs_inventory(
                     local_generation,
                     round.remote_heads.get(&root_key_hash),
@@ -356,6 +433,11 @@ impl CoreStore {
                     .await?;
                     continue;
                 }
+                // Q2 publication may normally leave one non-quorum replica
+                // behind. Recover that root without turning unrelated public
+                // operations into a process-wide outage. An incoming skipped
+                // register generation still revokes readiness through the
+                // supervised repair-target path.
                 let next_generation = local_generation.saturating_add(1);
                 if round
                     .attempted_scopes
@@ -494,7 +576,27 @@ impl CoreStore {
             round.pending_mutations_complete = !self.has_pending_mutations()?;
             round.durable_progress = true;
         }
+        // Earlier work in this round may itself have revoked readiness after
+        // discovering lag. Adopt that epoch only before a fresh authoritative
+        // directory pass; any later repair signal still invalidates the round.
+        round.readiness_epoch = self.begin_coremeta_recovery_round();
+        self.refresh_coremeta_recovery_convergence(&all_peers, &mut round)
+            .await
+            .context("refresh CoreMeta recovery convergence")?;
         Ok(round)
+    }
+
+    async fn refresh_coremeta_recovery_convergence(
+        &self,
+        peers: &[RecoveryPeer],
+        round: &mut RecoveryRound,
+    ) -> Result<()> {
+        let directory = self.discover_coremeta_root_directory(peers).await?;
+        round.reachable_peers = directory.reachable_peers;
+        round.remote_heads = directory.heads_by_root;
+        round.root_directory_complete = directory.complete;
+        round.known_roots.extend(round.remote_heads.keys().cloned());
+        self.verify_coremeta_recovery_convergence(round).await
     }
 
     pub(in crate::core_store::local) fn coremeta_recovery_peers(
@@ -614,6 +716,9 @@ impl CoreStore {
                 .retain(|node_id| node_ids.contains(node_id));
             state
                 .peer_entries
+                .retain(|node_id, _| node_ids.contains(node_id));
+            state
+                .pending_peer_entries
                 .retain(|node_id, _| node_ids.contains(node_id));
             peers
                 .iter()
@@ -1020,18 +1125,26 @@ impl CoreStore {
                 "root-register recovery found conflicting quorum generations: root={root_key_hash} generation={generation}"
             );
         }
-        committed
-            .pop()
-            .map(|candidate| candidate.read.root_anchor_record)
-            .ok_or_else(|| {
+        let candidate = committed.pop().ok_or_else(|| {
                 anyhow!(
                     "root-register recovery has no matching quorum: root={root_key_hash} generation={generation} required={required}: {}",
                     failures.join("; ")
                 )
-            })
+            })?;
+        let anchor = decode_root_anchor_record(&candidate.read.root_anchor_record)?;
+        self.ensure_local_committed_root_register_shard(
+            &anchor,
+            &candidate.read.root_anchor_record,
+            candidate.read.generation.saturating_sub(1),
+            &candidate.read.register_cohort_node_ids,
+            &candidate.read.register_cohort_hash,
+            candidate.read.placement_epoch,
+        )
+        .await?;
+        Ok(candidate.read.root_anchor_record)
     }
 
-    async fn fetch_committed_cache_anchor(
+    pub(in crate::core_store::local) async fn fetch_committed_cache_anchor(
         &self,
         peers: &[RecoveryPeer],
         root_key_hash: &str,
@@ -1330,27 +1443,47 @@ impl CoreStore {
     }
 
     pub(in crate::core_store::local) fn mark_coremeta_recovery_unready(&self) {
-        self.coremeta_recovery.ready.store(false, Ordering::Release);
-        let mut snapshot = self
+        if !self
             .coremeta_recovery
-            .snapshot
+            .distributed_required
+            .load(Ordering::Acquire)
+        {
+            return;
+        }
+        let targets = self
+            .coremeta_recovery
+            .requested_generations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        snapshot.ready = false;
-        snapshot.in_progress = true;
+        self.coremeta_recovery
+            .readiness_epoch
+            .fetch_add(1, Ordering::AcqRel);
+        self.set_coremeta_recovery_unready_locked();
+        drop(targets);
+        self.coremeta_recovery.wake.notify_one();
     }
 
     fn finish_coremeta_recovery_round(
         &self,
         round: &RecoveryRound,
-        ready: bool,
+        candidate_ready: bool,
         error: Option<String>,
-    ) {
+    ) -> bool {
         let completed_rounds = self
             .coremeta_recovery
             .completed_rounds
             .fetch_add(1, Ordering::AcqRel)
             .saturating_add(1);
+        let targets = self
+            .coremeta_recovery
+            .requested_generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current_epoch = self
+            .coremeta_recovery
+            .readiness_epoch
+            .load(Ordering::Acquire);
+        let ready = candidate_ready && round.readiness_epoch == current_epoch && targets.is_empty();
         self.coremeta_recovery.ready.store(ready, Ordering::Release);
         let mut snapshot = self
             .coremeta_recovery
@@ -1367,6 +1500,9 @@ impl CoreStore {
         snapshot.physical_register_quorum_complete = round.physical_register_quorum_complete;
         snapshot.completed_rounds = completed_rounds;
         snapshot.last_error = error;
+        drop(snapshot);
+        drop(targets);
+        ready
     }
 
     fn finish_stale_recovery_publication_retry(&self, error: String) {
@@ -1375,189 +1511,17 @@ impl CoreStore {
             .completed_rounds
             .fetch_add(1, Ordering::AcqRel)
             .saturating_add(1);
-        self.coremeta_recovery.ready.store(true, Ordering::Release);
+        let ready = self.coremeta_recovery.ready.load(Ordering::Acquire);
         let mut snapshot = self
             .coremeta_recovery
             .snapshot
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        snapshot.ready = true;
+        snapshot.ready = ready;
         snapshot.in_progress = false;
         snapshot.completed_rounds = completed_rounds;
         snapshot.last_error = Some(error);
     }
-}
-
-fn next_recovery_backoff(current: Duration) -> Duration {
-    current.saturating_mul(2).min(RECOVERY_MAX_BACKOFF)
-}
-
-fn is_stale_recovery_publication(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        matches!(
-            cause.downcast_ref::<CoreStoreCommitError>(),
-            Some(CoreStoreCommitError::RootChangedBeforeDurableStaging { .. })
-        )
-    })
-}
-
-fn root_directory_quorum_is_settled(
-    state: &StdMutex<RootDirectoryScanState>,
-    reachable_peers: &BTreeSet<String>,
-    authoritative_remote_peers: &BTreeSet<String>,
-    minimum_remote_recovery_peers: usize,
-) -> bool {
-    if minimum_remote_recovery_peers == 0 {
-        return true;
-    }
-    if reachable_peers
-        .intersection(authoritative_remote_peers)
-        .count()
-        < minimum_remote_recovery_peers
-    {
-        return false;
-    }
-    let state = state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    state
-        .peers_with_complete_pass
-        .iter()
-        .filter(|node_id| {
-            reachable_peers.contains(*node_id) && authoritative_remote_peers.contains(*node_id)
-        })
-        .count()
-        >= minimum_remote_recovery_peers
-}
-
-fn remote_recovery_acknowledgements(prepare_quorum: usize, local_is_replica: bool) -> usize {
-    prepare_quorum.saturating_sub(usize::from(local_is_replica))
-}
-
-fn recovery_round_is_ready(round: &RecoveryRound) -> bool {
-    recovery_round_is_serviceable(round)
-        && round.unresolved_publication_intents.is_empty()
-        && round.pending_mutations_complete
-}
-
-fn recovery_round_can_replay_pending_mutations(round: &RecoveryRound) -> bool {
-    round.unresolved_publication_intents.is_empty() && recovery_round_is_serviceable(round)
-}
-
-fn recovery_round_is_serviceable(round: &RecoveryRound) -> bool {
-    !round.reachable_peers.is_empty()
-        && round.root_directory_complete
-        && round.canonical_settlement_complete
-        && round.physical_register_quorum_complete
-        && round.lagging_roots.is_empty()
-        && round.pending_bundles.is_empty()
-}
-
-fn recovered_anchors_are_ready(
-    bundle: &CoreMetaRecoveryPublicationBundle,
-    anchors: &BTreeMap<(String, u64), Vec<u8>>,
-) -> bool {
-    bundle
-        .scopes
-        .iter()
-        .all(|scope| anchors.contains_key(scope))
-}
-
-fn validate_recovery_root_anchor_read(
-    peer: &RecoveryPeer,
-    root_key_hash: &str,
-    generation: u64,
-    read: &RootAnchorRead,
-) -> Result<()> {
-    validate_recovery_root_anchor_read_for_node(&peer.node_id, root_key_hash, generation, read)
-}
-
-fn validate_recovery_root_anchor_read_for_node(
-    node_id: &str,
-    root_key_hash: &str,
-    generation: u64,
-    read: &RootAnchorRead,
-) -> Result<()> {
-    let shard_index = usize::try_from(read.shard_index)
-        .map_err(|_| anyhow!("root-register recovery shard index overflow"))?;
-    if read.root_key_hash != root_key_hash
-        || read.generation != generation
-        || read.register_cohort_node_ids.len() != 3
-        || shard_index >= read.register_cohort_node_ids.len()
-        || read.register_cohort_node_ids[shard_index] != node_id
-        || read.placement_epoch == 0
-        || read.root_anchor_hash != format!("sha256:{}", sha256_hex(&read.root_anchor_record))
-        || read.register_cohort_hash
-            != root_register_cohort_hash(root_key_hash, generation, &read.register_cohort_node_ids)
-    {
-        bail!("root-register recovery replica provenance is invalid");
-    }
-    let anchor = decode_root_anchor_record(&read.root_anchor_record)?;
-    validate_root_anchor_record(&anchor)?;
-    if anchor.root_key_hash != root_key_hash || anchor.root_generation != generation {
-        bail!("root-register recovery anchor scope is invalid");
-    }
-    Ok(())
-}
-
-fn validate_recovery_committed_cache_read(
-    root_key_hash: &str,
-    generation: u64,
-    read: &RootAnchorRead,
-) -> Result<()> {
-    if read.root_key_hash != root_key_hash
-        || read.generation != generation
-        || read.root_anchor_hash != format!("sha256:{}", sha256_hex(&read.root_anchor_record))
-        || read.shard_index != 0
-        || !read.register_cohort_node_ids.is_empty()
-        || !read.register_cohort_hash.is_empty()
-        || read.placement_epoch != 0
-    {
-        bail!("CoreMeta recovery participant-root provenance is invalid");
-    }
-    let anchor = decode_root_anchor_record(&read.root_anchor_record)?;
-    validate_root_anchor_record(&anchor)?;
-    if anchor.root_key_hash != root_key_hash || anchor.root_generation != generation {
-        bail!("CoreMeta recovery participant-root scope is invalid");
-    }
-    Ok(())
-}
-
-pub(in crate::core_store::local) fn validate_recovery_publication_anchor(
-    bundle: &CoreMetaRecoveryPublicationBundle,
-    scope: &(String, u64),
-    anchor_bytes: &[u8],
-) -> Result<()> {
-    if !bundle.scopes.contains(scope) {
-        bail!("CoreMeta recovery anchor is outside its publication bundle");
-    }
-    let anchor = decode_root_anchor_record(anchor_bytes)?;
-    validate_root_anchor_record(&anchor)?;
-    if anchor.root_key_hash != scope.0
-        || anchor.root_generation != scope.1
-        || publication_transaction_id(&anchor)? != bundle.transaction_id
-    {
-        bail!("CoreMeta recovery anchor does not match its publication bundle");
-    }
-    Ok(())
-}
-
-fn highest_remote_root_generation(
-    remote_heads: Option<&BTreeMap<String, RootDirectoryEntry>>,
-) -> u64 {
-    remote_heads
-        .into_iter()
-        .flat_map(BTreeMap::values)
-        .map(|entry| entry.root_generation)
-        .max()
-        .unwrap_or(0)
-}
-
-fn remote_root_needs_inventory(
-    local_generation: u64,
-    remote_heads: Option<&BTreeMap<String, RootDirectoryEntry>>,
-) -> bool {
-    highest_remote_root_generation(remote_heads) > local_generation
 }
 
 fn root_directory_page_hash(
@@ -1595,353 +1559,5 @@ fn inventory_cursor_before(generation: u64) -> Option<CoreMetaInventoryCursor> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn readiness_waiter_blocks_until_recovery_is_ready() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = CoreStore::new(Storage::new_at(directory.path()).await.unwrap())
-            .await
-            .unwrap();
-        store.set_coremeta_recovery_required(true);
-
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(25),
-                store.wait_for_coremeta_recovery_ready(),
-            )
-            .await
-            .is_err()
-        );
-
-        store.set_coremeta_recovery_required(false);
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            store.wait_for_coremeta_recovery_ready(),
-        )
-        .await
-        .expect("readiness waiter did not observe the ready transition");
-    }
-
-    #[test]
-    fn recovery_backoff_is_bounded() {
-        let mut delay = RECOVERY_INITIAL_BACKOFF;
-        for _ in 0..16 {
-            delay = next_recovery_backoff(delay);
-        }
-        assert_eq!(delay, RECOVERY_MAX_BACKOFF);
-    }
-
-    #[test]
-    fn stale_foreground_publication_race_is_retryable_without_reopening_startup_barrier() {
-        let stale: anyhow::Error = CoreStoreCommitError::RootChangedBeforeDurableStaging {
-            root_key_hash: format!("sha256:{}", "a".repeat(64)),
-            expected_generation: 3,
-            expected_hash: format!("sha256:{}", "b".repeat(64)),
-            actual_generation: 4,
-            actual_hash: format!("sha256:{}", "c".repeat(64)),
-        }
-        .into();
-        assert!(is_stale_recovery_publication(&stale));
-        assert!(!is_stale_recovery_publication(&anyhow!(
-            "corrupt recovery generation"
-        )));
-    }
-
-    #[test]
-    fn recovery_sources_prefer_highest_generation_then_stable_node_id() {
-        let mut sources = [
-            RecoverySource {
-                peer: RecoveryPeer {
-                    node_id: "node-b".into(),
-                    public_api_addr: "b".into(),
-                },
-                final_generation: 8,
-                retention_floor_generation: 1,
-            },
-            RecoverySource {
-                peer: RecoveryPeer {
-                    node_id: "node-a".into(),
-                    public_api_addr: "a".into(),
-                },
-                final_generation: 8,
-                retention_floor_generation: 1,
-            },
-            RecoverySource {
-                peer: RecoveryPeer {
-                    node_id: "node-c".into(),
-                    public_api_addr: "c".into(),
-                },
-                final_generation: 7,
-                retention_floor_generation: 1,
-            },
-        ];
-        sources.sort_by(|left, right| {
-            right
-                .final_generation
-                .cmp(&left.final_generation)
-                .then_with(|| left.peer.node_id.cmp(&right.peer.node_id))
-        });
-        assert_eq!(sources[0].peer.node_id, "node-a");
-        assert_eq!(sources[1].peer.node_id, "node-b");
-    }
-
-    #[test]
-    fn recovery_readiness_requires_peer_convergence_and_no_pending_group() {
-        let mut round = RecoveryRound::default();
-        assert!(!recovery_round_is_ready(&round));
-
-        round.reachable_peers.insert("node-a".into());
-        assert!(!recovery_round_is_ready(&round));
-
-        round.root_directory_complete = true;
-        round.canonical_settlement_complete = true;
-        round.physical_register_quorum_complete = true;
-        round.pending_mutations_complete = true;
-        assert!(recovery_round_is_ready(&round));
-
-        round.lagging_roots.insert("root-a".into());
-        assert!(!recovery_round_is_ready(&round));
-        round.lagging_roots.clear();
-
-        round.pending_bundles.insert(
-            b"bundle-a".to_vec(),
-            CoreMetaRecoveryPublicationBundle {
-                transaction_id: "transaction-a".into(),
-                publisher_node_id: "node-a".into(),
-                scopes: vec![("root-a".into(), 1)],
-                coordinator_scope: ("root-a".into(), 1),
-                guard_context_hash: None,
-                transaction_expires_at_unix_nanos: 0,
-                guard_visible_update_count: 0,
-                guard_precondition_count: 0,
-            },
-        );
-        assert!(!recovery_round_is_ready(&round));
-    }
-
-    #[test]
-    fn admitted_recovery_remains_serviceable_during_foreground_publication() {
-        let mut round = RecoveryRound {
-            root_directory_complete: true,
-            canonical_settlement_complete: true,
-            physical_register_quorum_complete: true,
-            pending_mutations_complete: false,
-            ..RecoveryRound::default()
-        };
-        round.reachable_peers.insert("node-a".into());
-        round
-            .unresolved_publication_intents
-            .insert("foreground-transaction".into());
-
-        assert!(!recovery_round_is_ready(&round));
-        assert!(recovery_round_is_serviceable(&round));
-    }
-
-    #[test]
-    fn pending_mutations_wait_for_canonical_history_settlement() {
-        let mut round = RecoveryRound {
-            root_directory_complete: true,
-            canonical_settlement_complete: true,
-            physical_register_quorum_complete: true,
-            pending_mutations_complete: false,
-            ..RecoveryRound::default()
-        };
-        round.reachable_peers.insert("node-a".into());
-        assert!(recovery_round_can_replay_pending_mutations(&round));
-
-        round.lagging_roots.insert("stream-root".into());
-        assert!(!recovery_round_can_replay_pending_mutations(&round));
-        round.lagging_roots.clear();
-
-        round
-            .unresolved_publication_intents
-            .insert("publication-a".into());
-        assert!(!recovery_round_can_replay_pending_mutations(&round));
-    }
-
-    #[test]
-    fn root_directory_quorum_settle_requires_current_complete_and_quorum() {
-        let state = StdMutex::new(RootDirectoryScanState {
-            peers_with_complete_pass: BTreeSet::from(["node-a".into(), "node-b".into()]),
-            ..RootDirectoryScanState::default()
-        });
-        let authoritative = BTreeSet::from(["node-a".into(), "node-b".into(), "node-c".into()]);
-        let mut reachable = BTreeSet::from(["node-b".into(), "node-c".into()]);
-        assert!(!root_directory_quorum_is_settled(
-            &state,
-            &reachable,
-            &authoritative,
-            2,
-        ));
-
-        reachable.insert("node-a".into());
-        assert!(root_directory_quorum_is_settled(
-            &state,
-            &reachable,
-            &authoritative,
-            2,
-        ));
-
-        reachable.remove("node-c");
-        assert!(!root_directory_quorum_is_settled(
-            &state,
-            &reachable,
-            &authoritative,
-            3,
-        ));
-    }
-
-    #[test]
-    fn root_directory_quorum_ignores_non_register_peers() {
-        let state = StdMutex::new(RootDirectoryScanState {
-            peers_with_complete_pass: BTreeSet::from([
-                "register-a".into(),
-                "cache-d".into(),
-                "cache-e".into(),
-            ]),
-            ..RootDirectoryScanState::default()
-        });
-        let authoritative = BTreeSet::from([
-            "register-a".into(),
-            "register-b".into(),
-            "register-c".into(),
-        ]);
-        let reachable = BTreeSet::from(["register-a".into(), "cache-d".into(), "cache-e".into()]);
-        assert!(!root_directory_quorum_is_settled(
-            &state,
-            &reachable,
-            &authoritative,
-            2,
-        ));
-    }
-
-    #[test]
-    fn local_replica_plus_one_complete_remote_satisfies_r3q2_discovery() {
-        assert_eq!(remote_recovery_acknowledgements(2, true), 1);
-        assert_eq!(remote_recovery_acknowledgements(2, false), 2);
-        let state = StdMutex::new(RootDirectoryScanState {
-            peers_with_complete_pass: BTreeSet::from(["node-b".into()]),
-            ..RootDirectoryScanState::default()
-        });
-        let authoritative = BTreeSet::from(["node-a".into(), "node-b".into(), "node-c".into()]);
-        let reachable = BTreeSet::from(["node-b".into()]);
-        assert!(root_directory_quorum_is_settled(
-            &state,
-            &reachable,
-            &authoritative,
-            remote_recovery_acknowledgements(2, true),
-        ));
-        assert!(!root_directory_quorum_is_settled(
-            &state,
-            &reachable,
-            &authoritative,
-            remote_recovery_acknowledgements(2, false),
-        ));
-    }
-
-    #[test]
-    fn root_directory_heads_only_require_inventory_when_a_peer_is_ahead() {
-        let heads = BTreeMap::from([
-            (
-                "node-a".to_string(),
-                RootDirectoryEntry {
-                    root_key_hash:
-                        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                            .into(),
-                    root_generation: 7,
-                    root_anchor_hash:
-                        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                            .into(),
-                },
-            ),
-            (
-                "node-b".to_string(),
-                RootDirectoryEntry {
-                    root_key_hash:
-                        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                            .into(),
-                    root_generation: 9,
-                    root_anchor_hash:
-                        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-                            .into(),
-                },
-            ),
-        ]);
-        assert_eq!(highest_remote_root_generation(Some(&heads)), 9);
-        assert!(remote_root_needs_inventory(8, Some(&heads)));
-        assert!(!remote_root_needs_inventory(9, Some(&heads)));
-        assert!(!remote_root_needs_inventory(10, Some(&heads)));
-        assert_eq!(highest_remote_root_generation(Some(&BTreeMap::new())), 0);
-        assert_eq!(highest_remote_root_generation(None), 0);
-    }
-
-    #[test]
-    fn a_new_root_directory_pass_is_not_complete_until_its_last_page() {
-        let first = RootDirectoryEntry {
-            root_key_hash:
-                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            root_generation: 1,
-            root_anchor_hash:
-                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
-        };
-        let second = RootDirectoryEntry {
-            root_key_hash:
-                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into(),
-            root_generation: 2,
-            root_anchor_hash:
-                "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into(),
-        };
-        let mut state = RootDirectoryScanState::default();
-        state.record_page(
-            "node-a",
-            "",
-            &RootDirectoryPage {
-                entries: vec![first.clone()],
-                next_root_key_hash: first.root_key_hash.clone(),
-                directory_complete: false,
-                page_hash: String::new(),
-                encoded_bytes: 1,
-            },
-        );
-        assert!(!state.peers_with_complete_pass.contains("node-a"));
-        state.record_page(
-            "node-a",
-            &first.root_key_hash,
-            &RootDirectoryPage {
-                entries: vec![second],
-                next_root_key_hash: String::new(),
-                directory_complete: true,
-                page_hash: String::new(),
-                encoded_bytes: 1,
-            },
-        );
-        assert!(state.peers_with_complete_pass.contains("node-a"));
-        assert_eq!(state.peer_entries["node-a"].len(), 2);
-
-        state.record_page(
-            "node-a",
-            "",
-            &RootDirectoryPage {
-                entries: vec![first.clone()],
-                next_root_key_hash: first.root_key_hash,
-                directory_complete: false,
-                page_hash: String::new(),
-                encoded_bytes: 1,
-            },
-        );
-        assert!(!state.peers_with_complete_pass.contains("node-a"));
-        assert_eq!(state.peer_entries["node-a"].len(), 1);
-    }
-
-    #[test]
-    fn first_generation_agreement_starts_without_an_invalid_zero_cursor() {
-        assert_eq!(inventory_cursor_before(0), None);
-        assert_eq!(inventory_cursor_before(1), None);
-        assert_eq!(
-            inventory_cursor_before(2),
-            Some(CoreMetaInventoryCursor { generation: 1 })
-        );
-    }
-}
+#[path = "local_coremeta_recovery/tests.rs"]
+mod tests;

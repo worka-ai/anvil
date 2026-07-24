@@ -2454,9 +2454,18 @@ cannot weaken the committed quorum or extend client latency to that replica's
 transport timeout. After Q2, the publisher MAY spend a small, strictly bounded
 grace period draining already-issued CAS operations so healthy replicas usually
 reach R3 before the response is observed. This grace period is not a commit
-condition. If it expires, the publisher marks distributed recovery unready,
-cancels the remaining foreground attempts, and leaves convergence to the
-root-directory recovery loop.
+condition. If it expires, the publisher emits repair-pending telemetry and
+cancels the remaining foreground attempts, but MUST NOT revoke its own
+readiness: the publisher is already current and its local recovery loop cannot
+repair a different node. A register replica that observes a request beyond its
+next contiguous generation MUST mark its own distributed recovery unready and
+wake that loop before rejecting the request. After proving physical Q2, every CAS
+recipient MUST verify that the signed prepare receipts bind the same placement
+epoch and MUST idempotently reconstruct its own omitted root-register shard
+before advancing its local committed root. Anti-entropy MUST perform the same
+repair after proving physical Q2, then install CoreMeta and root-cache
+generations in order under the normal per-root publication lock. Only a complete
+serviceable recovery round may restore a lagging replica's public readiness.
 
 The loser must mark its pending CoreMeta rows aborted or delete them, release any
 reserved generation, re-read the current root, re-plan against the new generation,
@@ -2738,7 +2747,8 @@ For `RootAnchorKey K`, partition owner `O` publishes generation `N+1` as follows
 10. choose three register nodes using rendezvous(K, owner_epoch)
 11. compute register_cohort_hash from root_key_hash, N+1, and selected nodes
 12. write RootRegisterShard with create_new semantics to all three nodes
-13. require two matching durable shard receipts
+13. require two matching durable shard receipts whose signed payloads bind the
+    placement epoch
 14. record visible committed generation N+1 in memory
 15. return root_generation N+1 and root_anchor_hash
 ```
@@ -7011,7 +7021,11 @@ CoreMeta replication semantics:
 - Reaching Q2 may cancel speculative foreground replication. Equal-peer
   convergence remains mandatory: the root-directory recovery loop discovers
   any omitted root and completes its signed CoreMeta and root-anchor history
-  asynchronously. An unavailable third replica cannot delay the Q2 response.
+  asynchronously. Recovery is signalled immediately when foreground replication
+  is omitted or a generation gap is observed; it does not wait for the
+  steady-state scan interval. A recovering cohort member reconstructs its exact
+  missing root-register shard only after verifying physical Q2. An unavailable
+  third replica cannot delay the Q2 response.
 - CoreMeta replication is metadata-only. Large payload bytes are replicated by
   the erasure-coded block store. Inline payload rows are the bounded exception:
   they are replicated as full CoreMeta rows under the inline size cap.

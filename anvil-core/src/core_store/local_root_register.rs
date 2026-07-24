@@ -117,10 +117,42 @@ impl CoreStore {
             fsync_sequence: ROOT_REGISTER_FSYNC_SEQUENCE,
             signed_payload_hash: String::new(),
             signature: Vec::new(),
+            placement_epoch,
         };
         receipt.signed_payload_hash = root_prepare_receipt_payload_hash(&receipt);
         receipt.signature = self.sign_internal_core_receipt(&receipt.signed_payload_hash)?;
         Ok(receipt)
+    }
+
+    pub(crate) async fn ensure_local_committed_root_register_shard(
+        &self,
+        anchor: &CoreRootAnchorRecord,
+        anchor_bytes: &[u8],
+        expected_generation: u64,
+        cohort_node_ids: &[String],
+        cohort_hash: &str,
+        placement_epoch: u64,
+    ) -> Result<()> {
+        let Some(shard_index) = cohort_node_ids
+            .iter()
+            .position(|node_id| node_id == &self.node_identity.node_id)
+        else {
+            return Ok(());
+        };
+        let shard_index = u16::try_from(shard_index)
+            .map_err(|_| anyhow!("root-register repair shard index overflow"))?;
+        self.persist_root_register_prepare(
+            &self.node_identity.node_id,
+            anchor,
+            anchor_bytes,
+            expected_generation,
+            cohort_node_ids,
+            cohort_hash,
+            shard_index,
+            placement_epoch,
+        )
+        .await?;
+        Ok(())
     }
 
     pub(super) fn root_register_shard_path(&self, shard: &RootRegisterShard) -> PathBuf {
@@ -571,6 +603,30 @@ mod tests {
     }
 
     #[test]
+    fn root_prepare_receipt_signature_scope_binds_placement_epoch() {
+        let receipt = RootPrepareReceipt {
+            replica_node_id: "node-a".into(),
+            root_key_hash: format!("sha256:{}", sha256_hex(b"root-key")),
+            expected_generation: 8,
+            post_generation: 9,
+            new_root_hash: format!("sha256:{}", sha256_hex(b"root-anchor")),
+            shard_index: 0,
+            register_cohort_hash: format!("sha256:{}", sha256_hex(b"cohort")),
+            fsync_sequence: 1,
+            signed_payload_hash: String::new(),
+            signature: Vec::new(),
+            placement_epoch: 3,
+        };
+        let mut different_epoch = receipt.clone();
+        different_epoch.placement_epoch = 4;
+
+        assert_ne!(
+            root_prepare_receipt_payload_hash(&receipt),
+            root_prepare_receipt_payload_hash(&different_epoch)
+        );
+    }
+
+    #[test]
     fn exact_read_only_returns_the_preferred_nodes_encoded_slot() {
         let temporary = tempfile::tempdir().unwrap();
         let root_key_hash = format!("sha256:{}", sha256_hex(b"root-key"));
@@ -618,5 +674,23 @@ mod tests {
             .shard_index,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn root_register_shard_repair_is_idempotent_and_conflicts_fail_closed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("shard-0.anr");
+
+        persist_create_new_root_register_shard(path.clone(), b"committed-shard".to_vec())
+            .await
+            .unwrap();
+        persist_create_new_root_register_shard(path.clone(), b"committed-shard".to_vec())
+            .await
+            .unwrap();
+
+        let error = persist_create_new_root_register_shard(path, b"conflicting-shard".to_vec())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("generation is in doubt"));
     }
 }
