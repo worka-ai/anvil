@@ -26,7 +26,9 @@ impl SingleNodeMutationBatchFixture {
             &["test-region-1"],
         )
         .await;
-        cluster.start_and_converge(Duration::from_secs(5)).await;
+        cluster
+            .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+            .await;
 
         let actor = create_object_test_actor(&cluster, label).await;
         let bucket_name = unique_test_name("tx-mutation-batch");

@@ -212,7 +212,9 @@ async fn test_authz_namespace_watch_streams_snapshot_and_new_events() {
         &["test-region-1"],
     )
     .await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
 
     append_authz_namespace_watch_record(
         &cluster.states[0].storage,
@@ -797,7 +799,9 @@ async fn test_authz_derived_lag_watch_streams_snapshot_and_new_events() {
         &["test-region-1"],
     )
     .await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
 
     append_authz_derived_lag_watch_record(
         &cluster.states[0].storage,
@@ -869,7 +873,9 @@ async fn test_repair_authz_derived_index_rebuilds_from_tuple_log() {
         &["test-region-1"],
     )
     .await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
 
     let token = cluster.token.clone();
     let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())

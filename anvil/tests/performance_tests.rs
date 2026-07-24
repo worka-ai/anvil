@@ -19,7 +19,8 @@ use anvil_core::core_store::{
 use anvil_core::perf_baseline::{BaselineManifest, BaselineRunSummary, BaselineScenarioSummary};
 use anvil_core::storage::Storage;
 use anvil_test_utils::{
-    emit_test_timing, isolated_test_cluster, shared_docker_test_cluster, unique_test_name,
+    ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT, emit_test_timing, isolated_test_cluster,
+    shared_docker_test_cluster, unique_test_name,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -727,7 +728,9 @@ async fn performance_native_api_smoke() {
                 &["perf-region-1"],
             )
             .await;
-            cluster.start_and_converge(Duration::from_secs(5)).await;
+            cluster
+                .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+                .await;
             cluster
         })
         .await;

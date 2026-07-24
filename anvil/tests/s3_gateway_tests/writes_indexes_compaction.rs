@@ -575,7 +575,9 @@ async fn test_s3_writes_trigger_worker_metadata_compaction() {
         },
     )
     .await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
 
     let app_name = unique_test_name("s3-auto-compact");
     let (client_id, client_secret) = create_app(&cluster, &app_name).await;

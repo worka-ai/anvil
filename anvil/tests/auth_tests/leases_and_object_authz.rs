@@ -123,7 +123,9 @@ async fn test_coordination_task_lease_security_invariants() {
         },
     )
     .await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
 
     let (lease_app_a_id, lease_app_a_client, lease_app_a_secret) =
         create_app_with_id(&cluster, "lease-app-a").await;
@@ -488,7 +490,9 @@ async fn test_authz_tuple_rejects_invalid_caveat_hash_before_writing() {
         &["test-region-1"],
     )
     .await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
 
     let token = cluster.token.clone();
     let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())

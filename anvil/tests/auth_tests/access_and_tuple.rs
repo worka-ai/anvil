@@ -631,7 +631,9 @@ async fn test_authz_tuple_batch_failure_is_atomic() {
         &["test-region-1"],
     )
     .await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
 
     let token = cluster.token.clone();
     let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())

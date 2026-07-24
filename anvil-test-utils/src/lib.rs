@@ -48,6 +48,7 @@ static SHARED_PUBLIC_REGION_CLUSTER: OnceLock<Arc<TestCluster>> = OnceLock::new(
 static SHARED_DOCKER_CLUSTER: OnceLock<Arc<DockerTestCluster>> = OnceLock::new();
 
 const DEFAULT_TEST_REGION: &str = "test-region-1";
+pub const ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const SHARED_CLUSTER_REGIONS: [&str; 6] = [
     DEFAULT_TEST_REGION,
     DEFAULT_TEST_REGION,
